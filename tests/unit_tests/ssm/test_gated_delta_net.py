@@ -153,7 +153,9 @@ def test_parallel_gated_delta_net_correctness(tmp_path_dist_ckpt, tp, sp, cp):
     hidden_size = 128
 
     # Model initialization function
-    def initialize_gpt_model(config, pre_process=True, post_process=True, vp_stage=None, pg_collection=None):
+    def initialize_gpt_model(
+        config, pre_process=True, post_process=True, vp_stage=None, pg_collection=None
+    ):
         layer_spec = get_gpt_layer_with_transformer_engine_spec(
             experimental_attention_variant="gated_delta_net"
         )
@@ -210,9 +212,7 @@ def test_parallel_gated_delta_net_correctness(tmp_path_dist_ckpt, tp, sp, cp):
         init_basic_mock_args(mock_args, 1, 1, bf16=True)
         mock_args.context_parallel_size = 1
         mock_args.sequence_parallel = 1
-        gpt_model = unwrap_model(
-            get_model(initialize_gpt_model, config=transformer_config)
-        )
+        gpt_model = unwrap_model(get_model(initialize_gpt_model, config=transformer_config))
 
         # Initialize args and save checkpoint
         init_checkpointing_mock_args(mock_args, ckpt_dir, False)

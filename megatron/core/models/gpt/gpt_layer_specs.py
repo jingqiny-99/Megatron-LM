@@ -735,11 +735,11 @@ def get_gpt_decoder_block_spec(
         if not is_linear_attention_variant(config.experimental_attention_variant):
             linear_attention_pattern = [0] * config.num_layers
         else:
-            linear_attention_pattern = [1] * config.num_layers
-            warnings.warn(
+            # This should be caught by config validation, but raise here as a safety check
+            raise ValueError(
                 f"Linear attention type {config.experimental_attention_variant} is specified "
                 "but linear_attention_freq is None. "
-                "Setting linear_attention_pattern to [1] * config.num_layers as default."
+                "Please set linear_attention_freq to specify the LA/SDPA layer pattern."
             )
     else:
         raise ValueError(

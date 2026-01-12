@@ -435,7 +435,12 @@ def num_floating_point_operations(args, batch_size):
                     f"current linear attention pattern: {args.linear_attention_freq}"
                 )
             elif args.linear_attention_freq is None:
-                linear_attention_pattern = [1] * num_layers
+                # This should be caught by config validation, but raise here as a safety check
+                raise ValueError(
+                    f"Linear attention type {args.experimental_attention_variant} is specified "
+                    "but linear_attention_freq is None. "
+                    "Please set linear_attention_freq to specify the LA/SDPA layer pattern."
+                )
             else:
                 raise ValueError(
                     f"Invalid linear_attention_freq: {type(args.linear_attention_freq)},"
