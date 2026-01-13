@@ -192,6 +192,9 @@ class TransformerConfig(ModelParallelConfig):
     qk_layernorm: bool = False
     """Whether to apply `normalization` type of normalization to the query and key embeddings."""
 
+    qk_l2_norm: bool = False
+    """Whether to apply llama 4-style qk L2 norm."""
+
     qk_clip: bool = False
     """Whether to clip the query and key weights. Needed for Muon MLA Model training."""
 

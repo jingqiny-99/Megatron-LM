@@ -252,14 +252,12 @@ class GatedDeltaNet(MegatronModule):
         attention_mask: Tensor,
         key_value_states: Optional[Tensor] = None,
         inference_context: Optional[BaseInferenceContext] = None,
-        rotary_pos_emb: Optional[Union[Tensor, Tuple[Tensor, Tensor]]] = None,
-        rotary_pos_cos: Optional[Tensor] = None,
-        rotary_pos_sin: Optional[Tensor] = None,
         attention_bias: Optional[Tensor] = None,
         packed_seq_params: Optional[PackedSeqParams] = None,
         sequence_len_offset: Optional[int] = None,
         *,
         inference_params: Optional[BaseInferenceContext] = None,
+        **kwargs,
     ):
         """
         Perform a forward pass through the GDN module.
@@ -270,10 +268,6 @@ class GatedDeltaNet(MegatronModule):
             key_value_states (Optional[Tensor]): Key/value states (for cross attention).
             inference_context (Optional[BaseInferenceContext]): Inference context that manages
                 KV cache.
-            rotary_pos_emb (Optional[Union[Tensor, Tuple[Tensor, Tensor]]]): Rotary
-                embedding tensor(s).
-            rotary_pos_cos (Optional[Tensor]): Rotary embedding cosine.
-            rotary_pos_sin (Optional[Tensor]): Rotary embedding sine.
             attention_bias (Optional[Tensor]): Attention bias.
             packed_seq_params (Optional[PackedSeqparams]): Parameters used for THD format.
             sequence_len_offset (Optional[int]): Sequence length offset used for

@@ -9,7 +9,7 @@ from megatron.core.models.gpt.gpt_layer_specs import (
     get_gpt_mtp_block_spec,
 )
 from megatron.core.models.gpt.experimental_attention_variant_module_specs import (
-    is_linear_attention_variant,
+    get_transformer_block_with_experimental_attention_variant_spec,
 )
 from megatron.core.models.gpt.heterogeneous.heterogeneous_layer_specs import (
     get_gpt_heterogeneous_layer_spec,
@@ -45,7 +45,13 @@ def gpt_builder(args, pre_process, post_process, vp_stage=None, config=None, pg_
         else:
             use_te = args.transformer_impl == "transformer_engine"
 
-            if args.num_experts or is_linear_attention_variant(args.experimental_attention_variant):
+            if args.experimental_attention_variant is not None:
+                transformer_layer_spec = (
+                    get_transformer_block_with_experimental_attention_variant_spec(
+                        config=config, vp_stage=vp_stage
+                    )
+                )
+            elif args.num_experts:
                 assert not (config.transformer_impl == "inference_optimized")
                 # Define the decoder block spec
                 transformer_layer_spec = get_gpt_decoder_block_spec(
