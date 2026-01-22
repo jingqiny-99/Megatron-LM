@@ -159,7 +159,7 @@ class HyperConnectionModule(MegatronModule):
     
 
     # TODO: Kernel fusion
-    @nvtx_decorator()
+    @nvtx_decorator(message="HyperConnection::projection_and_rms")
     def _projection_and_rms(self, x : Tensor) -> Tuple[Tensor, Tensor]:
         """
         Project input hidden states to mapping space and apply RMS normalization.
@@ -176,7 +176,7 @@ class HyperConnectionModule(MegatronModule):
         return proj, r
     
     #TODO: kernel fusion
-    @nvtx_decorator()
+    @nvtx_decorator(message="HyperConnection::compute_h")
     def _compute_h(self, proj: Tensor, r: Tensor) -> Tensor:
         """
         Compute h from projected hidden states and scaling factors.
@@ -196,7 +196,7 @@ class HyperConnectionModule(MegatronModule):
         h_res = h[..., 2*self.n:]
         return h_pre, h_post, h_res
     
-    @nvtx_decorator()
+    @nvtx_decorator(message="HyperConnection::compute_mappings")
     def compute_mappings(self, x: Tensor) -> Tuple[Tensor, Tensor, Tensor]:
         """
         Compute mHC mappings from input hidden states.
@@ -218,7 +218,7 @@ class HyperConnectionModule(MegatronModule):
         
         return h_pre, h_post, h_res
     
-    @nvtx_decorator()
+    @nvtx_decorator(message="HyperConnection::apply_h_post_inner")
     def _apply_h_post(self, x: Tensor, h_post: Tensor) -> Tensor:
         """
         Core implementation of H_post application to a single tensor.
@@ -250,7 +250,7 @@ class HyperConnectionModule(MegatronModule):
         result = torch.einsum('sbij,sbjc->sbic', h_post.unsqueeze(-1), x_expanded)
         return result.view(s, b, n * C)
     
-    @nvtx_decorator()
+    @nvtx_decorator(message="HyperConnection::apply_h_post")
     def apply_h_post(
         self,
         x_with_bias: Tuple[Tensor, Optional[Tensor]],
@@ -302,7 +302,7 @@ class HyperConnectionModule(MegatronModule):
 
     
     #TODO: Kernel fusion
-    @nvtx_decorator()
+    @nvtx_decorator(message="HyperConnection::aggregate")
     def aggregate(self, x: Tensor, h_pre: Tensor) -> Tensor:
         """
         Aggregate n-stream to 1-stream using H_pre weights.
@@ -327,7 +327,7 @@ class HyperConnectionModule(MegatronModule):
         
         return aggregated
 
-    @nvtx_decorator()
+    @nvtx_decorator(message="HyperConnection::apply_h_res")
     def apply_h_res(self, h_res: Tensor, residual: Tensor) -> Tensor:
         """
         Apply H_res to residual using H_res weights.
@@ -478,7 +478,7 @@ class HyperConnectionModule(MegatronModule):
 
     # ==================== Fused kernel placeholder ====================
     
-    @nvtx_decorator()
+    @nvtx_decorator(message="HyperConnection::fused_h_res_h_post_bda")
     def fused_h_res_h_post_bda(
         self,
         h_res: Tensor,
@@ -528,6 +528,7 @@ class HyperConnectionModule(MegatronModule):
                 dropout_prob, training, fused
             )
     
+    @nvtx_decorator(message="HyperConnection::fused_h_res_h_post_bda_native")
     def _fused_h_res_h_post_bda_native(
         self,
         h_res: Tensor,
@@ -569,6 +570,7 @@ class HyperConnectionModule(MegatronModule):
         
         return output
     
+    @nvtx_decorator(message="HyperConnection::fused_h_res_h_post_bda_with_checkpoint")
     def _fused_h_res_h_post_bda_with_checkpoint(
         self,
         h_res: Tensor,
