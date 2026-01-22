@@ -6,7 +6,7 @@ from torch import Tensor
 
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.transformer_config import TransformerConfig
-from megatron.core.utils import nvtx_decorator
+from megatron.core.utils import nvtx_decorator, nvtx_range_push, nvtx_range_pop
 
 if TYPE_CHECKING:
     from megatron.core.tensor_parallel.random import MHCBlockRecomputeManager
@@ -422,16 +422,18 @@ class HyperConnectionModule(MegatronModule):
         """
         from megatron.core.tensor_parallel.random import CheckpointWithoutOutput
         
+        nvtx_range_push("HyperConnection::compute_mappings")
         # Checkpoint compute_mappings - auto-registers to manager via ckpt_manager parameter
         h_pre, h_post, h_res = CheckpointWithoutOutput(ckpt_manager=manager).checkpoint(
             self.compute_mappings, hidden_states
         )
-        
+        nvtx_range_pop("HyperConnection::compute_mappings")
         # Checkpoint aggregate - auto-registers to manager
+        nvtx_range_push("HyperConnection::aggregate")
         aggregated = CheckpointWithoutOutput(ckpt_manager=manager).checkpoint(
             self.aggregate, hidden_states, h_pre
         )
-        
+        nvtx_range_pop("HyperConnection::aggregate")
         return aggregated, h_res, h_post
     
     # ==================== Block-level utilities ====================
@@ -604,16 +606,18 @@ class HyperConnectionModule(MegatronModule):
         from megatron.core.fusions.fused_bias_dropout import get_bias_dropout_add
         
         # Step 1: Checkpoint apply_h_res
+        nvtx_range_push("HyperConnection::apply_h_res")
         mixed = CheckpointWithoutOutput(ckpt_manager=manager).checkpoint(
             self.apply_h_res, h_res, original_residual
         )
-        
+        nvtx_range_pop("HyperConnection::apply_h_res")
         # Step 2: Checkpoint apply_h_post for x
         x, bias = layer_output_with_bias
+        nvtx_range_push("HyperConnection::apply_h_post")
         x_expanded = CheckpointWithoutOutput(ckpt_manager=manager).checkpoint(
             self._apply_h_post, x, h_post
-        )
-        
+        )   
+        nvtx_range_pop("HyperConnection::apply_h_post")
         # Checkpoint apply_h_post for bias if not None
         if bias is not None:
             bias_expanded = CheckpointWithoutOutput(ckpt_manager=manager).checkpoint(
@@ -642,7 +646,9 @@ class HyperConnectionModule(MegatronModule):
             return bda_func((output, bias), res, dropout)
         
         ckpt = CheckpointWithoutOutput(ckpt_manager=manager)
+        nvtx_range_push("HyperConnection::bda_wrapper")
         output = ckpt.checkpoint(_bda_wrapper, x_expanded, bias_expanded, mixed, dropout_prob)
+        nvtx_range_pop("HyperConnection::bda_wrapper")
         
         return output
 
