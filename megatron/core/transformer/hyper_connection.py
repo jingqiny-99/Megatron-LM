@@ -159,6 +159,7 @@ class HyperConnectionModule(MegatronModule):
     
 
     # TODO: Kernel fusion
+    @torch.compile
     @nvtx_decorator(message="HyperConnection::projection_and_rms")
     def _projection_and_rms(self, x : Tensor) -> Tuple[Tensor, Tensor]:
         """
@@ -176,14 +177,20 @@ class HyperConnectionModule(MegatronModule):
         return proj, r
     
     #TODO: kernel fusion
+    @torch.compile
     @nvtx_decorator(message="HyperConnection::compute_h")
-    def _compute_h(self, proj: Tensor, r: Tensor) -> Tensor:
+    def _compute_h(self, proj: Tensor, r: Tensor) -> Tuple[Tensor, Tensor, Tensor]:
         """
         Compute h from projected hidden states and scaling factors.
         
         Args:
             proj: [s, b, n^2 + 2n] - projected hidden states
             r: [s, b, 1] - scaling factors
+        
+        Returns:
+            h_pre: [s, b, n] - aggregation weights
+            h_post: [s, b, n] - expansion weights
+            h_res: [s, b, n^2] - residual mixing logits
         """
         s, b, _ = proj.shape
         alpha_ = torch.cat([self.alpha_pre.expand(self.n), self.alpha_post.expand(self.n), self.alpha_res.expand(self.n * self.n)], dim = -1)
@@ -218,12 +225,13 @@ class HyperConnectionModule(MegatronModule):
         
         return h_pre, h_post, h_res
     
+    @torch.compile
     @nvtx_decorator(message="HyperConnection::apply_h_post_inner")
     def _apply_h_post(self, x: Tensor, h_post: Tensor) -> Tensor:
         """
         Core implementation of H_post application to a single tensor.
         
-        Computes: H_post^T @ x
+        Computes: H_post^T @ x (using broadcast multiply)
         
         Args:
             x: Input tensor, can be either:
@@ -246,8 +254,9 @@ class HyperConnectionModule(MegatronModule):
             C = x.shape[-1]
             x_expanded = x.unsqueeze(2)  # [s, b, 1, C]
         
-        # h_post^T @ x : [s, b, n, 1] @ [s, b, 1, C] -> [s, b, n, C]
-        result = torch.einsum('sbij,sbjc->sbic', h_post.unsqueeze(-1), x_expanded)
+        # h_post^T @ x : [s, b, n, 1] * [s, b, 1, C] -> [s, b, n, C]
+        # Using broadcast multiply instead of einsum
+        result = h_post.unsqueeze(-1) * x_expanded
         return result.view(s, b, n * C)
     
     @nvtx_decorator(message="HyperConnection::apply_h_post")
@@ -302,6 +311,7 @@ class HyperConnectionModule(MegatronModule):
 
     
     #TODO: Kernel fusion
+    @torch.compile
     @nvtx_decorator(message="HyperConnection::aggregate")
     def aggregate(self, x: Tensor, h_pre: Tensor) -> Tensor:
         """
@@ -327,22 +337,31 @@ class HyperConnectionModule(MegatronModule):
         
         return aggregated
 
+    @torch.compile
     @nvtx_decorator(message="HyperConnection::apply_h_res")
     def apply_h_res(self, h_res: Tensor, residual: Tensor) -> Tensor:
         """
         Apply H_res to residual using H_res weights.
         
-        Computes: H_res @ residual
+        Computes: H_res @ residual (using bmm)
         
         Args:
             h_res: [s, b, n, n] - residual mixing matrix
             residual: [s, b, n*C] - n-stream hidden states
         """
         s, b, _ = residual.shape 
+        n = self.n
         C = self.hidden_size
-        residual_streams = residual.view(s, b, self.n, C)
-        mixed = torch.einsum('sbij,sbjc->sbic', h_res, residual_streams) # [s, b, n, C]
-        return mixed.view(s, b, self.n * C)
+        
+        # Reshape for bmm: [s, b, n, n] -> [s*b, n, n]
+        h_res_batched = h_res.view(s * b, n, n)
+        # [s, b, n*C] -> [s, b, n, C] -> [s*b, n, C]
+        residual_batched = residual.view(s, b, n, C).view(s * b, n, C)
+        
+        # Batch matrix multiply: [s*b, n, n] @ [s*b, n, C] -> [s*b, n, C]
+        mixed = torch.bmm(h_res_batched, residual_batched)
+        
+        return mixed.view(s, b, n * C)
     
     def forward(
         self,
