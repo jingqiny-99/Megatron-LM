@@ -231,7 +231,7 @@ class HyperConnectionModule(MegatronModule):
         """
         Core implementation of H_post application to a single tensor.
         
-        Computes: H_post^T @ x (using broadcast multiply)
+        Computes: H_post^T @ x
         
         Args:
             x: Input tensor, can be either:
@@ -343,7 +343,7 @@ class HyperConnectionModule(MegatronModule):
         """
         Apply H_res to residual using H_res weights.
         
-        Computes: H_res @ residual (using bmm)
+        Computes: H_res @ residual
         
         Args:
             h_res: [s, b, n, n] - residual mixing matrix
