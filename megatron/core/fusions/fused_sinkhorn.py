@@ -88,38 +88,69 @@ if _TILELANG_AVAILABLE:
 
         return sinkhorn_forward_kernel_
 
-    # ==================== Backward Kernel ====================
+    # ==================== Backward Kernels ====================
+    # Split into two kernels to avoid register pressure:
+    # 1. Forward kernel that saves intermediate states to global memory
+    # 2. Backward kernel that reads states from global memory and computes gradients
 
     @tilelang.jit(pass_configs=pass_configs)
-    def _sinkhorn_backward_kernel_generator(hc: int, sinkhorn_iters: int, eps: float):
+    def _sinkhorn_backward_fwd_kernel_generator(hc: int, sinkhorn_iters: int, eps: float):
         """
-        Generate backward Sinkhorn kernel.
-        
-        The backward pass:
-        1. Recomputes forward pass to get all intermediate states
-        2. Backpropagates gradients through each normalization step
-        3. Applies chain rule: grad_input = grad_M_init * M_init
-        
-        For row normalization y = x / row_sum(x):
-            grad_x = (grad_y - (grad_y * y).sum(-1)) / row_sum
-        
-        For col normalization y = x / col_sum(x):
-            grad_x = (grad_y - (grad_y * y).sum(-2)) / col_sum
+        Generate kernel for forward pass that saves intermediate states.
+        Used in backward to recompute forward states.
         """
         n = T.symbolic("n")
         threads = 64
 
         @T.prim_func
-        def sinkhorn_backward_kernel_(
-            grad_output: T.Tensor[(n, hc, hc), FP32],  # dL/dM_final
-            M_init: T.Tensor[(n, hc, hc), FP32],       # exp(H_res_logits)
-            grad_input: T.Tensor[(n, hc, hc), FP32],   # output: dL/dH (includes chain rule)
+        def sinkhorn_backward_fwd_kernel_(
+            M_init: T.Tensor[(n, hc, hc), FP32],
+            M_row_states: T.Tensor[(n, sinkhorn_iters, hc, hc), FP32],
+            M_col_states: T.Tensor[(n, sinkhorn_iters, hc, hc), FP32],
         ):
             with T.Kernel(n, threads=threads) as i:
-                # Allocate storage for intermediate states
-                M_row_states = T.alloc_fragment((sinkhorn_iters, hc, hc), FP32)
-                M_col_states = T.alloc_fragment((sinkhorn_iters, hc, hc), FP32)
-                
+                M_frag = T.alloc_fragment((hc, hc), FP32)
+                row_sum = T.alloc_fragment(hc, FP32)
+                col_sum = T.alloc_fragment(hc, FP32)
+
+                T.copy(M_init[i, :, :], M_frag)
+
+                for t in T.serial(sinkhorn_iters):
+                    # Row normalization
+                    T.reduce_sum(M_frag, row_sum, dim=1)
+                    for j, k in T.Parallel(hc, hc):
+                        M_frag[j, k] = M_frag[j, k] / (row_sum[j] + eps)
+
+                    # Save row_norm result to global memory
+                    T.copy(M_frag, M_row_states[i, t, :, :])
+
+                    # Col normalization
+                    T.reduce_sum(M_frag, col_sum, dim=0)
+                    for j, k in T.Parallel(hc, hc):
+                        M_frag[j, k] = M_frag[j, k] / (col_sum[k] + eps)
+
+                    # Save col_norm result to global memory
+                    T.copy(M_frag, M_col_states[i, t, :, :])
+
+        return sinkhorn_backward_fwd_kernel_
+
+    @tilelang.jit(pass_configs=pass_configs)
+    def _sinkhorn_backward_bwd_kernel_generator(hc: int, sinkhorn_iters: int, eps: float):
+        """
+        Generate backward kernel that computes gradients using saved states.
+        """
+        n = T.symbolic("n")
+        threads = 64
+
+        @T.prim_func
+        def sinkhorn_backward_bwd_kernel_(
+            grad_output: T.Tensor[(n, hc, hc), FP32],
+            M_init: T.Tensor[(n, hc, hc), FP32],
+            M_row_states: T.Tensor[(n, sinkhorn_iters, hc, hc), FP32],
+            M_col_states: T.Tensor[(n, sinkhorn_iters, hc, hc), FP32],
+            grad_input: T.Tensor[(n, hc, hc), FP32],
+        ):
+            with T.Kernel(n, threads=threads) as i:
                 M_frag = T.alloc_fragment((hc, hc), FP32)
                 M_init_frag = T.alloc_fragment((hc, hc), FP32)
                 grad_frag = T.alloc_fragment((hc, hc), FP32)
@@ -128,86 +159,61 @@ if _TILELANG_AVAILABLE:
                 dot_prod = T.alloc_fragment(hc, FP32)
                 temp = T.alloc_fragment((hc, hc), FP32)
 
-                # Load M_init for later use in chain rule
                 T.copy(M_init[i, :, :], M_init_frag)
-                
-                # ============ Forward pass to save intermediate states ============
-                T.copy(M_init_frag, M_frag)
-
-                for t in T.serial(sinkhorn_iters):
-                    # Row normalization
-                    T.reduce_sum(M_frag, row_sum, dim=1)
-                    for j, k in T.Parallel(hc, hc):
-                        M_frag[j, k] = M_frag[j, k] / (row_sum[j] + eps)
-                    
-                    # Save row_norm result
-                    for j, k in T.Parallel(hc, hc):
-                        M_row_states[t, j, k] = M_frag[j, k]
-                    
-                    # Col normalization
-                    T.reduce_sum(M_frag, col_sum, dim=0)
-                    for j, k in T.Parallel(hc, hc):
-                        M_frag[j, k] = M_frag[j, k] / (col_sum[k] + eps)
-                    
-                    # Save col_norm result
-                    for j, k in T.Parallel(hc, hc):
-                        M_col_states[t, j, k] = M_frag[j, k]
-
-                # ============ Backward pass ============
                 T.copy(grad_output[i, :, :], grad_frag)
 
-                # Iterate backwards through Sinkhorn iterations
+                # Backward pass through Sinkhorn iterations
                 for t_rev in T.serial(sinkhorn_iters):
                     t = sinkhorn_iters - 1 - t_rev
-                    
+
                     # ---- Backward through col normalization ----
-                    for j, k in T.Parallel(hc, hc):
-                        M_frag[j, k] = M_col_states[t, j, k]
-                    
+                    # Load M_col from global memory
+                    T.copy(M_col_states[i, t, :, :], M_frag)
+
+                    # Compute (grad * M_col).sum(dim=0)
                     for j, k in T.Parallel(hc, hc):
                         temp[j, k] = grad_frag[j, k] * M_frag[j, k]
                     T.reduce_sum(temp, dot_prod, dim=0)
-                    
-                    for j, k in T.Parallel(hc, hc):
-                        M_frag[j, k] = M_row_states[t, j, k]
+
+                    # Load M_row to compute col_sum
+                    T.copy(M_row_states[i, t, :, :], M_frag)
                     T.reduce_sum(M_frag, col_sum, dim=0)
-                    
+
+                    # grad_M_row = (grad_M_col - dot_prod) / col_sum
                     for j, k in T.Parallel(hc, hc):
                         grad_frag[j, k] = (grad_frag[j, k] - dot_prod[k]) / (col_sum[k] + eps)
-                    
+
                     # ---- Backward through row normalization ----
-                    for j, k in T.Parallel(hc, hc):
-                        M_frag[j, k] = M_row_states[t, j, k]
-                    
+                    # M_row is already in M_frag
                     for j, k in T.Parallel(hc, hc):
                         temp[j, k] = grad_frag[j, k] * M_frag[j, k]
                     T.reduce_sum(temp, dot_prod, dim=1)
-                    
-                    # Get M_in (input to row_norm): M_col_states[t-1] if t > 0, else M_init
+
+                    # Get M_in (input to row_norm): M_col[t-1] if t > 0, else M_init
                     for j, k in T.Parallel(hc, hc):
                         if t > 0:
-                            temp[j, k] = M_col_states[t - 1, j, k]
+                            temp[j, k] = M_col_states[i, t - 1, j, k]
                         else:
                             temp[j, k] = M_init_frag[j, k]
                     T.reduce_sum(temp, row_sum, dim=1)
-                    
+
+                    # grad_M_in = (grad_M_row - dot_prod) / row_sum
                     for j, k in T.Parallel(hc, hc):
                         grad_frag[j, k] = (grad_frag[j, k] - dot_prod[j]) / (row_sum[j] + eps)
 
                 # Apply chain rule: grad_input = grad_M_init * M_init
-                # Since M_init = exp(H), d(exp(x))/dx = exp(x) = M_init
                 for j, k in T.Parallel(hc, hc):
                     grad_frag[j, k] = grad_frag[j, k] * M_init_frag[j, k]
 
-                # Output grad_input (dL/dH)
                 T.copy(grad_frag, grad_input[i, :, :])
 
-        return sinkhorn_backward_kernel_
+        return sinkhorn_backward_bwd_kernel_
 
     # ==================== Kernel Cache ====================
 
     _FORWARD_KERNEL_CACHE = {}
-    _BACKWARD_KERNEL_CACHE = {}
+    _BACKWARD_FWD_KERNEL_CACHE = {}
+    _BACKWARD_BWD_KERNEL_CACHE = {}
 
     def _get_forward_kernel(hc: int, sinkhorn_iters: int, eps: float):
         """Get or create a cached forward kernel."""
@@ -216,12 +222,19 @@ if _TILELANG_AVAILABLE:
             _FORWARD_KERNEL_CACHE[key] = _sinkhorn_forward_kernel_generator(hc, sinkhorn_iters, eps)
         return _FORWARD_KERNEL_CACHE[key]
 
-    def _get_backward_kernel(hc: int, sinkhorn_iters: int, eps: float):
+    def _get_backward_fwd_kernel(hc: int, sinkhorn_iters: int, eps: float):
+        """Get or create a cached backward forward kernel."""
+        key = (hc, sinkhorn_iters, eps)
+        if key not in _BACKWARD_FWD_KERNEL_CACHE:
+            _BACKWARD_FWD_KERNEL_CACHE[key] = _sinkhorn_backward_fwd_kernel_generator(hc, sinkhorn_iters, eps)
+        return _BACKWARD_FWD_KERNEL_CACHE[key]
+
+    def _get_backward_bwd_kernel(hc: int, sinkhorn_iters: int, eps: float):
         """Get or create a cached backward kernel."""
         key = (hc, sinkhorn_iters, eps)
-        if key not in _BACKWARD_KERNEL_CACHE:
-            _BACKWARD_KERNEL_CACHE[key] = _sinkhorn_backward_kernel_generator(hc, sinkhorn_iters, eps)
-        return _BACKWARD_KERNEL_CACHE[key]
+        if key not in _BACKWARD_BWD_KERNEL_CACHE:
+            _BACKWARD_BWD_KERNEL_CACHE[key] = _sinkhorn_backward_bwd_kernel_generator(hc, sinkhorn_iters, eps)
+        return _BACKWARD_BWD_KERNEL_CACHE[key]
 
 
 def sinkhorn_fused_forward(
@@ -288,14 +301,25 @@ def sinkhorn_fused_backward(
 
     original_shape = grad_output.shape
     hc = original_shape[-1]
-
+    
     grad_output_flat = grad_output.reshape(-1, hc, hc).contiguous().float()
     M_init_flat = M_init.reshape(-1, hc, hc).contiguous().float()
+    num_tokens = grad_output_flat.shape[0]
 
+    # Allocate global memory for intermediate states
+    M_row_states = torch.empty(num_tokens, num_iterations, hc, hc, 
+                               device=grad_output.device, dtype=torch.float32)
+    M_col_states = torch.empty(num_tokens, num_iterations, hc, hc,
+                               device=grad_output.device, dtype=torch.float32)
+
+    # Step 1: Forward pass to save intermediate states
+    fwd_kernel = _get_backward_fwd_kernel(hc, num_iterations, eps)
+    fwd_kernel(M_init_flat, M_row_states, M_col_states)
+
+    # Step 2: Backward pass using saved states
     grad_input = torch.empty_like(grad_output_flat)
-
-    kernel = _get_backward_kernel(hc, num_iterations, eps)
-    kernel(grad_output_flat, M_init_flat, grad_input)
+    bwd_kernel = _get_backward_bwd_kernel(hc, num_iterations, eps)
+    bwd_kernel(grad_output_flat, M_init_flat, M_row_states, M_col_states, grad_input)
 
     grad_input = grad_input.reshape(original_shape)
     if grad_output.dtype != torch.float32:
@@ -368,7 +392,6 @@ def sinkhorn_native_backward(
         )
 
     # Apply chain rule: grad_input = grad_M_init * M_init
-    # Since M_init = exp(H), d(exp(x))/dx = exp(x) = M_init
     grad_input = grad_M_init * M_init
 
     return grad_input
