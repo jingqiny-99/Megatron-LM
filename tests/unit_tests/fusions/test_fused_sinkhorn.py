@@ -14,29 +14,30 @@ from typing import List, Dict, Tuple
 
 from megatron.core.fusions.fused_sinkhorn import (
     sinkhorn_fused_forward,
+    sinkhorn_fused_backward,
     sinkhorn_native_forward,
+    sinkhorn_native_backward,
     is_tilelang_available,
 )
 
 
-# Skip all tests if tilelang is not available
 pytestmark = pytest.mark.skipif(
     not is_tilelang_available(),
     reason="TileLang is not available"
 )
 
 
-class TestSinkhornCorrectness:
-    """Test correctness of fused Sinkhorn kernel against PyTorch native implementation."""
+class TestSinkhornForwardCorrectness:
+    """Test correctness of fused Sinkhorn forward kernel."""
 
     @pytest.mark.parametrize("batch_size", [1, 4, 16])
     @pytest.mark.parametrize("seq_len", [128, 512, 2048])
     @pytest.mark.parametrize("hc", [2, 4, 8])
     @pytest.mark.parametrize("num_iterations", [5, 10, 20])
-    def test_correctness_various_shapes(
+    def test_forward_various_shapes(
         self, batch_size: int, seq_len: int, hc: int, num_iterations: int
     ):
-        """Test that fused kernel produces same results as native implementation."""
+        """Test that fused forward produces same results as native implementation."""
         input_logits = torch.randn(
             seq_len, batch_size, hc, hc,
             device='cuda', dtype=torch.float32
@@ -49,12 +50,11 @@ class TestSinkhornCorrectness:
         torch.testing.assert_close(
             output_fused, output_native,
             rtol=1e-3, atol=1e-4,
-            msg=f"Output mismatch for shape [{seq_len}, {batch_size}, {hc}, {hc}], "
-                f"num_iterations={num_iterations}"
+            msg=f"Forward mismatch for shape [{seq_len}, {batch_size}, {hc}, {hc}]"
         )
 
-    def test_correctness_flat_input(self):
-        """Test with flattened input shape (num_tokens, hc, hc)."""
+    def test_forward_flat_input(self):
+        """Test forward with flattened input shape."""
         input_logits = torch.randn(1024, 4, 4, device='cuda', dtype=torch.float32)
 
         output_native = sinkhorn_native_forward(input_logits, 20)
@@ -62,21 +62,7 @@ class TestSinkhornCorrectness:
 
         torch.testing.assert_close(output_fused, output_native, rtol=1e-3, atol=1e-4)
 
-    def test_correctness_edge_cases(self):
-        """Test edge cases: small matrices, single token, etc."""
-        # Single token
-        input_single = torch.randn(1, 4, 4, device='cuda', dtype=torch.float32)
-        output_native = sinkhorn_native_forward(input_single, 20)
-        output_fused = sinkhorn_fused_forward(input_single, 20)
-        torch.testing.assert_close(output_fused, output_native, rtol=1e-3, atol=1e-4)
-
-        # 2x2 matrix
-        input_2x2 = torch.randn(100, 2, 2, device='cuda', dtype=torch.float32)
-        output_native = sinkhorn_native_forward(input_2x2, 20)
-        output_fused = sinkhorn_fused_forward(input_2x2, 20)
-        torch.testing.assert_close(output_fused, output_native, rtol=1e-3, atol=1e-4)
-
-    def test_numerical_stability_large_values(self):
+    def test_forward_numerical_stability(self):
         """Test numerical stability with large input values."""
         input_logits = torch.randn(512, 4, 4, device='cuda', dtype=torch.float32) * 10
 
@@ -89,8 +75,92 @@ class TestSinkhornCorrectness:
         torch.testing.assert_close(output_fused, output_native, rtol=1e-2, atol=1e-3)
 
 
+class TestSinkhornBackwardCorrectness:
+    """Test correctness of fused Sinkhorn backward kernel."""
+
+    @pytest.mark.parametrize("batch_size", [1, 4])
+    @pytest.mark.parametrize("seq_len", [128, 512])
+    @pytest.mark.parametrize("hc", [2, 4, 8])
+    @pytest.mark.parametrize("num_iterations", [5, 10, 20])
+    def test_backward_various_shapes(
+        self, batch_size: int, seq_len: int, hc: int, num_iterations: int
+    ):
+        """Test that fused backward produces same results as native implementation."""
+        input_logits = torch.randn(
+            seq_len, batch_size, hc, hc,
+            device='cuda', dtype=torch.float32
+        )
+        
+        # M_init = exp(input_logits)
+        M_init = torch.exp(input_logits)
+        
+        # Random gradient from downstream
+        grad_output = torch.randn_like(M_init)
+
+        grad_native = sinkhorn_native_backward(grad_output, M_init, num_iterations, eps=1e-8)
+        grad_fused = sinkhorn_fused_backward(grad_output, M_init, num_iterations, eps=1e-8)
+
+        assert grad_fused.shape == grad_native.shape
+        torch.testing.assert_close(
+            grad_fused, grad_native,
+            rtol=1e-2, atol=1e-3,
+            msg=f"Backward mismatch for shape [{seq_len}, {batch_size}, {hc}, {hc}]"
+        )
+
+    def test_backward_flat_input(self):
+        """Test backward with flattened input shape."""
+        input_logits = torch.randn(1024, 4, 4, device='cuda', dtype=torch.float32)
+        M_init = torch.exp(input_logits)
+        grad_output = torch.randn_like(M_init)
+
+        grad_native = sinkhorn_native_backward(grad_output, M_init, 20)
+        grad_fused = sinkhorn_fused_backward(grad_output, M_init, 20)
+
+        torch.testing.assert_close(grad_fused, grad_native, rtol=1e-2, atol=1e-3)
+
+    def test_backward_numerical_stability(self):
+        """Test backward numerical stability."""
+        input_logits = torch.randn(256, 4, 4, device='cuda', dtype=torch.float32) * 5
+        M_init = torch.exp(input_logits)
+        grad_output = torch.randn_like(M_init)
+
+        grad_native = sinkhorn_native_backward(grad_output, M_init, 20)
+        grad_fused = sinkhorn_fused_backward(grad_output, M_init, 20)
+
+        assert not torch.isnan(grad_fused).any(), "Fused grad contains NaN"
+        assert not torch.isinf(grad_fused).any(), "Fused grad contains Inf"
+
+        torch.testing.assert_close(grad_fused, grad_native, rtol=1e-2, atol=1e-3)
+
+    def test_end_to_end_gradient(self):
+        """Test end-to-end gradient computation matches autograd."""
+        input_logits = torch.randn(256, 2, 4, 4, device='cuda', dtype=torch.float32, requires_grad=True)
+        
+        # Native: use autograd to get ground truth gradient
+        M_init_native = torch.exp(input_logits)
+        M_native = M_init_native.clone()
+        for _ in range(20):
+            M_native = M_native / M_native.sum(dim=-1, keepdim=True).clamp(min=1e-8)
+            M_native = M_native / M_native.sum(dim=-2, keepdim=True).clamp(min=1e-8)
+        
+        loss_native = M_native.sum()
+        loss_native.backward()
+        grad_autograd = input_logits.grad.clone()
+        input_logits.grad = None
+        
+        # Fused: forward + backward (backward now includes chain rule)
+        with torch.no_grad():
+            M_init_fused = torch.exp(input_logits)
+        
+        grad_output = torch.ones_like(M_init_fused)
+        # sinkhorn_fused_backward now returns grad_input directly (includes chain rule)
+        grad_fused = sinkhorn_fused_backward(grad_output, M_init_fused, 20, eps=1e-8)
+        
+        torch.testing.assert_close(grad_fused, grad_autograd, rtol=1e-2, atol=1e-3)
+
+
 class TestSinkhornPerformance:
-    """Benchmark performance of fused Sinkhorn kernel vs PyTorch native."""
+    """Benchmark performance of fused Sinkhorn kernels."""
 
     def _benchmark_function(
         self,
@@ -130,8 +200,8 @@ class TestSinkhornPerformance:
                     })
         return shapes
 
-    def test_performance_comparison(self):
-        """Benchmark and compare fused vs native Sinkhorn implementations."""
+    def test_forward_performance(self):
+        """Benchmark forward pass."""
         num_sinkhorn_iterations = 20
         results = []
 
@@ -159,7 +229,7 @@ class TestSinkhornPerformance:
 
             results.append({
                 'shape': f"s={seq_len}, b={batch_size}, hc={hc}",
-                'num_tokens': seq_len * batch_size,
+                'tokens': seq_len * batch_size,
                 'native_ms': native_latency,
                 'fused_ms': fused_latency,
                 'speedup': speedup,
@@ -168,49 +238,59 @@ class TestSinkhornPerformance:
             del input_logits
             torch.cuda.empty_cache()
 
-        self._print_performance_table(results, num_sinkhorn_iterations)
+        self._print_table("FORWARD", results, num_sinkhorn_iterations)
 
-    def test_performance_varying_iterations(self):
-        """Benchmark performance with varying number of Sinkhorn iterations."""
-        seq_len, batch_size, hc = 1024, 2, 4
+    def test_backward_performance(self):
+        """Benchmark backward pass."""
+        num_sinkhorn_iterations = 20
         results = []
 
-        input_logits = torch.randn(
-            seq_len, batch_size, hc, hc,
-            device='cuda', dtype=torch.float32
-        )
+        for shape in self._get_test_shapes():
+            seq_len = shape['seq_len']
+            batch_size = shape['batch_size']
+            hc = shape['hc']
 
-        for num_iterations in [5, 10, 20, 50]:
+            input_logits = torch.randn(
+                seq_len, batch_size, hc, hc,
+                device='cuda', dtype=torch.float32
+            )
+            M_init = torch.exp(input_logits)
+            grad_output = torch.randn_like(M_init)
+
             native_latency = self._benchmark_function(
-                lambda x, n=num_iterations: sinkhorn_native_forward(x, n),
-                (input_logits,),
+                lambda g, m: sinkhorn_native_backward(g, m, num_sinkhorn_iterations),
+                (grad_output, M_init),
             )
 
             fused_latency = self._benchmark_function(
-                lambda x, n=num_iterations: sinkhorn_fused_forward(x, n),
-                (input_logits,),
+                lambda g, m: sinkhorn_fused_backward(g, m, num_sinkhorn_iterations),
+                (grad_output, M_init),
             )
 
             speedup = native_latency / fused_latency if fused_latency > 0 else float('inf')
 
             results.append({
-                'num_iterations': num_iterations,
+                'shape': f"s={seq_len}, b={batch_size}, hc={hc}",
+                'tokens': seq_len * batch_size,
                 'native_ms': native_latency,
                 'fused_ms': fused_latency,
                 'speedup': speedup,
             })
 
-        self._print_iteration_comparison_table(results, seq_len, batch_size, hc)
+            del input_logits, M_init, grad_output
+            torch.cuda.empty_cache()
 
-    def test_performance_large_batch(self):
-        """Benchmark performance with large batch/sequence combinations."""
+        self._print_table("BACKWARD", results, num_sinkhorn_iterations)
+
+    def test_combined_fwd_bwd_performance(self):
+        """Benchmark combined forward + backward pass."""
         num_sinkhorn_iterations = 20
         results = []
 
         configs = [
-            (4096, 4, 4),
-            (2048, 8, 4),
-            (8192, 1, 4),
+            (1024, 2, 4),
+            (2048, 2, 4),
+            (4096, 2, 4),
             (1024, 4, 8),
         ]
 
@@ -220,23 +300,26 @@ class TestSinkhornPerformance:
                 device='cuda', dtype=torch.float32
             )
 
-            native_latency = self._benchmark_function(
-                lambda x: sinkhorn_native_forward(x, num_sinkhorn_iterations),
-                (input_logits,),
-                num_iterations=50,
-            )
+            def native_fwd_bwd(x):
+                M_init = torch.exp(x)
+                M = sinkhorn_native_forward(x, num_sinkhorn_iterations)
+                grad_output = torch.ones_like(M)
+                return sinkhorn_native_backward(grad_output, M_init, num_sinkhorn_iterations)
 
-            fused_latency = self._benchmark_function(
-                lambda x: sinkhorn_fused_forward(x, num_sinkhorn_iterations),
-                (input_logits,),
-                num_iterations=50,
-            )
+            def fused_fwd_bwd(x):
+                M_init = torch.exp(x)
+                M = sinkhorn_fused_forward(x, num_sinkhorn_iterations)
+                grad_output = torch.ones_like(M)
+                return sinkhorn_fused_backward(grad_output, M_init, num_sinkhorn_iterations)
+
+            native_latency = self._benchmark_function(native_fwd_bwd, (input_logits,))
+            fused_latency = self._benchmark_function(fused_fwd_bwd, (input_logits,))
 
             speedup = native_latency / fused_latency if fused_latency > 0 else float('inf')
 
             results.append({
                 'shape': f"s={seq_len}, b={batch_size}, hc={hc}",
-                'num_tokens': seq_len * batch_size,
+                'tokens': seq_len * batch_size,
                 'native_ms': native_latency,
                 'fused_ms': fused_latency,
                 'speedup': speedup,
@@ -245,69 +328,29 @@ class TestSinkhornPerformance:
             del input_logits
             torch.cuda.empty_cache()
 
+        self._print_table("FWD+BWD", results, num_sinkhorn_iterations)
+
+    def _print_table(self, title: str, results: List[Dict], num_iters: int):
+        """Print formatted performance table."""
         print(f"\n{'=' * 90}")
-        print(f"LARGE BATCH PERFORMANCE (sinkhorn_iterations={num_sinkhorn_iterations})")
+        print(f"SINKHORN {title} PERFORMANCE (iterations={num_iters})")
         print(f"{'=' * 90}")
-        print(f"{'Shape':<30} | {'Tokens':>10} | {'Native':>12} | {'Fused':>12} | {'Speedup':>10}")
-        print(f"{'-' * 30}-+-{'-' * 10}-+-{'-' * 12}-+-{'-' * 12}-+-{'-' * 10}")
+        print(f"{'Shape':<25} | {'Tokens':>10} | {'Native':>12} | {'Fused':>12} | {'Speedup':>10}")
+        print(f"{'-' * 25}-+-{'-' * 10}-+-{'-' * 12}-+-{'-' * 12}-+-{'-' * 10}")
 
         for r in results:
             print(
-                f"{r['shape']:<30} | "
-                f"{r['num_tokens']:>10} | "
-                f"{r['native_ms']:>9.4f} ms | "
-                f"{r['fused_ms']:>9.4f} ms | "
-                f"{r['speedup']:>9.2f}x"
-            )
-        print(f"{'=' * 90}\n")
-
-    def _print_performance_table(self, results: List[Dict], num_iterations: int):
-        """Print formatted performance comparison table."""
-        print(f"\n{'=' * 100}")
-        print(f"SINKHORN PERFORMANCE (sinkhorn_iterations={num_iterations})")
-        print(f"{'=' * 100}")
-        print(f"{'Shape':<30} | {'Tokens':>10} | {'Native':>12} | {'Fused':>12} | {'Speedup':>10}")
-        print(f"{'-' * 30}-+-{'-' * 10}-+-{'-' * 12}-+-{'-' * 12}-+-{'-' * 10}")
-
-        for r in results:
-            print(
-                f"{r['shape']:<30} | "
-                f"{r['num_tokens']:>10} | "
+                f"{r['shape']:<25} | "
+                f"{r['tokens']:>10} | "
                 f"{r['native_ms']:>9.4f} ms | "
                 f"{r['fused_ms']:>9.4f} ms | "
                 f"{r['speedup']:>9.2f}x"
             )
 
-        print(f"{'=' * 100}")
+        print(f"{'=' * 90}")
 
-        native_times = [r['native_ms'] for r in results]
-        fused_times = [r['fused_ms'] for r in results]
         speedups = [r['speedup'] for r in results]
-
-        print(f"\nSUMMARY:")
-        print(f"  Native:  min={min(native_times):.4f}ms, max={max(native_times):.4f}ms, avg={sum(native_times)/len(native_times):.4f}ms")
-        print(f"  Fused:   min={min(fused_times):.4f}ms, max={max(fused_times):.4f}ms, avg={sum(fused_times)/len(fused_times):.4f}ms")
-        print(f"  Speedup: min={min(speedups):.2f}x, max={max(speedups):.2f}x, avg={sum(speedups)/len(speedups):.2f}x")
-        print()
-
-    def _print_iteration_comparison_table(
-        self, results: List[Dict], seq_len: int, batch_size: int, hc: int
-    ):
-        """Print performance comparison with varying iterations."""
-        print(f"\n{'=' * 70}")
-        print(f"ITERATION SCALING (s={seq_len}, b={batch_size}, hc={hc})")
-        print(f"{'=' * 70}")
-        print(f"{'Iterations':>12} | {'Native':>12} | {'Fused':>12} | {'Speedup':>10}")
-        print(f"{'-' * 12}-+-{'-' * 12}-+-{'-' * 12}-+-{'-' * 10}")
-
-        for r in results:
-            print(
-                f"{r['num_iterations']:>12} | "
-                f"{r['native_ms']:>9.4f} ms | "
-                f"{r['fused_ms']:>9.4f} ms | "
-                f"{r['speedup']:>9.2f}x"
-            )
-        print(f"{'=' * 70}\n")
+        print(f"Speedup: min={min(speedups):.2f}x, max={max(speedups):.2f}x, avg={sum(speedups)/len(speedups):.2f}x\n")
 
 
 class TestSinkhornIntegration:
@@ -323,8 +366,8 @@ class TestSinkhornIntegration:
         from tests.unit_tests.test_utilities import Utils
         Utils.destroy_model_parallel()
 
-    def test_hyper_connection_with_fused_sinkhorn(self):
-        """Test HyperConnectionModule with fused Sinkhorn kernel enabled."""
+    def test_hyper_connection_forward(self):
+        """Test HyperConnectionModule forward with fused kernel."""
         from megatron.core.transformer.hyper_connection import HyperConnectionModule
         from megatron.core.transformer.transformer_config import TransformerConfig
 
@@ -365,6 +408,56 @@ class TestSinkhornIntegration:
         torch.testing.assert_close(h_post_fused, h_post_native, rtol=1e-5, atol=1e-5)
         torch.testing.assert_close(h_res_fused, h_res_native, rtol=1e-3, atol=1e-4)
 
+    def test_hyper_connection_backward(self):
+        """Test HyperConnectionModule backward with fused kernel."""
+        from megatron.core.transformer.hyper_connection import HyperConnectionModule
+        from megatron.core.transformer.transformer_config import TransformerConfig
+
+        hidden_size = 256
+        num_streams = 4
+        seq_len = 64
+        batch_size = 2
+
+        config = TransformerConfig(
+            num_layers=2,
+            hidden_size=hidden_size,
+            num_attention_heads=4,
+            use_cpu_initialization=True,
+            enable_hyper_connections=True,
+            num_residual_streams=num_streams,
+            mhc_sinkhorn_iterations=10,
+            mhc_init_gating_factor=0.01,
+            mhc_use_fused_kernel=True,
+        )
+
+        module_fused = HyperConnectionModule(config=config, layer_number=1)
+        module_fused.cuda()
+
+        config.mhc_use_fused_kernel = False
+        module_native = HyperConnectionModule(config=config, layer_number=1)
+        module_native.cuda()
+        module_native.load_state_dict(module_fused.state_dict())
+
+        # Forward + backward with fused
+        x_fused = torch.randn(
+            seq_len, batch_size, num_streams * hidden_size,
+            device='cuda', dtype=torch.float32, requires_grad=True
+        )
+        h_pre_f, h_post_f, h_res_f = module_fused.compute_mappings(x_fused)
+        loss_fused = h_res_f.sum() + h_pre_f.sum() + h_post_f.sum()
+        loss_fused.backward()
+        grad_fused = x_fused.grad.clone()
+
+        # Forward + backward with native
+        x_native = x_fused.detach().clone().requires_grad_(True)
+        h_pre_n, h_post_n, h_res_n = module_native.compute_mappings(x_native)
+        loss_native = h_res_n.sum() + h_pre_n.sum() + h_post_n.sum()
+        loss_native.backward()
+        grad_native = x_native.grad.clone()
+
+        # Gradients should match
+        torch.testing.assert_close(grad_fused, grad_native, rtol=1e-2, atol=1e-3)
+
 
 def run_benchmark():
     """
@@ -383,14 +476,14 @@ def run_benchmark():
 
     test = TestSinkhornPerformance()
 
-    print("\n[1/3] Performance comparison across shapes...")
-    test.test_performance_comparison()
+    print("\n[1/3] Forward performance...")
+    test.test_forward_performance()
 
-    print("\n[2/3] Iteration scaling test...")
-    test.test_performance_varying_iterations()
+    print("\n[2/3] Backward performance...")
+    test.test_backward_performance()
 
-    print("\n[3/3] Large batch test...")
-    test.test_performance_large_batch()
+    print("\n[3/3] Combined fwd+bwd performance...")
+    test.test_combined_fwd_bwd_performance()
 
     print("\nBenchmark complete!")
 

@@ -9,6 +9,7 @@ from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import nvtx_decorator, nvtx_range_push, nvtx_range_pop
 from megatron.core.fusions.fused_sinkhorn import (
     sinkhorn_fused_forward,
+    sinkhorn_fused_backward,
     is_tilelang_available,
 )
 
@@ -36,8 +37,8 @@ class SinkhornKnopp(torch.autograd.Function):
         Args:
             H_res_logits: [s, b, n, n] - raw logits for residual mixing matrix
             num_iterations: Number of Sinkhorn iterations (paper uses 20)
-            use_fused_kernel: Whether to use fused TileLang kernel for forward pass.
-                If True and TileLang is available, uses the fused kernel.
+            use_fused_kernel: Whether to use fused TileLang kernel.
+                If True and TileLang is available, uses fused kernels for both forward and backward.
                 Falls back to native PyTorch implementation otherwise.
         
         Returns:
@@ -46,7 +47,9 @@ class SinkhornKnopp(torch.autograd.Function):
         # M^{(0)} = exp(H_res_logits) - save initial M for backward recomputation
         M_init = torch.exp(H_res_logits)
         
-        if use_fused_kernel and is_tilelang_available():
+        _use_fused = use_fused_kernel and is_tilelang_available()
+        
+        if _use_fused:
             # Use fused TileLang kernel for forward computation
             with torch.no_grad():
                 M = sinkhorn_fused_forward(H_res_logits, num_iterations, eps=1e-8)
@@ -63,43 +66,52 @@ class SinkhornKnopp(torch.autograd.Function):
         # Save initial M for backward recomputation
         ctx.save_for_backward(M_init)
         ctx.num_iterations = num_iterations
+        ctx.use_fused_kernel = _use_fused
         return M
     
     @staticmethod  
-    def backward(ctx, grad_output: Tensor) -> Tuple[Tensor, None]:
+    def backward(ctx, grad_output: Tensor) -> Tuple[Tensor, None, None]:
         """
-        Backward through Sinkhorn-Knopp iterations using recomputation.
+        Backward through Sinkhorn-Knopp iterations.
         
-        Recomputes the forward pass with gradient tracking to obtain accurate gradients.
+        Uses fused TileLang kernel if enabled in forward, otherwise uses
+        recomputation with autograd for gradient computation.
+        
+        Both paths return dL/dH (gradient w.r.t. input logits), including
+        the chain rule (grad_input = grad_M_init * M_init).
         """
         M_init, = ctx.saved_tensors
         num_iterations = ctx.num_iterations
+        use_fused_kernel = ctx.use_fused_kernel
         
-        # Recompute forward with autograd enabled
-        with torch.enable_grad():
-            # Leaf for recomputation
-            M_input = M_init.detach().requires_grad_(True)
-
-            M_current = M_input
-            for _ in range(num_iterations):
-                # T_r: Row normalization
-                M_current = M_current / M_current.sum(dim=-1, keepdim=True).clamp(min=1e-8)
-                # T_c: Column normalization
-                M_current = M_current / M_current.sum(dim=-2, keepdim=True).clamp(min=1e-8)
-
-            # Compute dL/dM_input (i.e., dL/dM_init) via autograd
-            grad_M_init, = torch.autograd.grad(
-                outputs=M_current,
-                inputs=M_input,
-                grad_outputs=grad_output,
-                create_graph=False,   # typically what you want here
-                retain_graph=False,
+        if use_fused_kernel:
+            # Fused kernel computes grad_input = grad_M_init * M_init internally
+            grad_input = sinkhorn_fused_backward(
+                grad_output, M_init, num_iterations, eps=1e-8
             )
-        # Apply chain rule: dL/dH = dL/dM_init * dM_init/dH = dL/dM_init * M_init
-        # Since M_init = exp(H_res_logits), we have d(exp(x))/dx = exp(x) = M_init
-        grad_input = grad_M_init * M_init
+        else:
+            # Recompute forward with autograd enabled
+            with torch.enable_grad():
+                M_input = M_init.detach().requires_grad_(True)
+
+                M_current = M_input
+                for _ in range(num_iterations):
+                    M_current = M_current / M_current.sum(dim=-1, keepdim=True).clamp(min=1e-8)
+                    M_current = M_current / M_current.sum(dim=-2, keepdim=True).clamp(min=1e-8)
+
+                grad_M_init, = torch.autograd.grad(
+                    outputs=M_current,
+                    inputs=M_input,
+                    grad_outputs=grad_output,
+                    create_graph=False,
+                    retain_graph=False,
+                )
+            
+            # Apply chain rule: dL/dH = dL/dM_init * M_init
+            # Since M_init = exp(H), d(exp(x))/dx = exp(x) = M_init
+            grad_input = grad_M_init * M_init
         
-        return grad_input, None
+        return grad_input, None, None
 
 
 class HyperConnectionModule(MegatronModule):
