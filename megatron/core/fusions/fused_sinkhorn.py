@@ -31,17 +31,16 @@ def is_tilelang_available() -> bool:
 
 
 if _TILELANG_AVAILABLE:
-    FP32 = T.float32
+    # Suppress verbose tilelang logging
+    tilelang.set_log_level("WARNING")
+
+    FP32 = "float32"
 
     # TileLang pass configurations for optimization
-    pass_configs = tilelang.PassConfigContext(
-        [
-            tilelang.PassConfig(
-                "tl.ConvertForLoopsToSerial", 
-                {"check_race": False}
-            ),
-        ]
-    )
+    pass_configs = {
+        tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True,
+        tilelang.PassConfigKey.TL_DISABLE_TMA_LOWER: True,
+    }
 
     @tilelang.jit(pass_configs=pass_configs)
     def _sinkhorn_kernel_generator(hc: int, sinkhorn_iters: int, eps: float):
