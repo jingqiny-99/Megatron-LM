@@ -6,7 +6,7 @@ from torch import Tensor
 
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.transformer_config import TransformerConfig
-from megatron.core.utils import nvtx_decorator
+from megatron.core.utils import nvtx_decorator, nvtx_range_push, nvtx_range_pop
 
 if TYPE_CHECKING:
     from megatron.core.tensor_parallel.random import MHCBlockRecomputeManager
@@ -159,7 +159,8 @@ class HyperConnectionModule(MegatronModule):
     
 
     # TODO: Kernel fusion
-    @nvtx_decorator()
+    @torch.compile
+    @nvtx_decorator(message="HyperConnection::projection_and_rms")
     def _projection_and_rms(self, x : Tensor) -> Tuple[Tensor, Tensor]:
         """
         Project input hidden states to mapping space and apply RMS normalization.
@@ -176,14 +177,20 @@ class HyperConnectionModule(MegatronModule):
         return proj, r
     
     #TODO: kernel fusion
-    @nvtx_decorator()
-    def _compute_h(self, proj: Tensor, r: Tensor) -> Tensor:
+    @torch.compile
+    @nvtx_decorator(message="HyperConnection::compute_h")
+    def _compute_h(self, proj: Tensor, r: Tensor) -> Tuple[Tensor, Tensor, Tensor]:
         """
         Compute h from projected hidden states and scaling factors.
         
         Args:
             proj: [s, b, n^2 + 2n] - projected hidden states
             r: [s, b, 1] - scaling factors
+        
+        Returns:
+            h_pre: [s, b, n] - aggregation weights
+            h_post: [s, b, n] - expansion weights
+            h_res: [s, b, n^2] - residual mixing logits
         """
         s, b, _ = proj.shape
         alpha_ = torch.cat([self.alpha_pre.expand(self.n), self.alpha_post.expand(self.n), self.alpha_res.expand(self.n * self.n)], dim = -1)
@@ -196,7 +203,7 @@ class HyperConnectionModule(MegatronModule):
         h_res = h[..., 2*self.n:]
         return h_pre, h_post, h_res
     
-    @nvtx_decorator()
+    @nvtx_decorator(message="HyperConnection::compute_mappings")
     def compute_mappings(self, x: Tensor) -> Tuple[Tensor, Tensor, Tensor]:
         """
         Compute mHC mappings from input hidden states.
@@ -218,7 +225,8 @@ class HyperConnectionModule(MegatronModule):
         
         return h_pre, h_post, h_res
     
-    @nvtx_decorator()
+    @torch.compile
+    @nvtx_decorator(message="HyperConnection::apply_h_post_inner")
     def _apply_h_post(self, x: Tensor, h_post: Tensor) -> Tensor:
         """
         Core implementation of H_post application to a single tensor.
@@ -246,11 +254,12 @@ class HyperConnectionModule(MegatronModule):
             C = x.shape[-1]
             x_expanded = x.unsqueeze(2)  # [s, b, 1, C]
         
-        # h_post^T @ x : [s, b, n, 1] @ [s, b, 1, C] -> [s, b, n, C]
-        result = torch.einsum('sbij,sbjc->sbic', h_post.unsqueeze(-1), x_expanded)
+        # h_post^T @ x : [s, b, n, 1] * [s, b, 1, C] -> [s, b, n, C]
+        # Using broadcast multiply instead of einsum
+        result = h_post.unsqueeze(-1) * x_expanded
         return result.view(s, b, n * C)
     
-    @nvtx_decorator()
+    @nvtx_decorator(message="HyperConnection::apply_h_post")
     def apply_h_post(
         self,
         x_with_bias: Tuple[Tensor, Optional[Tensor]],
@@ -302,7 +311,8 @@ class HyperConnectionModule(MegatronModule):
 
     
     #TODO: Kernel fusion
-    @nvtx_decorator()
+    @torch.compile
+    @nvtx_decorator(message="HyperConnection::aggregate")
     def aggregate(self, x: Tensor, h_pre: Tensor) -> Tensor:
         """
         Aggregate n-stream to 1-stream using H_pre weights.
@@ -327,7 +337,8 @@ class HyperConnectionModule(MegatronModule):
         
         return aggregated
 
-    @nvtx_decorator()
+    @torch.compile
+    @nvtx_decorator(message="HyperConnection::apply_h_res")
     def apply_h_res(self, h_res: Tensor, residual: Tensor) -> Tensor:
         """
         Apply H_res to residual using H_res weights.
@@ -339,10 +350,18 @@ class HyperConnectionModule(MegatronModule):
             residual: [s, b, n*C] - n-stream hidden states
         """
         s, b, _ = residual.shape 
+        n = self.n
         C = self.hidden_size
-        residual_streams = residual.view(s, b, self.n, C)
-        mixed = torch.einsum('sbij,sbjc->sbic', h_res, residual_streams) # [s, b, n, C]
-        return mixed.view(s, b, self.n * C)
+        
+        # Reshape for bmm: [s, b, n, n] -> [s*b, n, n]
+        h_res_batched = h_res.view(s * b, n, n)
+        # [s, b, n*C] -> [s, b, n, C] -> [s*b, n, C]
+        residual_batched = residual.view(s, b, n, C).view(s * b, n, C)
+        
+        # Batch matrix multiply: [s*b, n, n] @ [s*b, n, C] -> [s*b, n, C]
+        mixed = torch.bmm(h_res_batched, residual_batched)
+        
+        return mixed.view(s, b, n * C)
     
     def forward(
         self,
@@ -422,18 +441,18 @@ class HyperConnectionModule(MegatronModule):
         """
         from megatron.core.tensor_parallel.random import CheckpointWithoutOutput
         
+        nvtx_range_push("HyperConnection::compute_mappings")
         # Checkpoint compute_mappings - auto-registers to manager via ckpt_manager parameter
-        # h_pre, h_post, h_res = CheckpointWithoutOutput(ckpt_manager=manager).checkpoint(
-        #     self.compute_mappings, hidden_states
-        # )
-        
-        h_pre, h_post, h_res = self.compute_mappings(hidden_states)
+        h_pre, h_post, h_res = CheckpointWithoutOutput(ckpt_manager=manager).checkpoint(
+            self.compute_mappings, hidden_states
+        )
+        nvtx_range_pop("HyperConnection::compute_mappings")
         # Checkpoint aggregate - auto-registers to manager
+        nvtx_range_push("HyperConnection::aggregate")
         aggregated = CheckpointWithoutOutput(ckpt_manager=manager).checkpoint(
             self.aggregate, hidden_states, h_pre
         )
-        # aggregated = self.aggregate(hidden_states, h_pre)
-        
+        nvtx_range_pop("HyperConnection::aggregate")
         return aggregated, h_res, h_post
     
     # ==================== Block-level utilities ====================
@@ -480,7 +499,7 @@ class HyperConnectionModule(MegatronModule):
 
     # ==================== Fused kernel placeholder ====================
     
-    @nvtx_decorator()
+    @nvtx_decorator(message="HyperConnection::fused_h_res_h_post_bda")
     def fused_h_res_h_post_bda(
         self,
         h_res: Tensor,
@@ -530,6 +549,7 @@ class HyperConnectionModule(MegatronModule):
                 dropout_prob, training, fused
             )
     
+    @nvtx_decorator(message="HyperConnection::fused_h_res_h_post_bda_native")
     def _fused_h_res_h_post_bda_native(
         self,
         h_res: Tensor,
@@ -571,6 +591,7 @@ class HyperConnectionModule(MegatronModule):
         
         return output
     
+    @nvtx_decorator(message="HyperConnection::fused_h_res_h_post_bda_with_checkpoint")
     def _fused_h_res_h_post_bda_with_checkpoint(
         self,
         h_res: Tensor,
@@ -604,16 +625,18 @@ class HyperConnectionModule(MegatronModule):
         from megatron.core.fusions.fused_bias_dropout import get_bias_dropout_add
         
         # Step 1: Checkpoint apply_h_res
+        nvtx_range_push("HyperConnection::apply_h_res")
         mixed = CheckpointWithoutOutput(ckpt_manager=manager).checkpoint(
             self.apply_h_res, h_res, original_residual
         )
-        
+        nvtx_range_pop("HyperConnection::apply_h_res")
         # Step 2: Checkpoint apply_h_post for x
         x, bias = layer_output_with_bias
+        nvtx_range_push("HyperConnection::apply_h_post")
         x_expanded = CheckpointWithoutOutput(ckpt_manager=manager).checkpoint(
             self._apply_h_post, x, h_post
-        )
-        
+        )   
+        nvtx_range_pop("HyperConnection::apply_h_post")
         # Checkpoint apply_h_post for bias if not None
         if bias is not None:
             bias_expanded = CheckpointWithoutOutput(ckpt_manager=manager).checkpoint(
@@ -642,7 +665,9 @@ class HyperConnectionModule(MegatronModule):
             return bda_func((output, bias), res, dropout)
         
         ckpt = CheckpointWithoutOutput(ckpt_manager=manager)
+        nvtx_range_push("HyperConnection::bda_wrapper")
         output = ckpt.checkpoint(_bda_wrapper, x_expanded, bias_expanded, mixed, dropout_prob)
+        nvtx_range_pop("HyperConnection::bda_wrapper")
         
         return output
 
