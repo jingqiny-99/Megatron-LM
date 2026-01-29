@@ -186,10 +186,9 @@ class HyperConnectionModule(MegatronModule):
         """
         s, b, nC = x.shape
         n = self.n
-        x_norm = self.norm(x)  # [s, b, n*C]
-        r = x_norm.norm(dim=-1, keepdim=True) / math.sqrt(nC) # shape: [s, b, 1]
+        r = x.norm(dim=-1, keepdim=True) / math.sqrt(nC) # shape: [s, b, 1]
         r = 1.0 / (r + 1e-8) # shape: [s, b, 1]
-        proj = self.mapping_proj(x_norm)  # [s, b, n^2 + 2n]
+        proj = self.mapping_proj(x)  # [s, b, n^2 + 2n]
         return proj, r
     
     #TODO: kernel fusion
@@ -463,9 +462,8 @@ class HyperConnectionModule(MegatronModule):
         
         nvtx_range_push("HyperConnection::compute_mappings")
         # Checkpoint compute_mappings - auto-registers to manager via ckpt_manager parameter
-        h_pre, h_post, h_res = CheckpointWithoutOutput(ckpt_manager=manager).checkpoint(
-            self.compute_mappings, hidden_states
-        )
+        h_pre, h_post, h_res = self.compute_mappings(hidden_states)
+        
         nvtx_range_pop("HyperConnection::compute_mappings")
         # Checkpoint aggregate - auto-registers to manager
         nvtx_range_push("HyperConnection::aggregate")
