@@ -78,12 +78,8 @@ class TestHyperConnectionCheckpoint:
         torch.manual_seed(42)
         torch.cuda.manual_seed(42)
         aggregated_ref, h_res_ref, h_post_ref = module._forward_normal(hidden_states, residual)
-<<<<<<< HEAD
-        residual_ref = torch.einsum('sbnn,sbnk->sbnk', h_res_ref, residual.view(seq_len, batch_size, num_streams, hidden_size))
-        loss_ref = aggregated_ref.sum() + residual_ref.sum() + h_post_ref.sum()
-=======
-        loss_ref = aggregated_ref.sum() + h_res_ref.sum() + h_post_ref.sum()
->>>>>>> c11caac9b (Fix: bugs in tests)
+        mixed_ref = module.apply_h_res(h_res_ref, residual)
+        loss_ref = aggregated_ref.sum() + mixed_ref.sum() + h_post_ref.sum()
         loss_ref.backward()
         grad_hidden_ref = hidden_states.grad.clone()
         grad_residual_ref = residual.grad.clone()
@@ -95,9 +91,9 @@ class TestHyperConnectionCheckpoint:
         aggregated_ckpt, h_res_ckpt, h_post_ckpt = module._forward_with_checkpoint(
             hidden_states_ckpt, residual_ckpt, manager
         )
-
+        mixed_ckpt = module.apply_h_res(h_res_ckpt, residual_ckpt)  
         # Calculate loss before discarding outputs
-        loss_ckpt = aggregated_ckpt.sum() + h_res_ckpt.sum() + h_post_ckpt.sum()
+        loss_ckpt = aggregated_ckpt.sum() + mixed_ckpt.sum() + h_post_ckpt.sum()
 
         # Register unified recompute hook
         manager.discard_all_outputs_and_register_unified_recompute(loss_ckpt)
