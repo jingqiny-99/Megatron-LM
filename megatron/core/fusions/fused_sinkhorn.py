@@ -152,13 +152,13 @@ if _TILELANG_AVAILABLE:
         - M_row[t] = M_col[t] * col_sum[t]  (reverse col normalization)
         - M_in[t] = M_row[t] * row_sum[t]   (reverse row normalization)
         
-        Backward formulas:
-        - For row normalization y = x / row_sum(x):
-            grad_x = (grad_y - (grad_y * y).sum(-1, keepdim=True) * y) / row_sum
-                   = (grad_y - dot_prod) / row_sum
+        Backward formulas (optimized to divide first, then subtract):
         - For col normalization y = x / col_sum(x):
-            grad_x = (grad_y - (grad_y * y).sum(-2, keepdim=True) * y) / col_sum
-                   = (grad_y - dot_prod) / col_sum
+            grad_x = (grad_y - (grad_y * y).sum(dim=0)) / col_sum
+            Optimized: grad_y' = grad_y / col_sum, then grad_x = grad_y' - (grad_y' * y).sum(dim=0)
+        - For row normalization y = x / row_sum(x):
+            grad_x = (grad_y - (grad_y * y).sum(dim=1)) / row_sum
+            Optimized: grad_y' = grad_y / row_sum, then grad_x = grad_y' - (grad_y' * y).sum(dim=1)
         """
         n = T.symbolic("n")
         threads = 64
@@ -204,21 +204,29 @@ if _TILELANG_AVAILABLE:
                     for j, k in T.Parallel(hc, hc):
                         M_in[j, k] = M_row[j, k] * row_sum[j]
 
-                    # ---- Backward through col normalization ----
-                    # grad_M_row = (grad_M_col - (grad_M_col * M_col).sum(dim=0)) / col_sum
+                    # ---- Backward through col normalization (optimized) ----
+                    # Step 1: grad_frag = grad_frag / col_sum
+                    for j, k in T.Parallel(hc, hc):
+                        grad_frag[j, k] = grad_frag[j, k] / col_sum[k]
+                    # Step 2: dot_prod = (grad_frag * M_col).sum(dim=0)
                     for j, k in T.Parallel(hc, hc):
                         temp[j, k] = grad_frag[j, k] * M_col[j, k]
                     T.reduce_sum(temp, dot_prod, dim=0)
+                    # Step 3: grad_frag = grad_frag - dot_prod
                     for j, k in T.Parallel(hc, hc):
-                        grad_frag[j, k] = (grad_frag[j, k] - dot_prod[k]) / col_sum[k]
+                        grad_frag[j, k] = grad_frag[j, k] - dot_prod[k]
 
-                    # ---- Backward through row normalization ----
-                    # grad_M_in = (grad_M_row - (grad_M_row * M_row).sum(dim=1)) / row_sum
+                    # ---- Backward through row normalization (optimized) ----
+                    # Step 1: grad_frag = grad_frag / row_sum
+                    for j, k in T.Parallel(hc, hc):
+                        grad_frag[j, k] = grad_frag[j, k] / row_sum[j]
+                    # Step 2: dot_prod = (grad_frag * M_row).sum(dim=1)
                     for j, k in T.Parallel(hc, hc):
                         temp[j, k] = grad_frag[j, k] * M_row[j, k]
                     T.reduce_sum(temp, dot_prod, dim=1)
+                    # Step 3: grad_frag = grad_frag - dot_prod
                     for j, k in T.Parallel(hc, hc):
-                        grad_frag[j, k] = (grad_frag[j, k] - dot_prod[j]) / row_sum[j]
+                        grad_frag[j, k] = grad_frag[j, k] - dot_prod[j]
 
                     # Update M_col for next iteration (t-1)
                     # M_col[t-1] = M_in[t] when t > 0
