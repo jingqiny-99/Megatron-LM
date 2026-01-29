@@ -7,12 +7,15 @@ from torch import Tensor
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import nvtx_decorator, nvtx_range_push, nvtx_range_pop
+from megatron.core.fusions.fused_sinkhorn import (
+    sinkhorn_fused_forward,
+    is_tilelang_available,
+)
 
 if TYPE_CHECKING:
     from megatron.core.tensor_parallel.random import MHCBlockRecomputeManager
 
 
-#TODO: kernel fusion
 class SinkhornKnopp(torch.autograd.Function):
     """
     Differentiable Sinkhorn-Knopp algorithm for doubly stochastic projection.
@@ -24,29 +27,38 @@ class SinkhornKnopp(torch.autograd.Function):
     """
     
     @staticmethod
-    def forward(ctx, H_res_logits: Tensor, num_iterations: int) -> Tensor:
+    def forward(
+        ctx, H_res_logits: Tensor, num_iterations: int, use_fused_kernel: bool = False
+    ) -> Tensor:
         """
         Project to doubly stochastic matrix via iterative row/col normalization.
         
         Args:
             H_res_logits: [s, b, n, n] - raw logits for residual mixing matrix
             num_iterations: Number of Sinkhorn iterations (paper uses 20)
+            use_fused_kernel: Whether to use fused TileLang kernel for forward pass.
+                If True and TileLang is available, uses the fused kernel.
+                Falls back to native PyTorch implementation otherwise.
         
         Returns:
             H_res: [s, b, n, n] - doubly stochastic matrix
         """
-        # Use no_grad to avoid creating unnecessary computation graph in forward.
-        # Gradients are computed explicitly in backward via recomputation.
-            # M^{(0)} = exp(H_res_logits) - save initial M for backward recomputation
+        # M^{(0)} = exp(H_res_logits) - save initial M for backward recomputation
         M_init = torch.exp(H_res_logits)
-        M = M_init.clone()
-            
-        with torch.no_grad():
-            for _ in range(num_iterations):
-                # T_r: Row normalization
-                M = M / M.sum(dim=-1, keepdim=True).clamp(min=1e-8)
-                # T_c: Column normalization
-                M = M / M.sum(dim=-2, keepdim=True).clamp(min=1e-8)
+        
+        if use_fused_kernel and is_tilelang_available():
+            # Use fused TileLang kernel for forward computation
+            with torch.no_grad():
+                M = sinkhorn_fused_forward(H_res_logits, num_iterations, eps=1e-8)
+        else:
+            # Native PyTorch implementation
+            M = M_init.clone()
+            with torch.no_grad():
+                for _ in range(num_iterations):
+                    # T_r: Row normalization
+                    M = M / M.sum(dim=-1, keepdim=True).clamp(min=1e-8)
+                    # T_c: Column normalization
+                    M = M / M.sum(dim=-2, keepdim=True).clamp(min=1e-8)
         
         # Save initial M for backward recomputation
         ctx.save_for_backward(M_init)
@@ -116,6 +128,10 @@ class HyperConnectionModule(MegatronModule):
         self.n = config.num_residual_streams
         self.hidden_size = config.hidden_size
         self.sinkhorn_iterations = config.mhc_sinkhorn_iterations
+        
+        # Whether to use fused TileLang kernel for Sinkhorn forward pass
+        # Can be controlled via config.mhc_use_fused_sinkhorn if available
+        self.use_fused_sinkhorn = getattr(config, 'mhc_use_fused_sinkhorn', False)
         
         # Projection weights for dynamic mappings
         # Input: [s, b, n*C] -> Output: n^2 + 2n values per token
@@ -221,7 +237,11 @@ class HyperConnectionModule(MegatronModule):
         s, b, _ = x.shape
         proj, r = self._projection_and_rms(x)
         h_pre, h_post, h_res = self._compute_h(proj, r)
-        h_res = SinkhornKnopp.apply(h_res.view(s, b, self.n, self.n), self.sinkhorn_iterations) # [s, b, n, n] 
+        h_res = SinkhornKnopp.apply(
+            h_res.view(s, b, self.n, self.n), 
+            self.sinkhorn_iterations,
+            self.use_fused_sinkhorn
+        )  # [s, b, n, n] 
         
         return h_pre, h_post, h_res
     
