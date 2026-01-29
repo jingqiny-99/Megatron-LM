@@ -3592,6 +3592,11 @@ def _add_experimental_args(parser):
                        help='Number of layers per MHC recompute block. '
                        'When set, every N layers form a recompute block. '
                        'If None, all layers share a single recompute block.')
+    group.add_argument('--mhc-use-fused-kernel', action='store_true',
+                       default=False,
+                       help='Enable fused TileLang kernels for Hyper-Connection operations. '
+                       'When enabled, uses optimized GPU kernels for Sinkhorn and other mHC operations. '
+                       'Requires TileLang to be installed.')
 
     return parser
 

@@ -450,7 +450,7 @@ class TestSinkhornIntegration:
         seq_len = 128
         batch_size = 2
         
-        # Create config with fused sinkhorn enabled
+        # Create config with fused kernel enabled
         config = TransformerConfig(
             num_layers=2,
             hidden_size=hidden_size,
@@ -460,15 +460,14 @@ class TestSinkhornIntegration:
             num_residual_streams=num_streams,
             mhc_sinkhorn_iterations=20,
             mhc_init_gating_factor=0.01,
+            mhc_use_fused_kernel=True,
         )
-        # Enable fused sinkhorn via attribute
-        config.mhc_use_fused_sinkhorn = True
         
         module_fused = HyperConnectionModule(config=config, layer_number=1)
         module_fused.cuda()
         
-        # Create module with native sinkhorn
-        config.mhc_use_fused_sinkhorn = False
+        # Create module with native implementation
+        config.mhc_use_fused_kernel = False
         module_native = HyperConnectionModule(config=config, layer_number=1)
         module_native.cuda()
         

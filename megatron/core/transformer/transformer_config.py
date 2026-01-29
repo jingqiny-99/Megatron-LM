@@ -799,6 +799,16 @@ class TransformerConfig(ModelParallelConfig):
     
     If None, all layers in the transformer block share a single recompute block."""
 
+    mhc_use_fused_kernel: bool = False
+    """Enable fused TileLang kernels for Hyper-Connection operations.
+    
+    When enabled, uses optimized GPU kernels for mHC operations including:
+    - Sinkhorn-Knopp iterations for doubly stochastic projection
+    - (Future) Other mHC operations like compute_h, projection_and_rms, etc.
+    
+    Requires TileLang to be installed. If TileLang is not available, 
+    falls back to native PyTorch implementation automatically."""
+
     ####################
     # miscellaneous
     ####################

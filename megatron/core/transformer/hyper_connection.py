@@ -129,9 +129,9 @@ class HyperConnectionModule(MegatronModule):
         self.hidden_size = config.hidden_size
         self.sinkhorn_iterations = config.mhc_sinkhorn_iterations
         
-        # Whether to use fused TileLang kernel for Sinkhorn forward pass
-        # Can be controlled via config.mhc_use_fused_sinkhorn if available
-        self.use_fused_sinkhorn = getattr(config, 'mhc_use_fused_sinkhorn', False)
+        # Whether to use fused TileLang kernels for mHC operations
+        # Controlled via config.mhc_use_fused_kernel
+        self.use_fused_kernel = getattr(config, 'mhc_use_fused_kernel', False)
         
         # Projection weights for dynamic mappings
         # Input: [s, b, n*C] -> Output: n^2 + 2n values per token
@@ -239,7 +239,7 @@ class HyperConnectionModule(MegatronModule):
         h_res = SinkhornKnopp.apply(
             h_res.view(s, b, self.n, self.n), 
             self.sinkhorn_iterations,
-            self.use_fused_sinkhorn
+            self.use_fused_kernel
         )  # [s, b, n, n] 
         
         return h_pre, h_post, h_res
