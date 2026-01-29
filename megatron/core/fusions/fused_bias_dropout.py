@@ -40,6 +40,7 @@ def _bias_dropout_add_func(x_with_bias, residual, prob, training):
     # done generically outside the if statement, but that stops fusing of Bias
     # Addition-Dropout-Residual Addition operation. So doing it together inside
     # the conditional branch to improve performance
+    # TODO: Add a check to see if prob is 0.0, if so, skip the dropout operation.
     if bias is not None:
         if inplace:
             x.add_(bias)

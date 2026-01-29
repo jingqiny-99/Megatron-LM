@@ -851,8 +851,10 @@ class CheckpointWithoutOutput(object):
                 output_size = recomputation_output.untyped_storage().size()
                 output.untyped_storage().resize_(output_size)
                 output.untyped_storage().copy_(recomputation_output.untyped_storage())
+                recomputation_output.untyped_storage().resize_(0)
 
-        self.ctx.outputs = outputs
+        # self.ctx.outputs = outputs
+        self.ctx.outputs = self.outputs
         self.ctx.inputs = inputs
         self.outputs = None
         self.ctx = None

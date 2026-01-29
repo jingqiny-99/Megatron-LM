@@ -423,14 +423,16 @@ class HyperConnectionModule(MegatronModule):
         from megatron.core.tensor_parallel.random import CheckpointWithoutOutput
         
         # Checkpoint compute_mappings - auto-registers to manager via ckpt_manager parameter
-        h_pre, h_post, h_res = CheckpointWithoutOutput(ckpt_manager=manager).checkpoint(
-            self.compute_mappings, hidden_states
-        )
+        # h_pre, h_post, h_res = CheckpointWithoutOutput(ckpt_manager=manager).checkpoint(
+        #     self.compute_mappings, hidden_states
+        # )
         
+        h_pre, h_post, h_res = self.compute_mappings(hidden_states)
         # Checkpoint aggregate - auto-registers to manager
         aggregated = CheckpointWithoutOutput(ckpt_manager=manager).checkpoint(
             self.aggregate, hidden_states, h_pre
         )
+        # aggregated = self.aggregate(hidden_states, h_pre)
         
         return aggregated, h_res, h_post
     
