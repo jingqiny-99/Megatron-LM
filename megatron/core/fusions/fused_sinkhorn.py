@@ -144,7 +144,7 @@ if _TILELANG_AVAILABLE:
         return sinkhorn_backward_fwd_kernel_
 
     @tilelang.jit(pass_configs=pass_configs)
-    def _sinkhorn_backward_bwd_kernel_generator(hc: int, sinkhorn_iters: int, eps: float):
+    def _sinkhorn_backward_bwd_kernel_generator(hc: int, sinkhorn_iters: int, eps: float, BLOCK_N: int):
         """
         Generate backward kernel that computes gradients.
         
@@ -172,77 +172,59 @@ if _TILELANG_AVAILABLE:
             col_sums: T.Tensor[(n, sinkhorn_iters, hc), FP32],
             grad_input: T.Tensor[(n, hc, hc), FP32],
         ):
-            with T.Kernel(n, threads=threads) as i:
-                M_frag = T.alloc_fragment((hc, hc), FP32)
+            with T.kernel(T.ceildiv(n, BLOCK_N), threads=BLOCK_N) as bn:
+                tn = T.get_thread_binding(0)  
                 grad_frag = T.alloc_fragment((hc, hc), FP32)
-                col_sum = T.alloc_fragment(hc, FP32)
+                T.copy(grad_output[bn, :, :], grad_frag)
+                M = T.alloc_shared((BLOCK_N, hc, hc), FP32)
+                M_init_shared = T.alloc_shared((BLOCK_N, hc, hc), FP32)
+                row_sums_shared = T.alloc_shared((BLOCK_N, sinkhorn_iters, hc), FP32)
+                col_sums_shared = T.alloc_shared((BLOCK_N, sinkhorn_iters, hc), FP32)
+                T.copy(M_final[bn * BLOCK_N + tn, :, :], M[tn, :, :])
+                T.copy(row_sums[bn * BLOCK_N + tn, :, :], row_sums_shared[tn, :, :])
+                T.copy(col_sums[bn * BLOCK_N + tn, :, :], col_sums_shared[tn, :, :])
+                T.copy(M_init[bn * BLOCK_N + tn, :, :], M_init_shared[tn, :, :])
                 dot_prod = T.alloc_fragment(hc, FP32)
-                # temp = T.alloc_fragment((hc, hc), FP32)
-
-                T.copy(grad_output[i, :, :], grad_frag)
-                T.copy(M_final[i, :, :], M_frag)
+                temp = T.alloc_fragment((hc, hc), FP32)
 
                 # Backward pass through Sinkhorn iterations
                 for t_rev in T.serial(sinkhorn_iters):
                     t = sinkhorn_iters - 1 - t_rev
-
-                    # Load saved sums
-                    for j in T.serial(hc):
-                        col_sum[j] = col_sums[i, t, j]
-                    # # Reconstruct M_row from M_col: M_row = M_col * col_sum
                     
-                    # for j, k in T.Parallel(hc, hc):
-                    #         M_frag[j, k] = M_frag[j, k] * col_sum[k]
-
-                    # # Reconstruct M_in from M_row: M_in = M_row * row_sum
-                    # for j in T.serial(hc):
-                    #     for k in T.serial(hc):
-                    #         M_in[j, k] = M_row[j, k] * row_sum[j]
-
-                    # ---- Backward through col normalization (optimized) ----
-                    # Step 1: grad_frag = grad_frag / col_sum
                     for j, k in T.Parallel(hc, hc):
-                        grad_frag[j, k] = grad_frag[j, k] / col_sum[k]
+                        grad_frag[j, k] = grad_frag[j, k] / col_sums_shared[tn, t, k]
                     # Step 2: dot_prod = (grad_frag * M_col).sum(dim=0)
                     for j, k in T.Parallel(hc, hc):
-                        grad_frag[j, k] = grad_frag[j, k] * M_frag[j, k]
+                        temp[j, k] = grad_frag[j, k] * M[tn, j, k]
 
-                    T.reduce_sum(grad_frag, dot_prod, dim=1)
-                    for j, k in T.Parallel(hc, hc): 
-                        grad_frag[j, k] = grad_frag[j, k] / M_frag[j, k]
+                    T.reduce_sum(temp, dot_prod, dim=1)
                     # Step 3: grad_frag = grad_frag - dot_prod
                     for j, k in T.Parallel(hc, hc):
                         grad_frag[j, k] = grad_frag[j, k] - dot_prod[k]
 
                     for j, k in T.Parallel(hc, hc):
-                        M_frag[j, k] = M_frag[j, k] * col_sum[k]
-                    for j in T.Parallel(hc):
-                        col_sum[j] = row_sums[i, t, j]
+                        M[tn, j, k] = M[tn, j, k] * col_sums_shared[tn, t, k]
                     # ---- Backward through row normalization (optimized) ----
                     # Step 1: grad_frag = grad_frag / row_sum
                     for j, k in T.Parallel(hc, hc):
-                        grad_frag[j, k] = grad_frag[j, k] / col_sum[j]
+                        grad_frag[j, k] = grad_frag[j, k] / row_sums_shared[tn, t, j]
                     # Step 2: dot_prod = (grad_frag * M_row).sum(dim=1)
                     for j, k in T.Parallel(hc, hc):
-                        grad_frag[j, k] = grad_frag[j, k] * M_frag[j, k]
+                        temp[j, k] = grad_frag[j, k] * M[tn, j, k]
 
-                    T.reduce_sum(grad_frag, dot_prod, dim=1)
-                    for j, k in T.Parallel(hc, hc): 
-                        grad_frag[j, k] = grad_frag[j, k] / M_frag[j, k]
+                    T.reduce_sum(temp, dot_prod, dim=1)
                     # Step 3: grad_frag = grad_frag - dot_prod
                     for j, k in T.Parallel(hc, hc):
                         grad_frag[j, k] = grad_frag[j, k] - dot_prod[j]
 
                     for j, k in T.Parallel(hc, hc):
-                        M_frag[j, k] = M_frag[j, k] * col_sum[j]
+                        M[tn, j, k] = M[tn, j, k] * row_sums_shared[tn, t, j]
 
-                T.copy(M_init[i, :, :], M_frag)
-                # Apply chain rule: grad_input = grad_M_init * M_init
                 for j in T.serial(hc):
                     for k in T.serial(hc):
-                        grad_frag[j, k] = grad_frag[j, k] * M_frag[j, k]
+                        grad_frag[j, k] = grad_frag[j, k] * M_init_shared[tn, j, k]
 
-                T.copy(grad_frag, grad_input[i, :, :])
+                T.copy(grad_frag, grad_input[bn * BLOCK_N + tn, :, :])
 
         return sinkhorn_backward_bwd_kernel_
 
