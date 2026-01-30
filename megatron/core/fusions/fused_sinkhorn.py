@@ -173,19 +173,14 @@ if _TILELANG_AVAILABLE:
             grad_input: T.Tensor[(n, hc, hc), FP32],
         ):
             with T.Kernel(n, threads=threads) as i:
-                M_col = T.alloc_fragment((hc, hc), FP32)
-                M_row = T.alloc_fragment((hc, hc), FP32)
-                M_in = T.alloc_fragment((hc, hc), FP32)
-                M_init_frag = T.alloc_fragment((hc, hc), FP32)
+                M_frag = T.alloc_fragment((hc, hc), FP32)
                 grad_frag = T.alloc_fragment((hc, hc), FP32)
-                row_sum = T.alloc_fragment(hc, FP32)
                 col_sum = T.alloc_fragment(hc, FP32)
                 dot_prod = T.alloc_fragment(hc, FP32)
-                temp = T.alloc_fragment((hc, hc), FP32)
+                # temp = T.alloc_fragment((hc, hc), FP32)
 
-                T.copy(M_init[i, :, :], M_init_frag)
                 T.copy(grad_output[i, :, :], grad_frag)
-                T.copy(M_final[i, :, :], M_col)
+                T.copy(M_final[i, :, :], M_frag)
 
                 # Backward pass through Sinkhorn iterations
                 for t_rev in T.serial(sinkhorn_iters):
@@ -193,60 +188,59 @@ if _TILELANG_AVAILABLE:
 
                     # Load saved sums
                     for j in T.serial(hc):
-                        row_sum[j] = row_sums[i, t, j]
                         col_sum[j] = col_sums[i, t, j]
-
-                    # Reconstruct M_row from M_col: M_row = M_col * col_sum
+                    # # Reconstruct M_row from M_col: M_row = M_col * col_sum
                     
-                    for j in T.serial(hc):
-                        for k in T.serial(hc):
-                            M_row[j, k] = M_col[j, k] * col_sum[k]
+                    # for j, k in T.Parallel(hc, hc):
+                    #         M_frag[j, k] = M_frag[j, k] * col_sum[k]
 
-                    # Reconstruct M_in from M_row: M_in = M_row * row_sum
-                    for j in T.serial(hc):
-                        for k in T.serial(hc):
-                            M_in[j, k] = M_row[j, k] * row_sum[j]
+                    # # Reconstruct M_in from M_row: M_in = M_row * row_sum
+                    # for j in T.serial(hc):
+                    #     for k in T.serial(hc):
+                    #         M_in[j, k] = M_row[j, k] * row_sum[j]
 
                     # ---- Backward through col normalization (optimized) ----
                     # Step 1: grad_frag = grad_frag / col_sum
-                    for j in T.serial(hc):
-                        for k in T.serial(hc):
-                            grad_frag[j, k] = grad_frag[j, k] / col_sum[k]
+                    for j, k in T.Parallel(hc, hc):
+                        grad_frag[j, k] = grad_frag[j, k] / col_sum[k]
                     # Step 2: dot_prod = (grad_frag * M_col).sum(dim=0)
-                    for j in T.serial(hc):
-                        for k in T.serial(hc):
-                            temp[j, k] = grad_frag[j, k] * M_col[j, k]
-                    T.reduce_sum(temp, dot_prod, dim=0)
-                    # Step 3: grad_frag = grad_frag - dot_prod
-                    for j in T.serial(hc):
-                        for k in T.serial(hc):
-                            grad_frag[j, k] = grad_frag[j, k] - dot_prod[k]
+                    for j, k in T.Parallel(hc, hc):
+                        grad_frag[j, k] = grad_frag[j, k] * M_frag[j, k]
 
+                    T.reduce_sum(grad_frag, dot_prod, dim=1)
+                    for j, k in T.Parallel(hc, hc): 
+                        grad_frag[j, k] = grad_frag[j, k] / M_frag[j, k]
+                    # Step 3: grad_frag = grad_frag - dot_prod
+                    for j, k in T.Parallel(hc, hc):
+                        grad_frag[j, k] = grad_frag[j, k] - dot_prod[k]
+
+                    for j, k in T.Parallel(hc, hc):
+                        M_frag[j, k] = M_frag[j, k] * col_sum[k]
+                    for j in T.Parallel(hc):
+                        col_sum[j] = row_sums[i, t, j]
                     # ---- Backward through row normalization (optimized) ----
                     # Step 1: grad_frag = grad_frag / row_sum
-                    for j in T.serial(hc):
-                        for k in T.serial(hc):
-                            grad_frag[j, k] = grad_frag[j, k] / row_sum[j]
+                    for j, k in T.Parallel(hc, hc):
+                        grad_frag[j, k] = grad_frag[j, k] / col_sum[j]
                     # Step 2: dot_prod = (grad_frag * M_row).sum(dim=1)
-                    for j in T.serial(hc):
-                        for k in T.serial(hc):
-                            temp[j, k] = grad_frag[j, k] * M_row[j, k]
-                    T.reduce_sum(temp, dot_prod, dim=1)
+                    for j, k in T.Parallel(hc, hc):
+                        grad_frag[j, k] = grad_frag[j, k] * M_frag[j, k]
+
+                    T.reduce_sum(grad_frag, dot_prod, dim=1)
+                    for j, k in T.Parallel(hc, hc): 
+                        grad_frag[j, k] = grad_frag[j, k] / M_frag[j, k]
                     # Step 3: grad_frag = grad_frag - dot_prod
-                    for j in T.serial(hc):
-                        for k in T.serial(hc):
-                            grad_frag[j, k] = grad_frag[j, k] - dot_prod[j]
+                    for j, k in T.Parallel(hc, hc):
+                        grad_frag[j, k] = grad_frag[j, k] - dot_prod[j]
 
-                    # Update M_col for next iteration (t-1)
-                    # M_col[t-1] = M_in[t] when t > 0
-                    for j in T.serial(hc):
-                        for k in T.serial(hc):
-                            M_col[j, k] = M_in[j, k]
+                    for j, k in T.Parallel(hc, hc):
+                        M_frag[j, k] = M_frag[j, k] * col_sum[j]
 
+                T.copy(M_init[i, :, :], M_frag)
                 # Apply chain rule: grad_input = grad_M_init * M_init
                 for j in T.serial(hc):
                     for k in T.serial(hc):
-                        grad_frag[j, k] = grad_frag[j, k] * M_init_frag[j, k]
+                        grad_frag[j, k] = grad_frag[j, k] * M_frag[j, k]
 
                 T.copy(grad_frag, grad_input[i, :, :])
 
