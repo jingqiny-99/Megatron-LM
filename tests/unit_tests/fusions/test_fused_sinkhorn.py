@@ -104,7 +104,7 @@ class TestSinkhornBackwardCorrectness:
         torch.testing.assert_close(
             grad_fused, grad_native,
             rtol=1e-2, atol=1e-3,
-            msg=f"Backward mismatch for shape [{seq_len}, {batch_size}, {hc}, {hc}]"
+            msg=f"Backward mismatch for shape [{seq_len}, {batch_size}, {hc}, {hc}], expected={grad_native}, actual={grad_fused}"
         )
 
     def test_backward_flat_input(self):
