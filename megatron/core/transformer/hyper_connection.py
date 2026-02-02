@@ -12,6 +12,10 @@ from megatron.core.fusions.fused_sinkhorn import (
     sinkhorn_fused_backward,
     is_tilelang_available,
 )
+from megatron.core.fusions.fused_h_post_bda import (
+    h_post_bda_fused_forward,
+    h_post_bda_fused_backward,
+)
 
 if TYPE_CHECKING:
     from megatron.core.tensor_parallel.random import MHCBlockRecomputeManager
@@ -112,6 +116,201 @@ class SinkhornKnopp(torch.autograd.Function):
             grad_input = grad_M_init * M_init
         
         return grad_input, None, None
+
+
+class FusedHPostBDA(torch.autograd.Function):
+    """
+    Differentiable fused H_post expansion and bias-dropout-add operation.
+    
+    This autograd function wraps the fused kernel for memory-efficient computation of:
+        1. mixed = H_res @ original_residual (apply_h_res)
+        2. x_expanded = H_post^T @ layer_output (apply_h_post)
+        3. bias_expanded = H_post^T @ bias (if bias is not None)
+        4. output = dropout(x_expanded + bias_expanded) + mixed (bias-dropout-add)
+    
+    When use_fused_kernel=True and TileLang is available, uses fused kernels.
+    Otherwise falls back to native PyTorch implementation.
+    """
+    
+    @staticmethod
+    def forward(
+        ctx,
+        h_res: Tensor,
+        original_residual: Tensor,
+        h_post: Tensor,
+        x: Tensor,
+        bias: Optional[Tensor],
+        dropout_prob: float,
+        training: bool,
+        use_fused_kernel: bool = False,
+    ) -> Tensor:
+        """
+        Fused forward pass for H_post expansion and bias-dropout-add.
+        
+        Args:
+            h_res: [s, b, n, n] - residual mixing matrix
+            original_residual: [s, b, n*C] - n-stream hidden states
+            h_post: [s, b, n] - expansion weights
+            x: [s, b, C] - layer output
+            bias: [C] or None - optional bias tensor
+            dropout_prob: Dropout probability
+            training: Whether in training mode
+            use_fused_kernel: Whether to use fused TileLang kernel.
+                If True and TileLang is available, uses fused kernels.
+                Falls back to native PyTorch implementation otherwise.
+        
+        Returns:
+            output: [s, b, n*C] - final output after all operations
+        """
+        s, b, n, _ = h_res.shape
+        C = x.shape[-1]
+        
+        # Reshape original_residual from [s, b, n*C] to [s, b, n, C]
+        original_residual_4d = original_residual.view(s, b, n, C)
+        
+        _use_fused = use_fused_kernel and is_tilelang_available()
+        
+        if _use_fused:
+            # Use fused TileLang kernel for forward computation
+            with torch.no_grad():
+                output_4d, dropout_mask = h_post_bda_fused_forward(
+                    h_res, original_residual_4d, h_post, x, bias,
+                    dropout_prob, training
+                )
+        else:
+            # Native PyTorch implementation
+            with torch.no_grad():
+                # Step 1: Apply H_res to original residual
+                # [s*b, n, n] @ [s*b, n, C] -> [s*b, n, C]
+                h_res_batched = h_res.view(s * b, n, n)
+                residual_batched = original_residual_4d.view(s * b, n, C)
+                mixed = torch.bmm(h_res_batched, residual_batched).view(s, b, n, C)
+                
+                # Step 2: Apply H_post to x
+                # x: [s, b, C] -> [s, b, 1, C]
+                # h_post: [s, b, n] -> [s, b, n, 1]
+                x_expanded = h_post.unsqueeze(-1) * x.unsqueeze(2)  # [s, b, n, C]
+                
+                # Step 3: Apply H_post to bias (if present)
+                if bias is not None:
+                    bias_expanded = h_post.unsqueeze(-1) * bias.view(1, 1, 1, C)
+                    pre_dropout = x_expanded + bias_expanded
+                else:
+                    pre_dropout = x_expanded
+                
+                # Step 4: Dropout and add mixed
+                if training and dropout_prob > 0:
+                    dropout_mask = torch.bernoulli(
+                        torch.full_like(pre_dropout, 1.0 - dropout_prob)
+                    ) / (1.0 - dropout_prob)
+                    output_4d = pre_dropout * dropout_mask + mixed
+                else:
+                    dropout_mask = None
+                    output_4d = pre_dropout + mixed
+        
+        # Save tensors for backward
+        ctx.save_for_backward(
+            h_res, original_residual_4d, h_post, x, bias, dropout_mask
+        )
+        ctx.use_fused_kernel = _use_fused
+        ctx.n = n
+        ctx.C = C
+        
+        # Reshape output from [s, b, n, C] to [s, b, n*C]
+        return output_4d.view(s, b, n * C)
+    
+    @staticmethod
+    def backward(
+        ctx, grad_output: Tensor
+    ) -> Tuple[Tensor, Tensor, Tensor, Tensor, Optional[Tensor], None, None, None]:
+        """
+        Backward through fused H_post BDA operations.
+        
+        Uses fused TileLang kernel if enabled in forward, otherwise uses
+        recomputation with autograd for gradient computation.
+        
+        Returns:
+            grad_h_res: gradient w.r.t. h_res
+            grad_original_residual: gradient w.r.t. original_residual
+            grad_h_post: gradient w.r.t. h_post
+            grad_x: gradient w.r.t. x
+            grad_bias: gradient w.r.t. bias (or None)
+            None: for dropout_prob
+            None: for training
+            None: for use_fused_kernel
+        """
+        h_res, original_residual_4d, h_post, x, bias, dropout_mask = ctx.saved_tensors
+        use_fused_kernel = ctx.use_fused_kernel
+        n = ctx.n
+        C = ctx.C
+        
+        s, b, _ = grad_output.shape
+        grad_output_4d = grad_output.view(s, b, n, C)
+        
+        if use_fused_kernel:
+            # Fused kernel computes all gradients
+            (grad_h_res, grad_original_residual_4d, grad_h_post, 
+             grad_x, grad_bias) = h_post_bda_fused_backward(
+                grad_output_4d, h_res, original_residual_4d, h_post, x, bias, dropout_mask
+            )
+        else:
+            # Recompute forward with autograd enabled
+            with torch.enable_grad():
+                # Make inputs require grad
+                h_res_input = h_res.detach().requires_grad_(True)
+                original_residual_input = original_residual_4d.detach().requires_grad_(True)
+                h_post_input = h_post.detach().requires_grad_(True)
+                x_input = x.detach().requires_grad_(True)
+                if bias is not None:
+                    bias_input = bias.detach().requires_grad_(True)
+                else:
+                    bias_input = None
+                
+                # Recompute forward
+                # Step 1: Apply H_res
+                h_res_batched = h_res_input.view(s * b, n, n)
+                residual_batched = original_residual_input.view(s * b, n, C)
+                mixed = torch.bmm(h_res_batched, residual_batched).view(s, b, n, C)
+                
+                # Step 2: Apply H_post to x
+                x_expanded = h_post_input.unsqueeze(-1) * x_input.unsqueeze(2)
+                
+                # Step 3: Apply H_post to bias
+                if bias_input is not None:
+                    bias_expanded = h_post_input.unsqueeze(-1) * bias_input.view(1, 1, 1, C)
+                    pre_dropout = x_expanded + bias_expanded
+                else:
+                    pre_dropout = x_expanded
+                
+                # Step 4: Dropout and add
+                if dropout_mask is not None:
+                    output = pre_dropout * dropout_mask + mixed
+                else:
+                    output = pre_dropout + mixed
+                
+                # Compute gradients
+                inputs = [h_res_input, original_residual_input, h_post_input, x_input]
+                if bias_input is not None:
+                    inputs.append(bias_input)
+                
+                grads = torch.autograd.grad(
+                    outputs=output,
+                    inputs=inputs,
+                    grad_outputs=grad_output_4d,
+                    create_graph=False,
+                    retain_graph=False,
+                )
+                
+                grad_h_res = grads[0]
+                grad_original_residual_4d = grads[1]
+                grad_h_post = grads[2]
+                grad_x = grads[3]
+                grad_bias = grads[4] if bias_input is not None else None
+        
+        # Reshape grad_original_residual from [s, b, n, C] to [s, b, n*C]
+        grad_original_residual = grad_original_residual_4d.view(s, b, n * C)
+        
+        return grad_h_res, grad_original_residual, grad_h_post, grad_x, grad_bias, None, None, None
 
 
 class HyperConnectionModule(MegatronModule):
@@ -593,6 +792,10 @@ class HyperConnectionModule(MegatronModule):
         """
         Native implementation of fused h_res, h_post and bda operations.
         
+        When use_fused_kernel is True and TileLang is available, uses the
+        FusedHPostBDA autograd function with fused TileLang kernels.
+        Otherwise falls back to the sequential PyTorch implementation.
+        
         Args:
             h_res: [s, b, n, n] - residual mixing matrix
             original_residual: [s, b, n*C] - n-stream hidden states
@@ -600,18 +803,27 @@ class HyperConnectionModule(MegatronModule):
             layer_output_with_bias: Tuple of (x, bias)
             dropout_prob: Dropout probability
             training: Whether in training mode
-            fused: Whether to use fused BDA implementation
+            fused: Whether to use fused BDA implementation (for non-kernel path)
         
         Returns:
             output: [s, b, n*C] - final output
         """
+        x, bias = layer_output_with_bias
+        
+        # Use fused kernel path when enabled
+        if self.use_fused_kernel and is_tilelang_available():
+            return FusedHPostBDA.apply(
+                h_res, original_residual, h_post, x, bias,
+                dropout_prob, training, True  # use_fused_kernel=True
+            )
+        
+        # Fallback to sequential PyTorch implementation
         from megatron.core.fusions.fused_bias_dropout import get_bias_dropout_add
         
         # Step 1: Apply H_res to original residual
         mixed = self.apply_h_res(h_res, original_residual)
         
         # Step 2: Apply H_post to layer output
-        x, bias = layer_output_with_bias
         x_expanded = self._apply_h_post(x, h_post)
         bias_expanded = self._apply_h_post(bias, h_post) if bias is not None else None
         
@@ -636,7 +848,9 @@ class HyperConnectionModule(MegatronModule):
         """
         Checkpointed implementation of fused h_res, h_post and bda operations.
         
-        Uses a single checkpoint wrapper around all operations for memory efficiency.
+        When use_fused_kernel is True and TileLang is available, uses the
+        FusedHPostBDA autograd function directly (which has its own backward).
+        Otherwise uses a single checkpoint wrapper around all operations.
         
         Args:
             h_res: [s, b, n, n] - residual mixing matrix
@@ -645,20 +859,28 @@ class HyperConnectionModule(MegatronModule):
             layer_output_with_bias: Tuple of (x, bias)
             dropout_prob: Dropout probability
             training: Whether in training mode
-            fused: Whether to use fused BDA implementation
+            fused: Whether to use fused BDA implementation (for non-kernel path)
             manager: MHCBlockRecomputeManager for checkpoint management
         
         Returns:
             output: [s, b, n*C] - final output
         """
+        x, bias = layer_output_with_bias
+        
+        # Use fused kernel path when enabled - FusedHPostBDA has its own backward
+        if self.use_fused_kernel and is_tilelang_available():
+            return FusedHPostBDA.apply(
+                h_res, original_residual, h_post, x, bias,
+                dropout_prob, training, True  # use_fused_kernel=True
+            )
+        
+        # Fallback to checkpointed sequential PyTorch implementation
         from megatron.core.tensor_parallel.random import CheckpointWithoutOutput
         from megatron.core.fusions.fused_bias_dropout import get_bias_dropout_add
         
         # Get BDA function (captured via closure)
         bda_func = get_bias_dropout_add(training, fused)
         
-        # Unpack layer_output_with_bias to avoid tuple tensors in checkpoint args
-        x, bias = layer_output_with_bias
         has_bias = bias is not None
         
         # Native wrapper that combines all operations without internal checkpointing.
