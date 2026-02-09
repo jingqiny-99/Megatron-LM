@@ -320,31 +320,167 @@ def h_post_bda_native_backward(
     return grad_h_res, grad_original_residual, grad_h_post, grad_x, grad_bias
 
 
-if __name__ == "__main__":
-    # Test native implementation
+def _benchmark_native(
+    s: int,
+    b: int,
+    n: int,
+    C: int,
+    dtype: torch.dtype = torch.float32,
+    dropout_prob: float = 0.0,
+    use_bias: bool = False,
+    warmup_iters: int = 20,
+    bench_iters: int = 100,
+):
+    """
+    Benchmark native H_post BDA forward + backward using CUDA events.
+
+    Args:
+        s: sequence length
+        b: batch size
+        n: number of hyper-connection streams
+        C: hidden dimension
+        dtype: data type
+        dropout_prob: dropout probability (0.0 = no dropout)
+        use_bias: whether to include bias tensor
+        warmup_iters: number of warmup iterations
+        bench_iters: number of benchmark iterations
+    """
+    device = "cuda"
     torch.manual_seed(42)
 
+    # --- Allocate tensors ---
+    h_res = torch.randn(s, b, n, n, dtype=dtype, device=device, requires_grad=True)
+    original_residual = torch.randn(s, b, n, C, dtype=dtype, device=device, requires_grad=True)
+    h_post = torch.randn(s, b, n, dtype=dtype, device=device, requires_grad=True)
+    x = torch.randn(s, b, C, dtype=dtype, device=device, requires_grad=True)
+    bias = torch.randn(C, dtype=dtype, device=device, requires_grad=True) if use_bias else None
+    grad_output = torch.randn(s, b, n, C, dtype=dtype, device=device)
+
+    training = dropout_prob > 0.0
+
+    # --- Helper: single fwd+bwd iteration ---
+    def _run_once():
+        # Zero grads
+        for t in [h_res, original_residual, h_post, x]:
+            if t.grad is not None:
+                t.grad.zero_()
+        if bias is not None and bias.grad is not None:
+            bias.grad.zero_()
+
+        output, dropout_mask = h_post_bda_native_forward(
+            h_res, original_residual, h_post, x, bias,
+            dropout_prob=dropout_prob, training=training,
+        )
+        grads = h_post_bda_native_backward(
+            grad_output, h_res, original_residual, h_post, x, bias, dropout_mask,
+        )
+        return output, grads
+
+    # --- Warmup ---
+    for _ in range(warmup_iters):
+        _run_once()
+    torch.cuda.synchronize()
+
+    # --- Benchmark with CUDA events ---
+    start_events = [torch.cuda.Event(enable_timing=True) for _ in range(bench_iters)]
+    end_events = [torch.cuda.Event(enable_timing=True) for _ in range(bench_iters)]
+
+    for i in range(bench_iters):
+        start_events[i].record()
+        _run_once()
+        end_events[i].record()
+
+    torch.cuda.synchronize()
+
+    times_ms = [s_evt.elapsed_time(e_evt) for s_evt, e_evt in zip(start_events, end_events)]
+    avg_ms = sum(times_ms) / len(times_ms)
+    min_ms = min(times_ms)
+    max_ms = max(times_ms)
+
+    return avg_ms, min_ms, max_ms
+
+
+if __name__ == "__main__":
+    import argparse
+
+    parser = argparse.ArgumentParser(description="Benchmark H_post BDA native implementation")
+    parser.add_argument("--warmup", type=int, default=20, help="Number of warmup iterations")
+    parser.add_argument("--iters", type=int, default=100, help="Number of benchmark iterations")
+    args = parser.parse_args()
+
+    print("=" * 70)
+    print("H_post BDA Native Benchmark (forward + backward)")
+    print("=" * 70)
+
+    # ---- Correctness check first ----
+    torch.manual_seed(42)
     s, b, n, C = 2, 2, 4, 64
     h_res = torch.randn(s, b, n, n, dtype=torch.float32, requires_grad=True).cuda()
     original_residual = torch.randn(s, b, n, C, dtype=torch.float32, requires_grad=True).cuda()
     h_post = torch.randn(s, b, n, dtype=torch.float32, requires_grad=True).cuda()
     x = torch.randn(s, b, C, dtype=torch.float32, requires_grad=True).cuda()
-    bias = torch.randn(C, dtype=torch.float32, requires_grad=True).cuda()
+    bias_tensor = torch.randn(C, dtype=torch.float32, requires_grad=True).cuda()
 
-    # Forward
     output, dropout_mask = h_post_bda_native_forward(
-        h_res, original_residual, h_post, x, bias,
-        dropout_prob=0.1, training=True
+        h_res, original_residual, h_post, x, bias_tensor,
+        dropout_prob=0.0, training=False,
     )
-    print(f"Output shape: {output.shape}")
+    print(f"\n[Correctness] Output shape: {output.shape}")
 
-    # Backward
     grad_output = torch.randn_like(output)
     grads = h_post_bda_native_backward(
-        grad_output, h_res, original_residual, h_post, x, bias, dropout_mask
+        grad_output, h_res, original_residual, h_post, x, bias_tensor, dropout_mask,
     )
-    print(f"grad_h_res shape: {grads[0].shape}")
-    print(f"grad_original_residual shape: {grads[1].shape}")
-    print(f"grad_h_post shape: {grads[2].shape}")
-    print(f"grad_x shape: {grads[3].shape}")
-    print(f"grad_bias shape: {grads[4].shape}")
+    print(f"[Correctness] grad_h_res shape:            {grads[0].shape}")
+    print(f"[Correctness] grad_original_residual shape: {grads[1].shape}")
+    print(f"[Correctness] grad_h_post shape:            {grads[2].shape}")
+    print(f"[Correctness] grad_x shape:                 {grads[3].shape}")
+    print(f"[Correctness] grad_bias shape:              {grads[4].shape}")
+
+    # ---- Benchmark configs ----
+    # Realistic sizes for GPT-style models with mHC
+    # (s, b, n, C): seq_len, batch_size, num_streams, hidden_dim
+    configs = [
+        # Small (debugging)
+        (128, 1, 4, 1024),
+        (128, 1, 4, 2048),
+        # Medium (e.g. GPT-like)
+        (512, 1, 4, 4096),
+        (1024, 1, 4, 4096),
+        # Larger hidden dim
+        (512, 1, 4, 8192),
+        (1024, 1, 4, 8192),
+        # Different stream counts
+        (512, 1, 2, 4096),
+        (512, 1, 8, 4096),
+    ]
+
+    # Note: For mHC, dropout is typically 0 and bias is typically None
+    # (modern LLMs use --disable-bias-linear).
+    # We benchmark both cases for reference.
+
+    for use_bias in [False, True]:
+        bias_label = "bias=yes" if use_bias else "bias=None"
+        dropout_prob = 0.0  # mHC typically uses dropout=0
+
+        print(f"\n{'=' * 70}")
+        print(f"  dropout_prob={dropout_prob}, {bias_label}, dtype=float32")
+        print(f"  warmup={args.warmup}, iters={args.iters}")
+        print(f"{'=' * 70}")
+        print(f"  {'(s, b, n, C)':<25s} {'avg (ms)':>10s} {'min (ms)':>10s} {'max (ms)':>10s}")
+        print(f"  {'-'*25} {'-'*10} {'-'*10} {'-'*10}")
+
+        for (s, b, n, C) in configs:
+            avg_ms, min_ms, max_ms = _benchmark_native(
+                s, b, n, C,
+                dtype=torch.float32,
+                dropout_prob=dropout_prob,
+                use_bias=use_bias,
+                warmup_iters=args.warmup,
+                bench_iters=args.iters,
+            )
+            label = f"({s}, {b}, {n}, {C})"
+            print(f"  {label:<25s} {avg_ms:10.3f} {min_ms:10.3f} {max_ms:10.3f}")
+
+    print(f"\n{'=' * 70}")
+    print("Done.")
