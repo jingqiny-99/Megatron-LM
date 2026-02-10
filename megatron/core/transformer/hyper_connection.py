@@ -275,10 +275,6 @@ class FusedHPostBDA(torch.autograd.Function):
         _use_fused = use_fused_kernel and is_tilelang_available()
         
         if _use_fused:
-            assert bias is not None, (
-                "Fused H_post BDA kernel requires bias to be non-None. "
-                "Please provide a bias tensor when using fused kernels."
-            )
             assert dropout_prob == 0.0, (
                 f"Fused H_post BDA kernel requires dropout_prob to be 0, "
                 f"got {dropout_prob}. Dropout is not supported in fused kernels."
@@ -945,10 +941,6 @@ class HyperConnectionModule(MegatronModule):
         
         # Use fused kernel path when enabled
         if self.use_fused_kernel and is_tilelang_available():
-            assert bias is not None, (
-                "Fused H_post BDA kernel requires bias to be non-None. "
-                "Please provide a bias tensor when using fused kernels."
-            )
             assert dropout_prob == 0.0, (
                 f"Fused H_post BDA kernel requires dropout_prob to be 0, "
                 f"got {dropout_prob}. Dropout is not supported in fused kernels."
@@ -1010,10 +1002,6 @@ class HyperConnectionModule(MegatronModule):
         
         # Use fused kernel path when enabled - FusedHPostBDA has its own backward
         if self.use_fused_kernel and is_tilelang_available():
-            assert bias is not None, (
-                "Fused H_post BDA kernel requires bias to be non-None. "
-                "Please provide a bias tensor when using fused kernels."
-            )
             assert dropout_prob == 0.0, (
                 f"Fused H_post BDA kernel requires dropout_prob to be 0, "
                 f"got {dropout_prob}. Dropout is not supported in fused kernels."
