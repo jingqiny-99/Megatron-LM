@@ -240,16 +240,17 @@ def h_post_bda_tilelang_forward(
     """
     s, b, n, C = original_residual.shape
     sb = s * b
+    original_dtype = h_res.dtype
 
-    # Reshape inputs to flattened batch dimension
-    h_res_flat = h_res.view(sb, n, n).contiguous()
-    original_residual_flat = original_residual.view(sb, n, C).contiguous()
-    h_post_flat = h_post.view(sb, n).contiguous()
-    x_flat = x.view(sb, C).contiguous()
-    bias_flat = bias.contiguous()
+    # Reshape inputs to flattened batch dimension and cast to fp32
+    h_res_flat = h_res.view(sb, n, n).contiguous().float()
+    original_residual_flat = original_residual.view(sb, n, C).contiguous().float()
+    h_post_flat = h_post.view(sb, n).contiguous().float()
+    x_flat = x.view(sb, C).contiguous().float()
+    bias_flat = bias.contiguous().float()
 
-    # Allocate output
-    output_flat = torch.empty(sb, n, C, dtype=h_res.dtype, device=h_res.device)
+    # Allocate output in fp32
+    output_flat = torch.empty(sb, n, C, dtype=torch.float32, device=h_res.device)
 
     # Get cached kernel
     kernel = _get_forward_kernel(sb, n, C)
@@ -257,8 +258,11 @@ def h_post_bda_tilelang_forward(
     # Launch kernel
     kernel(h_res_flat, original_residual_flat, h_post_flat, x_flat, bias_flat, output_flat)
 
-    # Reshape output back
-    return output_flat.view(s, b, n, C)
+    # Reshape output back and cast to original dtype
+    output = output_flat.view(s, b, n, C)
+    if original_dtype != torch.float32:
+        output = output.to(original_dtype)
+    return output
 
 
 def h_post_bda_tilelang_backward(
@@ -296,20 +300,21 @@ def h_post_bda_tilelang_backward(
     """
     s, b, n, C = original_residual.shape
     sb = s * b
+    original_dtype = h_res.dtype
 
-    # Reshape inputs to flattened batch dimension
-    grad_output_flat = grad_output.view(sb, n, C).contiguous()
-    h_res_flat = h_res.view(sb, n, n).contiguous()
-    original_residual_flat = original_residual.view(sb, n, C).contiguous()
-    h_post_flat = h_post.view(sb, n).contiguous()
-    x_flat = x.view(sb, C).contiguous()
-    bias_flat = bias.contiguous()
+    # Reshape inputs to flattened batch dimension and cast to fp32
+    grad_output_flat = grad_output.view(sb, n, C).contiguous().float()
+    h_res_flat = h_res.view(sb, n, n).contiguous().float()
+    original_residual_flat = original_residual.view(sb, n, C).contiguous().float()
+    h_post_flat = h_post.view(sb, n).contiguous().float()
+    x_flat = x.view(sb, C).contiguous().float()
+    bias_flat = bias.contiguous().float()
 
-    # Allocate outputs
-    grad_h_res_flat = torch.empty(sb, n, n, dtype=h_res.dtype, device=h_res.device)
-    grad_original_residual_flat = torch.empty(sb, n, C, dtype=h_res.dtype, device=h_res.device)
-    grad_h_post_flat = torch.empty(sb, n, dtype=h_res.dtype, device=h_res.device)
-    grad_x_flat = torch.empty(sb, C, dtype=h_res.dtype, device=h_res.device)
+    # Allocate outputs in fp32
+    grad_h_res_flat = torch.empty(sb, n, n, dtype=torch.float32, device=h_res.device)
+    grad_original_residual_flat = torch.empty(sb, n, C, dtype=torch.float32, device=h_res.device)
+    grad_h_post_flat = torch.empty(sb, n, dtype=torch.float32, device=h_res.device)
+    grad_x_flat = torch.empty(sb, C, dtype=torch.float32, device=h_res.device)
 
     # Get cached kernel
     kernel = _get_backward_kernel(sb, n, C)
@@ -329,6 +334,14 @@ def h_post_bda_tilelang_backward(
 
     # grad_bias[k] = Σ_i grad_x[i, k] (sum over batch dimension)
     grad_bias = grad_x_flat.sum(dim=0)
+
+    # Cast to original dtype
+    if original_dtype != torch.float32:
+        grad_h_res = grad_h_res.to(original_dtype)
+        grad_original_residual = grad_original_residual.to(original_dtype)
+        grad_h_post = grad_h_post.to(original_dtype)
+        grad_x = grad_x.to(original_dtype)
+        grad_bias = grad_bias.to(original_dtype)
 
     return grad_h_res, grad_original_residual, grad_h_post, grad_x, grad_bias
 

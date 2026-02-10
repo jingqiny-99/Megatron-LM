@@ -188,13 +188,14 @@ def h_aggregate_tilelang_forward(
     """
     s, b, n, C = x.shape
     sb = s * b
+    original_dtype = x.dtype
 
-    # Reshape inputs to flattened batch dimension
-    x_flat = x.view(sb, n, C).contiguous()
-    h_pre_flat = h_pre.view(sb, n).contiguous()
+    # Reshape inputs to flattened batch dimension and cast to fp32
+    x_flat = x.view(sb, n, C).contiguous().float()
+    h_pre_flat = h_pre.view(sb, n).contiguous().float()
 
-    # Allocate output
-    output_flat = torch.empty(sb, C, dtype=x.dtype, device=x.device)
+    # Allocate output in fp32
+    output_flat = torch.empty(sb, C, dtype=torch.float32, device=x.device)
 
     # Get cached kernel
     kernel = _get_forward_kernel(sb, n, C)
@@ -202,8 +203,11 @@ def h_aggregate_tilelang_forward(
     # Launch kernel
     kernel(x_flat, h_pre_flat, output_flat)
 
-    # Reshape output back
-    return output_flat.view(s, b, C)
+    # Reshape output back and cast to original dtype
+    output = output_flat.view(s, b, C)
+    if original_dtype != torch.float32:
+        output = output.to(original_dtype)
+    return output
 
 
 def h_aggregate_tilelang_backward(
@@ -229,15 +233,16 @@ def h_aggregate_tilelang_backward(
     """
     s, b, n, C = x.shape
     sb = s * b
+    original_dtype = x.dtype
 
-    # Reshape inputs to flattened batch dimension
-    grad_output_flat = grad_output.view(sb, C).contiguous()
-    x_flat = x.view(sb, n, C).contiguous()
-    h_pre_flat = h_pre.view(sb, n).contiguous()
+    # Reshape inputs to flattened batch dimension and cast to fp32
+    grad_output_flat = grad_output.view(sb, C).contiguous().float()
+    x_flat = x.view(sb, n, C).contiguous().float()
+    h_pre_flat = h_pre.view(sb, n).contiguous().float()
 
-    # Allocate outputs
-    grad_x_flat = torch.empty(sb, n, C, dtype=x.dtype, device=x.device)
-    grad_h_pre_flat = torch.empty(sb, n, dtype=x.dtype, device=x.device)
+    # Allocate outputs in fp32
+    grad_x_flat = torch.empty(sb, n, C, dtype=torch.float32, device=x.device)
+    grad_h_pre_flat = torch.empty(sb, n, dtype=torch.float32, device=x.device)
 
     # Get cached kernel
     kernel = _get_backward_kernel(sb, n, C)
@@ -245,9 +250,13 @@ def h_aggregate_tilelang_backward(
     # Launch kernel
     kernel(grad_output_flat, x_flat, h_pre_flat, grad_x_flat, grad_h_pre_flat)
 
-    # Reshape outputs back
+    # Reshape outputs back and cast to original dtype
     grad_x = grad_x_flat.view(s, b, n, C)
     grad_h_pre = grad_h_pre_flat.view(s, b, n)
+
+    if original_dtype != torch.float32:
+        grad_x = grad_x.to(original_dtype)
+        grad_h_pre = grad_h_pre.to(original_dtype)
 
     return grad_x, grad_h_pre
 
