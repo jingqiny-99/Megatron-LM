@@ -33,6 +33,12 @@ if _TILELANG_AVAILABLE:
 
     FP32 = "float32"
 
+    _TORCH_DTYPE_TO_TL = {
+        torch.float32: "float32",
+        torch.float16: "float16",
+        torch.bfloat16: "bfloat16",
+    }
+
     pass_configs = {
         tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True,
         tilelang.PassConfigKey.TL_DISABLE_TMA_LOWER: True,
@@ -41,21 +47,21 @@ if _TILELANG_AVAILABLE:
     # ==================== Forward Kernel ====================
 
     @tilelang.jit(pass_configs=pass_configs)
-    def _sinkhorn_forward_kernel_generator(hc: int, sinkhorn_iters: int, eps: float):
+    def _sinkhorn_forward_kernel_generator(hc: int, sinkhorn_iters: int, eps: float, dtype: str = FP32):
         """Generate forward Sinkhorn kernel."""
         n = T.symbolic("n")
         threads = 64
 
         @T.prim_func
         def sinkhorn_forward_kernel_(
-            input_logits: T.Tensor[(n, hc, hc), FP32],
-            output: T.Tensor[(n, hc, hc), FP32],
+            input_logits: T.Tensor[(n, hc, hc), dtype],
+            output: T.Tensor[(n, hc, hc), dtype],
         ):
             with T.Kernel(n, threads=threads) as i:
-                M_frag = T.alloc_fragment((hc, hc), FP32)
-                row_sum = T.alloc_fragment(hc, FP32)
-                col_sum = T.alloc_fragment(hc, FP32)
-                row_max = T.alloc_fragment(hc, FP32)
+                M_frag = T.alloc_fragment((hc, hc), dtype)
+                row_sum = T.alloc_fragment(hc, dtype)
+                col_sum = T.alloc_fragment(hc, dtype)
+                row_max = T.alloc_fragment(hc, dtype)
 
                 T.copy(input_logits[i, :, :], M_frag)
 
@@ -89,7 +95,7 @@ if _TILELANG_AVAILABLE:
         return sinkhorn_forward_kernel_
 
     @tilelang.jit(pass_configs=pass_configs)
-    def _sinkhorn_backward_bwd_kernel_generator(hc: int, sinkhorn_iters: int, eps: float):
+    def _sinkhorn_backward_bwd_kernel_generator(hc: int, sinkhorn_iters: int, eps: float, dtype: str = FP32):
         """
         Generate backward kernel that computes gradients.
         
@@ -110,20 +116,20 @@ if _TILELANG_AVAILABLE:
 
         @T.prim_func
         def sinkhorn_backward_bwd_kernel(
-            grad_output: T.Tensor[(n, hc, hc), FP32],
-            M_init: T.Tensor[(n, hc, hc), FP32],
-            grad_input: T.Tensor[(n, hc, hc), FP32],
+            grad_output: T.Tensor[(n, hc, hc), dtype],
+            M_init: T.Tensor[(n, hc, hc), dtype],
+            grad_input: T.Tensor[(n, hc, hc), dtype],
         ):
             with T.Kernel(n, threads=128) as bn:
-                M_median = T.alloc_shared((sinkhorn_iters * 2, hc, hc), FP32)
-                row_sums = T.alloc_shared((sinkhorn_iters, hc), FP32)
-                col_sums = T.alloc_shared((sinkhorn_iters, hc), FP32)
+                M_median = T.alloc_shared((sinkhorn_iters * 2, hc, hc), dtype)
+                row_sums = T.alloc_shared((sinkhorn_iters, hc), dtype)
+                col_sums = T.alloc_shared((sinkhorn_iters, hc), dtype)
 
-                M = T.alloc_fragment((hc, hc), FP32)
-                grad =  T.alloc_fragment((hc, hc), FP32)
-                row_sum = T.alloc_fragment(hc, FP32)
-                col_sum = T.alloc_fragment(hc, FP32)
-                temp = T.alloc_fragment((hc, hc), FP32)
+                M = T.alloc_fragment((hc, hc), dtype)
+                grad =  T.alloc_fragment((hc, hc), dtype)
+                row_sum = T.alloc_fragment(hc, dtype)
+                col_sum = T.alloc_fragment(hc, dtype)
+                temp = T.alloc_fragment((hc, hc), dtype)
                 T.copy(M_init[bn, :, :], M)
                 
                 for t in T.Serial(sinkhorn_iters):
@@ -141,8 +147,6 @@ if _TILELANG_AVAILABLE:
 
                 for t_rev in T.Serial(sinkhorn_iters):
                     t = sinkhorn_iters - t_rev - 1
-                    # grad[i, j] = grad[i][j] / (col_sum[j] + eps)
-                    # grad[i, j] = grad[i, j] - (grad[i, j] * M[i, j]).sum(dim=0)
                     for i, j in T.Parallel(hc, hc):
                         grad[i, j] = grad[i, j] / (col_sums[t, j] + eps)
                         temp[i, j] = grad[i, j] * M[i, j]
@@ -174,18 +178,18 @@ if _TILELANG_AVAILABLE:
     _BACKWARD_FWD_KERNEL_CACHE = {}
     _BACKWARD_BWD_KERNEL_CACHE = {}
 
-    def _get_forward_kernel(hc: int, sinkhorn_iters: int, eps: float):
+    def _get_forward_kernel(hc: int, sinkhorn_iters: int, eps: float, dtype: str = FP32):
         """Get or create a cached forward kernel."""
-        key = (hc, sinkhorn_iters, eps)
+        key = (hc, sinkhorn_iters, eps, dtype)
         if key not in _FORWARD_KERNEL_CACHE:
-            _FORWARD_KERNEL_CACHE[key] = _sinkhorn_forward_kernel_generator(hc, sinkhorn_iters, eps)
+            _FORWARD_KERNEL_CACHE[key] = _sinkhorn_forward_kernel_generator(hc, sinkhorn_iters, eps, dtype)
         return _FORWARD_KERNEL_CACHE[key]
 
-    def _get_backward_bwd_kernel(hc: int, sinkhorn_iters: int, eps: float):
+    def _get_backward_bwd_kernel(hc: int, sinkhorn_iters: int, eps: float, dtype: str = FP32):
         """Get or create a cached backward kernel."""
-        key = (hc, sinkhorn_iters, eps)
+        key = (hc, sinkhorn_iters, eps, dtype)
         if key not in _BACKWARD_BWD_KERNEL_CACHE:
-            _BACKWARD_BWD_KERNEL_CACHE[key] = _sinkhorn_backward_bwd_kernel_generator(hc, sinkhorn_iters, eps)
+            _BACKWARD_BWD_KERNEL_CACHE[key] = _sinkhorn_backward_bwd_kernel_generator(hc, sinkhorn_iters, eps, dtype)
         return _BACKWARD_BWD_KERNEL_CACHE[key]
 
 
@@ -210,20 +214,16 @@ def sinkhorn_fused_forward(
 
     original_shape = input_logits.shape
     hc = original_shape[-1]
+    dtype_str = _TORCH_DTYPE_TO_TL[input_logits.dtype]
 
     input_flat = input_logits.reshape(-1, hc, hc).contiguous()
-    input_fp32 = input_flat.float()
 
-    output = torch.empty_like(input_fp32)
+    output = torch.empty_like(input_flat)
 
-    kernel = _get_forward_kernel(hc, num_iterations, eps)
-    kernel(input_fp32, output)
+    kernel = _get_forward_kernel(hc, num_iterations, eps, dtype_str)
+    kernel(input_flat, output)
 
-    output = output.reshape(original_shape)
-    if input_logits.dtype != torch.float32:
-        output = output.to(input_logits.dtype)
-
-    return output
+    return output.reshape(original_shape)
 
 
 def sinkhorn_fused_backward(
@@ -256,19 +256,16 @@ def sinkhorn_fused_backward(
 
     original_shape = grad_output.shape
     hc = original_shape[-1]
+    dtype_str = _TORCH_DTYPE_TO_TL[grad_output.dtype]
     
-    grad_output_flat = grad_output.reshape(-1, hc, hc).contiguous().float()
-    M_init_flat = M_init.reshape(-1, hc, hc).contiguous().float()
+    grad_output_flat = grad_output.reshape(-1, hc, hc).contiguous()
+    M_init_flat = M_init.reshape(-1, hc, hc).contiguous()
 
     grad_input = torch.empty_like(M_init_flat)
-    bwd_kernel = _get_backward_bwd_kernel(hc, num_iterations, eps)
+    bwd_kernel = _get_backward_bwd_kernel(hc, num_iterations, eps, dtype_str)
     bwd_kernel(grad_output_flat, M_init_flat, grad_input)
 
-    grad_input = grad_input.reshape(original_shape)
-    if grad_output.dtype != torch.float32:
-        grad_input = grad_input.to(grad_output.dtype)
-
-    return grad_input
+    return grad_input.reshape(original_shape)
 
 
 def sinkhorn_native_forward(

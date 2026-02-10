@@ -37,6 +37,12 @@ if _TILELANG_AVAILABLE:
 
     FP32 = "float32"
 
+    _TORCH_DTYPE_TO_TL = {
+        torch.float32: "float32",
+        torch.float16: "float16",
+        torch.bfloat16: "bfloat16",
+    }
+
     pass_configs = {
         tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True,
         tilelang.PassConfigKey.TL_DISABLE_TMA_LOWER: True,
@@ -44,7 +50,6 @@ if _TILELANG_AVAILABLE:
 
     # ==================== Forward Kernel ====================
 
-    # TODO: Implement forward kernel
     # Input shapes:
     #   - h_res: [sb, n, n] - residual mixing matrix (flattened s*b)
     #   - original_residual: [sb, n, C] - n-stream hidden states
@@ -55,7 +60,7 @@ if _TILELANG_AVAILABLE:
     #   - output: [sb, n, C] - final output after all operations
 
     @tilelang.jit(pass_configs=pass_configs)
-    def _h_post_bda_forward_kernel_generator(sb: int, n: int, C: int):
+    def _h_post_bda_forward_kernel_generator(sb: int, n: int, C: int, dtype: str = FP32):
         """Generate forward H_post BDA kernel."""
         threads = 128
         BLOCK_SB = 16
@@ -63,23 +68,22 @@ if _TILELANG_AVAILABLE:
         BLOCK_C = math.gcd(EXPECTED_BLOCK_C, C)
         @T.prim_func
         def h_post_bda_forward_kernel_(
-            h_res: T.Tensor[(sb, n, n), FP32],
-            original_residual: T.Tensor[(sb, n, C), FP32],
-            h_post: T.Tensor[(sb, n), FP32],
-            x: T.Tensor[(sb, C), FP32],
-            bias: T.Tensor[(C,), FP32],
-            output: T.Tensor[(sb, n, C), FP32],
+            h_res: T.Tensor[(sb, n, n), dtype],
+            original_residual: T.Tensor[(sb, n, C), dtype],
+            h_post: T.Tensor[(sb, n), dtype],
+            x: T.Tensor[(sb, C), dtype],
+            bias: T.Tensor[(C,), dtype],
+            output: T.Tensor[(sb, n, C), dtype],
         ):
-            # no need for block div n, but need to block div sb and C. Notice that the output is in shape of (sb, n, C) 
             with T.Kernel(sb, threads=threads) as i:
-                h_res_local = T.alloc_fragment((n, n), FP32)
-                original_residual_local = T.alloc_fragment((n, BLOCK_C), FP32)
-                temp = T.alloc_fragment((n, BLOCK_C), FP32)
-                h_post_local = T.alloc_fragment((n), FP32)
-                x_local = T.alloc_fragment((BLOCK_C), FP32)
-                bias_local = T.alloc_fragment((BLOCK_C), FP32)
-                output_local = T.alloc_fragment((n, BLOCK_C), FP32)
-                temp = T.alloc_fragment((n, BLOCK_C, n ), FP32)
+                h_res_local = T.alloc_fragment((n, n), dtype)
+                original_residual_local = T.alloc_fragment((n, BLOCK_C), dtype)
+                temp = T.alloc_fragment((n, BLOCK_C), dtype)
+                h_post_local = T.alloc_fragment((n), dtype)
+                x_local = T.alloc_fragment((BLOCK_C), dtype)
+                bias_local = T.alloc_fragment((BLOCK_C), dtype)
+                output_local = T.alloc_fragment((n, BLOCK_C), dtype)
+                temp = T.alloc_fragment((n, BLOCK_C, n ), dtype)
                 T.copy(h_res[i, :, :], h_res_local)
                 T.copy(h_post[i, :], h_post_local)
 
@@ -108,12 +112,8 @@ if _TILELANG_AVAILABLE:
     #   grad_bias[k] = Σ_{i,j} (grad_output[i, j, k] × h_post[i, j])  # accumulated outside kernel
 
     @tilelang.jit(pass_configs=pass_configs)
-    def _h_post_bda_backward_kernel_generator(sb: int, n: int, C: int):
-        """Generate backward H_post BDA kernel.
-        
-        Computes gradients for h_res, original_residual, h_post, and x.
-        grad_bias is computed by summing grad_x across batch dimension outside kernel.
-        """
+    def _h_post_bda_backward_kernel_generator(sb: int, n: int, C: int, dtype: str = FP32):
+        """Generate backward H_post BDA kernel."""
         threads = 128
         BLOCK_SB = 16
         EXPECTED_BLOCK_C = 1024
@@ -121,58 +121,48 @@ if _TILELANG_AVAILABLE:
 
         @T.prim_func
         def h_post_bda_backward_kernel_(
-            grad_output: T.Tensor[(sb, n, C), FP32],
-            h_res: T.Tensor[(sb, n, n), FP32],
-            original_residual: T.Tensor[(sb, n, C), FP32],
-            h_post: T.Tensor[(sb, n), FP32],
-            x: T.Tensor[(sb, C), FP32],
-            bias: T.Tensor[(C,), FP32],
-            grad_h_res: T.Tensor[(sb, n, n), FP32],
-            grad_original_residual: T.Tensor[(sb, n, C), FP32],
-            grad_h_post: T.Tensor[(sb, n), FP32],
-            grad_x: T.Tensor[(sb, C), FP32],
+            grad_output: T.Tensor[(sb, n, C), dtype],
+            h_res: T.Tensor[(sb, n, n), dtype],
+            original_residual: T.Tensor[(sb, n, C), dtype],
+            h_post: T.Tensor[(sb, n), dtype],
+            x: T.Tensor[(sb, C), dtype],
+            bias: T.Tensor[(C,), dtype],
+            grad_h_res: T.Tensor[(sb, n, n), dtype],
+            grad_original_residual: T.Tensor[(sb, n, C), dtype],
+            grad_h_post: T.Tensor[(sb, n), dtype],
+            grad_x: T.Tensor[(sb, C), dtype],
         ):
             with T.Kernel(sb, threads=threads) as i:
-                # Allocate local fragments
-                grad_output_local = T.alloc_fragment((n, BLOCK_C), FP32)
-                h_res_local = T.alloc_fragment((n, n), FP32)
-                original_residual_local = T.alloc_fragment((n, BLOCK_C), FP32)
-                h_post_local = T.alloc_fragment((n,), FP32)
-                x_local = T.alloc_fragment((BLOCK_C,), FP32)
-                bias_local = T.alloc_fragment((BLOCK_C,), FP32)
+                grad_output_local = T.alloc_fragment((n, BLOCK_C), dtype)
+                h_res_local = T.alloc_fragment((n, n), dtype)
+                original_residual_local = T.alloc_fragment((n, BLOCK_C), dtype)
+                h_post_local = T.alloc_fragment((n,), dtype)
+                x_local = T.alloc_fragment((BLOCK_C,), dtype)
+                bias_local = T.alloc_fragment((BLOCK_C,), dtype)
                 
-                # Output fragments
-                grad_h_res_local = T.alloc_fragment((n, n), FP32)
-                grad_original_residual_local = T.alloc_fragment((n, BLOCK_C), FP32)
-                grad_h_post_local = T.alloc_fragment((n,), FP32)
-                grad_x_local = T.alloc_fragment((BLOCK_C,), FP32)
+                grad_h_res_local = T.alloc_fragment((n, n), dtype)
+                grad_original_residual_local = T.alloc_fragment((n, BLOCK_C), dtype)
+                grad_h_post_local = T.alloc_fragment((n,), dtype)
+                grad_x_local = T.alloc_fragment((BLOCK_C,), dtype)
                 
-                # Temp fragments for matmul
-                temp_h_res = T.alloc_fragment((n, n, BLOCK_C), FP32)
-                temp_orig_res = T.alloc_fragment((n, BLOCK_C, n), FP32)
-                temp_h_post = T.alloc_fragment((n, BLOCK_C), FP32)
-                temp_x = T.alloc_fragment((n, BLOCK_C), FP32)
+                temp_h_res = T.alloc_fragment((n, n, BLOCK_C), dtype)
+                temp_orig_res = T.alloc_fragment((n, BLOCK_C, n), dtype)
+                temp_h_post = T.alloc_fragment((n, BLOCK_C), dtype)
+                temp_x = T.alloc_fragment((n, BLOCK_C), dtype)
                 
-                # Load h_res and h_post (constant across C blocks)
                 T.copy(h_res[i, 0, 0], h_res_local)
                 T.copy(h_post[i, 0], h_post_local)
                 
-                # Initialize grad_h_res_local and grad_h_post_local to zero
                 T.clear(grad_h_res_local)
                 T.clear(grad_h_post_local)
                 
-                # Process C dimension in blocks
                 for pid_c in T.Pipelined(C // BLOCK_C, num_stages=3):
                     c_idx = pid_c * BLOCK_C
                     
-                    # Load inputs for this C block
                     T.copy(grad_output[i, 0, c_idx], grad_output_local)
                     T.copy(original_residual[i, 0, c_idx], original_residual_local)
                     T.copy(x[i, c_idx], x_local)
                     T.copy(bias[c_idx], bias_local)
-                    
-                    # grad_h_res[i, j, m] += Σ_k (grad_output[i, j, k] × original_residual[i, m, k])
-                    # temp_h_res[j, m, k] = grad_output[j, k] * original_residual[m, k]
 
                     for j, k, l in T.Parallel(n, n, BLOCK_C): 
                         temp_h_res[k, j, l] = grad_output_local[k, l] * original_residual_local[j, l]
@@ -189,7 +179,6 @@ if _TILELANG_AVAILABLE:
                     T.copy(grad_original_residual_local, grad_original_residual[i, 0, c_idx])
                     T.copy(grad_x_local, grad_x[i, c_idx])
                 
-                # Write accumulated results
                 T.copy(grad_h_res_local, grad_h_res[i, 0, 0])
                 T.copy(grad_h_post_local, grad_h_post[i, 0])
         
@@ -197,11 +186,8 @@ if _TILELANG_AVAILABLE:
 
     # ==================== No-Bias Forward Kernel ====================
 
-    # Same as forward kernel but without bias term:
-    #   output[i, j, k] = sum_m(h_res[i, j, m] * original_residual[i, m, k]) + h_post[i, j] * x[i, k]
-
     @tilelang.jit(pass_configs=pass_configs)
-    def _h_post_bda_nobias_forward_kernel_generator(sb: int, n: int, C: int):
+    def _h_post_bda_nobias_forward_kernel_generator(sb: int, n: int, C: int, dtype: str = FP32):
         """Generate forward H_post BDA kernel without bias."""
         threads = 128
         BLOCK_SB = 16
@@ -209,20 +195,20 @@ if _TILELANG_AVAILABLE:
         BLOCK_C = math.gcd(EXPECTED_BLOCK_C, C)
         @T.prim_func
         def h_post_bda_nobias_forward_kernel_(
-            h_res: T.Tensor[(sb, n, n), FP32],
-            original_residual: T.Tensor[(sb, n, C), FP32],
-            h_post: T.Tensor[(sb, n), FP32],
-            x: T.Tensor[(sb, C), FP32],
-            output: T.Tensor[(sb, n, C), FP32],
+            h_res: T.Tensor[(sb, n, n), dtype],
+            original_residual: T.Tensor[(sb, n, C), dtype],
+            h_post: T.Tensor[(sb, n), dtype],
+            x: T.Tensor[(sb, C), dtype],
+            output: T.Tensor[(sb, n, C), dtype],
         ):
             with T.Kernel(sb, threads=threads) as i:
-                h_res_local = T.alloc_fragment((n, n), FP32)
-                original_residual_local = T.alloc_fragment((n, BLOCK_C), FP32)
-                temp = T.alloc_fragment((n, BLOCK_C), FP32)
-                h_post_local = T.alloc_fragment((n), FP32)
-                x_local = T.alloc_fragment((BLOCK_C), FP32)
-                output_local = T.alloc_fragment((n, BLOCK_C), FP32)
-                temp = T.alloc_fragment((n, BLOCK_C, n ), FP32)
+                h_res_local = T.alloc_fragment((n, n), dtype)
+                original_residual_local = T.alloc_fragment((n, BLOCK_C), dtype)
+                temp = T.alloc_fragment((n, BLOCK_C), dtype)
+                h_post_local = T.alloc_fragment((n), dtype)
+                x_local = T.alloc_fragment((BLOCK_C), dtype)
+                output_local = T.alloc_fragment((n, BLOCK_C), dtype)
+                temp = T.alloc_fragment((n, BLOCK_C, n ), dtype)
                 T.copy(h_res[i, :, :], h_res_local)
                 T.copy(h_post[i, :], h_post_local)
 
@@ -241,14 +227,8 @@ if _TILELANG_AVAILABLE:
 
     # ==================== No-Bias Backward Kernel ====================
 
-    # Gradient formulas without bias:
-    #   grad_h_res[i, j, m] = Σ_k (grad_output[i, j, k] × original_residual[i, m, k])
-    #   grad_original_residual[i, m, k] = Σ_j (grad_output[i, j, k] × h_res[i, j, m])
-    #   grad_h_post[i, j] = Σ_k (grad_output[i, j, k] × x[i, k])
-    #   grad_x[i, k] = Σ_j (grad_output[i, j, k] × h_post[i, j])
-
     @tilelang.jit(pass_configs=pass_configs)
-    def _h_post_bda_nobias_backward_kernel_generator(sb: int, n: int, C: int):
+    def _h_post_bda_nobias_backward_kernel_generator(sb: int, n: int, C: int, dtype: str = FP32):
         """Generate backward H_post BDA kernel without bias."""
         threads = 128
         BLOCK_SB = 16
@@ -257,49 +237,42 @@ if _TILELANG_AVAILABLE:
 
         @T.prim_func
         def h_post_bda_nobias_backward_kernel_(
-            grad_output: T.Tensor[(sb, n, C), FP32],
-            h_res: T.Tensor[(sb, n, n), FP32],
-            original_residual: T.Tensor[(sb, n, C), FP32],
-            h_post: T.Tensor[(sb, n), FP32],
-            x: T.Tensor[(sb, C), FP32],
-            grad_h_res: T.Tensor[(sb, n, n), FP32],
-            grad_original_residual: T.Tensor[(sb, n, C), FP32],
-            grad_h_post: T.Tensor[(sb, n), FP32],
-            grad_x: T.Tensor[(sb, C), FP32],
+            grad_output: T.Tensor[(sb, n, C), dtype],
+            h_res: T.Tensor[(sb, n, n), dtype],
+            original_residual: T.Tensor[(sb, n, C), dtype],
+            h_post: T.Tensor[(sb, n), dtype],
+            x: T.Tensor[(sb, C), dtype],
+            grad_h_res: T.Tensor[(sb, n, n), dtype],
+            grad_original_residual: T.Tensor[(sb, n, C), dtype],
+            grad_h_post: T.Tensor[(sb, n), dtype],
+            grad_x: T.Tensor[(sb, C), dtype],
         ):
             with T.Kernel(sb, threads=threads) as i:
-                # Allocate local fragments
-                grad_output_local = T.alloc_fragment((n, BLOCK_C), FP32)
-                h_res_local = T.alloc_fragment((n, n), FP32)
-                original_residual_local = T.alloc_fragment((n, BLOCK_C), FP32)
-                h_post_local = T.alloc_fragment((n,), FP32)
-                x_local = T.alloc_fragment((BLOCK_C,), FP32)
+                grad_output_local = T.alloc_fragment((n, BLOCK_C), dtype)
+                h_res_local = T.alloc_fragment((n, n), dtype)
+                original_residual_local = T.alloc_fragment((n, BLOCK_C), dtype)
+                h_post_local = T.alloc_fragment((n,), dtype)
+                x_local = T.alloc_fragment((BLOCK_C,), dtype)
 
-                # Output fragments
-                grad_h_res_local = T.alloc_fragment((n, n), FP32)
-                grad_original_residual_local = T.alloc_fragment((n, BLOCK_C), FP32)
-                grad_h_post_local = T.alloc_fragment((n,), FP32)
-                grad_x_local = T.alloc_fragment((BLOCK_C,), FP32)
+                grad_h_res_local = T.alloc_fragment((n, n), dtype)
+                grad_original_residual_local = T.alloc_fragment((n, BLOCK_C), dtype)
+                grad_h_post_local = T.alloc_fragment((n,), dtype)
+                grad_x_local = T.alloc_fragment((BLOCK_C,), dtype)
 
-                # Temp fragments for matmul
-                temp_h_res = T.alloc_fragment((n, n, BLOCK_C), FP32)
-                temp_orig_res = T.alloc_fragment((n, BLOCK_C, n), FP32)
-                temp_h_post = T.alloc_fragment((n, BLOCK_C), FP32)
-                temp_x = T.alloc_fragment((n, BLOCK_C), FP32)
+                temp_h_res = T.alloc_fragment((n, n, BLOCK_C), dtype)
+                temp_orig_res = T.alloc_fragment((n, BLOCK_C, n), dtype)
+                temp_h_post = T.alloc_fragment((n, BLOCK_C), dtype)
+                temp_x = T.alloc_fragment((n, BLOCK_C), dtype)
 
-                # Load h_res and h_post (constant across C blocks)
                 T.copy(h_res[i, 0, 0], h_res_local)
                 T.copy(h_post[i, 0], h_post_local)
 
-                # Initialize grad_h_res_local and grad_h_post_local to zero
                 T.clear(grad_h_res_local)
                 T.clear(grad_h_post_local)
 
-                # Process C dimension in blocks
                 for pid_c in T.Pipelined(C // BLOCK_C, num_stages=3):
                     c_idx = pid_c * BLOCK_C
 
-                    # Load inputs for this C block
                     T.copy(grad_output[i, 0, c_idx], grad_output_local)
                     T.copy(original_residual[i, 0, c_idx], original_residual_local)
                     T.copy(x[i, c_idx], x_local)
@@ -319,7 +292,6 @@ if _TILELANG_AVAILABLE:
                     T.copy(grad_original_residual_local, grad_original_residual[i, 0, c_idx])
                     T.copy(grad_x_local, grad_x[i, c_idx])
 
-                # Write accumulated results
                 T.copy(grad_h_res_local, grad_h_res[i, 0, 0])
                 T.copy(grad_h_post_local, grad_h_post[i, 0])
 
@@ -332,32 +304,32 @@ if _TILELANG_AVAILABLE:
     _NOBIAS_FORWARD_KERNEL_CACHE = {}
     _NOBIAS_BACKWARD_KERNEL_CACHE = {}
 
-    def _get_forward_kernel(sb: int, n: int, C: int):
+    def _get_forward_kernel(sb: int, n: int, C: int, dtype: str = FP32):
         """Get cached forward kernel or create a new one."""
-        key = (sb, n, C)
+        key = (sb, n, C, dtype)
         if key not in _FORWARD_KERNEL_CACHE:
-            _FORWARD_KERNEL_CACHE[key] = _h_post_bda_forward_kernel_generator(sb, n, C)
+            _FORWARD_KERNEL_CACHE[key] = _h_post_bda_forward_kernel_generator(sb, n, C, dtype)
         return _FORWARD_KERNEL_CACHE[key]
 
-    def _get_backward_kernel(sb: int, n: int, C: int):
+    def _get_backward_kernel(sb: int, n: int, C: int, dtype: str = FP32):
         """Get cached backward kernel or create a new one."""
-        key = (sb, n, C)
+        key = (sb, n, C, dtype)
         if key not in _BACKWARD_KERNEL_CACHE:
-            _BACKWARD_KERNEL_CACHE[key] = _h_post_bda_backward_kernel_generator(sb, n, C)
+            _BACKWARD_KERNEL_CACHE[key] = _h_post_bda_backward_kernel_generator(sb, n, C, dtype)
         return _BACKWARD_KERNEL_CACHE[key]
 
-    def _get_nobias_forward_kernel(sb: int, n: int, C: int):
+    def _get_nobias_forward_kernel(sb: int, n: int, C: int, dtype: str = FP32):
         """Get cached no-bias forward kernel or create a new one."""
-        key = (sb, n, C)
+        key = (sb, n, C, dtype)
         if key not in _NOBIAS_FORWARD_KERNEL_CACHE:
-            _NOBIAS_FORWARD_KERNEL_CACHE[key] = _h_post_bda_nobias_forward_kernel_generator(sb, n, C)
+            _NOBIAS_FORWARD_KERNEL_CACHE[key] = _h_post_bda_nobias_forward_kernel_generator(sb, n, C, dtype)
         return _NOBIAS_FORWARD_KERNEL_CACHE[key]
 
-    def _get_nobias_backward_kernel(sb: int, n: int, C: int):
+    def _get_nobias_backward_kernel(sb: int, n: int, C: int, dtype: str = FP32):
         """Get cached no-bias backward kernel or create a new one."""
-        key = (sb, n, C)
+        key = (sb, n, C, dtype)
         if key not in _NOBIAS_BACKWARD_KERNEL_CACHE:
-            _NOBIAS_BACKWARD_KERNEL_CACHE[key] = _h_post_bda_nobias_backward_kernel_generator(sb, n, C)
+            _NOBIAS_BACKWARD_KERNEL_CACHE[key] = _h_post_bda_nobias_backward_kernel_generator(sb, n, C, dtype)
         return _NOBIAS_BACKWARD_KERNEL_CACHE[key]
 
 
@@ -389,30 +361,27 @@ def h_post_bda_tilelang_forward(
     """
     s, b, n, C = original_residual.shape
     sb = s * b
-    original_dtype = h_res.dtype
+    dtype_str = _TORCH_DTYPE_TO_TL[h_res.dtype]
 
-    # Reshape inputs to flattened batch dimension and cast to fp32
-    h_res_flat = h_res.view(sb, n, n).contiguous().float()
-    original_residual_flat = original_residual.view(sb, n, C).contiguous().float()
-    h_post_flat = h_post.view(sb, n).contiguous().float()
-    x_flat = x.view(sb, C).contiguous().float()
+    # Reshape inputs to flattened batch dimension
+    h_res_flat = h_res.view(sb, n, n).contiguous()
+    original_residual_flat = original_residual.view(sb, n, C).contiguous()
+    h_post_flat = h_post.view(sb, n).contiguous()
+    x_flat = x.view(sb, C).contiguous()
 
-    # Allocate output in fp32
-    output_flat = torch.empty(sb, n, C, dtype=torch.float32, device=h_res.device)
+    # Allocate output in same dtype
+    output_flat = torch.empty(sb, n, C, dtype=h_res.dtype, device=h_res.device)
 
     if bias is not None:
-        bias_flat = bias.contiguous().float()
-        kernel = _get_forward_kernel(sb, n, C)
+        bias_flat = bias.contiguous()
+        kernel = _get_forward_kernel(sb, n, C, dtype_str)
         kernel(h_res_flat, original_residual_flat, h_post_flat, x_flat, bias_flat, output_flat)
     else:
-        kernel = _get_nobias_forward_kernel(sb, n, C)
+        kernel = _get_nobias_forward_kernel(sb, n, C, dtype_str)
         kernel(h_res_flat, original_residual_flat, h_post_flat, x_flat, output_flat)
 
-    # Reshape output back and cast to original dtype
-    output = output_flat.view(s, b, n, C)
-    if original_dtype != torch.float32:
-        output = output.to(original_dtype)
-    return output
+    # Reshape output back
+    return output_flat.view(s, b, n, C)
 
 
 def h_post_bda_tilelang_backward(
@@ -450,31 +419,31 @@ def h_post_bda_tilelang_backward(
     """
     s, b, n, C = original_residual.shape
     sb = s * b
-    original_dtype = h_res.dtype
+    dtype_str = _TORCH_DTYPE_TO_TL[h_res.dtype]
 
-    # Reshape inputs to flattened batch dimension and cast to fp32
-    grad_output_flat = grad_output.view(sb, n, C).contiguous().float()
-    h_res_flat = h_res.view(sb, n, n).contiguous().float()
-    original_residual_flat = original_residual.view(sb, n, C).contiguous().float()
-    h_post_flat = h_post.view(sb, n).contiguous().float()
-    x_flat = x.view(sb, C).contiguous().float()
+    # Reshape inputs to flattened batch dimension
+    grad_output_flat = grad_output.view(sb, n, C).contiguous()
+    h_res_flat = h_res.view(sb, n, n).contiguous()
+    original_residual_flat = original_residual.view(sb, n, C).contiguous()
+    h_post_flat = h_post.view(sb, n).contiguous()
+    x_flat = x.view(sb, C).contiguous()
 
-    # Allocate outputs in fp32
-    grad_h_res_flat = torch.empty(sb, n, n, dtype=torch.float32, device=h_res.device)
-    grad_original_residual_flat = torch.empty(sb, n, C, dtype=torch.float32, device=h_res.device)
-    grad_h_post_flat = torch.empty(sb, n, dtype=torch.float32, device=h_res.device)
-    grad_x_flat = torch.empty(sb, C, dtype=torch.float32, device=h_res.device)
+    # Allocate outputs in same dtype
+    grad_h_res_flat = torch.empty(sb, n, n, dtype=h_res.dtype, device=h_res.device)
+    grad_original_residual_flat = torch.empty(sb, n, C, dtype=h_res.dtype, device=h_res.device)
+    grad_h_post_flat = torch.empty(sb, n, dtype=h_res.dtype, device=h_res.device)
+    grad_x_flat = torch.empty(sb, C, dtype=h_res.dtype, device=h_res.device)
 
     if bias is not None:
-        bias_flat = bias.contiguous().float()
-        kernel = _get_backward_kernel(sb, n, C)
+        bias_flat = bias.contiguous()
+        kernel = _get_backward_kernel(sb, n, C, dtype_str)
         kernel(
             grad_output_flat, h_res_flat, original_residual_flat,
             h_post_flat, x_flat, bias_flat,
             grad_h_res_flat, grad_original_residual_flat, grad_h_post_flat, grad_x_flat
         )
     else:
-        kernel = _get_nobias_backward_kernel(sb, n, C)
+        kernel = _get_nobias_backward_kernel(sb, n, C, dtype_str)
         kernel(
             grad_output_flat, h_res_flat, original_residual_flat,
             h_post_flat, x_flat,
@@ -489,15 +458,6 @@ def h_post_bda_tilelang_backward(
 
     # grad_bias[k] = Σ_i grad_x[i, k] (sum over batch dimension)
     grad_bias = grad_x_flat.sum(dim=0) if bias is not None else None
-
-    # Cast to original dtype
-    if original_dtype != torch.float32:
-        grad_h_res = grad_h_res.to(original_dtype)
-        grad_original_residual = grad_original_residual.to(original_dtype)
-        grad_h_post = grad_h_post.to(original_dtype)
-        grad_x = grad_x.to(original_dtype)
-        if grad_bias is not None:
-            grad_bias = grad_bias.to(original_dtype)
 
     return grad_h_res, grad_original_residual, grad_h_post, grad_x, grad_bias
 

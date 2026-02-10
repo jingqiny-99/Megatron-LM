@@ -39,6 +39,12 @@ if _TILELANG_AVAILABLE:
 
     FP32 = "float32"
 
+    _TORCH_DTYPE_TO_TL = {
+        torch.float32: "float32",
+        torch.float16: "float16",
+        torch.bfloat16: "bfloat16",
+    }
+
     pass_configs = {
         tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True,
         tilelang.PassConfigKey.TL_DISABLE_TMA_LOWER: True,
@@ -46,7 +52,6 @@ if _TILELANG_AVAILABLE:
 
     # ==================== Forward Kernel ====================
 
-    # TODO: Implement forward kernel
     # Input shapes (flattened s*b):
     #   - x: [sb, n, C] - n-stream hidden states
     #   - h_pre: [sb, n] - aggregation weights
@@ -57,7 +62,7 @@ if _TILELANG_AVAILABLE:
     #   output[i, c] = sum_j(h_pre[i, j] * x[i, j, c])
 
     @tilelang.jit(pass_configs=pass_configs)
-    def _h_aggregate_forward_kernel_generator(sb: int, n: int, C: int):
+    def _h_aggregate_forward_kernel_generator(sb: int, n: int, C: int, dtype: str = FP32):
         """Generate forward H_pre aggregate kernel."""
         EXPECTED_BLOCK_C = 1024
         BLOCK_C = math.gcd(EXPECTED_BLOCK_C, C)
@@ -65,20 +70,18 @@ if _TILELANG_AVAILABLE:
 
         @T.prim_func
         def h_aggregate_forward_kernel_(
-            x: T.Tensor[(sb, n, C), FP32],
-            h_pre: T.Tensor[(sb, n), FP32],
-            output: T.Tensor[(sb, C), FP32],
+            x: T.Tensor[(sb, n, C), dtype],
+            h_pre: T.Tensor[(sb, n), dtype],
+            output: T.Tensor[(sb, C), dtype],
         ):
             with T.Kernel(sb, threads=threads) as i:
-                x_local = T.alloc_fragment((n, BLOCK_C), FP32)
-                h_pre_local = T.alloc_fragment((n,), FP32)
-                output_local = T.alloc_fragment((BLOCK_C,), FP32)
-                temp = T.alloc_fragment((n, BLOCK_C), FP32)
-                # h_pre: (sb, n) -> h_pre_local: (n,)
+                x_local = T.alloc_fragment((n, BLOCK_C), dtype)
+                h_pre_local = T.alloc_fragment((n,), dtype)
+                output_local = T.alloc_fragment((BLOCK_C,), dtype)
+                temp = T.alloc_fragment((n, BLOCK_C), dtype)
                 T.copy(h_pre[i, 0], h_pre_local)
                 for pid_c in T.Pipelined(C // BLOCK_C, num_stages=3):
                     c_idx = pid_c * BLOCK_C
-                    # x: (sb, n, C) -> x_local: (n, BLOCK_C)
                     T.copy(x[i, 0, c_idx], x_local)
                     T.clear(output_local)
 
@@ -92,7 +95,6 @@ if _TILELANG_AVAILABLE:
 
     # ==================== Backward Kernel ====================
 
-    # TODO: Implement backward kernel
     # Input shapes (flattened s*b):
     #   - grad_output: [sb, C] - gradient w.r.t. output
     #   - x: [sb, n, C] - n-stream hidden states
@@ -106,7 +108,7 @@ if _TILELANG_AVAILABLE:
     #   grad_h_pre[i, j] = sum_c(grad_output[i, c] * x[i, j, c])
 
     @tilelang.jit(pass_configs=pass_configs)
-    def _h_aggregate_backward_kernel_generator(sb: int, n: int, C: int):
+    def _h_aggregate_backward_kernel_generator(sb: int, n: int, C: int, dtype: str = FP32):
         """Generate backward H_pre aggregate kernel."""
         EXPECTED_BLOCK_C = 1024
         BLOCK_C = math.gcd(EXPECTED_BLOCK_C, C)
@@ -114,20 +116,19 @@ if _TILELANG_AVAILABLE:
 
         @T.prim_func
         def h_aggregate_backward_kernel_(
-            grad_output: T.Tensor[(sb, C), FP32],
-            x: T.Tensor[(sb, n, C), FP32],
-            h_pre: T.Tensor[(sb, n), FP32],
-            grad_x: T.Tensor[(sb, n, C), FP32],
-            grad_h_pre: T.Tensor[(sb, n), FP32],
+            grad_output: T.Tensor[(sb, C), dtype],
+            x: T.Tensor[(sb, n, C), dtype],
+            h_pre: T.Tensor[(sb, n), dtype],
+            grad_x: T.Tensor[(sb, n, C), dtype],
+            grad_h_pre: T.Tensor[(sb, n), dtype],
         ):
             with T.Kernel(sb, threads=threads) as i:
-                grad_output_local = T.alloc_fragment((BLOCK_C,), FP32)
-                x_local = T.alloc_fragment((n, BLOCK_C), FP32)
-                h_pre_local = T.alloc_fragment((n,), FP32)
-                grad_x_local = T.alloc_fragment((n, BLOCK_C), FP32)
-                grad_h_pre_local = T.alloc_fragment((n,), FP32)
-                temp_h_pre = T.alloc_fragment((n, BLOCK_C), FP32)
-                # h_pre: (sb, n) -> h_pre_local: (n,)
+                grad_output_local = T.alloc_fragment((BLOCK_C,), dtype)
+                x_local = T.alloc_fragment((n, BLOCK_C), dtype)
+                h_pre_local = T.alloc_fragment((n,), dtype)
+                grad_x_local = T.alloc_fragment((n, BLOCK_C), dtype)
+                grad_h_pre_local = T.alloc_fragment((n,), dtype)
+                temp_h_pre = T.alloc_fragment((n, BLOCK_C), dtype)
                 T.copy(h_pre[i, 0], h_pre_local)
 
                 T.clear(grad_h_pre_local)
@@ -135,7 +136,6 @@ if _TILELANG_AVAILABLE:
                     c_idx = pid_c * BLOCK_C
 
                     T.copy(grad_output[i, c_idx], grad_output_local)
-                    # x: (sb, n, C) -> x_local: (n, BLOCK_C)
                     T.copy(x[i, 0, c_idx], x_local)
 
                     T.clear(grad_x_local)
@@ -144,27 +144,25 @@ if _TILELANG_AVAILABLE:
                         temp_h_pre[j, k] = grad_output_local[k] * x_local[j, k] 
 
                     T.reduce_sum(temp_h_pre, grad_h_pre_local, dim=1, clear=False)
-                    # grad_x_local: (n, BLOCK_C) -> grad_x: (sb, n, C)
                     T.copy(grad_x_local, grad_x[i, 0, c_idx])
-                # grad_h_pre_local: (n,) -> grad_h_pre: (sb, n)
                 T.copy(grad_h_pre_local, grad_h_pre[i, 0])
         return h_aggregate_backward_kernel_
 
     _FORWARD_KERNEL_CACHE = {}
     _BACKWARD_KERNEL_CACHE = {}
 
-    def _get_forward_kernel(sb: int, n: int, C: int):
+    def _get_forward_kernel(sb: int, n: int, C: int, dtype: str = FP32):
         """Get cached forward kernel or create a new one."""
-        key = (sb, n, C)
+        key = (sb, n, C, dtype)
         if key not in _FORWARD_KERNEL_CACHE:
-            _FORWARD_KERNEL_CACHE[key] = _h_aggregate_forward_kernel_generator(sb, n, C)
+            _FORWARD_KERNEL_CACHE[key] = _h_aggregate_forward_kernel_generator(sb, n, C, dtype)
         return _FORWARD_KERNEL_CACHE[key]
 
-    def _get_backward_kernel(sb: int, n: int, C: int):
+    def _get_backward_kernel(sb: int, n: int, C: int, dtype: str = FP32):
         """Get cached backward kernel or create a new one."""
-        key = (sb, n, C)
+        key = (sb, n, C, dtype)
         if key not in _BACKWARD_KERNEL_CACHE:
-            _BACKWARD_KERNEL_CACHE[key] = _h_aggregate_backward_kernel_generator(sb, n, C)
+            _BACKWARD_KERNEL_CACHE[key] = _h_aggregate_backward_kernel_generator(sb, n, C, dtype)
         return _BACKWARD_KERNEL_CACHE[key]
 
 
@@ -188,26 +186,23 @@ def h_aggregate_tilelang_forward(
     """
     s, b, n, C = x.shape
     sb = s * b
-    original_dtype = x.dtype
+    dtype_str = _TORCH_DTYPE_TO_TL[x.dtype]
 
-    # Reshape inputs to flattened batch dimension and cast to fp32
-    x_flat = x.view(sb, n, C).contiguous().float()
-    h_pre_flat = h_pre.view(sb, n).contiguous().float()
+    # Reshape inputs to flattened batch dimension
+    x_flat = x.view(sb, n, C).contiguous()
+    h_pre_flat = h_pre.view(sb, n).contiguous()
 
-    # Allocate output in fp32
-    output_flat = torch.empty(sb, C, dtype=torch.float32, device=x.device)
+    # Allocate output in same dtype
+    output_flat = torch.empty(sb, C, dtype=x.dtype, device=x.device)
 
     # Get cached kernel
-    kernel = _get_forward_kernel(sb, n, C)
+    kernel = _get_forward_kernel(sb, n, C, dtype_str)
 
     # Launch kernel
     kernel(x_flat, h_pre_flat, output_flat)
 
-    # Reshape output back and cast to original dtype
-    output = output_flat.view(s, b, C)
-    if original_dtype != torch.float32:
-        output = output.to(original_dtype)
-    return output
+    # Reshape output back
+    return output_flat.view(s, b, C)
 
 
 def h_aggregate_tilelang_backward(
@@ -233,32 +228,25 @@ def h_aggregate_tilelang_backward(
     """
     s, b, n, C = x.shape
     sb = s * b
-    original_dtype = x.dtype
+    dtype_str = _TORCH_DTYPE_TO_TL[x.dtype]
 
-    # Reshape inputs to flattened batch dimension and cast to fp32
-    grad_output_flat = grad_output.view(sb, C).contiguous().float()
-    x_flat = x.view(sb, n, C).contiguous().float()
-    h_pre_flat = h_pre.view(sb, n).contiguous().float()
+    # Reshape inputs to flattened batch dimension
+    grad_output_flat = grad_output.view(sb, C).contiguous()
+    x_flat = x.view(sb, n, C).contiguous()
+    h_pre_flat = h_pre.view(sb, n).contiguous()
 
-    # Allocate outputs in fp32
-    grad_x_flat = torch.empty(sb, n, C, dtype=torch.float32, device=x.device)
-    grad_h_pre_flat = torch.empty(sb, n, dtype=torch.float32, device=x.device)
+    # Allocate outputs in same dtype
+    grad_x_flat = torch.empty(sb, n, C, dtype=x.dtype, device=x.device)
+    grad_h_pre_flat = torch.empty(sb, n, dtype=x.dtype, device=x.device)
 
     # Get cached kernel
-    kernel = _get_backward_kernel(sb, n, C)
+    kernel = _get_backward_kernel(sb, n, C, dtype_str)
 
     # Launch kernel
     kernel(grad_output_flat, x_flat, h_pre_flat, grad_x_flat, grad_h_pre_flat)
 
-    # Reshape outputs back and cast to original dtype
-    grad_x = grad_x_flat.view(s, b, n, C)
-    grad_h_pre = grad_h_pre_flat.view(s, b, n)
-
-    if original_dtype != torch.float32:
-        grad_x = grad_x.to(original_dtype)
-        grad_h_pre = grad_h_pre.to(original_dtype)
-
-    return grad_x, grad_h_pre
+    # Reshape outputs back
+    return grad_x_flat.view(s, b, n, C), grad_h_pre_flat.view(s, b, n)
 
 
 def h_aggregate_native_forward(
