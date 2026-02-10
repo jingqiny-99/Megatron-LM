@@ -13,8 +13,12 @@ from megatron.core.fusions.fused_sinkhorn import (
     is_tilelang_available,
 )
 from megatron.core.fusions.fused_h_post_bda import (
-    h_post_bda_fused_forward,
-    h_post_bda_fused_backward,
+    h_post_bda_tilelang_forward,
+    h_post_bda_tilelang_backward,
+)
+from megatron.core.fusions.fused_h_aggregate import (
+    h_aggregate_tilelang_forward,
+    h_aggregate_tilelang_backward,
 )
 
 if TYPE_CHECKING:
@@ -118,6 +122,106 @@ class SinkhornKnopp(torch.autograd.Function):
         return grad_input, None, None
 
 
+class FusedHAggregate(torch.autograd.Function):
+    """
+    Differentiable fused H_pre aggregation operation.
+    
+    This autograd function wraps the fused kernel for aggregating n-stream
+    hidden states into a single stream using H_pre weights:
+        aggregated[i, c] = sum_j(h_pre[i, j] * x[i, j, c])
+    
+    When use_fused_kernel=True and TileLang is available, uses fused kernels.
+    Otherwise falls back to native PyTorch implementation.
+    """
+    
+    @staticmethod
+    def forward(
+        ctx,
+        x: Tensor,
+        h_pre: Tensor,
+        n: int,
+        C: int,
+        use_fused_kernel: bool = False,
+    ) -> Tensor:
+        """
+        Fused forward pass for H_pre aggregation.
+        
+        Args:
+            x: [s, b, n*C] - n-stream hidden states
+            h_pre: [s, b, n] - aggregation weights
+            n: Number of residual streams
+            C: Hidden size per stream
+            use_fused_kernel: Whether to use fused TileLang kernel.
+                If True and TileLang is available, uses fused kernels.
+                Falls back to native PyTorch implementation otherwise.
+        
+        Returns:
+            aggregated: [s, b, C] - aggregated hidden states
+        """
+        s, b, _ = x.shape
+        x_4d = x.view(s, b, n, C)
+        
+        _use_fused = use_fused_kernel and is_tilelang_available()
+        
+        if _use_fused:
+            with torch.no_grad():
+                aggregated = h_aggregate_tilelang_forward(x_4d, h_pre)
+        else:
+            with torch.no_grad():
+                aggregated = (x_4d * h_pre.unsqueeze(-1)).sum(dim=2)
+        
+        ctx.save_for_backward(x_4d, h_pre)
+        ctx.use_fused_kernel = _use_fused
+        ctx.n = n
+        ctx.C = C
+        return aggregated
+    
+    @staticmethod
+    def backward(ctx, grad_output: Tensor) -> Tuple[Tensor, Tensor, None, None, None]:
+        """
+        Backward through fused H_pre aggregation.
+        
+        Gradient formulas:
+            grad_x[i, j, c] = grad_output[i, c] * h_pre[i, j]
+            grad_h_pre[i, j] = sum_c(grad_output[i, c] * x[i, j, c])
+        
+        Returns:
+            grad_x: gradient w.r.t. x (reshaped to [s, b, n*C])
+            grad_h_pre: gradient w.r.t. h_pre
+            None: for n
+            None: for C
+            None: for use_fused_kernel
+        """
+        x_4d, h_pre = ctx.saved_tensors
+        use_fused_kernel = ctx.use_fused_kernel
+        n = ctx.n
+        C = ctx.C
+        s, b, _ = grad_output.shape
+        
+        if use_fused_kernel:
+            grad_x_4d, grad_h_pre = h_aggregate_tilelang_backward(
+                grad_output, x_4d, h_pre
+            )
+        else:
+            with torch.enable_grad():
+                x_input = x_4d.detach().requires_grad_(True)
+                h_pre_input = h_pre.detach().requires_grad_(True)
+                
+                output = (x_input * h_pre_input.unsqueeze(-1)).sum(dim=2)
+                
+                grad_x_4d, grad_h_pre = torch.autograd.grad(
+                    outputs=output,
+                    inputs=[x_input, h_pre_input],
+                    grad_outputs=grad_output,
+                    create_graph=False,
+                    retain_graph=False,
+                )
+        
+        # Reshape grad_x from [s, b, n, C] to [s, b, n*C]
+        grad_x = grad_x_4d.view(s, b, n * C)
+        return grad_x, grad_h_pre, None, None, None
+
+
 class FusedHPostBDA(torch.autograd.Function):
     """
     Differentiable fused H_post expansion and bias-dropout-add operation.
@@ -171,12 +275,20 @@ class FusedHPostBDA(torch.autograd.Function):
         _use_fused = use_fused_kernel and is_tilelang_available()
         
         if _use_fused:
-            # Use fused TileLang kernel for forward computation
+            assert bias is not None, (
+                "Fused H_post BDA kernel requires bias to be non-None. "
+                "Please provide a bias tensor when using fused kernels."
+            )
+            assert dropout_prob == 0.0, (
+                f"Fused H_post BDA kernel requires dropout_prob to be 0, "
+                f"got {dropout_prob}. Dropout is not supported in fused kernels."
+            )
+            # Use fused TileLang kernel for forward computation (no dropout support)
             with torch.no_grad():
-                output_4d, dropout_mask = h_post_bda_fused_forward(
-                    h_res, original_residual_4d, h_post, x, bias,
-                    dropout_prob, training
+                output_4d = h_post_bda_tilelang_forward(
+                    h_res, original_residual_4d, h_post, x, bias
                 )
+                dropout_mask = None
         else:
             # Native PyTorch implementation
             with torch.no_grad():
@@ -248,10 +360,10 @@ class FusedHPostBDA(torch.autograd.Function):
         grad_output_4d = grad_output.view(s, b, n, C)
         
         if use_fused_kernel:
-            # Fused kernel computes all gradients
+            # Fused TileLang kernel computes all gradients (no dropout)
             (grad_h_res, grad_original_residual_4d, grad_h_post, 
-             grad_x, grad_bias) = h_post_bda_fused_backward(
-                grad_output_4d, h_res, original_residual_4d, h_post, x, bias, dropout_mask
+             grad_x, grad_bias) = h_post_bda_tilelang_backward(
+                grad_output_4d, h_res, original_residual_4d, h_post, x, bias
             )
         else:
             # Recompute forward with autograd enabled
@@ -540,14 +652,35 @@ class HyperConnectionModule(MegatronModule):
         return x_out, bias_out
 
     
-    #TODO: Kernel fusion
-    @torch.compile
     @nvtx_decorator(message="HyperConnection::aggregate")
     def aggregate(self, x: Tensor, h_pre: Tensor) -> Tensor:
         """
         Aggregate n-stream to 1-stream using H_pre weights.
         
         Computes: sum_i(h_pre_i * x_stream_i)
+        
+        When use_fused_kernel is True and TileLang is available, uses the
+        FusedHAggregate autograd function with fused TileLang kernels.
+        Otherwise falls back to the torch.compile'd native implementation.
+        
+        Args:
+            x: [s, b, n*C] - n-stream hidden states
+            h_pre: [s, b, n] - aggregation weights
+        
+        Returns:
+            aggregated: [s, b, C] - single stream hidden states
+        """
+        if self.use_fused_kernel and is_tilelang_available():
+            return FusedHAggregate.apply(
+                x, h_pre, self.n, self.hidden_size, True
+            )
+        return self._aggregate_native(x, h_pre)
+    
+    @torch.compile
+    @nvtx_decorator(message="HyperConnection::aggregate_native")
+    def _aggregate_native(self, x: Tensor, h_pre: Tensor) -> Tensor:
+        """
+        Native PyTorch implementation of aggregate (torch.compile'd).
         
         Args:
             x: [s, b, n*C] - n-stream hidden states
@@ -812,6 +945,14 @@ class HyperConnectionModule(MegatronModule):
         
         # Use fused kernel path when enabled
         if self.use_fused_kernel and is_tilelang_available():
+            assert bias is not None, (
+                "Fused H_post BDA kernel requires bias to be non-None. "
+                "Please provide a bias tensor when using fused kernels."
+            )
+            assert dropout_prob == 0.0, (
+                f"Fused H_post BDA kernel requires dropout_prob to be 0, "
+                f"got {dropout_prob}. Dropout is not supported in fused kernels."
+            )
             return FusedHPostBDA.apply(
                 h_res, original_residual, h_post, x, bias,
                 dropout_prob, training, True  # use_fused_kernel=True
@@ -869,6 +1010,14 @@ class HyperConnectionModule(MegatronModule):
         
         # Use fused kernel path when enabled - FusedHPostBDA has its own backward
         if self.use_fused_kernel and is_tilelang_available():
+            assert bias is not None, (
+                "Fused H_post BDA kernel requires bias to be non-None. "
+                "Please provide a bias tensor when using fused kernels."
+            )
+            assert dropout_prob == 0.0, (
+                f"Fused H_post BDA kernel requires dropout_prob to be 0, "
+                f"got {dropout_prob}. Dropout is not supported in fused kernels."
+            )
             return FusedHPostBDA.apply(
                 h_res, original_residual, h_post, x, bias,
                 dropout_prob, training, True  # use_fused_kernel=True
