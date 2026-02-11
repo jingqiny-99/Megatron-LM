@@ -213,17 +213,21 @@ def sinkhorn_fused_forward(
         raise RuntimeError("TileLang is not available.")
 
     original_shape = input_logits.shape
+    original_dtype = input_logits.dtype
     hc = original_shape[-1]
-    dtype_str = _TORCH_DTYPE_TO_TL[input_logits.dtype]
 
-    input_flat = input_logits.reshape(-1, hc, hc).contiguous()
+    # Force fp32 for numerical stability (iterative exp + normalization)
+    input_flat = input_logits.reshape(-1, hc, hc).contiguous().to(torch.float32)
 
     output = torch.empty_like(input_flat)
 
-    kernel = _get_forward_kernel(hc, num_iterations, eps, dtype_str)
+    kernel = _get_forward_kernel(hc, num_iterations, eps)
     kernel(input_flat, output)
 
-    return output.reshape(original_shape)
+    output = output.reshape(original_shape)
+    if original_dtype != torch.float32:
+        output = output.to(original_dtype)
+    return output
 
 
 def sinkhorn_fused_backward(
@@ -255,17 +259,21 @@ def sinkhorn_fused_backward(
         raise RuntimeError("TileLang is not available.")
 
     original_shape = grad_output.shape
+    original_dtype = grad_output.dtype
     hc = original_shape[-1]
-    dtype_str = _TORCH_DTYPE_TO_TL[grad_output.dtype]
     
-    grad_output_flat = grad_output.reshape(-1, hc, hc).contiguous()
-    M_init_flat = M_init.reshape(-1, hc, hc).contiguous()
+    # Force fp32 for numerical stability (iterative backward through Sinkhorn)
+    grad_output_flat = grad_output.reshape(-1, hc, hc).contiguous().to(torch.float32)
+    M_init_flat = M_init.reshape(-1, hc, hc).contiguous().to(torch.float32)
 
     grad_input = torch.empty_like(M_init_flat)
-    bwd_kernel = _get_backward_bwd_kernel(hc, num_iterations, eps, dtype_str)
+    bwd_kernel = _get_backward_bwd_kernel(hc, num_iterations, eps)
     bwd_kernel(grad_output_flat, M_init_flat, grad_input)
 
-    return grad_input.reshape(original_shape)
+    grad_input = grad_input.reshape(original_shape)
+    if original_dtype != torch.float32:
+        grad_input = grad_input.to(original_dtype)
+    return grad_input
 
 
 def sinkhorn_native_forward(
