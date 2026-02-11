@@ -46,6 +46,7 @@ class TestHyperConnectionCheckpoint:
             num_residual_streams=num_residual_streams,
             mhc_sinkhorn_iterations=5,  # Fewer iterations for faster tests
             mhc_init_gating_factor=0.01,
+            mhc_use_fused_kernel=True,
         )
         module = HyperConnectionModule(config=config, layer_number=1)
         module.cuda()
@@ -245,6 +246,7 @@ class TestMHCBlockRecomputeIntegration:
             num_residual_streams=num_streams,
             mhc_sinkhorn_iterations=5,
             mhc_init_gating_factor=0.01,
+            mhc_use_fused_kernel=True,
         )
 
         modules = [
@@ -330,6 +332,7 @@ class TestMHCBlockRecomputeIntegration:
             num_residual_streams=num_streams,
             mhc_sinkhorn_iterations=5,
             mhc_init_gating_factor=0.01,
+            mhc_use_fused_kernel=True,
         )
 
         module = HyperConnectionModule(config=config, layer_number=1).cuda()

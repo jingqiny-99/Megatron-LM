@@ -339,6 +339,8 @@ class TestTransformerLayerWithHyperConnectionRecompute:
             recompute_granularity='selective',
             mhc_sinkhorn_iterations=5,
             mhc_init_gating_factor=0.01,
+            mhc_use_fused_kernel=True,
+            hidden_dropout=0.0,  # Fused kernel requires dropout_prob=0
         )
         layer_spec = get_gpt_layer_with_transformer_engine_spec()
         layer = TransformerLayer(config, layer_spec.submodules)
@@ -525,6 +527,8 @@ class TestTransformerLayerWithHyperConnectionRecompute:
             recompute_granularity='selective',
             mhc_sinkhorn_iterations=5,
             mhc_init_gating_factor=0.01,
+            mhc_use_fused_kernel=True,
+            hidden_dropout=0.0,  # Fused kernel requires dropout_prob=0
         )
         layer_spec = get_gpt_layer_with_transformer_engine_spec()
         layers = [
