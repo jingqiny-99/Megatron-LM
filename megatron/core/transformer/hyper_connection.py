@@ -7,12 +7,180 @@ import torch
 import torch.nn as nn
 from torch import Tensor
 
+import triton
+import triton.language as tl
+
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import nvtx_decorator
 
 if TYPE_CHECKING:
     from megatron.core.tensor_parallel.random import CheckpointManager
+
+
+def _alloc_fn(size: int, alignment: int, stream: int | None):
+    return torch.empty(size, device="cuda", dtype=torch.int8)
+
+
+triton.set_allocator(_alloc_fn)
+EPS = tl.constexpr(1e-10)
+
+
+@triton.jit
+def matvec_S(R, x):
+    """
+    S = I - R^T R, perform S @ x WITHOUT materializing RTR.
+    Computes: x - R^T (R x)  using two matvecs.
+    R: (tilesize, n, n)
+    x: (tilesize, n, 1)
+    returns: (tilesize, n, 1)
+    """
+    # R @ x: (tilesize, n, n) x (tilesize, n, 1) -> (tilesize, n, 1)
+    Rx = tl.sum(R * x.permute(0, 2, 1), axis=-1).expand_dims(-1)  # (tilesize, n, 1)
+    RT = R.permute(0, 2, 1)
+    # R^T @ Rx: (tilesize, n, n) x (tilesize, n, 1) -> (tilesize, n, 1)
+    RTRx = tl.sum(RT * Rx.permute(0, 2, 1), axis=-1).expand_dims(-1)  # (tilesize, n, 1)
+    return x - RTRx
+
+
+@triton.autotune(
+    configs=[
+        triton.Config({"tilesize": tilesize}, num_stages=1, num_warps=num_warps)
+        for tilesize in [1, 2, 4, 8, 16, 32, 64]
+        for num_warps in [1, 2, 4, 8]
+    ],
+    key=[],
+)
+@triton.jit
+def sinkhorn_bwd_implicit_cg_kernel(
+    seqlen,
+    out,
+    dout,
+    res,
+    out_stride_0,
+    out_stride_1,
+    out_stride_2,
+    dout_stride_0,
+    dout_stride_1,
+    dout_stride_2,
+    res_stride_0,
+    res_stride_1,
+    res_stride_2,
+    n_stream: tl.constexpr,
+    tilesize: tl.constexpr,
+):
+    out_desc = tl.make_tensor_descriptor(
+        out,
+        shape=[seqlen, n_stream, n_stream],
+        strides=[out_stride_0, out_stride_1, out_stride_2],
+        block_shape=[tilesize, n_stream, n_stream],
+    )
+
+    dout_desc = tl.make_tensor_descriptor(
+        dout,
+        shape=[seqlen, n_stream, n_stream],
+        strides=[dout_stride_0, dout_stride_1, dout_stride_2],
+        block_shape=[tilesize, n_stream, n_stream],
+    )
+
+    res_desc = tl.make_tensor_descriptor(
+        res,
+        shape=[seqlen, n_stream, n_stream],
+        strides=[res_stride_0, res_stride_1, res_stride_2],
+        block_shape=[tilesize, n_stream, n_stream],
+    )
+
+    seq_off = tl.program_id(0) * tilesize
+
+    R = out_desc.load([seq_off, 0, 0])
+    RT = R.permute(0, 2, 1)
+    dR = dout_desc.load([seq_off, 0, 0])
+
+    # Step 1: s_r = (G ⊙ R) 1,  s_c = (G ⊙ R)^T 1
+    RdR = R * dR
+    s_r = tl.sum(RdR, axis=-1).expand_dims(-1)  # (tilesize, n, 1)
+    s_c = tl.sum(RdR, axis=-2).expand_dims(-1)  # (tilesize, n, 1)
+
+    # Step 2: b = s_c - R^T s_r
+    # R^T @ s_r: (tilesize, n, n) x (tilesize, n, 1) -> (tilesize, n, 1)
+    b = s_c - tl.sum(RT * s_r.permute(0, 2, 1), axis=-1).expand_dims(-1)  # (tilesize, n, 1)
+
+    # Step 3: CG to solve (I - R^T R) x = b
+    # Key optimization: do NOT precompute RTR (avoids n² register pressure).
+    # Instead, each matvec_S call does: x - R^T(Rx)  (two n×1 matvecs).
+    x = tl.zeros((tilesize, n_stream, 1), dtype=tl.float32)
+    r = b - matvec_S(R, x)  # residual = b - S x = b (since x=0)
+    p = r
+    r_normsq = tl.sum(r * r, axis=1, keep_dims=True)
+
+    for _ in range(n_stream):
+        Sp = matvec_S(R, p)
+        pSp = tl.sum(p * Sp, axis=1, keep_dims=True)
+        # Avoid divide by zero is REQUIRED
+        alpha = r_normsq / (pSp + EPS)
+
+        x += alpha * p
+        r -= alpha * Sp
+
+        r_new_normsq = tl.sum(r * r, axis=1, keep_dims=True)
+        # Avoid divide by zero is experimentally not required, but good to have
+        beta = r_new_normsq / (r_normsq + EPS)
+
+        p = r + beta * p
+        r_normsq = r_new_normsq
+
+    # Step 4: u = s_r - R x,  v = x
+    # R @ x: (tilesize, n, n) x (tilesize, n, 1) -> (tilesize, n, 1)
+    u = s_r - tl.sum(R * x.permute(0, 2, 1), axis=-1).expand_dims(-1)  # (tilesize, n, 1)
+    v = x  # (tilesize, n, 1)
+
+    # Step 5: M_ij = u_i + v_j  =>  M = u 1^T + 1 v^T
+    # u: (tilesize, n, 1), v^T: (tilesize, 1, n)
+    vt = v.reshape(tilesize, 1, n_stream)
+    M_mat = u + vt  # broadcast -> (tilesize, n, n)
+
+    # Step 6: grad = (G - M) ⊙ R
+    res_tile = (dR - M_mat) * R
+
+    res_desc.store([seq_off, 0, 0], res_tile)
+
+
+def _sinkhorn_bwd_triton(R_3d: torch.Tensor, dR_3d: torch.Tensor) -> torch.Tensor:
+    """
+    Wrapper that calls the Triton implicit-CG backward kernel.
+
+    Args:
+        R_3d:  [seqlen, n, n]  - doubly stochastic matrix (forward output)
+        dR_3d: [seqlen, n, n]  - upstream gradient dL/dR
+
+    Returns:
+        grad_M_init: [seqlen, n, n]  - gradient w.r.t. M_init = exp(H - max(H))
+    """
+    seqlen = R_3d.size(0)
+    n_stream = R_3d.size(1)
+
+    res = torch.empty_like(R_3d)
+
+    def grid(META):
+        return (triton.cdiv(seqlen, META["tilesize"]), 1, 1)
+
+    sinkhorn_bwd_implicit_cg_kernel[grid](
+        seqlen,
+        R_3d,
+        dR_3d,
+        res,
+        R_3d.stride(0),
+        R_3d.stride(1),
+        R_3d.stride(2),
+        dR_3d.stride(0),
+        dR_3d.stride(1),
+        dR_3d.stride(2),
+        res.stride(0),
+        res.stride(1),
+        res.stride(2),
+        n_stream,
+    )
+    return res
 
 
 class SinkhornKnopp(torch.autograd.Function):
@@ -43,9 +211,7 @@ class SinkhornKnopp(torch.autograd.Function):
             M: [s, b, n, n] - doubly stochastic matrix
         """
         for _ in range(num_iterations):
-            # T_r: Row normalization
             M = M / M.sum(dim=-1, keepdim=True).clamp(min=SinkhornKnopp.eps)
-            # T_c: Column normalization
             M = M / M.sum(dim=-2, keepdim=True).clamp(min=SinkhornKnopp.eps)
         return M
 
@@ -69,38 +235,35 @@ class SinkhornKnopp(torch.autograd.Function):
 
         M = SinkhornKnopp._sinkhorn_normalize(M_init, num_iterations)
 
-        # Save initial M for backward recomputation
-        ctx.save_for_backward(M_init)
-        ctx.num_iterations = num_iterations
+        # Save what backward needs
+        ctx.save_for_backward(M, M_init)
+        ctx.input_shape = H_res_logits.shape  # [s, b, n, n]
         return M
 
     @staticmethod
     def backward(ctx, grad_output: Tensor) -> Tuple[Tensor, None]:
         """
-        Backward through Sinkhorn-Knopp iterations using recomputation.
+        Args:
+            grad_output: [s, b, n, n]  dL/dR
 
-        Recomputes the forward pass with gradient tracking to obtain accurate gradients.
+        Returns:
+            grad_input:  [s, b, n, n]  dL/dH
         """
-        (M_init,) = ctx.saved_tensors
-        num_iterations = ctx.num_iterations
+        M, M_init = ctx.saved_tensors
+        s, b, n, _ = ctx.input_shape
 
-        # Recompute forward with autograd enabled
-        with torch.enable_grad():
-            # Leaf for recomputation
-            M_input = M_init.detach().requires_grad_(True)
+        # Flatten (s, b) -> seqlen for the 3-D Triton kernel
+        SB = s * b
+        R_3d = M.reshape(SB, n, n).contiguous()
+        dR_3d = grad_output.reshape(SB, n, n).contiguous()
 
-            M_current = SinkhornKnopp._sinkhorn_normalize(M_input, num_iterations)
+        # Triton kernel: dL/dM_init  (gradient w.r.t. M_init = exp(H - max))
+        grad_M_init_3d = _sinkhorn_bwd_triton(R_3d, dR_3d)
 
-            # Compute dL/dM_input (i.e., dL/dM_init) via autograd
-            (grad_M_init,) = torch.autograd.grad(
-                outputs=M_current,
-                inputs=M_input,
-                grad_outputs=grad_output,
-                create_graph=False,
-                retain_graph=False,
-            )
-        # Apply chain rule: dL/dH = dL/dM_init * dM_init/dH = dL/dM_init * M_init
-        # Since M_init = exp(H_res_logits), we have d(exp(x))/dx = exp(x) = M_init
+        # Reshape back to [s, b, n, n]
+        grad_M_init = grad_M_init_3d.reshape(s, b, n, n)
+
+        # Chain rule: dL/dH = dL/dM_init * dM_init/dH = dL/dM_init * M_init
         grad_input = grad_M_init * M_init
 
         return grad_input, None
@@ -139,9 +302,7 @@ class HyperConnectionModule(MegatronModule):
         # - H_pre: n values
         # - H_post: n values
         # - H_res: n^2 values (before Sinkhorn projection)
-        self.mapping_proj = nn.Linear(
-            self.n * self.hidden_size, self.n * self.n + 2 * self.n, bias=False
-        )
+        self.mapping_proj = nn.Linear(self.n * self.hidden_size, self.n * self.n + 2 * self.n, bias=False)
 
         init_alpha = config.mhc_init_gating_factor
         # Learnable scaling factors (Eq. 5 in paper)
@@ -164,11 +325,11 @@ class HyperConnectionModule(MegatronModule):
         # This is required because HyperConnectionModule uses non-TP-aware layers
         # (nn.Linear, nn.RMSNorm) whose gradients need to be all-reduced.
         if self.config.sequence_parallel:
-            setattr(self.mapping_proj.weight, 'sequence_parallel', True)
-            setattr(self.alpha_pre, 'sequence_parallel', True)
-            setattr(self.alpha_post, 'sequence_parallel', True)
-            setattr(self.alpha_res, 'sequence_parallel', True)
-            setattr(self.bias, 'sequence_parallel', True)
+            setattr(self.mapping_proj.weight, "sequence_parallel", True)
+            setattr(self.alpha_pre, "sequence_parallel", True)
+            setattr(self.alpha_post, "sequence_parallel", True)
+            setattr(self.alpha_res, "sequence_parallel", True)
+            setattr(self.bias, "sequence_parallel", True)
 
     @torch.compile
     def _projection_and_get_norm(self, x: Tensor) -> Tuple[Tensor, Tensor]:
@@ -281,7 +442,7 @@ class HyperConnectionModule(MegatronModule):
         self,
         x_with_bias: Tuple[Tensor, Optional[Tensor]],
         h_post: Tensor,
-        manager: Optional['CheckpointManager'] = None,
+        manager: Optional["CheckpointManager"] = None,
     ) -> Tuple[Tensor, Optional[Tensor]]:
         """
         Apply H_post to x and optionally bias, with optional checkpointing.
@@ -308,9 +469,7 @@ class HyperConnectionModule(MegatronModule):
             from megatron.core.tensor_parallel.random import CheckpointWithoutOutput
 
             # Checkpoint _apply_h_post to discard the output
-            x_out = CheckpointWithoutOutput(ckpt_manager=manager).checkpoint(
-                self._apply_h_post, x, h_post
-            )
+            x_out = CheckpointWithoutOutput(ckpt_manager=manager).checkpoint(self._apply_h_post, x, h_post)
 
             # Checkpoint _apply_h_post for bias if not None
             if bias is not None:
@@ -377,7 +536,7 @@ class HyperConnectionModule(MegatronModule):
         return mixed.view(s, b, n * C)
 
     def forward(
-        self, hidden_states: Tensor, mhc_recompute_manager: Optional['CheckpointManager'] = None
+        self, hidden_states: Tensor, mhc_recompute_manager: Optional["CheckpointManager"] = None
     ) -> Tuple[Tensor, Tensor, Tensor]:
         """
         Full mHC forward pass.
@@ -419,7 +578,7 @@ class HyperConnectionModule(MegatronModule):
         return aggregated, h_res, h_post
 
     def _forward_with_checkpoint(
-        self, hidden_states: Tensor, manager: 'CheckpointManager'
+        self, hidden_states: Tensor, manager: "CheckpointManager"
     ) -> Tuple[Tensor, Tensor, Tensor]:
         """
         Forward pass with checkpointing for memory efficiency.
@@ -503,7 +662,7 @@ class HyperConnectionModule(MegatronModule):
         dropout_prob: float,
         training: bool,
         fused: bool,
-        manager: Optional['CheckpointManager'] = None,
+        manager: Optional["CheckpointManager"] = None,
     ) -> Tensor:
         """
         Fused kernel combining apply_h_res, apply_h_post and bias-dropout-add.
@@ -608,7 +767,7 @@ class HyperConnectionModule(MegatronModule):
         dropout_prob: float,
         training: bool,
         fused: bool,
-        manager: 'CheckpointManager',
+        manager: "CheckpointManager",
     ) -> Tensor:
         """
         Checkpointed implementation of fused h_res, h_post and bda operations.
