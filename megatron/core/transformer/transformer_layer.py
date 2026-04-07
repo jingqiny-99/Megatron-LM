@@ -1270,6 +1270,33 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         return
 
 
+class _HCPostForGraph(torch.nn.Module):
+    """Parameter-free wrapper around HC post for CUDA graph capture.
+
+    Wraps ``fused_h_res_h_post_bda`` into an ``nn.Module`` so it can be passed
+    to ``make_graphed_callables`` for forward + backward graph capture.
+    The module holds no trainable parameters — all data flows through the
+    function arguments.
+    """
+
+    def __init__(self, hc_module, hidden_dropout, bias_dropout_fusion):
+        super().__init__()
+        self.hc_module = hc_module
+        self.hidden_dropout = hidden_dropout
+        self.bias_dropout_fusion = bias_dropout_fusion
+
+    def forward(self, mlp_out, h_res, residual, h_post):
+        return self.hc_module.fused_h_res_h_post_bda(
+            h_res,
+            residual,
+            h_post,
+            (mlp_out, None),  # MoE bias is always None
+            self.hidden_dropout,
+            self.training,
+            self.bias_dropout_fusion,
+        )
+
+
 class HyperConnectionTransformerLayer(TransformerLayer):
     """A transformer layer with Manifold-Constrained Hyper-Connections (mHC).
 
@@ -1327,6 +1354,21 @@ class HyperConnectionTransformerLayer(TransformerLayer):
         # is IdentityOp (fused into TE linear) — there is nothing to recompute.
         self.mhc_checkpoint_input_layernorm = not isinstance(self.input_layernorm, IdentityOp)
         self.mhc_checkpoint_pre_mlp_layernorm = not isinstance(self.pre_mlp_layernorm, IdentityOp)
+
+        # ── HC post local CUDA graph for partial MoE TE capture ──
+        # When cuda_graph_scope includes moe_router but NOT full moe, the TE graph
+        # cuts before expert compute and MLP HC post runs eagerly.  We capture
+        # HC post into a *separate* per-microbatch CUDA graph (fwd + bwd) so that
+        # all four HC segments are graph-accelerated.
+        self._use_hc_post_graph = (
+            self.is_moe_layer
+            and config.cuda_graph_impl == "transformer_engine"
+            and config.cuda_graph_scope is not None
+            and CudaGraphScope.moe_router in config.cuda_graph_scope
+            and CudaGraphScope.moe not in config.cuda_graph_scope
+        )
+        # Per-microbatch graphed callables; lazily populated on first replay.
+        self._hc_post_graphed: Dict[int, _HCPostForGraph] = {}
 
     def get_layer_static_inputs(self, seq_length, micro_batch_size):
         """Override to produce n-stream hidden_states of shape [s, b, n*C].
@@ -1657,6 +1699,43 @@ class HyperConnectionTransformerLayer(TransformerLayer):
         )
         return output
 
+    def _capture_hc_post_graph(self, mlp_out, h_res, residual, h_post):
+        """Capture a local CUDA graph (fwd + bwd) for HC post.
+
+        Uses ``make_graphed_callables`` so that both forward and backward are
+        graph-accelerated and autograd / RNG state are handled correctly.
+
+        A new ``_HCPostForGraph`` module instance is created per microbatch
+        because ``make_graphed_callables`` allocates static I/O buffers that
+        must not be shared across concurrent microbatch streams (1F1B).
+
+        Args:
+            mlp_out: [s, b, C]   — MoE output (used for shape / dtype only).
+            h_res:   [s, b, n, n] — residual mixing matrix.
+            residual:[s, b, n*C] — n-stream residual.
+            h_post:  [s, b, n]   — expansion weights.
+
+        Returns:
+            Graphed ``_HCPostForGraph`` module ready for replay.
+        """
+        from torch.cuda.graphs import make_graphed_callables
+
+        module = _HCPostForGraph(
+            self.mlp_hyper_connection,
+            self.hidden_dropout,
+            self.config.bias_dropout_fusion,
+        )
+        module.train(self.training)
+
+        sample_args = (
+            torch.empty_like(mlp_out),
+            torch.empty_like(h_res),
+            torch.empty_like(residual),
+            torch.empty_like(h_post),
+        )
+        make_graphed_callables(module, sample_args, num_warmup_iters=3)
+        return module
+
     def _te_cuda_graph_replay(self, *args, **kwargs):
         """CUDA graph replay with hyper connection support for MoE partial capture.
 
@@ -1739,12 +1818,36 @@ class HyperConnectionTransformerLayer(TransformerLayer):
             self.mlp.cudagraph_tensor_store.clear()
             nvtx_range_pop(suffix="mlp")
 
-            # HC post-processing with fused h_res, h_post and BDA.
+            # HC post-processing: fused h_res, h_post and BDA.
+            # Recompute hooks were attached during TE graph capture; disable here.
             recompute_pre_mlp_layernorm = self.recompute_pre_mlp_layernorm
             self.recompute_pre_mlp_layernorm = False
-            output = self._forward_post_mlp_with_fused_hyper_connection(
-                mlp_output_with_bias, mlp_h_res, residual, mlp_hc_h_post
-            )
+
+            if self._use_hc_post_graph:
+                cg_idx = getattr(self, 'current_microbatch', 0) % len(self.cuda_graphs)
+                if cg_idx not in self._hc_post_graphed:
+                    nvtx_range_push(suffix="capture_hc_post_graph")
+                    self._hc_post_graphed[cg_idx] = self._capture_hc_post_graph(
+                        mlp_output_with_bias[0], mlp_h_res, residual, mlp_hc_h_post
+                    )
+                    nvtx_range_pop(suffix="capture_hc_post_graph")
+
+                nvtx_range_push(suffix="mlp_fused_h_res_h_post_bda")
+                hidden_states = self._hc_post_graphed[cg_idx](
+                    mlp_output_with_bias[0], mlp_h_res, residual, mlp_hc_h_post
+                )
+                nvtx_range_pop(suffix="mlp_fused_h_res_h_post_bda")
+
+                output = make_viewless_tensor(
+                    inp=hidden_states,
+                    requires_grad=hidden_states.requires_grad,
+                    keep_graph=True,
+                )
+            else:
+                output = self._forward_post_mlp_with_fused_hyper_connection(
+                    mlp_output_with_bias, mlp_h_res, residual, mlp_hc_h_post
+                )
+
             self.recompute_pre_mlp_layernorm = recompute_pre_mlp_layernorm
         else:
             output = self._forward_mlp(*cuda_graph_output)
