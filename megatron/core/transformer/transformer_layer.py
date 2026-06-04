@@ -1393,17 +1393,20 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         self._mhc_recompute_manager = kwargs.pop("mhc_recompute_manager", None)
         kwargs.pop("is_last_layer_in_recompute_block", None)
 
-        if self._should_call_local_cudagraph(*args, **kwargs):
-            # Inference mode.
-            if kwargs.get('inference_context') is not None:
-                # dynamic_inference_decode_only is not a real argument to forward, it is only used
-                # to differentiate the cuda graph used for decode from the one used for non-decode
-                # inference.
-                kwargs["dynamic_inference_decode_only"] = kwargs[
-                    'inference_context'
-                ].is_decode_only()
+        try:
+            if self._should_call_local_cudagraph(*args, **kwargs):
+                # Inference mode.
+                if kwargs.get('inference_context') is not None:
+                    # dynamic_inference_decode_only is not a real argument to forward, it is only
+                    # used to differentiate the cuda graph used for decode from the one used for
+                    # non-decode inference.
+                    kwargs["dynamic_inference_decode_only"] = kwargs[
+                        'inference_context'
+                    ].is_decode_only()
 
-        return super().__call__(*args, **kwargs)
+            return super().__call__(*args, **kwargs)
+        finally:
+            self._mhc_recompute_manager = None
 
     def _set_offload_modules(self):
         """Set the offload modules for the transformer layer."""

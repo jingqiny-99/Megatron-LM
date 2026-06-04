@@ -13,6 +13,7 @@ from megatron.core.models.gpt.gpt_layer_specs import (
     get_gpt_layer_with_transformer_engine_spec,
     get_gpt_layer_with_transformer_engine_submodules,
 )
+from megatron.core.pipeline_parallel.schedules import custom_backward, deallocate_output_tensor
 from megatron.core.tensor_parallel.random import (
     HAVE_TE,
     CheckpointManager,
@@ -21,6 +22,7 @@ from megatron.core.tensor_parallel.random import (
 )
 from megatron.core.transformer.cuda_graphs import CudaGraphManager, _CudagraphGlobalRecord
 from megatron.core.transformer.enums import InferenceCudaGraphScope
+from megatron.core.transformer.transformer_block import TransformerBlock
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.transformer_layer import (
     HyperConnectionTransformerLayer,
@@ -570,6 +572,105 @@ class TestTransformerLayerWithHyperConnectionRecompute:
         assert hidden_states.grad.shape == hidden_states.shape
         # Check that gradient is non-trivial (not all zeros)
         assert hidden_states.grad.abs().sum() > 0
+
+    @pytest.mark.skipif(not HAVE_TE, reason="Transformer Engine is required for TE-backed mHC")
+    @pytest.mark.parametrize("mhc_recompute_layer_num", [1, 2])
+    def test_two_microbatch_forward_then_backward_with_pipeline_deallocation(
+        self, mhc_recompute_layer_num
+    ):
+        """Simulate 1F1B warmup: two forwards happen before either backward."""
+        hidden_size = 64
+        num_streams = 4
+        seq_len = 8
+        batch_size = 2
+        num_layers = 2
+
+        def build_block(use_mhc_recompute):
+            config = _make_mhc_config(
+                hidden_size=hidden_size,
+                num_streams=num_streams,
+                num_layers=num_layers,
+                recompute_granularity='selective' if use_mhc_recompute else None,
+                recompute_modules=["mhc"] if use_mhc_recompute else [],
+                mhc_recompute_layer_num=mhc_recompute_layer_num if use_mhc_recompute else None,
+            )
+            block = TransformerBlock(
+                config,
+                get_gpt_layer_with_transformer_engine_spec(enable_hyper_connection=True),
+                post_layer_norm=False,
+                pre_process=True,
+                post_process=False,
+            )
+            block.cuda()
+            block.train()
+            return block
+
+        torch.manual_seed(1234)
+        torch.cuda.manual_seed(1234)
+        ref_block = build_block(use_mhc_recompute=False)
+
+        torch.manual_seed(1234)
+        torch.cuda.manual_seed(1234)
+        recompute_block = build_block(use_mhc_recompute=True)
+        recompute_block.load_state_dict(ref_block.state_dict())
+
+        inputs_ref = [
+            torch.randn(seq_len, batch_size, hidden_size, device='cuda', requires_grad=True)
+            for _ in range(2)
+        ]
+        inputs_recompute = [inp.detach().clone().requires_grad_(True) for inp in inputs_ref]
+        attention_mask = torch.ones((1, 1, seq_len, seq_len), dtype=bool, device='cuda')
+
+        outputs_ref = [
+            ref_block(hidden_states=inp, attention_mask=attention_mask) for inp in inputs_ref
+        ]
+        loss_ref = sum(output.sum() for output in outputs_ref)
+        loss_ref.backward()
+
+        ref_outputs = [output.detach().clone() for output in outputs_ref]
+        ref_input_grads = [inp.grad.detach().clone() for inp in inputs_ref]
+        ref_param_grads = {
+            name: param.grad.detach().clone()
+            for name, param in ref_block.named_parameters()
+            if param.grad is not None
+        }
+
+        outputs_recompute = []
+        recompute_output_values = []
+        recompute_output_grads = []
+        for inp in inputs_recompute:
+            output = recompute_block(hidden_states=inp, attention_mask=attention_mask)
+            outputs_recompute.append(output)
+            recompute_output_values.append(output.detach().clone())
+            recompute_output_grads.append(torch.ones_like(output))
+            for layer in recompute_block.layers:
+                assert getattr(layer, "_mhc_recompute_manager", None) is None
+
+        for output in outputs_recompute:
+            deallocate_output_tensor(output, deallocate_pipeline_outputs=True)
+
+        for output, grad_output in zip(outputs_recompute, recompute_output_grads):
+            custom_backward(output, grad_output)
+
+        recompute_input_grads = [inp.grad.detach().clone() for inp in inputs_recompute]
+        recompute_param_grads = {
+            name: param.grad.detach().clone()
+            for name, param in recompute_block.named_parameters()
+            if param.grad is not None
+        }
+
+        for ref_output, recompute_output in zip(ref_outputs, recompute_output_values):
+            torch.testing.assert_close(recompute_output, ref_output, rtol=1e-4, atol=1e-4)
+        for ref_grad, recompute_grad in zip(ref_input_grads, recompute_input_grads):
+            torch.testing.assert_close(recompute_grad, ref_grad, rtol=1e-4, atol=1e-4)
+
+        assert set(recompute_param_grads) == set(ref_param_grads)
+        for name, ref_grad in ref_param_grads.items():
+            torch.testing.assert_close(
+                recompute_param_grads[name], ref_grad, rtol=1e-4, atol=1e-4
+            )
+        for layer in recompute_block.layers:
+            assert getattr(layer, "_mhc_recompute_manager", None) is None
 
 
 class TestMHCRecomputeMemorySaving:
