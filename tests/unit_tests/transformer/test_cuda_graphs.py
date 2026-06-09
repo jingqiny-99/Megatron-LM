@@ -254,6 +254,129 @@ class TestCudaGraphConfigAndArguments:
         assert cfg.cuda_graph_modules == [CudaGraphModule.attn, CudaGraphModule.mlp]
         assert cfg.cuda_graph_scope is None
 
+    def test_mhc_mlp_post_scope_requires_transformer_engine(self):
+        with pytest.raises(
+            AssertionError,
+            match='mhc_mlp_post cuda graph is only supported with cuda_graph_impl="transformer_engine"',
+        ):
+            _base_cuda_graph_config(
+                cuda_graph_impl='local',
+                cuda_graph_modules=[CudaGraphModule.moe_router, CudaGraphModule.mhc_mlp_post],
+                enable_hyper_connections=True,
+                num_moe_experts=4,
+            )
+
+    def test_mhc_mlp_post_scope_requires_hyper_connections(self):
+        with pytest.raises(
+            AssertionError,
+            match='mhc_mlp_post cuda graph requires enable_hyper_connections=True',
+        ):
+            _base_cuda_graph_config(
+                cuda_graph_impl='transformer_engine',
+                cuda_graph_modules=[CudaGraphModule.moe_router, CudaGraphModule.mhc_mlp_post],
+                num_moe_experts=4,
+            )
+
+    def test_mhc_mlp_post_scope_requires_moe_router(self):
+        with pytest.raises(
+            AssertionError,
+            match='mhc_mlp_post cuda graph is only supported with moe_router cuda graph',
+        ):
+            _base_cuda_graph_config(
+                cuda_graph_impl='transformer_engine',
+                cuda_graph_modules=[CudaGraphModule.mhc_mlp_post],
+                enable_hyper_connections=True,
+                num_moe_experts=4,
+            )
+
+    def test_mhc_mlp_post_scope_allowed_with_overlap(self, monkeypatch):
+        monkeypatch.setattr(
+            "megatron.core.transformer.transformer_config.is_torch_min_version",
+            lambda version: True,
+        )
+        cfg = _base_cuda_graph_config(
+            cuda_graph_impl='transformer_engine',
+            cuda_graph_modules=[CudaGraphModule.moe_router, CudaGraphModule.mhc_mlp_post],
+            enable_hyper_connections=True,
+            num_moe_experts=4,
+            bf16=True,
+            expert_model_parallel_size=2,
+            moe_token_dispatcher_type='alltoall',
+            overlap_moe_expert_parallel_comm=True,
+        )
+        assert cfg.cuda_graph_modules == [
+            CudaGraphModule.moe_router,
+            CudaGraphModule.mhc_mlp_post,
+        ]
+
+    def test_overlap_rejects_mlp_scope_with_mhc_mlp_post(self, monkeypatch):
+        monkeypatch.setattr(
+            "megatron.core.transformer.transformer_config.is_torch_min_version",
+            lambda version: True,
+        )
+        with pytest.raises(
+            AssertionError,
+            match='CUDA graph scope on moe and mlp is not supported',
+        ):
+            _base_cuda_graph_config(
+                cuda_graph_impl='transformer_engine',
+                cuda_graph_modules=[
+                    CudaGraphModule.mlp,
+                    CudaGraphModule.moe_router,
+                    CudaGraphModule.mhc_mlp_post,
+                ],
+                enable_hyper_connections=True,
+                num_moe_experts=4,
+                moe_layer_freq=[0, 1],
+                bf16=True,
+                expert_model_parallel_size=2,
+                moe_token_dispatcher_type='alltoall',
+                overlap_moe_expert_parallel_comm=True,
+            )
+
+    def test_overlap_rejects_moe_scope(self, monkeypatch):
+        monkeypatch.setattr(
+            "megatron.core.transformer.transformer_config.is_torch_min_version",
+            lambda version: True,
+        )
+        with pytest.raises(
+            AssertionError,
+            match='CUDA graph scope on moe and mlp is not supported',
+        ):
+            _base_cuda_graph_config(
+                cuda_graph_impl='transformer_engine',
+                cuda_graph_modules=[CudaGraphModule.moe],
+                num_moe_experts=4,
+                moe_expert_capacity_factor=1.0,
+                moe_pad_expert_input_to_capacity=True,
+                bf16=True,
+                expert_model_parallel_size=2,
+                moe_token_dispatcher_type='alltoall',
+                overlap_moe_expert_parallel_comm=True,
+            )
+
+    def test_overlap_rejects_mhc_recompute(self, monkeypatch):
+        monkeypatch.setattr(
+            "megatron.core.transformer.transformer_config.is_torch_min_version",
+            lambda version: True,
+        )
+        with pytest.raises(
+            AssertionError,
+            match='disable mhc in recompute_modules',
+        ):
+            _base_cuda_graph_config(
+                cuda_graph_impl='transformer_engine',
+                cuda_graph_modules=[CudaGraphModule.moe_router, CudaGraphModule.mhc_mlp_post],
+                enable_hyper_connections=True,
+                num_moe_experts=4,
+                bf16=True,
+                expert_model_parallel_size=2,
+                moe_token_dispatcher_type='alltoall',
+                overlap_moe_expert_parallel_comm=True,
+                recompute_granularity='selective',
+                recompute_modules=['mhc'],
+            )
+
     def test_new_full_iteration_impl_does_not_populate_deprecated_scope(self):
         cfg = _base_cuda_graph_config(cuda_graph_impl='full_iteration', cuda_graph_modules=[])
         assert cfg.cuda_graph_scope is None
@@ -1254,6 +1377,28 @@ class TestPartialCudaGraph:
             # Capture CUDA graphs after warmup if helper is provided
             if self.cuda_graph_helper is not None and i == cuda_graph_warmup_steps:
                 self.cuda_graph_helper.create_cudagraphs()
+                modules = cuda_graph_modules or []
+                expected_post_layers = [
+                    layer
+                    for layer in self.cuda_graph_helper.flattened_callables
+                    if getattr(layer.config, 'enable_hyper_connections', False)
+                    and getattr(layer, 'is_moe_layer', False)
+                ]
+                post_callables = self.cuda_graph_helper.flattened_mhc_mlp_post_callables
+                assert all(
+                    post_callable not in self.cuda_graph_helper.flattened_callables
+                    for post_callable in post_callables
+                )
+                if CudaGraphModule.mhc_mlp_post in modules:
+                    assert len(post_callables) == len(expected_post_layers)
+                    for layer in expected_post_layers:
+                        assert len(layer.mhc_mlp_post_cuda_graphs) == (
+                            self.cuda_graph_helper.num_microbatches
+                        )
+                else:
+                    assert len(post_callables) == 0
+                    for layer in expected_post_layers:
+                        assert not getattr(layer, 'mhc_mlp_post_cuda_graphs', [])
 
             gpt_model[0].set_is_first_microbatch()
             output = gpt_model[0].forward(
@@ -1392,10 +1537,22 @@ class TestPartialCudaGraph:
             [CudaGraphModule.attn],
             [CudaGraphModule.mlp, CudaGraphModule.moe_router],
             [
+                CudaGraphModule.mlp,
+                CudaGraphModule.moe_router,
+                CudaGraphModule.mhc_mlp_post,
+            ],
+            [
                 CudaGraphModule.attn,
                 CudaGraphModule.mlp,
                 CudaGraphModule.moe_router,
                 CudaGraphModule.moe_preprocess,
+            ],
+            [
+                CudaGraphModule.attn,
+                CudaGraphModule.mlp,
+                CudaGraphModule.moe_router,
+                CudaGraphModule.moe_preprocess,
+                CudaGraphModule.mhc_mlp_post,
             ],
         ]:
             cuda_graph_warmup_steps = 3

@@ -7,6 +7,7 @@ import logging
 import math
 import os
 import time
+import weakref
 from collections import defaultdict
 from contextlib import nullcontext
 from copy import deepcopy
@@ -1732,6 +1733,36 @@ def _layer_is_graphable(layer, config):
     return False
 
 
+def _layer_has_mhc_mlp_post_graph(layer, config):
+    """Return whether the layer needs an auxiliary mHC MLP post graph."""
+
+    return (
+        CudaGraphModule.mhc_mlp_post in config.cuda_graph_modules
+        and getattr(config, 'enable_hyper_connections', False)
+        and getattr(layer, 'is_moe_layer', False)
+        and hasattr(layer, '_forward_mhc_mlp_post_core')
+    )
+
+
+class _MHCMLPPostCudaGraphCallable(torch.nn.Module):
+    """Small callable that captures only the mHC post-MLP fused core for one parent layer."""
+
+    def __init__(self, layer):
+        super().__init__()
+        self._layer_ref = weakref.ref(layer)
+
+    @property
+    def layer(self):
+        layer = self._layer_ref()
+        assert layer is not None, "Parent layer for mHC MLP post CUDA graph was deleted."
+        return layer
+
+    def forward(self, mlp_output, mlp_h_res, mhc_residual, mlp_hc_h_post):
+        return self.layer._forward_mhc_mlp_post_core(
+            mlp_output, mlp_h_res, mhc_residual, mlp_hc_h_post
+        )
+
+
 class TECudaGraphHelper:
     """
     Helper class to capture CUDA Graphs using TE make_graphed_callables().
@@ -1791,6 +1822,8 @@ class TECudaGraphHelper:
         self.callables_per_chunk_is_mtp = []
         self.flattened_callables = []
         self.flattened_callables_is_mtp = []
+        self.mhc_mlp_post_callables_per_chunk = []
+        self.flattened_mhc_mlp_post_callables = []
         for chunk_number, model_chunk in enumerate(self.model):
             try:
                 chunk_with_decoder = get_attr_wrapped_model(
@@ -1814,18 +1847,27 @@ class TECudaGraphHelper:
                     num_mtp_layers = 0
                 num_graphable_layers = 0
                 callables, callables_is_mtp = [], []
+                mhc_mlp_post_callables = []
                 for layer_number in range(num_decoder_layers):
                     layer = chunk_with_decoder.decoder.layers[layer_number]
                     if _layer_is_graphable(layer, self.config):
                         num_graphable_layers += 1
                         callables.append(layer)
                         callables_is_mtp.append(False)
+                        if _layer_has_mhc_mlp_post_graph(layer, self.config):
+                            post_callable = _MHCMLPPostCudaGraphCallable(layer)
+                            mhc_mlp_post_callables.append(post_callable)
+                            self.flattened_mhc_mlp_post_callables.append(post_callable)
                 for layer_number in range(num_mtp_layers):
                     layer = chunk_with_decoder.mtp.layers[layer_number].mtp_model_layer
                     if _layer_is_graphable(layer, self.config):
                         num_graphable_layers += 1
                         callables.append(layer)
                         callables_is_mtp.append(True)
+                        if _layer_has_mhc_mlp_post_graph(layer, self.config):
+                            post_callable = _MHCMLPPostCudaGraphCallable(layer)
+                            mhc_mlp_post_callables.append(post_callable)
+                            self.flattened_mhc_mlp_post_callables.append(post_callable)
                 log_on_each_pipeline_stage(
                     logger=logger,
                     tp_group=self.tp_group,
@@ -1841,6 +1883,7 @@ class TECudaGraphHelper:
                     self.num_layers_per_chunk.append(num_graphable_layers)
                     self.callables_per_chunk.append(callables)
                     self.callables_per_chunk_is_mtp.append(callables_is_mtp)
+                    self.mhc_mlp_post_callables_per_chunk.append(mhc_mlp_post_callables)
                     self.flattened_callables.extend(callables)
                     self.flattened_callables_is_mtp.extend(callables_is_mtp)
                 else:
@@ -1848,6 +1891,7 @@ class TECudaGraphHelper:
                     self.num_layers_per_chunk.append(0)
                     self.callables_per_chunk.append([])
                     self.callables_per_chunk_is_mtp.append([])
+                    self.mhc_mlp_post_callables_per_chunk.append([])
 
         log_on_each_pipeline_stage(
             logger=logger,
@@ -1855,7 +1899,8 @@ class TECudaGraphHelper:
             dp_cp_group=self.dp_cp_group,
             level=logging.INFO,
             msg=f'Rank {torch.distributed.get_rank()}: '
-            f'{len(self.flattened_callables)} graphable layers.',
+            f'{len(self.flattened_callables)} graphable layers. '
+            f'{len(self.flattened_mhc_mlp_post_callables)} auxiliary mHC MLP post callables.',
         )
 
     def capture_finished(self):
@@ -2299,6 +2344,98 @@ class TECudaGraphHelper:
         kwargs = get_make_graphed_callables_kwargs()
         return sample_args, kwargs
 
+    def _get_mhc_mlp_post_cuda_graph_input_data(self):
+        """Create callables and tensor inputs for auxiliary mHC MLP post CUDA graphs."""
+
+        capture_callables = []
+        sample_args = []
+        graph_locations = []
+
+        for post_callable in self.flattened_mhc_mlp_post_callables:
+            layer = post_callable.layer
+            static_inputs = layer.get_layer_static_inputs(self.seq_length, self.micro_batch_size)
+            mhc_residual = static_inputs["hidden_states"]
+            seq_len, micro_batch_size, n_hidden = mhc_residual.shape
+            num_residual_streams = layer.config.num_residual_streams
+            hidden_size = layer.config.hidden_size
+            assert n_hidden == num_residual_streams * hidden_size, (
+                "mHC residual hidden size mismatch for auxiliary MLP post CUDA graph: "
+                f"got {n_hidden}, expected {num_residual_streams * hidden_size}."
+            )
+
+            for microbatch in range(self.num_microbatches):
+                capture_callables.append(_MHCMLPPostCudaGraphCallable(layer))
+                graph_locations.append((layer, microbatch))
+                sample_args.append(
+                    (
+                        torch.ones(
+                            (seq_len, micro_batch_size, hidden_size),
+                            dtype=mhc_residual.dtype,
+                            requires_grad=True,
+                            device=mhc_residual.device,
+                        ),
+                        torch.ones(
+                            (
+                                seq_len,
+                                micro_batch_size,
+                                num_residual_streams,
+                                num_residual_streams,
+                            ),
+                            dtype=mhc_residual.dtype,
+                            requires_grad=True,
+                            device=mhc_residual.device,
+                        ),
+                        torch.ones_like(mhc_residual, requires_grad=True),
+                        torch.ones(
+                            (seq_len, micro_batch_size, num_residual_streams),
+                            dtype=mhc_residual.dtype,
+                            requires_grad=True,
+                            device=mhc_residual.device,
+                        ),
+                    )
+                )
+
+        return capture_callables, sample_args, graph_locations
+
+    def _capture_mhc_mlp_post_cudagraphs(self, num_warmup_iters):
+        """Capture auxiliary mHC MLP post CUDA graphs and attach them to parent layers."""
+
+        if not self.flattened_mhc_mlp_post_callables:
+            return False
+
+        capture_callables, sample_args, graph_locations = (
+            self._get_mhc_mlp_post_cuda_graph_input_data()
+        )
+        if not capture_callables:
+            return False
+
+        kwargs = {
+            'allow_unused_input': True,
+            'num_warmup_iters': num_warmup_iters,
+            'fp8_enabled': False,
+        }
+        if self.config.sequence_parallel:
+            rng_context = get_cuda_rng_tracker().fork()
+        else:
+            rng_context = nullcontext()
+
+        with rng_context:
+            graphs = make_graphed_callables(tuple(capture_callables), sample_args, **kwargs)
+        if len(capture_callables) == 1 and not isinstance(graphs, (list, tuple)):
+            graphs = (graphs,)
+        assert len(graphs) == len(graph_locations), (
+            f"Expected {len(graph_locations)} mHC MLP post CUDA graphs, got {len(graphs)}."
+        )
+
+        for post_callable in self.flattened_mhc_mlp_post_callables:
+            post_callable.layer.mhc_mlp_post_cuda_graphs = [None] * self.num_microbatches
+        for graph, (layer, microbatch) in zip(graphs, graph_locations):
+            layer.mhc_mlp_post_cuda_graphs[microbatch] = graph
+        for post_callable in self.flattened_mhc_mlp_post_callables:
+            assert all(graph is not None for graph in post_callable.layer.mhc_mlp_post_cuda_graphs)
+
+        return True
+
     def _start_capturing(self):
         """
         Start capturing CUDA Graphs.
@@ -2412,6 +2549,8 @@ class TECudaGraphHelper:
                         layer.cuda_graphs.append(graphs[graph_idx])
                 num_layers_accumulated += len(layers)
 
+            self._capture_mhc_mlp_post_cudagraphs(kwargs['num_warmup_iters'])
+
             self._graphs_created = True
 
         self._finish_capturing(start_time)
@@ -2443,6 +2582,16 @@ class TECudaGraphHelper:
                     else:
                         graphs_not_reset += 1
                 layer.cuda_graphs = []
+                for graph in getattr(layer, 'mhc_mlp_post_cuda_graphs', []):
+                    if graph is None:
+                        continue
+                    if graph_resettable:
+                        graph.reset()
+                        graphs_reset += 1
+                    else:
+                        graphs_not_reset += 1
+                if hasattr(layer, 'mhc_mlp_post_cuda_graphs'):
+                    layer.mhc_mlp_post_cuda_graphs = []
                 layer.cuda_graph_manual_hooks = []
 
         log_on_each_pipeline_stage(

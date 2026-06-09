@@ -1013,7 +1013,8 @@ class TransformerConfig(ModelParallelConfig):
     cuda_graph_modules: Union[str, CudaGraphModule, List[str], List[CudaGraphModule]] = "full"
     """Selects training capture coverage within per-layer CUDA graphs (local and
     transformer_engine implementations).
-    Valid values are "attn", "mlp", "moe", "moe_router", "moe_preprocess", and "mamba":
+    Valid values are "attn", "mlp", "moe", "moe_router", "moe_preprocess", "mamba",
+    and "mhc_mlp_post":
     "attn": captures operations in TransformerLayer._forward_attention().
     "mlp": captures operations in TransformerLayer._forward_mlp() for a dense layer.
     "moe": captures operations in TransformerLayer._forward_mlp() for a MoE layer.
@@ -1022,6 +1023,8 @@ class TransformerConfig(ModelParallelConfig):
     "moe_preprocess": captures operations in MoELayer.preprocess(). Must be used together with
     "moe_router".
     "mamba": captures the mamba layer.
+    "mhc_mlp_post": captures the mHC MoE post-MLP fused H_res/H_post/BDA core as an
+    auxiliary graph. Must be used together with "moe_router" and enable_hyper_connections.
     An empty list means capturing the whole Transformer layer.
     This field is meaningless when cuda_graph_impl="full_iteration" and must be empty.
     Backward compatibility: "full" is deprecated but kept for backward compatibility; it is
@@ -2585,6 +2588,17 @@ class TransformerConfig(ModelParallelConfig):
             self.cuda_graph_impl == "full_iteration" and self.cuda_graph_modules
         ), 'cuda_graph_modules must be empty when cuda_graph_impl="full_iteration".'
 
+        if CudaGraphModule.mhc_mlp_post in self.cuda_graph_modules:
+            assert (
+                self.cuda_graph_impl == "transformer_engine"
+            ), 'mhc_mlp_post cuda graph is only supported with cuda_graph_impl="transformer_engine".'
+            assert (
+                self.enable_hyper_connections
+            ), 'mhc_mlp_post cuda graph requires enable_hyper_connections=True.'
+            assert (
+                CudaGraphModule.moe_router in self.cuda_graph_modules
+            ), 'mhc_mlp_post cuda graph is only supported with moe_router cuda graph.'
+
         if self.cuda_graph_impl != "none":
 
             if self.cpu_offloading and self.cuda_graph_impl != "full_iteration":
@@ -2769,6 +2783,9 @@ class TransformerConfig(ModelParallelConfig):
             assert (
                 "moe" not in self.recompute_modules
             ), 'disable moe in recompute_modules when enabling overlap_moe_expert_parallel_comm'
+            assert (
+                "mhc" not in self.recompute_modules
+            ), 'disable mhc in recompute_modules when enabling overlap_moe_expert_parallel_comm'
 
             # Check if bf16 or fp16 is used
             assert (

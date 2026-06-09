@@ -499,6 +499,11 @@ def build_transformer_layer_callables(layer: TransformerLayer):
         layer.config.moe_token_dispatcher_type == "flex"
         and layer.config.moe_flex_dispatcher_backend == "hybridep"
     )
+    is_mhc_layer = (
+        getattr(layer.config, 'enable_hyper_connections', False)
+        and hasattr(layer, 'mlp_hyper_connection')
+        and hasattr(layer, '_forward_mhc_mlp_post')
+    )
 
     def submodule_attn_forward(node: ScheduleNode, hidden_states: torch.Tensor):
         """
@@ -536,6 +541,15 @@ def build_transformer_layer_callables(layer: TransformerLayer):
                 )
                 if not isinstance(layer.mlp, MoELayer):
                     return hidden_states, None, None, None
+                if is_mhc_layer:
+                    nvtx_range_push(suffix="mlp_hyper_connection")
+                    hidden_states, mlp_h_res, mlp_hc_h_post, residual = (
+                        layer.mlp_hyper_connection(hidden_states)
+                    )
+                    nvtx_range_pop(suffix="mlp_hyper_connection")
+                else:
+                    mlp_h_res, mlp_hc_h_post = None, None
+                    residual = hidden_states
                 mlp_norm_manager = off_interface(layer.offload_mlp_norm, hidden_states, "mlp_norm")
                 node.layer_state.mlp_norm_manager = mlp_norm_manager
                 if layer.recompute_pre_mlp_layernorm:
@@ -561,15 +575,26 @@ def build_transformer_layer_callables(layer: TransformerLayer):
                             f"got {len(pre_mlp_layernorm_output)}"
                         )
                     pre_mlp_layernorm_output, hidden_states = pre_mlp_layernorm_output
+                    if not is_mhc_layer:
+                        residual = hidden_states
 
                 shared_expert_output = layer.mlp.shared_experts_compute(pre_mlp_layernorm_output)
                 probs, routing_map = layer.mlp.route(pre_mlp_layernorm_output)
                 local_tokens, probs = layer.mlp.preprocess(
                     pre_mlp_layernorm_output, probs, routing_map
                 )
+                if is_mhc_layer:
+                    return (
+                        residual,
+                        local_tokens,
+                        probs,
+                        shared_expert_output,
+                        mlp_h_res,
+                        mlp_hc_h_post,
+                    )
                 return hidden_states, local_tokens, probs, shared_expert_output
 
-        hidden_states, local_tokens, probs, shared_expert_output = forward_func(
+        forward_outputs = forward_func(
             hidden_states=hidden_states,
             attention_mask=node.chunk_state.attention_mask,
             rotary_pos_emb=node.chunk_state.rotary_pos_emb,
@@ -578,11 +603,26 @@ def build_transformer_layer_callables(layer: TransformerLayer):
             packed_seq_params=node.chunk_state.packed_seq_params,
             sequence_len_offset=node.chunk_state.sequence_len_offset,
         )
+        if is_mhc_layer and len(forward_outputs) == 6:
+            (
+                hidden_states,
+                local_tokens,
+                probs,
+                shared_expert_output,
+                mlp_h_res,
+                mlp_hc_h_post,
+            ) = forward_outputs
+        else:
+            hidden_states, local_tokens, probs, shared_expert_output = forward_outputs
+            mlp_h_res, mlp_hc_h_post = None, None
         if not isinstance(layer.mlp, MoELayer):
             return hidden_states
 
         # Detach here for mlp_bda residual connection
         node.layer_state.residual = node.detach(hidden_states)
+        if is_mhc_layer:
+            node.layer_state.mlp_h_res = node.detach(mlp_h_res)
+            node.layer_state.mlp_hc_h_post = node.detach(mlp_hc_h_post)
         if layer.mlp.use_shared_expert and not layer.mlp.shared_expert_overlap:
             # Detach here for shared expert connection in moe_combine
             node.layer_state.shared_expert_output = node.detach(shared_expert_output)
@@ -650,13 +690,21 @@ def build_transformer_layer_callables(layer: TransformerLayer):
         output = layer.mlp.combine(output)
         output = layer.mlp.postprocess(output, shared_expert_output)
 
-        mlp_output_with_bias = (output, None)
         if hasattr(layer, 'cuda_graphs') and layer.cuda_graphs:
             layer.mlp.cudagraph_tensor_store.clear()
-        with layer.bias_dropout_add_exec_handler():
-            hidden_states = layer.mlp_bda(layer.training, layer.config.bias_dropout_fusion)(
-                mlp_output_with_bias, residual, layer.hidden_dropout
+        if is_mhc_layer:
+            hidden_states = layer._forward_mhc_mlp_post(
+                output,
+                node.layer_state.mlp_h_res,
+                residual,
+                node.layer_state.mlp_hc_h_post,
             )
+        else:
+            mlp_output_with_bias = (output, None)
+            with layer.bias_dropout_add_exec_handler():
+                hidden_states = layer.mlp_bda(layer.training, layer.config.bias_dropout_fusion)(
+                    mlp_output_with_bias, residual, layer.hidden_dropout
+                )
         # Delay the offload of the mlp norm until after the mlp_bda has been computed
         # because the residual is needed in the mlp_bda.
         mlp_norm_manager = getattr(node.layer_state, 'mlp_norm_manager', None)
@@ -673,10 +721,16 @@ def build_transformer_layer_callables(layer: TransformerLayer):
         node.layer_state.residual.record_stream(torch.cuda.current_stream())
         if shared_expert_output is not None:
             shared_expert_output.record_stream(torch.cuda.current_stream())
+        if is_mhc_layer:
+            node.layer_state.mlp_h_res.record_stream(torch.cuda.current_stream())
+            node.layer_state.mlp_hc_h_post.record_stream(torch.cuda.current_stream())
 
         # release tensor reference after use
         node.layer_state.residual = None
         node.layer_state.shared_expert_output = None
+        if is_mhc_layer:
+            node.layer_state.mlp_h_res = None
+            node.layer_state.mlp_hc_h_post = None
 
         # final layer norm from decoder
         final_layernorm = node.chunk_state.model.decoder.final_layernorm

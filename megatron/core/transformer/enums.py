@@ -71,6 +71,7 @@ class CudaGraphModule(enum.Enum):
     moe_router = 4  # Captures MoE router part
     moe_preprocess = 5  # Captures MoE preprocessing part (requires moe_router)
     mamba = 6  # Captures Mamba layers
+    mhc_mlp_post = 7  # Auxiliary mHC MoE post-MLP graph (requires moe_router)
 
 
 # Deprecated: use CudaGraphModule instead. Retained only for checkpoint backward compat.
