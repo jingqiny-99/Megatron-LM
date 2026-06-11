@@ -3,6 +3,7 @@
 import gc
 import os
 import sys
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -33,6 +34,7 @@ from megatron.core.transformer.cuda_graphs import (
     CudaGraphManager,
     TECudaGraphHelper,
     _CudagraphGlobalRecord,
+    _CudaGraphOrderInfo,
 )
 from megatron.core.transformer.enums import CudaGraphModule, CudaGraphScope, InferenceCudaGraphScope
 from megatron.core.transformer.module import MegatronModule
@@ -929,6 +931,37 @@ class TestParallelHybridBlockCudagraphs:
 _unique_buffer_counts = {}
 
 
+class _FakeMHCPostLayer(torch.nn.Module):
+    """Minimal layer exposing the mHC post static-input contract."""
+
+    def __init__(self, hidden_size=8, num_residual_streams=2):
+        super().__init__()
+        self.config = SimpleNamespace(
+            hidden_size=hidden_size,
+            num_residual_streams=num_residual_streams,
+        )
+
+    def get_layer_static_inputs(self, seq_length, micro_batch_size):
+        return {
+            "hidden_states": torch.ones(
+                seq_length,
+                micro_batch_size,
+                self.config.hidden_size * self.config.num_residual_streams,
+                requires_grad=True,
+            )
+        }
+
+    def _forward_mhc_mlp_post_core(self, mlp_output, mlp_h_res, mhc_residual, mlp_hc_h_post):
+        return mlp_output
+
+
+class _FakeMHCPostCallable:
+    """Simple callable wrapper with the same layer property used by the helper."""
+
+    def __init__(self, layer):
+        self.layer = layer
+
+
 class TestTECudaGraphHelper:
     def setup_method(self, method):
         # Initialize parallel state
@@ -940,6 +973,155 @@ class TestTECudaGraphHelper:
         destroy_num_microbatches_calculator()
         # Note: _unique_buffer_counts is intentionally NOT cleared here so we can
         # compare values across parametrized test runs
+
+    def _make_fake_mhc_post_helper(self, num_microbatches):
+        helper = object.__new__(TECudaGraphHelper)
+        helper.config = SimpleNamespace(
+            cuda_graph_warmup_steps=0,
+            cuda_graph_retain_backward_graph=False,
+        )
+        helper.seq_length = 4
+        helper.micro_batch_size = 2
+        helper.num_microbatches = num_microbatches
+
+        dense_layer_0 = torch.nn.Module()
+        post_layer_0 = _FakeMHCPostLayer()
+        post_layer_1 = _FakeMHCPostLayer()
+        post_layer_2 = _FakeMHCPostLayer()
+        dense_layer_1 = torch.nn.Module()
+
+        helper.callables_per_chunk = [
+            [dense_layer_0, post_layer_0, post_layer_1],
+            [post_layer_2, dense_layer_1],
+        ]
+        helper.flattened_callables = [
+            layer for layers in helper.callables_per_chunk for layer in layers
+        ]
+        helper.flattened_mhc_mlp_post_callables = [
+            _FakeMHCPostCallable(post_layer_0),
+            _FakeMHCPostCallable(post_layer_1),
+            _FakeMHCPostCallable(post_layer_2),
+        ]
+        return helper
+
+    def test_mhc_mlp_post_input_data_reuses_sample_args_non_overlap(self):
+        num_microbatches = 8
+        helper = self._make_fake_mhc_post_helper(num_microbatches)
+        order_info = _CudaGraphOrderInfo(
+            order=[1, 2, -2, -1] * num_microbatches,
+            chunk_id_list=None,
+            num_microbatches=num_microbatches,
+            num_model_chunks=2,
+            num_layers_per_chunk=[3, 2],
+            original_num_model_chunks=2,
+            original_num_layers_per_chunk=[3, 2],
+        )
+
+        post_callables, sample_args, graph_locations, post_order, post_layers_per_chunk = (
+            helper._get_mhc_mlp_post_cuda_graph_input_data(order_info)
+        )
+        kwargs = helper._get_mhc_mlp_post_make_graphed_callables_kwargs(
+            post_order, post_layers_per_chunk, num_warmup_iters=3
+        )
+
+        assert len(post_callables) == 3
+        assert post_callables == helper.flattened_mhc_mlp_post_callables
+        assert post_layers_per_chunk == [1, 1, 1]
+        assert len(sample_args) == len(post_callables) * num_microbatches
+        assert len(graph_locations) == len(sample_args)
+        assert all(
+            post_callable not in helper.flattened_callables for post_callable in post_callables
+        )
+
+        assert kwargs['_order'] == post_order
+        assert kwargs['allow_unused_input'] is True
+        assert kwargs['num_warmup_iters'] == 3
+        assert kwargs['fp8_enabled'] is False
+        if is_te_min_version("2.6.0"):
+            assert kwargs['_num_layers_per_chunk'] == post_layers_per_chunk
+        if is_te_min_version("2.7.0"):
+            assert kwargs['_reuse_graph_input_output_buffers'] is True
+
+        unique_counts = helper._get_mhc_mlp_post_sample_unique_data_ptr_counts(sample_args)
+        assert unique_counts['mlp_output'] < len(sample_args)
+        assert unique_counts['mhc_residual'] < len(sample_args)
+        assert unique_counts['mlp_output'] <= len(post_callables)
+        assert unique_counts['mhc_residual'] <= len(post_callables)
+
+    def test_mhc_mlp_post_memory_cost_does_not_scale_with_microbatches(self):
+        def get_unique_counts(num_microbatches):
+            helper = self._make_fake_mhc_post_helper(num_microbatches)
+            order_info = _CudaGraphOrderInfo(
+                order=[1, 2, -2, -1] * num_microbatches,
+                chunk_id_list=None,
+                num_microbatches=num_microbatches,
+                num_model_chunks=2,
+                num_layers_per_chunk=[3, 2],
+                original_num_model_chunks=2,
+                original_num_layers_per_chunk=[3, 2],
+            )
+            post_callables, sample_args, _, _, _ = (
+                helper._get_mhc_mlp_post_cuda_graph_input_data(order_info)
+            )
+            return (
+                len(post_callables),
+                len(sample_args),
+                helper._get_mhc_mlp_post_sample_unique_data_ptr_counts(sample_args),
+            )
+
+        small_post_layers, small_entries, small_counts = get_unique_counts(num_microbatches=8)
+        large_post_layers, large_entries, large_counts = get_unique_counts(num_microbatches=64)
+
+        assert small_post_layers == large_post_layers == 3
+        assert large_entries == small_entries * 8
+        assert large_counts == small_counts
+        for unique_count in large_counts.values():
+            assert unique_count <= large_post_layers
+
+    def test_mhc_mlp_post_order_filters_ep_overlap_wgrad_entries(self):
+        num_microbatches = 2
+        helper = self._make_fake_mhc_post_helper(num_microbatches)
+        layer_wise_cycle = [
+            1,
+            2,
+            3,
+            4,
+            5,
+            -5,
+            -4,
+            -4.5,
+            -3,
+            -3.5,
+            -2,
+            -2.5,
+            -1,
+        ]
+        order = layer_wise_cycle * num_microbatches
+        order_info = _CudaGraphOrderInfo(
+            order=order,
+            chunk_id_list=[None] * len(order),
+            num_microbatches=num_microbatches,
+            num_model_chunks=5,
+            num_layers_per_chunk=[1, 1, 1, 1, 1],
+            original_num_model_chunks=2,
+            original_num_layers_per_chunk=[3, 2],
+        )
+
+        post_callables, sample_args, _, post_order, post_layers_per_chunk = (
+            helper._get_mhc_mlp_post_cuda_graph_input_data(order_info)
+        )
+
+        assert len(post_callables) == 3
+        assert len(sample_args) == len(post_callables) * num_microbatches
+        assert post_layers_per_chunk == [1, 1, 1]
+        assert all(int(chunk_id) == chunk_id for chunk_id in post_order)
+        assert sum(1 for chunk_id in post_order if chunk_id > 0) == (
+            len(post_callables) * num_microbatches
+        )
+        assert sum(1 for chunk_id in post_order if chunk_id < 0) == (
+            len(post_callables) * num_microbatches
+        )
+        assert post_order == [1, 2, 3, -3, -2, -1] * num_microbatches
 
     @pytest.mark.parametrize("num_microbatches", [16, 64, 256])
     @pytest.mark.parametrize("pp_size", [1, 2, 4])
@@ -1430,6 +1612,184 @@ class TestPartialCudaGraph:
             self.cuda_graph_helper = None
 
         return torch.tensor(loss_list)
+
+    def _cuda_memory_snapshot(self):
+        torch.cuda.synchronize()
+        return {
+            "allocated": int(torch.cuda.memory_allocated()),
+            "reserved": int(torch.cuda.memory_reserved()),
+            "max_allocated": int(torch.cuda.max_memory_allocated()),
+            "max_reserved": int(torch.cuda.max_memory_reserved()),
+        }
+
+    def _run_mhc_cuda_graph_memory_case(
+        self, name, ep_size, cuda_graph_impl, cuda_graph_modules, cuda_graph_warmup_steps, **kwargs
+    ):
+        args = self.create_test_args(
+            cuda_graph_impl, cuda_graph_modules, cuda_graph_warmup_steps, ep_size, **kwargs
+        )
+        set_args(args)
+        torch.manual_seed(123)
+        model_parallel_cuda_manual_seed(123)
+
+        torch.cuda.empty_cache()
+        torch.cuda.reset_peak_memory_stats()
+        memory_at_start = self._cuda_memory_snapshot()
+
+        input_ids, labels, position_ids, attention_mask, loss_mask = self.get_batch(
+            self.seq_length, self.micro_batch_size, self.cp_size
+        )
+        gpt_model, optimizer, _ = setup_model_and_optimizer(
+            self.model_provider, ModelType.encoder_or_decoder
+        )
+        assert len(gpt_model) == 1
+
+        cuda_graph_helper = None
+        if cuda_graph_impl == "transformer_engine":
+            cuda_graph_helper = TECudaGraphHelper(
+                model=gpt_model,
+                config=gpt_model[0].config,
+                seq_length=self.seq_length,
+                micro_batch_size=self.micro_batch_size,
+                optimizers=[optimizer],
+            )
+
+        memory_after_setup = self._cuda_memory_snapshot()
+        if cuda_graph_helper is None:
+            torch.cuda.reset_peak_memory_stats()
+        memory_before_capture = None
+        memory_after_capture = None
+        capture_peak = None
+
+        try:
+            for iteration in range(cuda_graph_warmup_steps + 2):
+                gpt_model[0].zero_grad_buffer()
+                optimizer.zero_grad()
+
+                if cuda_graph_helper is not None and iteration == cuda_graph_warmup_steps:
+                    memory_before_capture = self._cuda_memory_snapshot()
+                    torch.cuda.reset_peak_memory_stats()
+                    cuda_graph_helper.create_cudagraphs()
+                    capture_peak = self._cuda_memory_snapshot()
+                    memory_after_capture = {
+                        **capture_peak,
+                        "allocated_delta": capture_peak["allocated"]
+                        - memory_before_capture["allocated"],
+                        "reserved_delta": capture_peak["reserved"]
+                        - memory_before_capture["reserved"],
+                    }
+                    torch.cuda.reset_peak_memory_stats()
+
+                gpt_model[0].set_is_first_microbatch()
+                output = gpt_model[0].forward(
+                    input_ids=input_ids,
+                    position_ids=position_ids,
+                    attention_mask=attention_mask,
+                    labels=labels,
+                    loss_mask=loss_mask,
+                )
+                loss = output.mean()
+                loss.backward()
+                update_successful, _, _ = optimizer.step()
+                assert update_successful
+
+            memory_after_iterations = self._cuda_memory_snapshot()
+        finally:
+            if cuda_graph_helper is not None and cuda_graph_helper.graphs_created():
+                cuda_graph_helper.delete_cuda_graphs()
+            del gpt_model, optimizer
+            torch.cuda.synchronize()
+            gc.collect()
+            torch.cuda.empty_cache()
+
+        if memory_before_capture is None:
+            memory_before_capture = memory_after_setup
+            memory_after_capture = {
+                **memory_after_setup,
+                "allocated_delta": 0,
+                "reserved_delta": 0,
+            }
+            capture_peak = memory_after_setup
+
+        return {
+            "name": name,
+            "start": memory_at_start,
+            "after_setup": memory_after_setup,
+            "before_capture": memory_before_capture,
+            "after_capture": memory_after_capture,
+            "capture_peak": capture_peak,
+            "after_iterations": memory_after_iterations,
+        }
+
+    def _print_mhc_cuda_graph_memory_comparison(self, results):
+        mib = 1024 * 1024
+        print("\n[mHC CUDA graph memory comparison]")
+        print(
+            "case,"
+            "setup_reserved_mib,"
+            "capture_reserved_delta_mib,"
+            "capture_max_reserved_mib,"
+            "iteration_max_reserved_mib,"
+            "iteration_max_allocated_mib"
+        )
+        for result in results:
+            print(
+                f"{result['name']},"
+                f"{result['after_setup']['reserved'] / mib:.2f},"
+                f"{result['after_capture']['reserved_delta'] / mib:.2f},"
+                f"{result['capture_peak']['max_reserved'] / mib:.2f},"
+                f"{result['after_iterations']['max_reserved'] / mib:.2f},"
+                f"{result['after_iterations']['max_allocated'] / mib:.2f}"
+            )
+
+    @pytest.mark.flaky
+    @pytest.mark.flaky_in_dev
+    @pytest.mark.skipif(
+        not (HAVE_TE and is_te_min_version("2.10.0")),
+        reason="mHC CUDA graph memory comparison requires TransformerEngine version >= 2.10.0",
+    )
+    def test_mhc_mlp_post_cuda_graph_memory_cost_comparison(self):
+        initialize_rng_tracker(use_te_rng_tracker=True, force_reset=True)
+        Utils.initialize_model_parallel(
+            tensor_model_parallel_size=self.tp_size,
+            context_parallel_size=self.cp_size,
+            pipeline_model_parallel_size=1,
+            expert_tensor_parallel_size=self.tp_size,
+            expert_model_parallel_size=1,
+        )
+
+        extra_kwargs = {
+            "enable_hyper_connections": True,
+            "num_residual_streams": 4,
+            "mtp_num_layers": None,
+        }
+        cases = [
+            ("no_cuda_graph", "none", None, 0),
+            ("moe_router_graph", "transformer_engine", [CudaGraphModule.moe_router], 1),
+            (
+                "moe_router_mhc_mlp_post_graph",
+                "transformer_engine",
+                [CudaGraphModule.moe_router, CudaGraphModule.mhc_mlp_post],
+                1,
+            ),
+        ]
+
+        results = []
+        for name, cuda_graph_impl, cuda_graph_modules, cuda_graph_warmup_steps in cases:
+            results.append(
+                self._run_mhc_cuda_graph_memory_case(
+                    name,
+                    ep_size=1,
+                    cuda_graph_impl=cuda_graph_impl,
+                    cuda_graph_modules=cuda_graph_modules,
+                    cuda_graph_warmup_steps=cuda_graph_warmup_steps,
+                    **extra_kwargs,
+                )
+            )
+
+        self._print_mhc_cuda_graph_memory_comparison(results)
+        assert [result["name"] for result in results] == [case[0] for case in cases]
+        assert all(result["after_iterations"]["max_reserved"] > 0 for result in results)
 
     @pytest.mark.flaky
     @pytest.mark.flaky_in_dev

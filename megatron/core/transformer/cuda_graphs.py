@@ -16,7 +16,7 @@ from enum import Enum
 from functools import partial
 from itertools import chain, zip_longest
 from math import ceil
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 import torch
 from torch.utils._pytree import tree_map as tree_map_pyt
@@ -1763,6 +1763,19 @@ class _MHCMLPPostCudaGraphCallable(torch.nn.Module):
         )
 
 
+@dataclass
+class _CudaGraphOrderInfo:
+    """Schedule metadata used by the main TE graphs and auxiliary post graphs."""
+
+    order: List[Any]
+    chunk_id_list: Optional[List[Any]]
+    num_microbatches: int
+    num_model_chunks: int
+    num_layers_per_chunk: List[int]
+    original_num_model_chunks: int
+    original_num_layers_per_chunk: List[int]
+
+
 class TECudaGraphHelper:
     """
     Helper class to capture CUDA Graphs using TE make_graphed_callables().
@@ -1804,6 +1817,7 @@ class TECudaGraphHelper:
 
         # Number of microbatches to capture. The value will be set in _get_cuda_graph_input_data().
         self.num_microbatches = None
+        self._cuda_graph_order_info = None
 
         self._discover_layers()
 
@@ -2220,6 +2234,8 @@ class TECudaGraphHelper:
         order = convert_schedule_table_to_order(
             num_warmup_microbatches, self.num_model_chunks, schedule_table
         )
+        original_num_model_chunks = self.num_model_chunks
+        original_num_layers_per_chunk = list(self.num_layers_per_chunk)
         log_on_each_pipeline_stage(
             logger=logger,
             tp_group=self.tp_group,
@@ -2254,6 +2270,16 @@ class TECudaGraphHelper:
                 msg=f'Rank {torch.distributed.get_rank()}: '
                 f'ORDER after overlap_moe_expert_parallel_comm {order}',
             )
+
+        self._cuda_graph_order_info = _CudaGraphOrderInfo(
+            order=order,
+            chunk_id_list=chunk_id_list,
+            num_microbatches=self.num_microbatches,
+            num_model_chunks=self.num_model_chunks,
+            num_layers_per_chunk=list(self.num_layers_per_chunk),
+            original_num_model_chunks=original_num_model_chunks,
+            original_num_layers_per_chunk=original_num_layers_per_chunk,
+        )
 
         # Generate sample arguments and keyword arguments for capturing.
         sample_args, sample_kwargs = self._get_sample_arguments(order, chunk_id_list)
@@ -2344,17 +2370,90 @@ class TECudaGraphHelper:
         kwargs = get_make_graphed_callables_kwargs()
         return sample_args, kwargs
 
-    def _get_mhc_mlp_post_cuda_graph_input_data(self):
-        """Create callables and tensor inputs for auxiliary mHC MLP post CUDA graphs."""
+    def _get_mhc_mlp_post_layer_mappings(self):
+        """Map main graph layer/chunk positions to compact auxiliary post chunks."""
 
-        capture_callables = []
-        sample_args = []
-        graph_locations = []
+        post_layer_to_chunk_id = {
+            id(post_callable.layer): post_idx + 1
+            for post_idx, post_callable in enumerate(self.flattened_mhc_mlp_post_callables)
+        }
+        post_ids_per_original_chunk = [[] for _ in self.callables_per_chunk]
+        main_layer_id_to_post_id = {}
 
-        for post_callable in self.flattened_mhc_mlp_post_callables:
+        main_layer_id = 1
+        for chunk_idx, layers in enumerate(self.callables_per_chunk):
+            for layer in layers:
+                post_id = post_layer_to_chunk_id.get(id(layer))
+                if post_id is not None:
+                    post_ids_per_original_chunk[chunk_idx].append(post_id)
+                    main_layer_id_to_post_id[main_layer_id] = post_id
+                main_layer_id += 1
+
+        return post_ids_per_original_chunk, main_layer_id_to_post_id
+
+    def _get_mhc_mlp_post_order(self, order_info):
+        """Build a compact TE order where each mHC post layer is one post chunk."""
+
+        post_ids_per_original_chunk, main_layer_id_to_post_id = (
+            self._get_mhc_mlp_post_layer_mappings()
+        )
+        post_order = []
+
+        if order_info.chunk_id_list is not None:
+            # EP-overlap main graphs are already expanded to layer-wise chunks. Filter to
+            # layers that own an auxiliary post graph and remap them to compact post chunks.
+            for chunk_id in order_info.order:
+                if ceil(chunk_id) != chunk_id:
+                    continue
+                main_layer_id = abs(int(chunk_id))
+                post_id = main_layer_id_to_post_id.get(main_layer_id)
+                if post_id is None:
+                    continue
+                post_order.append(post_id if chunk_id > 0 else -post_id)
+        else:
+            # Non-overlap order is chunk-wise. Expand each original chunk into its post layers.
+            for chunk_id in order_info.order:
+                if ceil(chunk_id) != chunk_id:
+                    continue
+                original_chunk_idx = abs(int(chunk_id)) - 1
+                post_ids = post_ids_per_original_chunk[original_chunk_idx]
+                if chunk_id > 0:
+                    post_order.extend(post_ids)
+                else:
+                    post_order.extend(-post_id for post_id in reversed(post_ids))
+
+        num_post_layers = len(self.flattened_mhc_mlp_post_callables)
+        if num_post_layers:
+            expected_count = num_post_layers * order_info.num_microbatches
+            forward_count = sum(1 for chunk_id in post_order if chunk_id > 0)
+            backward_count = sum(1 for chunk_id in post_order if chunk_id < 0)
+            assert forward_count == expected_count, (
+                "mHC MLP post forward order count mismatch: "
+                f"expected {expected_count}, got {forward_count}."
+            )
+            assert backward_count == expected_count, (
+                "mHC MLP post backward order count mismatch: "
+                f"expected {expected_count}, got {backward_count}."
+            )
+            assert max(abs(chunk_id) for chunk_id in post_order) == num_post_layers, (
+                "mHC MLP post order must use compact one-based post chunk IDs."
+            )
+
+        return post_order
+
+    def _get_mhc_mlp_post_sample_args(self, post_order, num_microbatches):
+        """Create mHC post sample args with schedule-aware static buffer reuse."""
+
+        post_callables = self.flattened_mhc_mlp_post_callables
+        sample_args = [None] * (len(post_callables) * num_microbatches)
+
+        def _get_post_static_inputs(post_callable):
             layer = post_callable.layer
             static_inputs = layer.get_layer_static_inputs(self.seq_length, self.micro_batch_size)
             mhc_residual = static_inputs["hidden_states"]
+            if not mhc_residual.requires_grad:
+                mhc_residual.requires_grad_(True)
+
             seq_len, micro_batch_size, n_hidden = mhc_residual.shape
             num_residual_streams = layer.config.num_residual_streams
             hidden_size = layer.config.hidden_size
@@ -2363,39 +2462,157 @@ class TECudaGraphHelper:
                 f"got {n_hidden}, expected {num_residual_streams * hidden_size}."
             )
 
-            for microbatch in range(self.num_microbatches):
-                capture_callables.append(_MHCMLPPostCudaGraphCallable(layer))
-                graph_locations.append((layer, microbatch))
-                sample_args.append(
-                    (
-                        torch.ones(
-                            (seq_len, micro_batch_size, hidden_size),
-                            dtype=mhc_residual.dtype,
-                            requires_grad=True,
-                            device=mhc_residual.device,
-                        ),
-                        torch.ones(
-                            (
-                                seq_len,
-                                micro_batch_size,
-                                num_residual_streams,
-                                num_residual_streams,
-                            ),
-                            dtype=mhc_residual.dtype,
-                            requires_grad=True,
-                            device=mhc_residual.device,
-                        ),
-                        torch.ones_like(mhc_residual, requires_grad=True),
-                        torch.ones(
-                            (seq_len, micro_batch_size, num_residual_streams),
-                            dtype=mhc_residual.dtype,
-                            requires_grad=True,
-                            device=mhc_residual.device,
-                        ),
-                    )
+            return (
+                torch.ones(
+                    (seq_len, micro_batch_size, hidden_size),
+                    dtype=mhc_residual.dtype,
+                    requires_grad=True,
+                    device=mhc_residual.device,
+                ),
+                torch.ones(
+                    (seq_len, micro_batch_size, num_residual_streams, num_residual_streams),
+                    dtype=mhc_residual.dtype,
+                    requires_grad=True,
+                    device=mhc_residual.device,
+                ),
+                mhc_residual,
+                torch.ones(
+                    (seq_len, micro_batch_size, num_residual_streams),
+                    dtype=mhc_residual.dtype,
+                    requires_grad=True,
+                    device=mhc_residual.device,
+                ),
+            )
+
+        def _sample_keys(args):
+            return tuple((tensor.shape, tensor.dtype, tensor.layout) for tensor in args)
+
+        fwd_sample_queues = defaultdict(list)
+        consumed_sample_queue = defaultdict(list)
+        post_sample_keys_cache = {}
+        fwd_idx = [0] * len(post_callables)
+
+        for chunk_id in post_order:
+            post_chunk_idx = abs(int(chunk_id)) - 1
+            if chunk_id > 0:
+                assert fwd_idx[post_chunk_idx] < num_microbatches, (
+                    "mHC MLP post order has more forward entries than sample slots."
+                )
+                per_callable_fwd_idx = post_chunk_idx * num_microbatches + fwd_idx[post_chunk_idx]
+                assert sample_args[per_callable_fwd_idx] is None, (
+                    "mHC MLP post sample_args slot must be empty before assignment."
                 )
 
-        return capture_callables, sample_args, graph_locations
+                if post_chunk_idx not in post_sample_keys_cache:
+                    sample_args[per_callable_fwd_idx] = _get_post_static_inputs(
+                        post_callables[post_chunk_idx]
+                    )
+                    post_sample_keys_cache[post_chunk_idx] = _sample_keys(
+                        sample_args[per_callable_fwd_idx]
+                    )
+
+                sample_keys = post_sample_keys_cache[post_chunk_idx]
+                fwd_sample_queues[post_chunk_idx].append((sample_keys, per_callable_fwd_idx))
+                if consumed_sample_queue[sample_keys]:
+                    reuse_fwd_idx = consumed_sample_queue[sample_keys].pop(0)
+                    assert sample_args[reuse_fwd_idx] is not None, (
+                        "mHC MLP post sample_args must exist before reuse."
+                    )
+                    sample_args[per_callable_fwd_idx] = sample_args[reuse_fwd_idx]
+
+                if sample_args[per_callable_fwd_idx] is None:
+                    sample_args[per_callable_fwd_idx] = _get_post_static_inputs(
+                        post_callables[post_chunk_idx]
+                    )
+
+                fwd_idx[post_chunk_idx] += 1
+            else:
+                if fwd_sample_queues[post_chunk_idx]:
+                    sample_keys, per_callable_fwd_idx = fwd_sample_queues[post_chunk_idx].pop(0)
+                    consumed_sample_queue[sample_keys].append(per_callable_fwd_idx)
+
+        assert all(args is not None for args in sample_args), (
+            "All mHC MLP post sample_args entries must be populated."
+        )
+        return sample_args
+
+    def _get_mhc_mlp_post_cuda_graph_input_data(self, order_info=None):
+        """Create callables, sample args, locations, and TE order for mHC post graphs."""
+
+        if order_info is None:
+            order_info = self._cuda_graph_order_info
+        assert order_info is not None, (
+            "mHC MLP post CUDA graph input data requires main CUDA graph order info. "
+            "Call _get_cuda_graph_input_data() first."
+        )
+
+        post_callables = self.flattened_mhc_mlp_post_callables
+        post_num_layers_per_chunk = [1] * len(post_callables)
+        post_order = self._get_mhc_mlp_post_order(order_info)
+        sample_args = self._get_mhc_mlp_post_sample_args(
+            post_order, order_info.num_microbatches
+        )
+        graph_locations = [
+            (post_callable.layer, microbatch)
+            for post_callable in post_callables
+            for microbatch in range(order_info.num_microbatches)
+        ]
+
+        return post_callables, sample_args, graph_locations, post_order, post_num_layers_per_chunk
+
+    def _get_mhc_mlp_post_make_graphed_callables_kwargs(
+        self, post_order, post_num_layers_per_chunk, num_warmup_iters=None
+    ):
+        """Build TE make_graphed_callables kwargs for auxiliary mHC post graphs."""
+
+        if num_warmup_iters is None:
+            num_warmup_iters = max(
+                1,
+                math.ceil(
+                    (10 - self.config.cuda_graph_warmup_steps * get_num_microbatches())
+                    / self.num_microbatches
+                ),
+            )
+
+        kwargs = {
+            'allow_unused_input': True,
+            'num_warmup_iters': num_warmup_iters,
+            'fp8_enabled': False,
+            '_order': post_order,
+            'retain_graph_in_backward': self.config.cuda_graph_retain_backward_graph,
+        }
+        if is_te_min_version("2.6.0"):
+            kwargs['_num_layers_per_chunk'] = post_num_layers_per_chunk
+        if is_te_min_version("2.7.0"):
+            kwargs['_reuse_graph_input_output_buffers'] = True
+        return kwargs
+
+    def _get_mhc_mlp_post_sample_unique_data_ptr_counts(self, sample_args):
+        """Count unique backing buffers for each auxiliary post sample argument."""
+
+        names = ("mlp_output", "mlp_h_res", "mhc_residual", "mlp_hc_h_post")
+        ptrs_by_name = {name: set() for name in names}
+        for args in sample_args:
+            for name, tensor in zip(names, args):
+                if torch.is_tensor(tensor):
+                    ptrs_by_name[name].add(tensor.data_ptr())
+        return {name: len(ptrs) for name, ptrs in ptrs_by_name.items()}
+
+    def _log_mhc_mlp_post_cuda_memory(self, label):
+        """Log CUDA allocator state for auxiliary post graph diagnostics."""
+
+        if not torch.cuda.is_available():
+            return
+        rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+        log_on_each_pipeline_stage(
+            logger=logger,
+            tp_group=self.tp_group,
+            dp_cp_group=self.dp_cp_group,
+            level=logging.DEBUG,
+            msg=f'Rank {rank}: mHC MLP post {label}: '
+            f'allocated={torch.cuda.memory_allocated()} '
+            f'reserved={torch.cuda.memory_reserved()}',
+        )
 
     def _capture_mhc_mlp_post_cudagraphs(self, num_warmup_iters):
         """Capture auxiliary mHC MLP post CUDA graphs and attach them to parent layers."""
@@ -2403,17 +2620,37 @@ class TECudaGraphHelper:
         if not self.flattened_mhc_mlp_post_callables:
             return False
 
-        capture_callables, sample_args, graph_locations = (
-            self._get_mhc_mlp_post_cuda_graph_input_data()
-        )
+        self._log_mhc_mlp_post_cuda_memory("before sample construction")
+        (
+            post_callables,
+            sample_args,
+            graph_locations,
+            post_order,
+            post_num_layers_per_chunk,
+        ) = self._get_mhc_mlp_post_cuda_graph_input_data()
+        self._log_mhc_mlp_post_cuda_memory("after sample construction")
+        capture_callables = post_callables
         if not capture_callables:
             return False
 
-        kwargs = {
-            'allow_unused_input': True,
-            'num_warmup_iters': num_warmup_iters,
-            'fp8_enabled': False,
-        }
+        kwargs = self._get_mhc_mlp_post_make_graphed_callables_kwargs(
+            post_order, post_num_layers_per_chunk, num_warmup_iters
+        )
+        unique_data_ptr_counts = self._get_mhc_mlp_post_sample_unique_data_ptr_counts(sample_args)
+        forward_count = sum(1 for chunk_id in post_order if chunk_id > 0)
+        backward_count = sum(1 for chunk_id in post_order if chunk_id < 0)
+        rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+        log_on_each_pipeline_stage(
+            logger=logger,
+            tp_group=self.tp_group,
+            dp_cp_group=self.dp_cp_group,
+            level=logging.INFO,
+            msg=f'Rank {rank}: Capturing {len(sample_args)} mHC MLP post CUDA graphs '
+            f'from {len(capture_callables)} post callables; '
+            f'post_order_forward={forward_count}, post_order_backward={backward_count}, '
+            f'unique_data_ptrs={unique_data_ptr_counts}.',
+        )
+
         if self.config.sequence_parallel:
             rng_context = get_cuda_rng_tracker().fork()
         else:
@@ -2421,10 +2658,19 @@ class TECudaGraphHelper:
 
         with rng_context:
             graphs = make_graphed_callables(tuple(capture_callables), sample_args, **kwargs)
+        self._log_mhc_mlp_post_cuda_memory("after make_graphed_callables")
         if len(capture_callables) == 1 and not isinstance(graphs, (list, tuple)):
             graphs = (graphs,)
         assert len(graphs) == len(graph_locations), (
             f"Expected {len(graph_locations)} mHC MLP post CUDA graphs, got {len(graphs)}."
+        )
+
+        log_on_each_pipeline_stage(
+            logger=logger,
+            tp_group=self.tp_group,
+            dp_cp_group=self.dp_cp_group,
+            level=logging.INFO,
+            msg=f'Rank {rank}: Captured {len(graphs)} mHC MLP post CUDA graphs.',
         )
 
         for post_callable in self.flattened_mhc_mlp_post_callables:
