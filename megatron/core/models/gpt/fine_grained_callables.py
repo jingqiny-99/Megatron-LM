@@ -159,13 +159,16 @@ class PreProcessNode(ScheduleNode):
             padding_mask=self.chunk_state.padding_mask,
         )
 
-        # Saved for later use
+        # Saved for later use. Keep this as the GPT preprocess output; the decoder layer input may
+        # be expanded below by TransformerBlock boundary logic when mHC is enabled.
         self.chunk_state.decoder_input = decoder_input
         self.chunk_state.rotary_pos_emb = rotary_pos_emb
         self.chunk_state.rotary_pos_cos = rotary_pos_cos
         self.chunk_state.rotary_pos_sin = rotary_pos_sin
         self.chunk_state.sequence_len_offset = sequence_len_offset
         self.chunk_state.padding_mask = padding_mask
+
+        decoder_input = self.gpt_model.decoder.preprocess_for_layer_schedule(decoder_input)
         return decoder_input
 
 
@@ -203,13 +206,12 @@ class PostProcessNode(ScheduleNode):
             The logits or loss depending on whether labels are provided.
         """
 
-        empty_decoder = len(self.gpt_model.decoder.layers) == 0
-        layer_norm = self.gpt_model.decoder.final_layernorm
-        if not self.gpt_model.config.mtp_num_layers and empty_decoder and layer_norm:
-            hidden_states = layer_norm(hidden_states)
-            hidden_states = make_viewless_tensor(
-                inp=hidden_states, requires_grad=True, keep_graph=True
+        if len(self.gpt_model.decoder.layers) == 0:
+            hidden_states = self.gpt_model.decoder.postprocess_for_layer_schedule(
+                hidden_states, is_last_decoder_layer=True
             )
+            if isinstance(hidden_states, tuple):
+                hidden_states = hidden_states[0]
 
         # Run GPTModel._postprocess
         loss = self.gpt_model._postprocess(
@@ -713,9 +715,20 @@ def build_transformer_layer_callables(layer: TransformerLayer):
                 hidden_states, forced_released_tensors=[residual]
             )
             node.layer_state.mlp_norm_manager = None
-        output = make_viewless_tensor(
-            inp=hidden_states, requires_grad=hidden_states.requires_grad, keep_graph=True
-        )
+        if not node.is_mtp and node.is_last_layer:
+            output, mhc_multistream = node.chunk_state.model.decoder.postprocess_for_layer_schedule(
+                hidden_states,
+                is_last_decoder_layer=True,
+                return_mhc_multistream=True,
+            )
+            output = make_viewless_tensor(
+                inp=output, requires_grad=output.requires_grad, keep_graph=True
+            )
+            node.chunk_state.mhc_multistream = mhc_multistream
+        else:
+            output = make_viewless_tensor(
+                inp=hidden_states, requires_grad=hidden_states.requires_grad, keep_graph=True
+            )
 
         # Need to record tensors created on comp stream to comm stream
         node.layer_state.residual.record_stream(torch.cuda.current_stream())
@@ -732,11 +745,6 @@ def build_transformer_layer_callables(layer: TransformerLayer):
             node.layer_state.mlp_h_res = None
             node.layer_state.mlp_hc_h_post = None
 
-        # final layer norm from decoder
-        final_layernorm = node.chunk_state.model.decoder.final_layernorm
-        if not node.is_mtp and final_layernorm and node.is_last_layer:
-            output = final_layernorm(output)
-            output = make_viewless_tensor(inp=output, requires_grad=True, keep_graph=True)
         return output
 
     @copy_signature(layer._forward_mlp, handle_first_dst_param='preserve')
@@ -778,7 +786,11 @@ def build_mtp_layer_callables(layer):
         if node.is_first_layer:
             offset = get_mtp_layer_offset(layer.config, node.chunk_state.model.vp_stage)
             node.chunk_state.mtp_hidden_states = list(torch.chunk(hidden_states, 1 + offset, dim=0))
-            hidden_states = node.chunk_state.mtp_hidden_states[offset]
+            mhc_multistream = getattr(node.chunk_state, "mhc_multistream", None)
+            if layer.config.enable_hyper_connections and mhc_multistream is not None:
+                hidden_states = list(torch.chunk(mhc_multistream, 1 + offset, dim=0))[offset]
+            else:
+                hidden_states = node.chunk_state.mtp_hidden_states[offset]
 
         input_ids, position_ids, decoder_input, hidden_states = layer._get_embeddings(
             input_ids=node.chunk_state.input_ids,
@@ -809,11 +821,15 @@ def build_mtp_layer_callables(layer):
             return attn_forward(node, hidden_states)
 
     def submodule_mtp_postprocess_forward(node, hidden_states):
+        next_hidden_states = hidden_states if layer.config.enable_hyper_connections else None
         hidden_states = layer._postprocess(hidden_states)
         node.chunk_state.mtp_hidden_states.append(hidden_states)
         if node.is_last_layer:
             hidden_states = torch.cat(node.chunk_state.mtp_hidden_states, dim=0)
             node.chunk_state.mtp_hidden_states = None
+            node.chunk_state.mhc_multistream = None
+        elif next_hidden_states is not None:
+            hidden_states = next_hidden_states
         return hidden_states
 
     def rng_context_wrapper(func, *args, **kwargs):
