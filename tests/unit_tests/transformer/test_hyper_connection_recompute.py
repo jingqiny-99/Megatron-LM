@@ -11,13 +11,40 @@ Tests the following functionality:
 5. TransformerConfig 'mhc' in recompute_modules option
 """
 
+import json
+import os
+import weakref
+from contextlib import contextmanager
+from pathlib import Path
+
 import pytest
 import torch
+import torch.nn.functional as F
 
 from megatron.core.tensor_parallel.random import CheckpointManager, model_parallel_cuda_manual_seed
 from megatron.core.transformer.hyper_connection import HyperConnectionModule
 from megatron.core.transformer.transformer_config import TransformerConfig
 from tests.unit_tests.test_utilities import Utils
+
+
+class _AggregateOnly(torch.nn.Module):
+    """Expose the production mHC aggregate without registering unrelated parameters."""
+
+    def __init__(self, module: HyperConnectionModule):
+        super().__init__()
+        self._module_ref = weakref.ref(module)
+
+    def forward(self, x: torch.Tensor, h_pre: torch.Tensor) -> torch.Tensor:
+        module = self._module_ref()
+        assert module is not None
+        return module.aggregate(x, h_pre)
+
+
+@contextmanager
+def _timeline_range(name: str):
+    """Emit both a PyTorch profiler range and an NVTX range."""
+    with torch.profiler.record_function(name), torch.cuda.nvtx.range(name):
+        yield
 
 
 class TestHyperConnectionCheckpoint:
@@ -216,6 +243,202 @@ class TestHyperConnectionCheckpoint:
 
         # Verify gradients match
         assert torch.allclose(grad_hidden_ckpt, grad_hidden_ref, atol=1e-5)
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    def test_te_split_forward_recompute_backward_cuda_graphs(self):
+        """Prove that separate TE graphs can bridge original forward and recompute.
+
+        The original mHC forward writes a fixed output surface A. A captured consumer
+        stages A into its fixed input surface B. After A and B are invalidated, a
+        separate mHC recompute graph overwrites B before the consumer backward graph
+        reads it. Finally, the recompute backward graph consumes the consumer's input
+        gradient. This is the address and scheduling contract required to keep the
+        original forward, recompute forward, and backward in separate CUDA graphs.
+        """
+        from transformer_engine.pytorch.graph import make_graphed_callables
+
+        hidden_size = 16
+        num_streams = 4
+        seq_len = 8
+        batch_size = 2
+        module = self._create_hyper_connection_module(hidden_size, num_streams)
+
+        sample_x = torch.randn(
+            seq_len, batch_size, num_streams * hidden_size, device="cuda", requires_grad=True
+        )
+        sample_h_pre = torch.randn(
+            seq_len, batch_size, num_streams, device="cuda", requires_grad=True
+        )
+
+        # Compile and initialize the production aggregate before CUDA graph capture.
+        warmup = module.aggregate(sample_x, sample_h_pre)
+        torch.autograd.grad(warmup, (sample_x, sample_h_pre), grad_outputs=torch.ones_like(warmup))
+        torch.cuda.synchronize()
+
+        # Capture the recompute forward/backward pair first and expose its fixed
+        # output surface B. Complete the probe backward before the next replay.
+        recompute = _AggregateOnly(module).train()
+        recompute = make_graphed_callables(recompute, (sample_x, sample_h_pre), num_warmup_iters=3)
+        recompute_surface = recompute(sample_x, sample_h_pre)
+        bridge = recompute_surface.detach().requires_grad_(True)
+        torch.autograd.grad(
+            recompute_surface,
+            (sample_x, sample_h_pre),
+            grad_outputs=torch.zeros_like(recompute_surface),
+        )
+        recompute_ptr = bridge.data_ptr()
+
+        # The consumer graph captures B itself as its static input. At runtime,
+        # the TE replay wrapper stages A into B before launching consumer forward,
+        # while the captured backward graph always reads B.
+        consumer = torch.nn.Linear(hidden_size, hidden_size, bias=False, device="cuda")
+        consumer.train()
+        consumer = make_graphed_callables(consumer, (bridge,), num_warmup_iters=3)
+
+        # Capture the original forward independently. It has a distinct graph pool
+        # and fixed output surface A, and does not need a backward graph.
+        original_sample_x = sample_x.detach().clone()
+        original_sample_h_pre = sample_h_pre.detach().clone()
+        original = _AggregateOnly(module).eval()
+        original = make_graphed_callables(
+            original, (original_sample_x, original_sample_h_pre), num_warmup_iters=3
+        )
+        original_surface = original(original_sample_x, original_sample_h_pre)
+        original_ptr = original_surface.data_ptr()
+
+        assert original_ptr != recompute_ptr
+        assert bridge.data_ptr() == recompute_ptr
+
+        # Replaying this graph invalidates both surfaces without touching PyTorch
+        # version counters. A valid schedule must restore B via recompute before BWD.
+        torch.cuda.synchronize()
+        poison_graph = torch.cuda.CUDAGraph()
+        with torch.no_grad(), torch.cuda.graph(poison_graph):
+            original_surface.fill_(float("nan"))
+            bridge.fill_(float("nan"))
+
+        x_data = torch.randn_like(sample_x)
+        h_pre_data = torch.randn_like(sample_h_pre)
+        grad_output = torch.randn(seq_len, batch_size, hidden_size, device="cuda")
+        reference_weight = consumer.weight.detach().clone().requires_grad_(True)
+
+        # Negative control: captured consumer BWD must observe poisoned B when
+        # recompute is intentionally skipped. dW depends on B, while dA does not.
+        negative_a = original(x_data.detach(), h_pre_data.detach())
+        negative_a_leaf = negative_a.detach().requires_grad_(True)
+        negative_output = consumer(negative_a_leaf)
+        torch.testing.assert_close(bridge, negative_a)
+        poison_graph.replay()
+        negative_d_a, negative_d_weight = torch.autograd.grad(
+            negative_output, (negative_a_leaf, consumer.weight), grad_outputs=grad_output
+        )
+        assert torch.isfinite(negative_d_a).all()
+        assert torch.isnan(negative_d_weight).all()
+
+        def run_split_graph_chain():
+            runtime_x = x_data.detach().clone().requires_grad_(True)
+            runtime_h_pre = h_pre_data.detach().clone().requires_grad_(True)
+
+            with _timeline_range("01_ORIGINAL_FWD_GRAPH_A"):
+                original_output = original(x_data.detach(), h_pre_data.detach())
+            original_leaf = original_output.detach().requires_grad_(True)
+
+            with _timeline_range("02_TE_CONSUMER_FWD_A_TO_B"):
+                consumer_output = consumer(original_leaf)
+
+            with _timeline_range("03_INVALIDATE_A_AND_B"):
+                poison_graph.replay()
+
+            with _timeline_range("04_RECOMPUTE_FWD_GRAPH_B"):
+                recompute_output = recompute(runtime_x, runtime_h_pre)
+
+            with _timeline_range("05_TE_CONSUMER_BWD_READ_B"):
+                d_a, d_weight = torch.autograd.grad(
+                    consumer_output, (original_leaf, consumer.weight), grad_outputs=grad_output
+                )
+
+            with _timeline_range("06_RECOMPUTE_BWD_GRAPH"):
+                d_x, d_h_pre = torch.autograd.grad(
+                    recompute_output, (runtime_x, runtime_h_pre), grad_outputs=d_a
+                )
+
+            return {
+                "original_output": original_output,
+                "consumer_output": consumer_output,
+                "recompute_output": recompute_output,
+                "d_a": d_a,
+                "d_weight": d_weight,
+                "d_x": d_x,
+                "d_h_pre": d_h_pre,
+            }
+
+        actual = run_split_graph_chain()
+
+        # Build an eager reference without calling consumer.forward, which TE replaces
+        # in place with its graphed wrapper.
+        reference_x = x_data.detach().clone().requires_grad_(True)
+        reference_h_pre = h_pre_data.detach().clone().requires_grad_(True)
+        reference_a = module.aggregate(reference_x, reference_h_pre)
+        reference_output = F.linear(reference_a, reference_weight)
+        reference_d_a, reference_d_weight = torch.autograd.grad(
+            reference_output,
+            (reference_a, reference_weight),
+            grad_outputs=grad_output,
+            retain_graph=True,
+        )
+        reference_d_x, reference_d_h_pre = torch.autograd.grad(
+            reference_a, (reference_x, reference_h_pre), grad_outputs=reference_d_a
+        )
+
+        expected = {
+            "consumer_output": reference_output,
+            "recompute_output": reference_a,
+            "d_a": reference_d_a,
+            "d_weight": reference_d_weight,
+            "d_x": reference_d_x,
+            "d_h_pre": reference_d_h_pre,
+        }
+        max_abs_errors = {}
+        for name, expected_tensor in expected.items():
+            actual_tensor = actual[name]
+            torch.testing.assert_close(actual_tensor, expected_tensor, atol=1e-5, rtol=1e-5)
+            max_abs_errors[name] = (actual_tensor - expected_tensor).abs().max().item()
+
+        assert actual["original_output"].data_ptr() == original_ptr
+        assert actual["recompute_output"].data_ptr() == recompute_ptr
+        assert torch.isnan(actual["original_output"]).all()
+        assert torch.isfinite(actual["recompute_output"]).all()
+
+        trace_path = os.environ.get("MHC_SPLIT_CUDAGRAPH_TRACE")
+        if trace_path:
+            trace_file = Path(trace_path)
+            trace_file.parent.mkdir(parents=True, exist_ok=True)
+            torch.cuda.synchronize()
+            with torch.profiler.profile(
+                activities=[
+                    torch.profiler.ProfilerActivity.CPU,
+                    torch.profiler.ProfilerActivity.CUDA,
+                ],
+                record_shapes=True,
+            ) as profiler:
+                traced = run_split_graph_chain()
+                torch.cuda.synchronize()
+            profiler.export_chrome_trace(str(trace_file))
+            assert traced["original_output"].data_ptr() == original_ptr
+            assert traced["recompute_output"].data_ptr() == recompute_ptr
+            assert torch.isnan(traced["original_output"]).all()
+            for name, expected_tensor in expected.items():
+                torch.testing.assert_close(traced[name], expected_tensor, atol=1e-5, rtol=1e-5)
+
+        proof = {
+            "original_output_ptr": original_ptr,
+            "recompute_output_ptr": recompute_ptr,
+            "pointers_are_distinct": original_ptr != recompute_ptr,
+            "negative_control_weight_grad_is_nan": True,
+            "max_abs_errors": max_abs_errors,
+            "trace_path": trace_path,
+        }
+        print(f"MHC_SPLIT_CUDAGRAPH_PROOF={json.dumps(proof, sort_keys=True)}")
 
 
 class TestMHCBlockRecomputeIntegration:
