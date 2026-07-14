@@ -430,8 +430,9 @@ class TestHyperConnectionCheckpoint:
                 ],
                 record_shapes=True,
             ) as profiler:
-                traced = run_split_graph_chain()
-                torch.cuda.synchronize()
+                with torch.profiler.record_function("ProfilerStep#0"):
+                    traced = run_split_graph_chain()
+                    torch.cuda.synchronize()
             profiler.export_chrome_trace(str(trace_file))
             assert traced["original_output"].data_ptr() == original_ptr
             assert traced["recompute_output"].data_ptr() == recompute_ptr
