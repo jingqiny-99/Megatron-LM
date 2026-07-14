@@ -263,17 +263,26 @@ class TestHyperConnectionCheckpoint:
         batch_size = 2
         module = self._create_hyper_connection_module(hidden_size, num_streams)
 
+        # Compile and initialize the production aggregate with disposable tensors.
+        # Reusing these leaves for capture would retain default-stream AccumulateGrad
+        # nodes and make the TE backward capture depend on the legacy stream.
+        warmup_x = torch.randn(
+            seq_len, batch_size, num_streams * hidden_size, device="cuda", requires_grad=True
+        )
+        warmup_h_pre = torch.randn(
+            seq_len, batch_size, num_streams, device="cuda", requires_grad=True
+        )
+        warmup = module.aggregate(warmup_x, warmup_h_pre)
+        torch.autograd.grad(warmup, (warmup_x, warmup_h_pre), grad_outputs=torch.ones_like(warmup))
+        del warmup, warmup_x, warmup_h_pre
+        torch.cuda.synchronize()
+
         sample_x = torch.randn(
             seq_len, batch_size, num_streams * hidden_size, device="cuda", requires_grad=True
         )
         sample_h_pre = torch.randn(
             seq_len, batch_size, num_streams, device="cuda", requires_grad=True
         )
-
-        # Compile and initialize the production aggregate before CUDA graph capture.
-        warmup = module.aggregate(sample_x, sample_h_pre)
-        torch.autograd.grad(warmup, (sample_x, sample_h_pre), grad_outputs=torch.ones_like(warmup))
-        torch.cuda.synchronize()
 
         # Capture the recompute forward/backward pair first and expose its fixed
         # output surface B. Complete the probe backward before the next replay.
