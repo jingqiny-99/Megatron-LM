@@ -2856,20 +2856,37 @@ class TransformerConfig(ModelParallelConfig):
             and "mhc" in self.recompute_modules
             and self.cuda_graph_impl != "none"
         ):
-            if self.cuda_graph_impl in ("local", "full_iteration"):
+            if self.cuda_graph_impl == "local":
                 # Intentionally fail-closed even for inference-only local-graph
                 # configs that carry leftover training recompute args: mHC
                 # recompute is inert outside training, but silently accepting
                 # the combination would mask misconfigured training runs.
                 raise ValueError(
-                    f"mHC recompute is not supported with cuda_graph_impl="
-                    f"'{self.cuda_graph_impl}': eager mHC recompute and its per-microbatch "
-                    "checkpoint registration need host execution between captured "
-                    "segments, which only the Transformer Engine partial implementation "
-                    "provides. Use cuda_graph_impl='transformer_engine' with "
-                    "cuda_graph_modules=['attn'], or disable CUDA graphs."
+                    "mHC recompute is not supported with cuda_graph_impl='local': "
+                    "eager mHC recompute and its per-microbatch checkpoint "
+                    "registration need host execution between captured segments, "
+                    "which the local per-layer implementation does not provide. Use "
+                    "cuda_graph_impl='transformer_engine' with "
+                    "cuda_graph_modules=['attn'], cuda_graph_impl='full_iteration' "
+                    "with dropout disabled, or disable CUDA graphs."
                 )
-            if list(self.cuda_graph_modules or []) != [CudaGraphModule.attn] or list(
+            if self.cuda_graph_impl == "full_iteration":
+                # Full-iteration capture records the whole eager iteration —
+                # including mHC checkpoint registration, recompute kernels, and
+                # storage rebinding — into one graph, so replays re-execute the
+                # recompute at fixed addresses by construction (no partial-graph
+                # bridge involved). The one mechanical hazard is RNG-consuming
+                # ops inside a checkpointed region: the recompute-time RNG rewind
+                # cannot run under stream capture, so a captured recompute would
+                # replay a different dropout mask than its captured forward.
+                if self.hidden_dropout != 0.0 or self.attention_dropout != 0.0:
+                    raise ValueError(
+                        "mHC recompute with cuda_graph_impl='full_iteration' requires "
+                        "hidden_dropout=0 and attention_dropout=0: RNG state cannot be "
+                        "rewound inside CUDA graph capture, so a captured recompute "
+                        "would replay a different dropout mask than its forward pass."
+                    )
+            elif list(self.cuda_graph_modules or []) != [CudaGraphModule.attn] or list(
                 self.recompute_modules
             ) != ["mhc"]:
                 raise ValueError(
@@ -2880,8 +2897,8 @@ class TransformerConfig(ModelParallelConfig):
                 )
             if self.virtual_pipeline_model_parallel_size is not None:
                 raise ValueError(
-                    "mHC recompute with attention-only TE CUDA Graphs has not been "
-                    "validated with interleaved pipeline (VPP) schedules: graph-slot "
+                    "mHC recompute with CUDA Graphs has not been validated with "
+                    "interleaved pipeline (VPP) schedules: graph and recompute "
                     "lifetimes are only proven for non-interleaved 1F1B. Disable "
                     "virtual pipeline or CUDA graphs."
                 )

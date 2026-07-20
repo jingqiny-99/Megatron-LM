@@ -21,6 +21,7 @@ from megatron.core.tensor_parallel.random import (
     CheckpointManager,
     CheckpointWithoutOutput,
     CudaGraphCheckpointBridge,
+    get_all_rng_states,
     get_cuda_rng_tracker,
     model_parallel_cuda_manual_seed,
 )
@@ -618,11 +619,46 @@ class TestTransformerConfigRecomputeMhc:
                 )
             )
 
-    def test_config_rejects_full_iteration_impl_with_mhc_recompute(self):
-        with pytest.raises(ValueError, match="cuda_graph_impl='full_iteration'"):
+    def test_config_accepts_full_iteration_with_mhc_recompute_and_no_dropout(self):
+        """Full-iteration capture swallows the eager recompute; dropout=0 is the gate."""
+        config = TransformerConfig(
+            **self._mhc_recompute_config_kwargs(
+                cuda_graph_impl="full_iteration",
+                cuda_graph_modules=[],
+                hidden_dropout=0.0,
+                attention_dropout=0.0,
+            )
+        )
+        assert config.cuda_graph_impl == "full_iteration"
+
+    @pytest.mark.parametrize(
+        "dropout_kwargs",
+        [
+            {"hidden_dropout": 0.1, "attention_dropout": 0.0},
+            {"hidden_dropout": 0.0, "attention_dropout": 0.1},
+        ],
+    )
+    def test_config_rejects_full_iteration_mhc_recompute_with_dropout(self, dropout_kwargs):
+        """RNG cannot be rewound inside capture, so dropout>0 must fail closed."""
+        with pytest.raises(ValueError, match="requires hidden_dropout=0"):
             TransformerConfig(
                 **self._mhc_recompute_config_kwargs(
-                    cuda_graph_impl="full_iteration", cuda_graph_modules=[]
+                    cuda_graph_impl="full_iteration", cuda_graph_modules=[], **dropout_kwargs
+                )
+            )
+
+    def test_config_rejects_full_iteration_mhc_recompute_with_vpp(self):
+        with pytest.raises(ValueError, match="interleaved pipeline"):
+            TransformerConfig(
+                **self._mhc_recompute_config_kwargs(
+                    num_layers=4,
+                    cuda_graph_impl="full_iteration",
+                    cuda_graph_modules=[],
+                    hidden_dropout=0.0,
+                    attention_dropout=0.0,
+                    pipeline_model_parallel_size=2,
+                    virtual_pipeline_model_parallel_size=2,
+                    pipeline_dtype=torch.bfloat16,
                 )
             )
 
@@ -801,6 +837,107 @@ class TestCheckpointRngReplay:
                 return F.dropout(value * 3.0, p=0.5, training=True)
 
         self._roundtrip(run_function)
+
+
+class TestCheckpointRecomputeUnderFullGraphCapture:
+    """Full-graph capture must swallow eager mHC recompute wholesale.
+
+    With ``cuda_graph_impl="full_iteration"`` the whole iteration — including
+    mHC checkpoint registration, the storage discard, the backward-time eager
+    recompute, and the storage rebind — is recorded into one CUDA graph, so
+    replays re-execute the recompute at fixed addresses by construction (no
+    partial-graph bridge involved). These tests mirror FullCudaGraphWrapper
+    mechanics (side-stream warmup, registered graph-safe RNG states, static
+    input buffers) around a checkpointed mHC forward+backward and compare
+    replayed gradients against eager references on fresh data.
+    """
+
+    def setup_method(self, method):
+        Utils.initialize_model_parallel(1, 1)
+        model_parallel_cuda_manual_seed(123, use_cudagraphable_rng=True, force_reset_rng=True)
+
+    def teardown_method(self, method):
+        Utils.destroy_model_parallel()
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    def test_mhc_checkpoint_recompute_captured_forward_backward_matches_eager(self):
+        hidden_size, num_streams, seq_len, batch = 32, 4, 8, 2
+        config = TransformerConfig(
+            num_layers=2,
+            hidden_size=hidden_size,
+            num_attention_heads=4,
+            use_cpu_initialization=True,
+            enable_hyper_connections=True,
+            num_residual_streams=num_streams,
+            mhc_sinkhorn_iterations=5,
+            mhc_init_gating_factor=0.01,
+        )
+        module = HyperConnectionModule(config=config, layer_number=1).cuda()
+
+        static_x = torch.randn(
+            seq_len, batch, num_streams * hidden_size, device="cuda", requires_grad=True
+        )
+
+        def run_step(x):
+            manager = CheckpointManager()
+            aggregated, _h_res, h_post, _residual = module.forward(x, mhc_recompute_manager=manager)
+            loss = aggregated.square().mean() + h_post.square().mean()
+            manager.discard_all_outputs_and_register_unified_recompute(loss)
+            loss.backward()
+            return loss
+
+        def zero_grads(x):
+            with torch.no_grad():
+                if x.grad is not None:
+                    x.grad.zero_()
+                for p in module.parameters():
+                    if p.grad is not None:
+                        p.grad.zero_()
+
+        # Warmup on a side stream per the torch CUDA-graphs contract; this also
+        # materializes .grad tensors at addresses that stay fixed for capture.
+        side = torch.cuda.Stream()
+        side.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(side):
+            for _ in range(2):
+                zero_grads(static_x)
+                run_step(static_x)
+        torch.cuda.current_stream().wait_stream(side)
+
+        graph = torch.cuda.CUDAGraph()
+        for state in get_all_rng_states().values():
+            if isinstance(state, torch.Generator):
+                graph.register_generator_state(state)
+        zero_grads(static_x)
+        with torch.cuda.graph(graph):
+            static_loss = run_step(static_x)
+
+        for _trial in range(3):
+            fresh = torch.randn_like(static_x)
+
+            # Eager reference with the same weights, same recompute machinery.
+            zero_grads(static_x)
+            ref_x = fresh.detach().clone().requires_grad_(True)
+            ref_loss_t = run_step(ref_x)
+            ref_loss = ref_loss_t.detach().clone()
+            ref_x_grad = ref_x.grad.detach().clone()
+            ref_param_grads = [
+                p.grad.detach().clone() for p in module.parameters() if p.grad is not None
+            ]
+
+            # Captured replay on the same fresh data.
+            zero_grads(static_x)
+            with torch.no_grad():
+                static_x.copy_(fresh)
+            graph.replay()
+            torch.cuda.synchronize()
+
+            torch.testing.assert_close(static_loss, ref_loss)
+            torch.testing.assert_close(static_x.grad, ref_x_grad)
+            replay_param_grads = [p.grad for p in module.parameters() if p.grad is not None]
+            assert len(replay_param_grads) == len(ref_param_grads)
+            for got, want in zip(replay_param_grads, ref_param_grads):
+                torch.testing.assert_close(got, want)
 
 
 if __name__ == "__main__":
