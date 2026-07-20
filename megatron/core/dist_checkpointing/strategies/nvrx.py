@@ -41,9 +41,13 @@ def has_nvrx_async_support() -> bool:
         getattr(state_dict_saver, "save_state_dict_async_finalize", None),
         getattr(state_dict_saver, "save_state_dict_async_plan", None),
     )
-    assert (
-        is_nvrx_min_version()
-    ), f"Minimum required nvidia-resiliency-ext package version is {NVRX_MIN_VERSION}."
+    # An availability probe must degrade gracefully: this runs at import time
+    # (torch.py evaluates HAVE_NVRX on module import), so raising here makes
+    # every environment with an older nvidia-resiliency-ext unable to start,
+    # even when nothing uses the NVRx async strategy. Callers that *require*
+    # NVRx still fail explicitly through get_async_strategy's import errors.
+    if not is_nvrx_min_version():
+        return False
 
     return all(symbol is not None for symbol in required_symbols) and hasattr(
         filesystem_async, "_results_queue"
