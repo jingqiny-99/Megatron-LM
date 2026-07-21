@@ -28,6 +28,7 @@ from megatron.core.tensor_parallel.random import (
 from megatron.core.transformer.enums import CudaGraphModule
 from megatron.core.transformer.hyper_connection import HyperConnectionModule
 from megatron.core.transformer.transformer_config import TransformerConfig
+from megatron.core.utils import is_torch_min_version
 from tests.unit_tests.test_utilities import Utils
 
 
@@ -590,6 +591,50 @@ class TestTransformerConfigRecomputeMhc:
         )
         base.update(extra)
         return base
+
+    @staticmethod
+    def _mhc_overlap_config_kwargs(**extra):
+        base = dict(
+            num_layers=2,
+            hidden_size=64,
+            num_attention_heads=4,
+            enable_hyper_connections=True,
+            num_residual_streams=4,
+            recompute_modules=["mhc"],
+            recompute_granularity="selective",
+            num_moe_experts=8,
+            moe_token_dispatcher_type="alltoall",
+            expert_model_parallel_size=8,
+            overlap_moe_expert_parallel_comm=True,
+            add_bias_linear=False,
+            bf16=True,
+            pipeline_dtype=torch.bfloat16,
+        )
+        base.update(extra)
+        return base
+
+    def test_config_accepts_attention_split_with_ep_overlap(self):
+        """mHC recompute + attn TE CUDA graph composes with EP a2a overlap."""
+        if not is_torch_min_version("2.6.0"):
+            pytest.skip("EP a2a overlap requires torch >= 2.6.0")
+        config = TransformerConfig(
+            **self._mhc_overlap_config_kwargs(
+                cuda_graph_impl="transformer_engine", cuda_graph_modules=[CudaGraphModule.attn]
+            )
+        )
+        assert config.cuda_graph_modules == [CudaGraphModule.attn]
+        assert config.overlap_moe_expert_parallel_comm is True
+
+    def test_config_rejects_ep_overlap_with_local_cuda_graph(self):
+        """Only the TE attention-only split is exempt; local impl stays rejected."""
+        if not is_torch_min_version("2.6.0"):
+            pytest.skip("EP a2a overlap requires torch >= 2.6.0")
+        with pytest.raises(ValueError, match="overlap_moe_expert_parallel_comm requires"):
+            TransformerConfig(
+                **self._mhc_overlap_config_kwargs(
+                    cuda_graph_impl="local", cuda_graph_modules=[CudaGraphModule.attn]
+                )
+            )
 
     @pytest.mark.parametrize("modules", ["attn", ["attn"]])
     def test_config_accepts_string_module_forms_for_attention_split(self, modules):

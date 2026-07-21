@@ -1909,10 +1909,14 @@ class HyperConnectionTransformerLayer(TransformerLayer):
             return
 
         unsupported = []
-        if self.is_moe_layer:
-            unsupported.append("MoE layers")
-        if self.config.overlap_moe_expert_parallel_comm:
-            unsupported.append("EP overlap")
+        # Two validated modalities share the attention-only split capture:
+        #  - dense BF16 non-interleaved 1F1B (no MoE, no overlap), and
+        #  - MoE + EP a2a overlap, where the split feeds the fine-grained
+        #    schedule (see _te_cuda_graph_replay_mhc_attention_split_overlap).
+        # A MoE layer is only supported under overlap; a non-overlap MoE layer
+        # would replay the whole MoE synchronously via the dense split tail.
+        if self.is_moe_layer and not self.config.overlap_moe_expert_parallel_comm:
+            unsupported.append("MoE layers without EP overlap")
         if self.config.fp8 or self.config.fp4:
             unsupported.append("FP8/FP4")
         if not self.config.bf16:
@@ -2404,8 +2408,17 @@ class HyperConnectionTransformerLayer(TransformerLayer):
         )
         return output
 
-    def _te_cuda_graph_replay_mhc_attention_split(self, args, kwargs, context):
-        """Replay captured attention between eager mHC pre/post operations."""
+    def _replay_mhc_attention_consumer(self, args, kwargs, context):
+        """Eager mHC aggregate -> captured attention replay -> eager post-BDA.
+
+        Shared head of the attention-only split for both the dense 1F1B path and
+        the EP-overlap path. Builds the fixed-address bridge, runs the eager mHC
+        aggregate (which registers its checkpoint against the recompute manager
+        and stages values into the captured static input), replays the captured
+        input-layernorm + self-attention graph, and runs the eager self-attention
+        mHC post-processing. Returns the post-attention hidden state, the cross-
+        attention context, and the recompute manager for the caller's MLP tail.
+        """
         kwargs = kwargs.copy()
         if len(args) > 1:
             raise ValueError(
@@ -2484,6 +2497,13 @@ class HyperConnectionTransformerLayer(TransformerLayer):
             inference_context=kwargs.get("inference_context"),
             mhc_recompute_manager=mhc_recompute_manager,
         )
+        return hidden_states, context, mhc_recompute_manager, kwargs
+
+    def _te_cuda_graph_replay_mhc_attention_split(self, args, kwargs, context):
+        """Replay captured attention between eager mHC pre/post operations."""
+        hidden_states, context, mhc_recompute_manager, kwargs = (
+            self._replay_mhc_attention_consumer(args, kwargs, context)
+        )
         output = self._forward_mlp(
             hidden_states,
             inference_context=kwargs.get("inference_context"),
@@ -2493,6 +2513,67 @@ class HyperConnectionTransformerLayer(TransformerLayer):
             mhc_recompute_manager=mhc_recompute_manager,
         )
         return output, context
+
+    def _te_cuda_graph_replay_mhc_attention_split_overlap(self, args, kwargs, context):
+        """Attention-only split replay for the EP a2a-overlap schedule.
+
+        Shares the bridge/attention head with the dense path, then—instead of
+        running the whole MLP synchronously—emits the MoE preprocessing tail
+        (mHC MLP aggregate, pre-MLP layernorm checkpoint, shared-expert compute,
+        routing, dispatch preprocess) so the fine-grained schedule can overlap
+        dispatch/experts/combine. The return contract matches the eager mHC-MoE
+        callable in fine_grained_callables.submodule_attn_forward.
+        """
+        hidden_states, _context, mhc_recompute_manager, _kwargs = (
+            self._replay_mhc_attention_consumer(args, kwargs, context)
+        )
+        if not self.is_moe_layer:
+            # Dense hyper-connection layers coexist with MoE ones under overlap;
+            # they carry no MoE tail (mirror of the eager non-MoE early return).
+            return hidden_states, None, None, None
+
+        nvtx_range_push(suffix="mlp_hyper_connection")
+        hidden_states, mlp_h_res, mlp_hc_h_post, residual = self.mlp_hyper_connection(
+            hidden_states, mhc_recompute_manager=mhc_recompute_manager
+        )
+        nvtx_range_pop(suffix="mlp_hyper_connection")
+
+        checkpoint_pre_mlp_layernorm = self.recompute_pre_mlp_layernorm or (
+            mhc_recompute_manager is not None and self.mhc_checkpoint_pre_mlp_layernorm
+        )
+        if checkpoint_pre_mlp_layernorm:
+            self.pre_mlp_norm_checkpoint = tensor_parallel.CheckpointWithoutOutput(
+                ckpt_manager=mhc_recompute_manager
+            )
+            pre_mlp_layernorm_output = self.pre_mlp_norm_checkpoint.checkpoint(
+                apply_module(self.pre_mlp_layernorm), hidden_states
+            )
+        else:
+            pre_mlp_layernorm_output = apply_module(self.pre_mlp_layernorm)(hidden_states)
+
+        # Fused residual norm (e.g. TEFusedResidualRMSNorm) returns (output,
+        # residual); the mHC residual comes from mlp_hyper_connection, so the
+        # fused residual is dropped here to match the eager mHC-MoE tail.
+        if isinstance(pre_mlp_layernorm_output, tuple):
+            if len(pre_mlp_layernorm_output) != 2:
+                raise ValueError(
+                    "When the output of pre_mlp_layernorm is a tuple, it is expected to "
+                    f"have 2 elements (output, residual), but got "
+                    f"{len(pre_mlp_layernorm_output)}"
+                )
+            pre_mlp_layernorm_output, _ = pre_mlp_layernorm_output
+
+        shared_expert_output = self.mlp.shared_experts_compute(pre_mlp_layernorm_output)
+        probs, routing_map = self.mlp.route(pre_mlp_layernorm_output)
+        local_tokens, probs = self.mlp.preprocess(pre_mlp_layernorm_output, probs, routing_map)
+        return (
+            residual,
+            local_tokens,
+            probs,
+            shared_expert_output,
+            mlp_h_res,
+            mlp_hc_h_post,
+        )
 
     def _te_cuda_graph_replay_impl(self, args, kwargs, context):
         """Implementation of _te_cuda_graph_replay with hyper connection support.
@@ -2506,6 +2587,10 @@ class HyperConnectionTransformerLayer(TransformerLayer):
         extracts the HC state and uses it for post-processing after resuming the MoE forward.
         """
         if self._uses_mhc_recompute_attn_cuda_graph_split():
+            if self.config.overlap_moe_expert_parallel_comm:
+                return self._te_cuda_graph_replay_mhc_attention_split_overlap(
+                    args, kwargs, context
+                )
             return self._te_cuda_graph_replay_mhc_attention_split(args, kwargs, context)
 
         cuda_graph_output = list(

@@ -581,6 +581,12 @@ def build_transformer_layer_callables(layer: TransformerLayer):
         )
         if using_cuda_graph_replay:
             layer.set_te_cuda_graph_backward_dw_wrapper()
+            # The fine-grained schedule calls _te_cuda_graph_replay directly,
+            # bypassing TransformerLayer.__call__ where _mhc_recompute_manager is
+            # normally set. Thread it here so the attention-only split replay can
+            # build its fixed-address recompute bridge (see
+            # HyperConnectionTransformerLayer._te_cuda_graph_replay_mhc_attention_split_overlap).
+            layer._mhc_recompute_manager = mhc_recompute_manager
             forward_func = layer._te_cuda_graph_replay
         else:
             # wrapper function that keeps consistent api with cuda graph replay

@@ -2150,16 +2150,34 @@ class TransformerConfig(ModelParallelConfig):
         # enable_cuda_graph/external_cuda_graph migration, so that string module
         # forms and legacy flags reach the same gate.
 
+        # The attention-only Transformer Engine split keeps the mHC producer and
+        # its checkpoint registration eager per microbatch (only input-layernorm
+        # + self-attention are captured), so it composes with EP a2a overlap:
+        # the captured attention backward reads the fixed bridge that the
+        # group-end recompute node materializes. Every other CUDA-graph form
+        # (local, full_iteration, whole-MLP/MoE capture, deprecated flags) still
+        # collides with the eager group replay and stays rejected.
+        is_te_attn_split = (
+            self.cuda_graph_impl == "transformer_engine"
+            and not self.enable_cuda_graph
+            and not self.external_cuda_graph
+            and list(self.cuda_graph_modules or []) == [CudaGraphModule.attn]
+            and list(self.recompute_modules) == ["mhc"]
+        )
         if (
             self.overlap_moe_expert_parallel_comm
             and use_mhc_recompute
+            and not is_te_attn_split
             and (
                 self.cuda_graph_impl != "none" or self.enable_cuda_graph or self.external_cuda_graph
             )
         ):
             raise ValueError(
                 "mHC recompute with overlap_moe_expert_parallel_comm requires CUDA graphs "
-                "to be disabled because explicit group replay is eager-only."
+                "to be disabled, except for the attention-only Transformer Engine split "
+                "(cuda_graph_impl='transformer_engine', cuda_graph_modules=[attn], "
+                "recompute_modules=[mhc]), because the explicit group replay is otherwise "
+                "eager-only."
             )
 
         if self.mhc_post_on_compute_stream:
