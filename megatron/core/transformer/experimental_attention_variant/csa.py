@@ -2360,6 +2360,7 @@ class CompressedSparseAttention(MegatronModule):
 
             if indexer is not None:
                 # ---- Step 4: optional indexer compressed path -----------------
+                nvtx_range_push("IndexerForward")
                 indexer_x, indexer_qr = x.detach(), qr.detach()
                 if indexer_x.shape[1] != 1:
                     raise RuntimeError(
@@ -2418,6 +2419,7 @@ class CompressedSparseAttention(MegatronModule):
                 )
                 # Each top-k entry is still a logical compressed id within that
                 # query's sequence here.
+                nvtx_range_push("IndexerScore")
                 compressed_topk, indexer_layout = cp_utils.compute_cp_indexer_topk(
                     q_indexer_cp,
                     weights_indexer_cp,
@@ -2431,6 +2433,8 @@ class CompressedSparseAttention(MegatronModule):
                     max_seqlen_q=max_seqlen_q,
                     use_fused=self.apply_dsa_kernel_fusion,
                 )
+                nvtx_range_pop("IndexerScore")
+                nvtx_range_pop("IndexerForward")
 
             # ---- Step 5: attention compressed KV path -------------------------
             compressed_kv_local, _ = self.compressor._forward_thd(
