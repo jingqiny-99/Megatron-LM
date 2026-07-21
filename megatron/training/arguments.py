@@ -1609,6 +1609,16 @@ def validate_args(args, defaults={}):
             f"to {args.data_parallel_size * args.context_parallel_size}."
         )
 
+    # DSv4 hybrid attention requires the contiguous CP partition (its indexer and
+    # sparse-attention kernels assume rank r owns global rows [r*L, (r+1)*L)). There
+    # is no CLI arg for cp_partition_mode, so auto-derive it here; the generic field
+    # loop in core_transformer_config_from_args then carries it into TransformerConfig
+    # so its __post_init__ check ("DSv4 Hybrid with CP requires contiguous") passes.
+    if getattr(args, 'experimental_attention_variant', None) == 'dsv4_hybrid' and (
+        args.context_parallel_size > 1 or getattr(args, 'dynamic_context_parallel', False)
+    ):
+        args.cp_partition_mode = 'contiguous'
+
     if getattr(args, 'pad_packed_seq_alignment', None) is not None:
         args.pad_packed_seq_alignment = _parse_pad_packed_seq_alignment(
             args.pad_packed_seq_alignment
