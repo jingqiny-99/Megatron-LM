@@ -1927,7 +1927,15 @@ class HyperConnectionTransformerLayer(TransformerLayer):
             unsupported.append("delayed weight-gradient compute")
         if self._is_thd_cuda_graph():
             unsupported.append("THD/packed-sequence CUDA Graphs")
-        if not isinstance(self.input_layernorm, IdentityOp):
+        # A non-fused (real) input layernorm is captured inside the attention
+        # graph and recomputed by the graph's own backward, so it composes with
+        # the split. The dense non-interleaved 1F1B path was only validated with
+        # a fused (IdentityOp) input layernorm, so it stays restricted; the
+        # EP-overlap modality (e.g. MLA, where both dense and MoE hyper-connection
+        # layers carry a real input layernorm) is validated end to end.
+        if not isinstance(
+            self.input_layernorm, IdentityOp
+        ) and not self.config.overlap_moe_expert_parallel_comm:
             unsupported.append("an unfused input layernorm")
         if not isinstance(self.cross_attention, IdentityOp):
             unsupported.append("cross-attention")
