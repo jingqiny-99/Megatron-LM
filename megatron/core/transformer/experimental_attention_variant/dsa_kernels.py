@@ -250,7 +250,7 @@ def run_fused_dsa_attention(
     local_packed_cp_query_start: int = 0,
     local_packed_cp_query_len: Optional[int] = None,
     pg_collection: Optional[ProcessGroupCollection] = None,
-) -> Optional[Tuple[Tensor, Tensor]]:
+) -> Optional[Tuple[Tensor, Tensor, Tensor, Tensor]]:
     """Optional full fused DSA hook for backends that fuse indexer and attention together."""
     fn = _resolve_fused_hook(config, "run_fused_dsa_attention")
     if fn is None:

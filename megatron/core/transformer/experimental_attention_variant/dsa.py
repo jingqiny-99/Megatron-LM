@@ -2186,7 +2186,10 @@ class DSAttention(MegatronModule):
             )
 
         fused_output = None
-        if use_fused_kernels and not self.index_share:
+        # Sharing only requires that SKIP layers get their top-k from somewhere; a layer
+        # that computes its own has no reason to be excluded from the fused path. The
+        # fused Function now returns its top-k so computing layers can publish it.
+        if use_fused_kernels and computes_topk:
             assert q is not None and k is not None and weights is not None
             fused_output = dsa_kernels.run_fused_dsa_attention(
                 config=self.config,
@@ -2220,7 +2223,12 @@ class DSAttention(MegatronModule):
                 pg_collection=self.pg_collection,
             )
         if fused_output is not None:
-            output, indexer_loss = fused_output
+            output, indexer_loss, fused_topk_indices, fused_topk_length = fused_output
+            if self.index_share and computes_topk:
+                assert topk_holder is not None
+                topk_holder[self.layer_number] = fused_topk_indices
+                if topk_length_holder is not None and fused_topk_length is not None:
+                    topk_length_holder[self.layer_number] = fused_topk_length
             if use_indexer_loss:
                 if indexer_loss is None:
                     raise RuntimeError("Fused DSA attention did not produce a valid indexer loss.")

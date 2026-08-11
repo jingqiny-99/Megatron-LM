@@ -274,7 +274,7 @@ def run_fused_dsa_attention(
             "packed_cp_size": cp_size,
         }
 
-    output, indexer_loss = fused_indexer_sparse_attn(
+    output, indexer_loss, topk_indices_share, topk_length_share = fused_indexer_sparse_attn(
         query.contiguous(),
         kv_full,
         q_indexer.contiguous(),
@@ -301,7 +301,7 @@ def run_fused_dsa_attention(
 
     output = output.view(sq, b, num_heads, latent_v_channels)
     output = torch.einsum("sbhc,hdc->sbhd", output, up_v_weight).contiguous()
-    return output.view(sq, b, -1), indexer_loss
+    return output.view(sq, b, -1), indexer_loss, topk_indices_share, topk_length_share
 
 
 def _ensure_flash_mla() -> None:
@@ -2292,6 +2292,14 @@ class FusedIndexerSparseAttnFunc(torch.autograd.Function):
             precomputed_grad_k_indexer = None
             precomputed_grad_weights = None
 
+        # Share-ready top-k. The holder is filled by the split path with the
+        # attention form (compacted + index-sorted), so produce the same form here
+        # rather than the raw _cmp indices this Function consumes internally.
+        topk_indices_share, topk_length_share = _prepare_attention_topk_indices(
+            topk_indices_cmp, kv_full.size(0)
+        )
+        ctx.mark_non_differentiable(topk_indices_share, topk_length_share)
+
         ctx.save_for_backward(
             q_flat,
             kv_flat,
@@ -2320,10 +2328,11 @@ class FusedIndexerSparseAttnFunc(torch.autograd.Function):
         )
 
         output = out_flat.reshape(sq, b, num_heads, d_v).reshape(sq, b, num_heads * d_v)
-        return output, indexer_loss
+        return output, indexer_loss, topk_indices_share, topk_length_share
 
     @staticmethod
-    def backward(ctx, grad_output, grad_loss):
+    def backward(ctx, grad_output, grad_loss, grad_topk_indices, grad_topk_length):
+        del grad_topk_indices, grad_topk_length
         """Backward: sparse attention bwd + scale pre-computed indexer grads."""
         (
             q_flat,
