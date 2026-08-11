@@ -2185,6 +2185,14 @@ class DSAttention(MegatronModule):
                 self.config.dsa_indexer_scoring_relu,
             )
 
+        fused_bounds_for_diag = None
+        if use_fused_kernels and computes_topk and q is not None:
+            fused_bounds_for_diag = dsa_masking.build_fused_indexer_varlen_bounds(
+                sq=sq, skv=skv, device=q.device, mask=float_mask,
+                varlen_starts=varlen_starts, varlen_ends=varlen_ends,
+                key_positions=key_positions,
+            )
+
         fused_output = None
         # Sharing only requires that SKIP layers get their top-k from somewhere; a layer
         # that computes its own has no reason to be excluded from the fused path. The
@@ -2226,6 +2234,29 @@ class DSAttention(MegatronModule):
             output, indexer_loss, fused_topk_indices, fused_topk_length = fused_output
             if self.index_share and computes_topk:
                 assert topk_holder is not None
+                # DIAG: recompute the split-path top-k and compare, to prove the
+                # fused Function's shared top-k is substitutable.
+                if fused_bounds_for_diag is not None:
+                    _s, _e = fused_bounds_for_diag
+                    _ref = dsa_kernels.run_fused_qk_topk(
+                        self.config, q, k, weights, self.index_topk, _s, _e,
+                        block_size=8192,
+                        use_relu=self.config.dsa_indexer_scoring_relu,
+                        packed_seq_params=packed_seq_params, cp_size=cp_size,
+                    )
+                    import torch.distributed as _d
+                    _r = _d.get_rank() if (_d.is_available() and _d.is_initialized()) else 0
+                    if _ref is not None and _r == 0:
+                        _ri, _rl = _ref
+                        _same_i = (_ri.shape == fused_topk_indices.shape
+                                   and bool((_ri == fused_topk_indices).all()))
+                        _same_l = (_rl is None or fused_topk_length is None
+                                   or (_rl.shape == fused_topk_length.shape
+                                       and bool((_rl == fused_topk_length).all())))
+                        print(f"[TOPKPARITY] layer={self.layer_number} "
+                              f"indices_match={_same_i} lengths_match={_same_l} "
+                              f"fused_shape={tuple(fused_topk_indices.shape)} "
+                              f"ref_shape={tuple(_ri.shape)}", flush=True)
                 topk_holder[self.layer_number] = fused_topk_indices
                 if topk_length_holder is not None and fused_topk_length is not None:
                     topk_length_holder[self.layer_number] = fused_topk_length
