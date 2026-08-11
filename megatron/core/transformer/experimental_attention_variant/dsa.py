@@ -2253,8 +2253,24 @@ class DSAttention(MegatronModule):
                         _same_l = (_rl is None or fused_topk_length is None
                                    or (_rl.shape == fused_topk_length.shape
                                        and bool((_rl == fused_topk_length).all())))
+                        # Quantify: is the difference pure ordering (harmless,
+                        # same selected set) or genuinely different elements?
+                        _nel = _ri.numel()
+                        _pos_diff = int((_ri != fused_topk_indices).sum()) \
+                            if _ri.shape == fused_topk_indices.shape else -1
+                        _a = torch.sort(_ri.flatten(-1).long(), dim=-1).values
+                        _b = torch.sort(fused_topk_indices.flatten(-1).long(), dim=-1).values
+                        _set_same = bool((_a == _b).all()) if _a.shape == _b.shape else False
+                        _set_diff = int((_a != _b).sum()) if _a.shape == _b.shape else -1
+                        _rows = _a.reshape(-1, _a.shape[-1])
+                        _rb = _b.reshape(-1, _b.shape[-1])
+                        _bad_rows = int((_rows != _rb).any(dim=-1).sum()) \
+                            if _rows.shape == _rb.shape else -1
                         print(f"[TOPKPARITY] layer={self.layer_number} "
                               f"indices_match={_same_i} lengths_match={_same_l} "
+                              f"set_same={_set_same} nel={_nel} "
+                              f"pos_diff={_pos_diff} set_diff={_set_diff} "
+                              f"bad_rows={_bad_rows}/{_rows.shape[0]} "
                               f"fused_shape={tuple(fused_topk_indices.shape)} "
                               f"ref_shape={tuple(_ri.shape)}", flush=True)
                 topk_holder[self.layer_number] = fused_topk_indices
