@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import functools
+import os
 from typing import TYPE_CHECKING, Optional, Protocol, Tuple
 
 import torch
@@ -2148,6 +2149,9 @@ def _run_sparse_attention_forward(
     return out_flat, lse, q_flat, kv_flat, attn_sink, global_idxs_for_bwd, topk_length_flat
 
 
+_DEBUG_ASSERT_ROWS_NONEMPTY = bool(int(os.environ.get("DSA_DEBUG_ASSERT_ROWS", "0")))
+
+
 def _run_sparse_attention_backward(
     *,
     q_flat: Tensor,
@@ -2195,6 +2199,15 @@ def _run_sparse_attention_backward(
         bwd_attn_sink[:num_heads] = attn_sink
 
     _ensure_dsa_namespace()
+    if all_rows_nonempty and _DEBUG_ASSERT_ROWS_NONEMPTY:
+        # Opt-in check: the fast path assumes every row selects at least one key.
+        # Off by default because it costs the very sync the fast path removes.
+        empty_rows = int((topk_length <= 0).sum())
+        if empty_rows:
+            raise RuntimeError(
+                f"sparse-attn backward fast path saw {empty_rows} empty rows; "
+                "the caller reported all rows non-empty"
+            )
     if all_rows_nonempty:
         attn_bwd = _cudnn_dsa.sparse_attention_backward_wrapper(
             bwd_q_flat,
@@ -2437,9 +2450,15 @@ class FusedIndexerSparseAttnFunc(torch.autograd.Function):
         ctx.num_heads = num_heads
         ctx.d = d
         ctx.skv = skv
+        # A row selects zero keys only where the query itself is padding, which
+        # query_valid_rows marks; under a causal mask every real row can attend to at
+        # least itself. Requiring use_local_indexer_varlen on top of that excluded
+        # non-packed causal runs from the fast path for no reason, and the compaction
+        # they fell back to costs a torch.nonzero -- a data-dependent output shape, so
+        # a device-to-host sync -- twice per step. Measured at THD 32K / CP16 the
+        # compaction never dropped a row: empty=0/2048 on every call.
         ctx.all_sparse_bwd_rows_nonempty = (
             query_valid_rows is None
-            and use_local_indexer_varlen
             and varlen_starts is not None
             and varlen_ends is not None
             and key_positions is None
