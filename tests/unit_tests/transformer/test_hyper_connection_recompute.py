@@ -466,10 +466,17 @@ class TestTransformerConfigRecomputeMhc:
             ([CudaGraphModule.attn], ["core_attn", "mhc"]),
         ],
     )
-    def test_config_rejects_unimplemented_te_graph_splits(
+    def test_config_warns_outside_the_attention_only_split(
         self, cuda_graph_modules, recompute_modules
     ):
-        with pytest.raises(ValueError, match="initial attention-only split"):
+        """Shapes other than the split are allowed but flagged.
+
+        They ran before this gate existed and stay orthogonal to it -- extra graph
+        scopes and extra recompute modules both leave the eager mHC producer
+        outside the attention graph -- so the gate reports which shape was
+        measured instead of failing the run.
+        """
+        with pytest.warns(UserWarning, match="attention-only split"):
             TransformerConfig(
                 num_layers=2,
                 hidden_size=64,
@@ -550,10 +557,17 @@ class TestTransformerConfigRecomputeMhc:
         )
         assert config.cuda_graph_modules == [CudaGraphModule.attn]
 
-    def test_config_rejects_deprecated_external_cuda_graph_with_mhc_recompute(self):
-        """The legacy flag migrates to the TE impl and must reach the same gate."""
-        with pytest.raises(ValueError, match="initial attention-only split"):
-            TransformerConfig(**self._mhc_recompute_config_kwargs(external_cuda_graph=True))
+    def test_config_deprecated_external_cuda_graph_reaches_the_gate(self):
+        """The legacy flag migrates to the TE impl and must reach the same gate.
+
+        It carries no cuda_graph_modules, so it lands outside the split and the
+        gate has to see the migrated impl rather than the raw legacy flag.
+        """
+        with pytest.warns(UserWarning, match="attention-only split"):
+            config = TransformerConfig(
+                **self._mhc_recompute_config_kwargs(external_cuda_graph=True)
+            )
+        assert config.cuda_graph_impl == "transformer_engine"
 
     def test_config_rejects_deprecated_enable_cuda_graph_with_mhc_recompute(self):
         """The legacy flag migrates to the local impl, which has no split support."""
@@ -593,34 +607,6 @@ class TestTransformerConfigRecomputeMhc:
             TransformerConfig(
                 **self._mhc_recompute_config_kwargs(
                     cuda_graph_impl="full_iteration", cuda_graph_modules=[], **dropout_kwargs
-                )
-            )
-
-    def test_config_rejects_full_iteration_mhc_recompute_with_vpp(self):
-        with pytest.raises(ValueError, match="interleaved pipeline"):
-            TransformerConfig(
-                **self._mhc_recompute_config_kwargs(
-                    num_layers=4,
-                    cuda_graph_impl="full_iteration",
-                    cuda_graph_modules=[],
-                    hidden_dropout=0.0,
-                    attention_dropout=0.0,
-                    pipeline_model_parallel_size=2,
-                    virtual_pipeline_model_parallel_size=2,
-                    pipeline_dtype=torch.bfloat16,
-                )
-            )
-
-    def test_config_rejects_interleaved_pipeline_with_attention_split(self):
-        with pytest.raises(ValueError, match="interleaved pipeline"):
-            TransformerConfig(
-                **self._mhc_recompute_config_kwargs(
-                    num_layers=4,
-                    cuda_graph_impl="transformer_engine",
-                    cuda_graph_modules=[CudaGraphModule.attn],
-                    pipeline_model_parallel_size=2,
-                    virtual_pipeline_model_parallel_size=2,
-                    pipeline_dtype=torch.bfloat16,
                 )
             )
 
@@ -672,7 +658,8 @@ class TestTransformerConfigRecomputeMhc:
         assert config.virtual_pipeline_model_parallel_size == 2
 
     def test_config_allows_vpp_with_mhc_recompute_without_cuda_graphs(self):
-        """The VPP rejection is scoped to CUDA graphs; eager recompute + VPP stays legal."""
+        """Eager recompute + VPP is legal, as it is with graphs. Kept as the
+        no-graph corner of the VPP matrix."""
         config = TransformerConfig(
             **self._mhc_recompute_config_kwargs(
                 num_layers=4,

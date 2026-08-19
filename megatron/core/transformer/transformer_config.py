@@ -3097,58 +3097,45 @@ class TransformerConfig(ModelParallelConfig):
                         "rewound inside CUDA graph capture, so a captured recompute "
                         "would replay a different dropout mask than its forward pass."
                     )
-            elif list(self.cuda_graph_modules or []) != [CudaGraphModule.attn] or list(
-                self.recompute_modules
-            ) != ["mhc"]:
-                raise ValueError(
-                    "mHC recompute with Transformer Engine CUDA Graphs currently supports "
-                    "only the initial attention-only split: cuda_graph_modules=[attn] and "
-                    "recompute_modules=[mhc]. The eager mHC producer must remain outside "
-                    "the captured consumer."
-                )
-            if (
-                self.cuda_graph_impl == "transformer_engine"
-                and self.fine_grained_activation_offloading
-            ):
-                # HyperConnectionTransformerLayer._te_cuda_graph_capture replaces
-                # TransformerLayer's implementation rather than extending it, so it
-                # never plants the offload synchronization edges the full-layer
-                # capture plants -- backward_record() on the graph input and
-                # forward_record() after capture. _set_offload_modules plants those
-                # exactly for the attention-scope modules under an attn-scope graph,
-                # so without them the offload copies race the captured attention.
-                attn_scope_offload = {"qkv_linear", "core_attn", "attn_proj"} & set(
-                    self.offload_modules or []
-                )
-                if attn_scope_offload:
-                    raise ValueError(
-                        f"mHC recompute with attention-only TE CUDA Graphs is incompatible "
-                        f"with offload_modules {sorted(attn_scope_offload)}. The split "
-                        f"capture path omits the offload stream synchronization the "
-                        f"full-layer capture path performs, so the offload copies can race "
-                        f"the captured attention. Remove {sorted(attn_scope_offload)} from "
-                        f"offload_modules, or drop 'attn' from cuda_graph_modules."
+            elif self.cuda_graph_impl == "transformer_engine":
+                # The attention-only split is the shape this feature was built and
+                # measured for: it keeps the eager mHC producer outside the captured
+                # consumer. Other shapes are not rejected -- they were running before
+                # this gate existed -- but they take the ordinary capture path, so
+                # say so rather than fail the run.
+                is_attn_split = list(self.cuda_graph_modules or []) == [
+                    CudaGraphModule.attn
+                ] and list(self.recompute_modules) == ["mhc"]
+                if not is_attn_split:
+                    warnings.warn(
+                        "mHC recompute with Transformer Engine CUDA Graphs is validated "
+                        "only for the attention-only split (cuda_graph_modules=[attn] "
+                        "with recompute_modules=[mhc]). This configuration is allowed "
+                        "but takes the unsplit capture path."
                     )
-                # The replay half of the same gap is fixed, not rejected: see
-                # _replay_mhc_attention_consumer.
-            if self.virtual_pipeline_model_parallel_size is not None:
-                # VPP is admitted only together with EP overlap. Interleaving used
-                # to diverge here (grad norms ~1e8 from the first iteration) on a
-                # caching-allocator use-after-free: mHC post-processing ran inside
-                # the communication-stream combine node, so the recompute subgraph
-                # was allocated on the compute stream and read from another, a
-                # window the allocator cannot track. The fix -- the post node owning
-                # a compute-stream schedule node -- lives in the overlap schedule,
-                # so the non-overlap VPP path has never carried it and stays
-                # unvalidated. StaticBufferLoader itself is VPP-safe, since only the
-                # pre_process chunk carries a data iterator.
-                if not self.overlap_moe_expert_parallel_comm:
-                    raise ValueError(
-                        "mHC recompute supports interleaved pipeline (VPP) "
-                        "schedules only together with "
-                        "overlap_moe_expert_parallel_comm: the non-overlap VPP "
-                        "path is unvalidated."
+                elif self.fine_grained_activation_offloading:
+                    # Split only. HyperConnectionTransformerLayer._te_cuda_graph_capture
+                    # replaces TransformerLayer's implementation rather than extending
+                    # it, so it never plants the offload synchronization edges the
+                    # full-layer capture plants -- backward_record() on the graph input
+                    # and forward_record() after capture. _set_offload_modules plants
+                    # those exactly for the attention-scope modules under an attn-scope
+                    # graph, so without them the offload copies race the captured
+                    # attention. Outside the split the override falls through to the
+                    # parent, which does plant them. (The replay half of the same gap is
+                    # fixed, not rejected: see _replay_mhc_attention_consumer.)
+                    attn_scope_offload = {"qkv_linear", "core_attn", "attn_proj"} & set(
+                        self.offload_modules or []
                     )
+                    if attn_scope_offload:
+                        raise ValueError(
+                            f"mHC recompute with attention-only TE CUDA Graphs is incompatible "
+                            f"with offload_modules {sorted(attn_scope_offload)}. The split "
+                            f"capture path omits the offload stream synchronization the "
+                            f"full-layer capture path performs, so the offload copies can race "
+                            f"the captured attention. Remove {sorted(attn_scope_offload)} from "
+                            f"offload_modules, or drop 'attn' from cuda_graph_modules."
+                        )
 
         if self.cuda_graph_impl != "none":
 
