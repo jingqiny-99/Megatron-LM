@@ -3653,3 +3653,5 @@ class MLATransformerConfig(TransformerConfig):
             assert (
                 self.apply_rope_fusion is False
             ), "Rope Fusion is not compatible with caching latents"
+
+print("VENDOR_MARKER=PRE5841", flush=True)
