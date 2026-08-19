@@ -2215,6 +2215,20 @@ def _run_sparse_attention_backward(
         grad_kv_full = grad_kv_flat.reshape(skv, b, kv_flat.size(-1))
         return grad_query, grad_kv_full
 
+    # DIAG: does the compaction ever actually remove a row? If topk_length is
+    # always > 0 here, the nonzero (and its device sync) is pure overhead.
+    import torch.distributed as _d
+    if (_d.get_rank() if (_d.is_available() and _d.is_initialized()) else 0) == 0:
+        _n_empty = int((topk_length <= 0).sum())
+        _key = f"empty={_n_empty}/{topk_length.numel()}"
+        global _DIAG_EMPTY_SEEN
+        try:
+            _DIAG_EMPTY_SEEN
+        except NameError:
+            _DIAG_EMPTY_SEEN = set()
+        if _key not in _DIAG_EMPTY_SEEN:
+            _DIAG_EMPTY_SEEN.add(_key)
+            print(f"[ROWSDIAG] {_key}", flush=True)
     valid_row_indices = torch.nonzero(topk_length > 0, as_tuple=False).flatten()
     dummy_row_index = torch.full(
         (1,), bwd_q_flat.size(0), dtype=valid_row_indices.dtype, device=valid_row_indices.device
