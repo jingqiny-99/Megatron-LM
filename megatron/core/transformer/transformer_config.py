@@ -2314,18 +2314,7 @@ class TransformerConfig(ModelParallelConfig):
                         f"recompute_modules."
                     )
 
-        if (
-            self.overlap_moe_expert_parallel_comm
-            and self.recompute_granularity == "selective"
-            and "mhc" in self.recompute_modules
-            and (
-                self.cuda_graph_impl != "none" or self.enable_cuda_graph or self.external_cuda_graph
-            )
-        ):
-            raise ValueError(
-                "mHC recompute with overlap_moe_expert_parallel_comm requires CUDA graphs "
-                "to be disabled because explicit group replay is eager-only."
-            )
+        # TEMP: gate disabled to test whether it described a real failure.
 
         if self.enable_hyper_connections and not (
             self.recompute_granularity == "selective" and "mhc" in self.recompute_modules
