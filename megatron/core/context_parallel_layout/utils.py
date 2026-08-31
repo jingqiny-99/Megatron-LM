@@ -28,9 +28,16 @@ def get_packed_seq_params_cp_partition_cu_seqlens(
 
 
 def finalize_packed_seq_params(
-    packed_seq_params: Optional["PackedSeqParams"],
+    packed_seq_params: Optional["PackedSeqParams"], *, prebuild_cp_partition_route: bool = True
 ) -> Optional["PackedSeqParams"]:
-    """Resolve CP metadata and prebuild the THD layout route for a microbatch."""
+    """Resolve CP metadata and optionally prebuild the THD layout route.
+
+    ``prebuild_cp_partition_route=False`` is reserved for graph-static THD
+    configurations that are validated to never convert between CP layouts
+    (currently full-iteration DSv4 hybrid with contiguous CP). Route construction
+    compacts ``cu_seqlens`` on the host and therefore cannot run inside a
+    full-iteration CUDA Graph capture.
+    """
     if packed_seq_params is None:
         return None
 
@@ -41,5 +48,6 @@ def finalize_packed_seq_params(
 
     cp_group = resolve_cp_group(get_context_parallel_group(), packed_seq_params)
     packed_seq_params.cp_group = cp_group
-    prebuild_thd_cp_partition_routes(packed_seq_params, cp_group)
+    if prebuild_cp_partition_route:
+        prebuild_thd_cp_partition_routes(packed_seq_params, cp_group)
     return packed_seq_params

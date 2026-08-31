@@ -330,7 +330,15 @@ def create_data_iterator(
     ):
         vpp_size = config.virtual_pipeline_model_parallel_size
         if tp_group.rank() == 0:
-            metadata_keys = ["max_seqlen", "cu_seqlens", "cu_seqlens_padded"]
+            metadata_keys = [
+                "max_seqlen",
+                "cu_seqlens",
+                "cu_seqlens_padded",
+                # Full-iteration THD pre-padding builds this outside graph
+                # capture. Middle VPP stages still need it to preserve the
+                # same fixed local token extent as data-carrying stages.
+                "padding_mask",
+            ]
             if is_dynamic_cp:
                 metadata_keys.append("local_cp_size")
             new_data_iterator = []

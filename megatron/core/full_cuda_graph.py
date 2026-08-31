@@ -72,33 +72,85 @@ def copy_tensors_in_struct(src):
         return src
 
 
-def clone_tensors_in_struct(tgt, src):
-    """Copy src to pre-existing tensors in tgt."""
+def clone_tensors_in_struct(tgt, src, path="inputs"):
+    """Copy ``src`` into graph-static ``tgt`` tensors.
+
+    Once a CUDA Graph input buffer exists, changing its structure, tensor
+    shape, or dtype would either invalidate the captured addresses or replay
+    stale data. Reject those changes explicitly instead of reallocating a
+    replacement that the captured graph cannot observe.
+    """
     if isinstance(src, tuple):
         if not isinstance(tgt, tuple) or len(tgt) != len(src):
-            return copy_tensors_in_struct(src)
-        return tuple(clone_tensors_in_struct(t, s) for t, s in zip(tgt, src))
+            raise RuntimeError(
+                f"Full-iteration CUDA Graph static input structure changed at {path}: "
+                f"expected tuple length {len(tgt) if isinstance(tgt, tuple) else 'n/a'}, "
+                f"got {len(src)}."
+            )
+        result = []
+        for i, (target_value, source_value) in enumerate(zip(tgt, src)):
+            if isinstance(source_value, (tuple, list, dict, torch.Tensor)):
+                result.append(clone_tensors_in_struct(target_value, source_value, f"{path}[{i}]"))
+            elif type(target_value) is not type(source_value) or target_value != source_value:
+                raise RuntimeError(
+                    f"Full-iteration CUDA Graph non-tensor input changed at {path}[{i}]: "
+                    f"expected {target_value!r}, got {source_value!r}."
+                )
+            else:
+                result.append(target_value)
+        return tuple(result)
     elif isinstance(src, list):
         if not isinstance(tgt, list) or len(tgt) != len(src):
-            return copy_tensors_in_struct(src)
+            raise RuntimeError(
+                f"Full-iteration CUDA Graph static input structure changed at {path}: "
+                f"expected list length {len(tgt) if isinstance(tgt, list) else 'n/a'}, "
+                f"got {len(src)}."
+            )
         for i in range(len(src)):
             if isinstance(src[i], (tuple, list, dict, torch.Tensor)):
-                tgt[i] = clone_tensors_in_struct(tgt[i], src[i])
-            else:
-                tgt[i] = src[i]
+                tgt[i] = clone_tensors_in_struct(tgt[i], src[i], f"{path}[{i}]")
+            elif type(tgt[i]) is not type(src[i]) or tgt[i] != src[i]:
+                raise RuntimeError(
+                    f"Full-iteration CUDA Graph non-tensor input changed at {path}[{i}]: "
+                    f"expected {tgt[i]!r}, got {src[i]!r}."
+                )
         return tgt
     elif isinstance(src, dict):
         if not isinstance(tgt, dict):
-            return copy_tensors_in_struct(src)
+            raise RuntimeError(
+                f"Full-iteration CUDA Graph static input structure changed at {path}: "
+                f"expected {type(tgt).__name__}, got dict."
+            )
+        if tgt.keys() != src.keys():
+            raise RuntimeError(
+                f"Full-iteration CUDA Graph static input keys changed at {path}: "
+                f"expected {sorted(tgt)}, got {sorted(src)}."
+            )
         for k in src:
             if isinstance(src[k], (tuple, list, dict, torch.Tensor)):
-                clone_tensors_in_struct(tgt[k], src[k])
-            else:
-                tgt[k] = src[k]
+                tgt[k] = clone_tensors_in_struct(tgt[k], src[k], f"{path}.{k}")
+            elif type(tgt[k]) is not type(src[k]) or tgt[k] != src[k]:
+                raise RuntimeError(
+                    f"Full-iteration CUDA Graph non-tensor input changed at {path}.{k}: "
+                    f"expected {tgt[k]!r}, got {src[k]!r}."
+                )
+        return tgt
     elif isinstance(src, torch.Tensor):
+        if not isinstance(tgt, torch.Tensor):
+            raise RuntimeError(
+                f"Full-iteration CUDA Graph static input type changed at {path}: "
+                f"expected {type(tgt).__name__}, got Tensor."
+            )
+        if tgt.shape != src.shape or tgt.dtype != src.dtype or tgt.layout != src.layout:
+            raise RuntimeError(
+                f"Full-iteration CUDA Graph static tensor metadata changed at {path}: "
+                f"expected shape={tuple(tgt.shape)}, dtype={tgt.dtype}, layout={tgt.layout}; "
+                f"got shape={tuple(src.shape)}, dtype={src.dtype}, layout={src.layout}."
+            )
         tgt.copy_(src, non_blocking=True)
+        return tgt
     else:
-        raise Exception(f"Expect top-level as container type but got: {type(src)}")
+        raise TypeError(f"Expected a tensor container at {path}, got {type(src)}")
 
 
 # Class to copy dataloader output to static CUDA tensors for CUDA graph input. This
@@ -106,40 +158,35 @@ def clone_tensors_in_struct(tgt, src):
 class StaticBufferLoader:
     """Load data to static buffers."""
 
-    static_buffers: dict = {'training': [], 'validation': []}
+    static_buffers: dict = {'training': {}, 'validation': {}}
 
     def __init__(self):
         self.stream = torch.cuda.Stream()
 
-    def __call__(self, inputs, stage, microbatch):
+    def __call__(self, inputs, stage, microbatch, model_chunk=0):
         assert stage in ['training', 'validation']
-        assert microbatch <= len(StaticBufferLoader.static_buffers[stage])
-        if isinstance(inputs, tuple) and isinstance(inputs[0], dict):
+        assert isinstance(microbatch, int) and microbatch >= 0
+        assert isinstance(model_chunk, int) and model_chunk >= 0
+        if isinstance(inputs, tuple) and inputs and isinstance(inputs[0], dict):
             inputs = inputs[0]
 
         assert isinstance(inputs, dict)
-        if microbatch == len(StaticBufferLoader.static_buffers[stage]):
+        buffer_key = (model_chunk, microbatch)
+        stage_buffers = StaticBufferLoader.static_buffers[stage]
+        if buffer_key not in stage_buffers:
             self.stream.wait_stream(torch.cuda.current_stream())
             with torch.cuda.stream(self.stream):
-                StaticBufferLoader.static_buffers[stage].append(copy_tensors_in_struct(inputs))
+                stage_buffers[buffer_key] = copy_tensors_in_struct(inputs)
         else:
-
-            for k in inputs.keys():
-                if k not in StaticBufferLoader.static_buffers[stage][microbatch]:
-                    if isinstance(inputs[k], torch.Tensor):
-                        StaticBufferLoader.static_buffers[stage][microbatch][k] = torch.empty_like(
-                            inputs[k], device="cuda"
-                        )
-                    else:
-                        StaticBufferLoader.static_buffers[stage][microbatch][k] = inputs[k]
-
             self.stream.wait_stream(torch.cuda.current_stream())
             with torch.cuda.stream(self.stream):
                 clone_tensors_in_struct(
-                    StaticBufferLoader.static_buffers[stage][microbatch], inputs
+                    stage_buffers[buffer_key],
+                    inputs,
+                    path=f"{stage}[model_chunk={model_chunk},microbatch={microbatch}]",
                 )
         torch.cuda.current_stream().wait_stream(self.stream)
-        return StaticBufferLoader.static_buffers[stage][microbatch]
+        return stage_buffers[buffer_key]
 
 
 class FullCudaGraphWrapper:
@@ -148,6 +195,7 @@ class FullCudaGraphWrapper:
     curr_iteration = {'training': 0, 'validation': 0}
     cuda_graph = {'training': None, 'validation': None}
     result = {'training': None, 'validation': None}
+    captured_num_microbatches = {'training': None, 'validation': None}
 
     def __init__(self, forward_backward_func, cuda_graph_warmup_steps=1, use_single_mempool=False):
         self.forward_backward_func = forward_backward_func
@@ -165,7 +213,10 @@ class FullCudaGraphWrapper:
                 for b in range(num_microbatches):
                     data_list.append(
                         self.static_loader(
-                            next(iterator0), 'training' if training else 'validation', b
+                            next(iterator0),
+                            'training' if training else 'validation',
+                            b,
+                            model_chunk=0,
                         )
                     )
                 data_list = [iter(data_list)]
@@ -180,7 +231,10 @@ class FullCudaGraphWrapper:
                     for b in range(num_microbatches):
                         data_list_i.append(
                             self.static_loader(
-                                next(data_iterator[i]), 'training' if training else 'validation', b
+                                next(data_iterator[i]),
+                                'training' if training else 'validation',
+                                b,
+                                model_chunk=i,
                             )
                         )
                     data_list.append(iter(data_list_i))
@@ -206,11 +260,21 @@ class FullCudaGraphWrapper:
         num_microbatches = kwargs['num_microbatches']
 
         training = not kwargs['forward_only']
+        training_str = 'training' if training else 'validation'
+        captured_num_microbatches = FullCudaGraphWrapper.captured_num_microbatches[training_str]
+        if (
+            FullCudaGraphWrapper.cuda_graph[training_str] is not None
+            and captured_num_microbatches != num_microbatches
+        ):
+            raise RuntimeError(
+                f"Full-iteration CUDA Graph captured {captured_num_microbatches} "
+                f"{training_str} microbatches, but the current iteration produced "
+                f"{num_microbatches}. CUDA Graph replay requires a fixed iteration schedule."
+            )
         data_iterator = kwargs['data_iterator']
         data_list = self.data_read(data_iterator, model, training, num_microbatches)
         kwargs['data_iterator'] = data_list
 
-        training_str = 'training' if training else 'validation'
         curr_iteration = self.curr_iter(training_str)
         if curr_iteration == self.cuda_graph_warmup_steps:
             logger.info(f'Capture CUDA graph for {training_str}!!!')
@@ -248,6 +312,7 @@ class FullCudaGraphWrapper:
                 )
             torch.cuda.synchronize()
             torch.distributed.barrier()
+            FullCudaGraphWrapper.captured_num_microbatches[training_str] = num_microbatches
             logger.info(f'CUDA graph capture done for {training_str}!!!')
         if FullCudaGraphWrapper.cuda_graph[training_str] is None:
             FullCudaGraphWrapper.result[training_str] = self.forward_backward_func(*args, **kwargs)
@@ -272,10 +337,12 @@ class FullCudaGraphWrapper:
                 FullCudaGraphWrapper.cuda_graph['training'] = None
             FullCudaGraphWrapper.result['training'] = None
             FullCudaGraphWrapper.curr_iteration['training'] = 0
+            FullCudaGraphWrapper.captured_num_microbatches['training'] = None
         if stage is None or stage == 'validation':
             if FullCudaGraphWrapper.cuda_graph['validation'] is not None:
                 del FullCudaGraphWrapper.cuda_graph['validation']
                 FullCudaGraphWrapper.cuda_graph['validation'] = None
             FullCudaGraphWrapper.result['validation'] = None
             FullCudaGraphWrapper.curr_iteration['validation'] = 0
+            FullCudaGraphWrapper.captured_num_microbatches['validation'] = None
         gc.collect()

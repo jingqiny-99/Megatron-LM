@@ -126,6 +126,15 @@ This implementation does not create inference CUDA graphs. For inference, use
   which cannot run inside a CUDA graph.
 - `--cuda-graph-modules` must be omitted (or left empty): per-module selection has no meaning
   when the entire iteration is captured as a single graph.
+- Packed THD inputs must have a graph-static iteration contract. The supported scheduler path is
+  `--sequence-packing-scheduler dp_balanced` with fixed (non-dynamic) CP,
+  `--pad-packed-seq-alignment max`, and `--thd-max-packed-sequences`. With CP greater than one,
+  use `--cp-partition-mode contiguous` and `--thd-tail-padding-policy extend_last`. CP greater than
+  one is currently restricted to `--experimental-attention-variant dsv4_hybrid`; generic attention
+  and GDN/KDA require a packed-boundary-dependent CP layout conversion. The scheduler pads token
+  tensors and THD metadata to fixed global capacities before they enter the graph input loader.
+- The number of packed microbatches must remain unchanged after capture. Replay fails explicitly if
+  a later scheduler step produces a different iteration schedule.
 
 ### Example
 

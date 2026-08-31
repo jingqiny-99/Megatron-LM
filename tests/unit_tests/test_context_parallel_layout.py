@@ -11,12 +11,14 @@ from megatron.core.context_parallel_layout import (
     CpPartitionModeConverter,
     ThdCpRoute,
     convert_module_input_tensors_cp_partition_mode,
+    finalize_packed_seq_params,
     prebuild_thd_cp_partition_routes,
 )
 from megatron.core.context_parallel_layout.routes import (
     build_thd_cp_partition_route,
     get_thd_cp_partition_route,
 )
+from megatron.core.packed_seq_params import PackedSeqParams
 from tests.unit_tests.test_utilities import Utils
 
 
@@ -414,6 +416,28 @@ def test_prebuild_thd_cp_partition_routes_raises_route_errors():
 
     with pytest.raises(ValueError, match="divisible"):
         prebuild_thd_cp_partition_routes(packed_seq_params, cp_group)
+
+
+def test_finalize_packed_seq_params_can_skip_host_route_prebuild(monkeypatch):
+    """Graph-static models may resolve CP without compacting cu_seqlens on the host."""
+    cp_group = _FakeGroup(size=2, rank=0)
+    packed_seq_params = PackedSeqParams(
+        qkv_format='thd',
+        cu_seqlens_q=torch.tensor([0, 16, 40], dtype=torch.int32),
+        cu_seqlens_q_padded=torch.tensor([0, 16, 40], dtype=torch.int32),
+        cp_partition_mode='contiguous',
+    )
+    monkeypatch.setattr(parallel_state, 'get_context_parallel_group', lambda: cp_group)
+    monkeypatch.setattr(
+        'megatron.core.context_parallel_layout.routes.prebuild_thd_cp_partition_routes',
+        lambda *_args, **_kwargs: pytest.fail('route prebuild must be skipped during capture'),
+    )
+
+    result = finalize_packed_seq_params(packed_seq_params, prebuild_cp_partition_route=False)
+
+    assert result is packed_seq_params
+    assert result.cp_group is cp_group
+    assert result.cp_partition_route is None
 
 
 def test_cp_partition_mode_converter_recurses_over_tensor_containers(monkeypatch):

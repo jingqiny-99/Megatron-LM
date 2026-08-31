@@ -74,6 +74,138 @@ def _sanitize_thd_padding_values(batch: Dict[str, Any], padding_mask: torch.Tens
         batch[key] = tensor.masked_fill(padding_mask, pad_value)
 
 
+def _validate_full_iteration_static_thd(config, cp_size: int) -> bool:
+    """Validate and identify the graph-static packed THD scheduler path.
+
+    Full-iteration CUDA Graph replay fixes both tensor shapes and collective
+    topology at capture time.  The supported scheduler contract is therefore
+    deliberately narrower than the per-layer CUDA Graph contract: regular
+    ``dp_balanced`` packing, a fixed CP group, and contiguous CP slices when
+    CP is enabled.  The scheduler pads each packed sample to the global static
+    extent before :class:`FullCudaGraphWrapper` copies it into graph inputs.
+
+    Returns:
+        True when ``config`` selects full-iteration packed THD, else False.
+    """
+    if getattr(config, 'cuda_graph_impl', 'none') != 'full_iteration':
+        return False
+    if getattr(config, 'sequence_packing_scheduler', None) is None:
+        return False
+
+    scheduler = config.sequence_packing_scheduler
+    if getattr(config, 'dynamic_context_parallel', False) or scheduler != 'dp_balanced':
+        raise ValueError(
+            "Full-iteration CUDA Graph with packed THD requires static "
+            "sequence_packing_scheduler='dp_balanced'; Dynamic CP changes the "
+            "process group and tensor layout between microbatches."
+        )
+    if cp_size > 1 and getattr(config, 'cp_partition_mode', 'zigzag') != 'contiguous':
+        raise ValueError(
+            "Full-iteration CUDA Graph with packed THD and context parallelism "
+            "requires cp_partition_mode='contiguous'. The contiguous path has a "
+            "configuration-derived fixed slice; zigzag partition indices depend on "
+            "per-batch cu_seqlens."
+        )
+    if cp_size > 1 and getattr(config, 'experimental_attention_variant', None) != 'dsv4_hybrid':
+        raise ValueError(
+            "Full-iteration CUDA Graph with packed THD and context parallelism is only "
+            "supported for experimental_attention_variant='dsv4_hybrid'. Generic attention "
+            "and GDN/KDA require contiguous/zigzag CP layout conversion whose all-to-all split "
+            "topology can vary with packed sequence boundaries."
+        )
+    if getattr(config, 'pad_packed_seq_alignment', None) not in (
+        'max',
+        getattr(config, 'max_seqlen_per_dp_cp_rank', None),
+    ):
+        raise ValueError(
+            "Full-iteration CUDA Graph with packed THD requires "
+            "pad_packed_seq_alignment='max' (or the same numeric value as "
+            "max_seqlen_per_dp_cp_rank)."
+        )
+    if getattr(config, 'thd_max_packed_sequences', None) is None:
+        raise ValueError(
+            "Full-iteration CUDA Graph with packed THD requires "
+            "thd_max_packed_sequences so cu_seqlens has a fixed capacity."
+        )
+    if resolve_thd_tail_padding_policy(config) != "extend_last":
+        raise ValueError(
+            "Full-iteration CUDA Graph with packed THD requires "
+            "thd_tail_padding_policy='extend_last'. DSv4 derives its indexer-loss query "
+            "padding from the difference between valid and padded THD boundaries; appending "
+            "a positive-length dummy sequence would incorrectly treat the padding tail as "
+            "valid indexer-loss queries."
+        )
+    return True
+
+
+def _prepare_full_iteration_static_thd_sample(
+    sample: Dict[str, torch.Tensor], config, cp_size: int
+) -> Dict[str, torch.Tensor]:
+    """Pad one scheduler output to the fixed global full-iteration graph shape.
+
+    This function runs in :meth:`DpBalancedScheduler.run`, outside
+    ``FullCudaGraphWrapper`` capture.  It resolves all data-dependent THD
+    metadata once, sanitizes padding slots, and stores fixed-size tensors that
+    the wrapper can copy into stable graph input buffers on every iteration.
+    """
+    assert _validate_full_iteration_static_thd(config, cp_size)
+    local_target_len = int(config.max_seqlen_per_dp_cp_rank)
+    global_target_len = local_target_len * cp_size
+    max_num_seqs = int(config.thd_max_packed_sequences)
+
+    prepared = dict(sample)
+    padding_mask = _build_thd_padding_mask(prepared['cu_seqlens'], prepared['cu_seqlens_padded'])
+    _sanitize_thd_padding_values(prepared, padding_mask)
+
+    max_seqlen = prepared['max_seqlen']
+    if isinstance(max_seqlen, torch.Tensor):
+        max_seqlen = int(max_seqlen.item())
+    packed_seq_params = PackedSeqParams(
+        qkv_format='thd',
+        cu_seqlens_q=prepared['cu_seqlens'],
+        cu_seqlens_kv=prepared['cu_seqlens'],
+        cu_seqlens_q_padded=prepared['cu_seqlens_padded'],
+        cu_seqlens_kv_padded=prepared['cu_seqlens_padded'],
+        max_seqlen_q=max_seqlen,
+        max_seqlen_kv=max_seqlen,
+        cp_partition_mode=getattr(config, 'cp_partition_mode', 'zigzag'),
+        pad_between_seqs=True,
+    )
+
+    tokens, labels, loss_mask, position_ids, packed_seq_params, padding_mask = pad_sequence_for_thd(
+        prepared.get('tokens'),
+        prepared.get('labels'),
+        prepared.get('loss_mask'),
+        prepared.get('position_ids'),
+        packed_seq_params,
+        target_len=global_target_len,
+        max_num_seqs=max_num_seqs,
+        tail_padding_policy=resolve_thd_tail_padding_policy(config),
+        padding_mask=padding_mask,
+        # This is global pre-padding before CP partitioning. Treat the
+        # packed sample as one global rank here; the fixed CP slice is
+        # applied later inside get_batch.
+        cp_size=1,
+        cp_rank=0,
+    )
+
+    for key, value in (
+        ('tokens', tokens),
+        ('labels', labels),
+        ('loss_mask', loss_mask),
+        ('position_ids', position_ids),
+    ):
+        if key in prepared:
+            prepared[key] = value
+    prepared['padding_mask'] = padding_mask.reshape(-1)
+    prepared['cu_seqlens'] = packed_seq_params.cu_seqlens_q
+    prepared['cu_seqlens_padded'] = packed_seq_params.cu_seqlens_q_padded
+    prepared['max_seqlen'] = prepared['cu_seqlens'].new_tensor(
+        packed_seq_params.max_seqlen_q, dtype=torch.int32
+    )
+    return prepared
+
+
 class BasePackingScheduler:
     """Base class for sequence packing schedulers."""
 
@@ -363,6 +495,11 @@ class DpBalancedScheduler(BasePackingScheduler):
             new_samples = build_packed_microbatches(
                 samples_this_rank_with_id, sample_id_groups, dcp_rank, dev, self.is_dynamic_cp
             )
+            if _validate_full_iteration_static_thd(config, self.cp_size):
+                new_samples = [
+                    _prepare_full_iteration_static_thd_sample(sample, config, self.cp_size)
+                    for sample in new_samples
+                ]
 
             # Step 7: Calculate FLOPs info
             seqlen_sum_this_global_batch = float(sum(seqlens_gathered))
@@ -602,9 +739,16 @@ def get_batch_on_this_rank_for_sequence_packing(
 
     is_first_or_last_stage = is_first_stage or is_last_stage
     dev = torch.cuda.current_device()
+    full_iteration_static_thd = _validate_full_iteration_static_thd(config, cp_group.size())
+    if full_iteration_static_thd:
+        local_static_tokens = int(config.max_seqlen_per_dp_cp_rank)
+        global_static_tokens = local_static_tokens * cp_group.size()
+        static_cu_seqlen_size = int(config.thd_max_packed_sequences) + 1
 
     # data_iterator should return a batch including the following keys.
     batch_keys = ['cu_seqlens', 'cu_seqlens_padded', 'max_seqlen']
+    if full_iteration_static_thd:
+        batch_keys.append('padding_mask')
     if dynamic_cp:
         batch_keys.append('local_cp_size')
     if is_first_stage or mtp_on_this_rank:
@@ -665,7 +809,7 @@ def get_batch_on_this_rank_for_sequence_packing(
 
     # Build padding_mask before CP slicing while tensors still have the full
     # packed length represented by cu_seqlens_padded[-1].
-    if is_tp_rank_0:
+    if is_tp_rank_0 and not full_iteration_static_thd:
         batch['padding_mask'] = _build_thd_padding_mask(
             batch['cu_seqlens'], batch['cu_seqlens_padded']
         )
@@ -710,16 +854,21 @@ def get_batch_on_this_rank_for_sequence_packing(
 
     # Broadcast cu_seqlens_size because we need it to create placeholder for cu_seqlens and
     # cu_seqlens_padded for non TP 0 ranks.
-    if is_tp_rank_0:
+    if full_iteration_static_thd:
+        cu_seqlen_size = static_cu_seqlen_size
+    elif is_tp_rank_0:
         cu_seqlen_size = torch.tensor(batch['cu_seqlens'].size(0), dtype=torch.int32, device=dev)
     else:
         cu_seqlen_size = torch.empty(1, dtype=torch.int32, device=dev)
-    broadcast_tensor(cu_seqlen_size, tp_src_rank, tp_group)
-    cu_seqlen_size = cu_seqlen_size.item()
+    if not full_iteration_static_thd:
+        broadcast_tensor(cu_seqlen_size, tp_src_rank, tp_group)
+        cu_seqlen_size = cu_seqlen_size.item()
 
     # Broadcast total_tokens because padding_mask is prepared on every PP stage.
     # Tokens/labels/loss_mask/position_ids use the same length on stages that own them.
-    if is_tp_rank_0:
+    if full_iteration_static_thd:
+        total_tokens = local_static_tokens
+    elif is_tp_rank_0:
         if contiguous_cp_local_target_len is not None:
             total_tokens = torch.tensor(
                 [contiguous_cp_local_target_len], dtype=torch.int32, device=dev
@@ -733,8 +882,9 @@ def get_batch_on_this_rank_for_sequence_packing(
             total_tokens = (batch['cu_seqlens_padded'][-1].to(torch.int32) // cp_world).reshape(1)
     else:
         total_tokens = torch.empty(1, dtype=torch.int32, device=dev)
-    broadcast_tensor(total_tokens, tp_src_rank, tp_group)
-    total_tokens = total_tokens.item()
+    if not full_iteration_static_thd:
+        broadcast_tensor(total_tokens, tp_src_rank, tp_group)
+        total_tokens = total_tokens.item()
 
     # Step1: Prepare "tokens", "position_ids" for first stage and stage with mtp on all TP ranks.
     if is_first_stage or mtp_on_this_rank:
@@ -823,12 +973,12 @@ def get_batch_on_this_rank_for_sequence_packing(
     padding_mask = batch['padding_mask']
     cu_seqlens = batch['cu_seqlens']
     cu_seqlens_padded = batch['cu_seqlens_padded']
-    max_seqlen = batch['max_seqlen'].item()
+    max_seqlen = global_static_tokens if full_iteration_static_thd else batch['max_seqlen'].item()
     local_cp_size = batch['local_cp_size'].item() if dynamic_cp else None
     cp_group = (
         parallel_state.get_dynamic_data_context_parallel_groups(group_size=local_cp_size)
         if dynamic_cp
-        else None
+        else (cp_group if full_iteration_static_thd else None)
     )
 
     # cu_seqlens_q/kv hold the original (unpadded) boundaries so downstream
@@ -853,7 +1003,7 @@ def get_batch_on_this_rank_for_sequence_packing(
     # Non-dummy tensors and their final padded endpoint were extended before
     # slicing; this call is then a no-op except for fixed-capacity cu_seqlens
     # entries in eager or graph mode.
-    if pad_alignment is not None:
+    if pad_alignment is not None and not full_iteration_static_thd:
         tokens, labels, loss_mask, position_ids, packed_seq_params, padding_mask = (
             pad_sequence_for_thd(
                 tokens,

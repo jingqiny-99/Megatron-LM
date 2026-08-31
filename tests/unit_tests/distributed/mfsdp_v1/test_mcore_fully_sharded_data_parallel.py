@@ -1013,7 +1013,8 @@ class TestMegatronFSDPE2E:
         FullCudaGraphWrapper.curr_iteration = {'training': 0, 'validation': 0}
         FullCudaGraphWrapper.cuda_graph = {'training': None, 'validation': None}
         FullCudaGraphWrapper.result = {'training': None, 'validation': None}
-        StaticBufferLoader.static_buffers = {'training': [], 'validation': []}
+        FullCudaGraphWrapper.captured_num_microbatches = {'training': None, 'validation': None}
+        StaticBufferLoader.static_buffers = {'training': {}, 'validation': {}}
 
     @staticmethod
     def _reset_cuda_rng_tracker():

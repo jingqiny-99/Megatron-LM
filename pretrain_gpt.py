@@ -141,7 +141,18 @@ def get_batch(data_iterator, vp_stage: Optional[int] = None):
             dynamic_cp=args.dynamic_context_parallel,
             config=config,
         )
-        finalize_packed_seq_params(batch[5])
+        skip_cp_route_prebuild = (
+            args.cuda_graph_impl == "full_iteration"
+            and args.context_parallel_size > 1
+            and args.experimental_attention_variant == "dsv4_hybrid"
+        )
+        finalize_packed_seq_params(
+            batch[5],
+            # The static full-iteration CP path is fail-closed to DSv4 hybrid,
+            # whose attention and linear layers consume contiguous THD directly.
+            # Route construction would compact cu_seqlens on the host during capture.
+            prebuild_cp_partition_route=not skip_cp_route_prebuild,
+        )
         return batch
 
     # TODO: this is pretty hacky, find a better way

@@ -13,7 +13,9 @@ from megatron.core.datasets.data_schedule import (
     DefaultDynamicCPScheduler,
     _build_thd_padding_mask,
     _get_scheduler_max_real_num_seqs,
+    _prepare_full_iteration_static_thd_sample,
     _sanitize_thd_padding_values,
+    _validate_full_iteration_static_thd,
     get_batch_on_this_rank_for_sequence_packing,
     wrap_data_iterator,
 )
@@ -80,6 +82,127 @@ def test_scheduler_sanitizes_thd_padding_values():
     assert torch.equal(batch['labels'], torch.tensor([12, 13, 0, 22, 0]))
     assert torch.equal(batch['loss_mask'], torch.tensor([1.0, 1.0, 0.0, 1.0, 0.0]))
     assert torch.equal(batch['position_ids'], torch.tensor([0, 1, 0, 0, 0]))
+
+
+def _full_iteration_static_thd_config(**overrides):
+    values = {
+        'cuda_graph_impl': 'full_iteration',
+        'sequence_packing_scheduler': 'dp_balanced',
+        'dynamic_context_parallel': False,
+        'cp_partition_mode': 'contiguous',
+        'pad_packed_seq_alignment': 'max',
+        'max_seqlen_per_dp_cp_rank': 4,
+        'thd_max_packed_sequences': 8,
+        'thd_tail_padding_policy': 'extend_last',
+        'experimental_attention_variant': 'dsv4_hybrid',
+    }
+    values.update(overrides)
+    return SimpleNamespace(**values)
+
+
+def _packed_sample(tokens, cu_seqlens, cu_seqlens_padded):
+    tokens = torch.tensor(tokens, dtype=torch.int64)
+    return {
+        'tokens': tokens.clone(),
+        'labels': tokens.clone() + 100,
+        'loss_mask': torch.ones(tokens.numel(), dtype=torch.float32),
+        'position_ids': torch.arange(tokens.numel(), dtype=torch.int64),
+        'cu_seqlens': torch.tensor(cu_seqlens, dtype=torch.int32),
+        'cu_seqlens_padded': torch.tensor(cu_seqlens_padded, dtype=torch.int32),
+        'max_seqlen': torch.tensor(
+            max(b - a for a, b in zip(cu_seqlens_padded, cu_seqlens_padded[1:])), dtype=torch.int32
+        ),
+    }
+
+
+def test_full_iteration_static_thd_prepares_fixed_global_shapes():
+    config = _full_iteration_static_thd_config()
+    samples = [
+        _packed_sample([11, 12, 13, -1, 21, 22, 23], [0, 3, 6], [0, 4, 7]),
+        _packed_sample([31, 32, 33, 34, 35], [0, 5], [0, 5]),
+    ]
+
+    prepared = [
+        _prepare_full_iteration_static_thd_sample(sample, config, cp_size=8) for sample in samples
+    ]
+
+    for sample in prepared:
+        assert sample['tokens'].shape == (32,)
+        assert sample['labels'].shape == (32,)
+        assert sample['loss_mask'].shape == (32,)
+        assert sample['position_ids'].shape == (32,)
+        assert sample['padding_mask'].shape == (32,)
+        assert sample['cu_seqlens'].shape == (9,)
+        assert sample['cu_seqlens_padded'].shape == (9,)
+        assert sample['max_seqlen'].shape == ()
+        assert sample['max_seqlen'].item() == 32
+
+    # Inter-sequence padding and the static tail are neutralized before graph input copy.
+    assert prepared[0]['tokens'][3].item() == 0
+    assert prepared[0]['padding_mask'][3].item()
+    assert prepared[0]['padding_mask'][7:].all()
+    assert torch.count_nonzero(prepared[0]['loss_mask'][7:]) == 0
+    # Different raw packs retain different data despite sharing the same static shapes.
+    assert not torch.equal(prepared[0]['tokens'], prepared[1]['tokens'])
+
+
+@pytest.mark.parametrize(
+    'overrides, cp_size, match',
+    [
+        (
+            {'dynamic_context_parallel': True, 'sequence_packing_scheduler': 'default_dynamic_cp'},
+            8,
+            'requires static',
+        ),
+        ({'cp_partition_mode': 'zigzag'}, 8, "requires cp_partition_mode='contiguous'"),
+        ({'experimental_attention_variant': None}, 8, "only supported for.*dsv4_hybrid"),
+        ({'experimental_attention_variant': 'gdn'}, 8, "only supported for.*dsv4_hybrid"),
+        ({'experimental_attention_variant': 'kda'}, 8, "only supported for.*dsv4_hybrid"),
+        ({'thd_tail_padding_policy': 'append_dummy_seq'}, 8, "requires.*extend_last"),
+    ],
+)
+def test_full_iteration_static_thd_rejects_dynamic_layouts(overrides, cp_size, match):
+    with pytest.raises(ValueError, match=match):
+        _validate_full_iteration_static_thd(_full_iteration_static_thd_config(**overrides), cp_size)
+
+
+def test_full_iteration_static_thd_allows_dsv4_contiguous_cp():
+    assert _validate_full_iteration_static_thd(_full_iteration_static_thd_config(), cp_size=8)
+
+
+def test_full_iteration_static_thd_batch_fetch_has_no_tensor_item(monkeypatch):
+    """The capture-side batch path must use config-derived sizes only."""
+    config = _full_iteration_static_thd_config()
+    batch = _prepare_full_iteration_static_thd_sample(
+        _packed_sample([11, 12, 13, -1, 21, 22, 23], [0, 3, 6], [0, 4, 7]), config, cp_size=8
+    )
+    pg_collection = SimpleNamespace(
+        tp=_MockCPGroup(size=1, rank=0),
+        pp=_MockCPGroup(size=1, rank=0),
+        cp=_MockCPGroup(size=8, rank=3),
+    )
+
+    monkeypatch.setattr(torch.cuda, 'current_device', lambda: torch.device('cpu'))
+    monkeypatch.setattr(torch.distributed, 'get_process_group_ranks', lambda _: [0])
+    monkeypatch.setattr(data_schedule, 'broadcast_tensor', lambda *_: None)
+
+    with monkeypatch.context() as item_guard:
+        item_guard.setattr(
+            torch.Tensor,
+            'item',
+            lambda self: pytest.fail('capture-side static THD batch fetch called Tensor.item()'),
+        )
+        result = get_batch_on_this_rank_for_sequence_packing(
+            data_iterator=iter([batch]), pg_collection=pg_collection, config=config
+        )
+
+    tokens, labels, loss_mask, _, position_ids, packed_seq_params, padding_mask = result
+    for tensor in (tokens, labels, loss_mask, position_ids, padding_mask):
+        assert tensor.shape == (1, 4)
+    assert packed_seq_params.cu_seqlens_q.shape == (9,)
+    assert packed_seq_params.cu_seqlens_q_padded.shape == (9,)
+    assert packed_seq_params.max_seqlen_q == 32
+    assert packed_seq_params.cp_group is pg_collection.cp
 
 
 def test_scheduler_reroute_uses_dp_all_gather(monkeypatch):

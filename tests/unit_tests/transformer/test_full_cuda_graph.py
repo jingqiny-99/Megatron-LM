@@ -9,7 +9,11 @@ from pytest_mock import mocker
 
 import megatron.core.pipeline_parallel.schedules as schedule
 from megatron.core import ModelParallelConfig
-from megatron.core.full_cuda_graph import FullCudaGraphWrapper, StaticBufferLoader
+from megatron.core.full_cuda_graph import (
+    FullCudaGraphWrapper,
+    StaticBufferLoader,
+    clone_tensors_in_struct,
+)
 from megatron.core.models.gpt.gpt_layer_specs import (
     get_gpt_layer_with_transformer_engine_spec,
     get_gpt_mtp_block_spec,
@@ -33,7 +37,8 @@ def _reset_full_cuda_graph_state():
     FullCudaGraphWrapper.curr_iteration = {'training': 0, 'validation': 0}
     FullCudaGraphWrapper.cuda_graph = {'training': None, 'validation': None}
     FullCudaGraphWrapper.result = {'training': None, 'validation': None}
-    StaticBufferLoader.static_buffers = {'training': [], 'validation': []}
+    FullCudaGraphWrapper.captured_num_microbatches = {'training': None, 'validation': None}
+    StaticBufferLoader.static_buffers = {'training': {}, 'validation': {}}
 
 
 @pytest.fixture(autouse=True)
@@ -48,6 +53,79 @@ def reset_full_cuda_graph_state():
     MTPLossLoggingHelper.tracker = {}
     Utils.destroy_model_parallel()
     gc.collect()
+
+
+@pytest.mark.parametrize(
+    'replacement, match',
+    [
+        ({'tokens': torch.ones(5, dtype=torch.int64)}, 'shape=\\(4,\\)'),
+        ({'tokens': torch.ones(4, dtype=torch.float32)}, 'dtype=torch.int64'),
+        ({'labels': torch.ones(4, dtype=torch.int64)}, 'input keys changed'),
+    ],
+)
+def test_static_buffer_copy_rejects_graph_input_metadata_changes(replacement, match):
+    target = {'tokens': torch.zeros(4, dtype=torch.int64)}
+
+    with pytest.raises(RuntimeError, match=match):
+        clone_tensors_in_struct(target, replacement)
+
+
+def test_static_buffer_copy_supports_fixed_scalar_tuple_metadata():
+    target = {'metadata': (2, 'contiguous', torch.zeros(2, dtype=torch.int64))}
+    source = {'metadata': (2, 'contiguous', torch.ones(2, dtype=torch.int64))}
+
+    result = clone_tensors_in_struct(target, source)
+
+    assert result['metadata'][:2] == (2, 'contiguous')
+    assert torch.equal(result['metadata'][2], torch.ones(2, dtype=torch.int64))
+    with pytest.raises(RuntimeError, match='non-tensor input changed'):
+        clone_tensors_in_struct(target, {'metadata': (3, 'contiguous', source['metadata'][2])})
+
+
+def test_static_buffer_loader_isolates_virtual_pipeline_model_chunks(monkeypatch):
+    class _FakeStream:
+        def wait_stream(self, _stream):
+            return None
+
+    loader = object.__new__(StaticBufferLoader)
+    loader.stream = _FakeStream()
+    monkeypatch.setattr(torch.cuda, 'current_stream', lambda: object())
+    monkeypatch.setattr(torch.cuda, 'stream', lambda _stream: contextlib.nullcontext())
+    monkeypatch.setattr(
+        'megatron.core.full_cuda_graph.copy_tensors_in_struct',
+        lambda inputs: {key: value.clone() for key, value in inputs.items()},
+    )
+    wrapper = object.__new__(FullCudaGraphWrapper)
+    wrapper.static_loader = loader
+
+    data = wrapper.data_read(
+        [iter([{'tokens': torch.tensor([1])}]), iter([{'labels': torch.tensor([2])}])],
+        model=[object(), object()],
+        training=True,
+        num_microbatches=1,
+    )
+
+    assert set(StaticBufferLoader.static_buffers['training']) == {(0, 0), (1, 0)}
+    assert torch.equal(next(data[0])['tokens'], torch.tensor([1]))
+    assert torch.equal(next(data[1])['labels'], torch.tensor([2]))
+
+
+def test_full_cuda_graph_rejects_changed_num_microbatches_before_data_read():
+    wrapper = object.__new__(FullCudaGraphWrapper)
+    wrapper.data_read = lambda *_args, **_kwargs: pytest.fail(
+        'microbatch mismatch must fail before reading or updating static inputs'
+    )
+    FullCudaGraphWrapper.cuda_graph['training'] = object()
+    FullCudaGraphWrapper.captured_num_microbatches['training'] = 2
+
+    with pytest.raises(RuntimeError, match='captured 2 training microbatches.*produced 1'):
+        wrapper(
+            model=[object()],
+            data_iterator=[iter(())],
+            num_microbatches=1,
+            seq_length=4,
+            forward_only=False,
+        )
 
 
 @pytest.mark.skipif(
@@ -261,7 +339,8 @@ def test_full_cuda_graph_training_with_mhc_recompute():
         FullCudaGraphWrapper.cuda_graph = {'training': None, 'validation': None}
         FullCudaGraphWrapper.result = {'training': None, 'validation': None}
         FullCudaGraphWrapper.curr_iteration = {'training': 0, 'validation': 0}
-        StaticBufferLoader.static_buffers = {'training': [], 'validation': []}
+        FullCudaGraphWrapper.captured_num_microbatches = {'training': None, 'validation': None}
+        StaticBufferLoader.static_buffers = {'training': {}, 'validation': {}}
 
     def build_model():
         model_parallel_cuda_manual_seed(123, te_rng_tracker=True, force_reset_rng=True)

@@ -231,6 +231,15 @@ Phase 1        │  (once per global      │   ────────►   �
 
 - **`get_batch_on_this_rank_for_sequence_packing(wrapped_data_iterator)`** — Per-microbatch entry point called by the training loop. Takes the **wrapped** data iterator returned by `wrap_data_iterator` as input. Fetches one packed microbatch via `next(wrapped_data_iterator)`, broadcasts batch fields across TP ranks, optionally partitions sequences across CP ranks using Transformer Engine's `thd_get_partitioned_indices`, and constructs `PackedSeqParams` (with `cu_seqlens`, `max_seqlen`, `qkv_format=thd`).
 
+For full-iteration CUDA Graphs, the static `dp_balanced` path performs one additional step before
+`create_data_iterator`: each packed sample is padded to
+`max_seqlen_per_dp_cp_rank * context_parallel_size`, its padding values are sanitized, and its
+`cu_seqlens` tensors are padded to `thd_max_packed_sequences + 1` entries. This work happens outside
+capture so the graph-side batch fetch only copies and slices fixed-shape tensors; it does not derive
+Python scalars from device metadata. With CP greater than one, this path requires contiguous CP,
+`thd_tail_padding_policy=extend_last`, and DSv4 hybrid attention, which consumes the contiguous THD
+layout directly without a data-dependent contiguous/zigzag conversion route.
+
 #### Scheduler Classes
 
 - **`BasePackingScheduler`** — Abstract base class. Defines the interface:
