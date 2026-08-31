@@ -110,6 +110,37 @@ def test_static_buffer_loader_isolates_virtual_pipeline_model_chunks(monkeypatch
     assert torch.equal(next(data[1])['labels'], torch.tensor([2]))
 
 
+def test_static_buffer_loader_protects_owned_container_from_batch_mutation(monkeypatch):
+    class _FakeStream:
+        def wait_stream(self, _stream):
+            return None
+
+    loader = object.__new__(StaticBufferLoader)
+    loader.stream = _FakeStream()
+    monkeypatch.setattr(torch.cuda, 'current_stream', lambda: object())
+    monkeypatch.setattr(torch.cuda, 'stream', lambda _stream: contextlib.nullcontext())
+    monkeypatch.setattr(
+        'megatron.core.full_cuda_graph.copy_tensors_in_struct',
+        lambda inputs: {key: value.clone() for key, value in inputs.items()},
+    )
+
+    batch = loader({'tokens': torch.arange(8)}, 'training', 0)
+    owned = StaticBufferLoader.static_buffers['training'][(0, 0)]
+
+    assert batch is not owned
+    assert batch['tokens'] is owned['tokens']
+    batch['local_cp_size'] = None
+    batch['tokens'] = batch['tokens'][:4]
+
+    assert set(owned) == {'tokens'}
+    assert owned['tokens'].shape == (8,)
+
+    refreshed = loader({'tokens': torch.arange(8) + 10}, 'training', 0)
+    assert set(refreshed) == {'tokens'}
+    assert refreshed['tokens'] is owned['tokens']
+    assert torch.equal(refreshed['tokens'], torch.arange(8) + 10)
+
+
 def test_full_cuda_graph_rejects_changed_num_microbatches_before_data_read():
     wrapper = object.__new__(FullCudaGraphWrapper)
     wrapper.data_read = lambda *_args, **_kwargs: pytest.fail(

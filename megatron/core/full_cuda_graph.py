@@ -186,7 +186,11 @@ class StaticBufferLoader:
                     path=f"{stage}[model_chunk={model_chunk},microbatch={microbatch}]",
                 )
         torch.cuda.current_stream().wait_stream(self.stream)
-        return stage_buffers[buffer_key]
+        # Batch consumers may add metadata keys or replace tensor values with
+        # local views (for example, static THD context-parallel slicing).  Keep
+        # the graph-owned container immutable while preserving the identities
+        # of the static tensors that CUDA Graph replay observes.
+        return dict(stage_buffers[buffer_key])
 
 
 class FullCudaGraphWrapper:
