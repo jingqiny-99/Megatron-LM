@@ -599,10 +599,8 @@ class PipelineOffloadManager:
         for chunk in self._cached_chunks_backward:
             for group in chunk.offload_groups:
                 if group.offload and keep_on_gpu_bytes > 0:
-                    debug_rank(
-                        f"group {group._name} offload {group.offload} \
-                        keep_on_gpu_bytes {keep_on_gpu_bytes}"
-                    )
+                    debug_rank(f"group {group._name} offload {group.offload} \
+                        keep_on_gpu_bytes {keep_on_gpu_bytes}")
                     keep_on_gpu_bytes -= group.total_offload_bytes
                     group.offload = False
         # Disable the later groups to meet the activation offload fraction.
@@ -1345,13 +1343,21 @@ class FineGrainedOffloadingBackwardRecordFunction(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, grad_output):
-        """Record the backward event and wait for the h2d stream on cuda graph stream."""
+        """Queue the graph-tail event and H2D join after every backward node finishes."""
         debug_rank("FineGrainedOffloadingBackwardRecordFunction backward")
-        mgr = PipelineOffloadManager.get_instance()
-        # This event connects TE's graph stream with the reload stream so
-        # backward consumers do not race H2D reloads launched outside the graph.
-        torch.cuda.current_stream().record_event(mgr.cuda_graph_event)
-        torch.cuda.current_stream().wait_stream(mgr.h2d_stream)
+
+        def record_backward_completion():
+            mgr = PipelineOffloadManager.get_instance()
+            current_stream = torch.cuda.current_stream()
+            # TE uses this external event to synchronize the main stream after
+            # replay. Record it only after the entire GraphTask, including all
+            # requested parameter and input gradients, has completed. The following
+            # H2D join remains after the event so next-group reload can overlap
+            # main-stream work while still belonging to the captured graph.
+            current_stream.record_event(mgr.cuda_graph_event)
+            current_stream.wait_stream(mgr.h2d_stream)
+
+        torch.autograd.Variable._execution_engine.queue_callback(record_backward_completion)
         return (grad_output,)
 
 

@@ -1447,6 +1447,29 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
                 hidden_states = kwargs.pop("hidden_states")
                 hidden_states = self.off_interface.backward_record(hidden_states)
                 kwargs["hidden_states"] = hidden_states
+
+        cuda_graph_outputs = self._te_cuda_graph_capture_impl(*args, **kwargs)
+
+        # Record the forward event on cuda graph stream for cuda graph capture.
+        # This is to ensure the main stream waits for computing on cuda graph stream to complete,
+        # and overlaps with the D2H transfer on offloading stream.
+        if self.offload_module_in_cuda_graph:
+            self.off_interface.forward_record()
+        return cuda_graph_outputs
+
+    def _te_cuda_graph_capture_impl(self, *args, **kwargs):
+        """Capture this layer's graph-safe body without offload boundary events.
+
+        The public capture entry owns the graph boundary. Outer graphable wrappers
+        may call this implementation when they capture the TransformerLayer body as
+        part of a larger callable, avoiding nested events in the middle of that graph.
+        ``packed_seq_params`` must already be reconstructed by the boundary owner.
+        """
+        assert 'cu_seqlens_q' not in kwargs, (
+            "TransformerLayer CUDA graph capture body received raw THD sequence tensors. "
+            "The outer capture boundary must reconstruct PackedSeqParams first."
+        )
+
         context = None
         if (
             not self.config.cuda_graph_modules
@@ -1482,11 +1505,6 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             cuda_graph_outputs = list(hidden_states)
         if context is not None:
             cuda_graph_outputs.append(context)
-        # Record the forward event on cuda graph stream for cuda graph capture.
-        # This is to ensure the main stream waits for computing on cuda graph stream to complete,
-        # and overlaps with the D2H transfer on offloading stream.
-        if self.offload_module_in_cuda_graph:
-            self.off_interface.forward_record()
         return tuple(cuda_graph_outputs)
 
     def _te_cuda_graph_replay(self, *args, **kwargs):
@@ -2140,7 +2158,13 @@ class HyperConnectionTransformerLayer(TransformerLayer):
         return attention_output, output_bias
 
     def _te_cuda_graph_capture(self, *args, **kwargs):
-        """Capture only the attention consumer for the split mHC path."""
+        """Capture only the attention consumer for the split mHC path.
+
+        This GPT layer is itself the top-level TE graph callable. HybridStack instead wraps
+        plain ``TransformerLayer`` instances in ``HyperConnectionHybridLayer``, so no outer
+        wrapper calls this subclass's ``_te_cuda_graph_capture_impl``. If that topology changes,
+        this subclass must override the implementation entry point as well.
+        """
         if not self._uses_mhc_recompute_attn_cuda_graph_split():
             return super()._te_cuda_graph_capture(*args, **kwargs)
 
