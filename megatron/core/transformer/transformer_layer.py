@@ -1191,6 +1191,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         residual: Tensor,
         *,
         _return_layer_delta: bool = False,
+        mlp_norm_input: Optional[Tensor] = None,
     ) -> Tensor:
         """
         Perform operations after the MLP computation.
@@ -1200,6 +1201,9 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             residual (Tensor): Residual tensor.
             _return_layer_delta (bool): Internal split-hybrid mode: omit the residual
                 addition while retaining norm ownership and recompute hooks.
+            mlp_norm_input (Tensor, optional): Input owned by the pre-MLP norm offload group.
+                Defaults to ``residual``. AttnRes supplies this separately because its BDA
+                residual is the running partial sum, not the aggregated norm input.
 
         Returns:
             output (Tensor): Transformed hidden states of shape [s, b, h].
@@ -1235,8 +1239,9 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         # Delay the offload of the mlp norm until after the mlp_bda has been computed
         # because the residual is needed in the mlp_bda.
         if self.mlp_norm_manager is not None:
+            norm_input = residual if mlp_norm_input is None else mlp_norm_input
             hidden_states = self.mlp_norm_manager.group_offload(
-                hidden_states, forced_released_tensors=[residual]
+                hidden_states, forced_released_tensors=[norm_input]
             )
             self.mlp_norm_manager = None
 
@@ -3071,7 +3076,7 @@ class AttnResTransformerLayer(TransformerLayer):
         aggregated = self.self_attention_attn_res(values)
         nvtx_range_pop(suffix="self_attention_attn_res")
 
-        attention_output_with_bias, attn_norm_manager, _ = (
+        attention_output_with_bias, attn_norm_manager, attn_norm_input = (
             self._forward_self_attention_output_with_bias(
                 aggregated,
                 attention_mask=attention_mask,
@@ -3105,7 +3110,7 @@ class AttnResTransformerLayer(TransformerLayer):
         nvtx_range_pop(suffix="self_attn_bda")
 
         hidden_states = attn_norm_manager.group_offload(
-            hidden_states, forced_released_tensors=[aggregated]
+            hidden_states, forced_released_tensors=[attn_norm_input]
         )
 
         return hidden_states, context
@@ -3132,9 +3137,9 @@ class AttnResTransformerLayer(TransformerLayer):
         aggregated = self.mlp_attn_res(values)
         nvtx_range_pop(suffix="mlp_attn_res")
 
-        # The helper captures its own residual from the aggregated input; it is
-        # discarded — the BDA residual is the partial sum.
-        mlp_output_with_bias, _ = self._forward_mlp_output_with_bias(
+        # The aggregated input belongs to the norm offload group, while the BDA
+        # residual is the independently owned partial sum.
+        mlp_output_with_bias, mlp_norm_input = self._forward_mlp_output_with_bias(
             aggregated,
             inference_context=inference_context,
             padding_mask=padding_mask,
@@ -3142,7 +3147,7 @@ class AttnResTransformerLayer(TransformerLayer):
             packed_seq_params=packed_seq_params,
         )
 
-        return self._forward_post_mlp(mlp_output_with_bias, partial)
+        return self._forward_post_mlp(mlp_output_with_bias, partial, mlp_norm_input=mlp_norm_input)
 
 
 class MoETransformerLayer(TransformerLayer):

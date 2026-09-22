@@ -48,8 +48,6 @@ from ..utils import (
 
 logger = logging.getLogger(__name__)
 
-_ATTN_RES_SUPPORTED_OFFLOAD_MODULES = frozenset({"qkv_linear", "core_attn", "attn_proj"})
-
 try:
     from packaging.version import Version as PkgVersion
 
@@ -1598,11 +1596,10 @@ class TransformerConfig(ModelParallelConfig):
         uniform width plus a rank-local source cache — see
         attention_residual.AttnResStageSources), selective recompute of modules
         that live inside a sublayer (e.g. core_attn), MoE (incl. shared-expert
-        overlap), attention-scope fine-grained activation offloading
-        (qkv_linear, core_attn, and attn_proj), and MTP in the standard or
-        hybrid last-stage placement. Everything rejected below either has no mechanism
-        yet (CUDA graphs, full recompute, EP-overlap fine-grained schedule,
-        non-attention activation offloading, zero-layer virtual chunks) or
+        overlap), fine-grained activation offloading, and MTP in the standard
+        or hybrid last-stage placement. Everything rejected below either has no
+        mechanism yet (CUDA graphs, full recompute, EP-overlap fine-grained
+        schedule, zero-layer virtual chunks) or
         would silently bypass the AttnRes residual interception (fused residual
         norms, fp32 residual connection) or the static pipeline payload-width
         reasoning (variable sequence lengths with PP/VPP).
@@ -1667,15 +1664,6 @@ class TransformerConfig(ModelParallelConfig):
         if self.cpu_offloading:
             unsupported.append(
                 "cpu_offloading (depth sources outlive the per-layer lifetime model)"
-            )
-        unsupported_offload_modules = set(self.offload_modules or ()) - (
-            _ATTN_RES_SUPPORTED_OFFLOAD_MODULES
-        )
-        if unsupported_offload_modules:
-            unsupported.append(
-                "fine-grained activation offloading for unsupported modules "
-                f"{sorted(unsupported_offload_modules)}; supported AttnRes offload modules are "
-                f"{sorted(_ATTN_RES_SUPPORTED_OFFLOAD_MODULES)}"
             )
         if self.heterogeneous_block_specs:
             unsupported.append("heterogeneous_block_specs")

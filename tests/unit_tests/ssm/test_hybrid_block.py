@@ -880,7 +880,21 @@ class TestAttnResHybridBlock:
         Utils.destroy_model_parallel()
 
     def get_pg_collection(self):
-        return ProcessGroupCollection.use_mpu_process_groups(required_pgs=['tp', 'pp', 'cp'])
+        return ProcessGroupCollection.use_mpu_process_groups(
+            required_pgs=[
+                'tp',
+                'pp',
+                'embd',
+                'cp',
+                'dp_cp',
+                'ep',
+                'expt_tp',
+                'expt_dp',
+                'tp_ep',
+                'tp_cp',
+                'tp_dp_cp',
+            ]
+        )
 
     def _make_config(
         self, num_layers, block_layers=1, enable=True, eps=1e-6, attn_res_impl="eager", **kwargs
@@ -906,10 +920,12 @@ class TestAttnResHybridBlock:
             **kwargs,
         )
 
-    def _make_stack(self, config, layer_type_list, pp_layer_offset=0, pre=True, post=True):
+    def _make_stack(
+        self, config, layer_type_list, pp_layer_offset=0, pre=True, post=True, submodules=None
+    ):
         return HybridStack(
             config,
-            hybrid_stack_spec.submodules,
+            hybrid_stack_spec.submodules if submodules is None else submodules,
             layer_type_list=layer_type_list,
             pp_layer_offset=pp_layer_offset,
             pre_process=pre,
@@ -1028,6 +1044,7 @@ class TestAttnResHybridBlock:
         "attn_res_impl",
         [
             "eager",
+            "compile",
             pytest.param(
                 "fla",
                 marks=pytest.mark.skipif(
@@ -1036,37 +1053,99 @@ class TestAttnResHybridBlock:
             ),
         ],
     )
-    def test_attention_activation_offloading_forward_backward(self, attn_res_impl):
-        """Attention-scope offloading preserves AttnRes hybrid outputs and gradients."""
-        layer_type_list = validate_segment_layers(
-            Symbols.ATTENTION + Symbols.MLP + Symbols.ATTENTION + Symbols.MLP
-        )
-        offload_modules = ["qkv_linear", "core_attn", "attn_proj"]
+    @pytest.mark.parametrize(
+        "layer_pattern,offload_modules,model_kwargs",
+        [
+            pytest.param(
+                Symbols.ATTENTION + Symbols.MLP + Symbols.ATTENTION + Symbols.MLP,
+                ["attn_norm", "qkv_linear", "core_attn", "attn_proj", "mlp_norm"],
+                {},
+                id="dense-all",
+            ),
+            pytest.param(
+                Symbols.ATTENTION + Symbols.MOE + Symbols.ATTENTION + Symbols.MOE,
+                [
+                    "attn_norm",
+                    "qkv_linear",
+                    "core_attn",
+                    "attn_proj",
+                    "mlp_norm",
+                    "expert_fc1",
+                    "moe_act",
+                ],
+                {
+                    "bf16": True,
+                    "params_dtype": torch.bfloat16,
+                    "num_moe_experts": 4,
+                    "moe_ffn_hidden_size": 512,
+                    "moe_router_topk": 2,
+                    "moe_router_load_balancing_type": "none",
+                    "moe_grouped_gemm": True,
+                    "gated_linear_unit": True,
+                    "activation_func": torch.nn.functional.silu,
+                    "add_bias_linear": False,
+                },
+                id="moe-all-non-fused",
+            ),
+        ],
+    )
+    @pytest.mark.parametrize("recompute_layernorm", [False, True])
+    def test_activation_offloading_forward_backward(
+        self, attn_res_impl, layer_pattern, offload_modules, model_kwargs, recompute_layernorm
+    ):
+        """Every applicable offload boundary preserves hybrid outputs and gradients."""
+        layer_type_list = validate_segment_layers(layer_pattern)
 
         baseline_config = self._make_config(
-            len(layer_type_list), block_layers=2, attn_res_impl=attn_res_impl
+            len(layer_type_list),
+            block_layers=2,
+            attn_res_impl=attn_res_impl,
+            recompute_granularity="selective" if recompute_layernorm else None,
+            recompute_modules=["layernorm"] if recompute_layernorm else [],
+            **model_kwargs,
         )
         offload_config = self._make_config(
             len(layer_type_list),
             block_layers=2,
             attn_res_impl=attn_res_impl,
+            recompute_granularity="selective" if recompute_layernorm else None,
+            recompute_modules=["layernorm"] if recompute_layernorm else [],
             fine_grained_activation_offloading=True,
             offload_modules=offload_modules,
             min_offloaded_tensor_size=1,
+            **model_kwargs,
         )
 
         model_parallel_cuda_manual_seed(123)
         torch.manual_seed(123)
-        baseline = self._make_stack(baseline_config, layer_type_list).cuda().train()
+        baseline = (
+            self._make_stack(
+                baseline_config,
+                layer_type_list,
+                submodules=TestHybridBlock._non_fused_norm_submodules(),
+            )
+            .cuda()
+            .train()
+        )
         model_parallel_cuda_manual_seed(123)
         torch.manual_seed(123)
-        offloaded = self._make_stack(offload_config, layer_type_list).cuda().train()
+        offloaded = (
+            self._make_stack(
+                offload_config,
+                layer_type_list,
+                submodules=TestHybridBlock._non_fused_norm_submodules(),
+            )
+            .cuda()
+            .train()
+        )
         offloaded.load_state_dict(baseline.state_dict())
 
         sequence_length, micro_batch_size = 32, 2
         torch.manual_seed(7)
         hidden_data = torch.randn(
-            (sequence_length, micro_batch_size, baseline_config.hidden_size), device="cuda"
+            (sequence_length, micro_batch_size, baseline_config.hidden_size),
+            device="cuda",
+            dtype=baseline_config.params_dtype,
         )
         attention_mask = torch.ones(
             (micro_batch_size, 1, sequence_length, sequence_length), dtype=bool, device="cuda"
@@ -1111,6 +1190,11 @@ class TestAttnResHybridBlock:
 
             manager = PipelineOffloadManager.get_instance()
             for module in offload_modules:
+                if module == "qkv_linear" and recompute_layernorm:
+                    # The QKV input is a CheckpointWithoutOutput tensor. The norm
+                    # checkpoint owns its storage and regenerates it in backward.
+                    assert manager.offload_summary_bytes.get(module, 0) == 0
+                    continue
                 assert manager.offload_summary_bytes.get(module, 0) > 0, (
                     f"Expected {module} to offload at least one activation, got "
                     f"{manager.offload_summary_bytes.get(module, 0)} bytes"

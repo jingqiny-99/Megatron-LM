@@ -615,17 +615,30 @@ class TestAttnResConfigValidation:
                 )
             )
 
+    @pytest.mark.parametrize("attn_res_impl", ["eager", "compile", "fla"])
     @pytest.mark.parametrize(
-        "offload_modules,attn_res_impl",
+        "offload_modules",
         [
-            (["qkv_linear"], "eager"),
-            (["core_attn"], "eager"),
-            (["core_attn", "attn_proj"], "eager"),
-            (["qkv_linear", "core_attn", "attn_proj"], "compile"),
-            (["qkv_linear", "core_attn", "attn_proj"], "fla"),
+            ["attn_norm"],
+            ["qkv_linear"],
+            ["core_attn"],
+            ["core_attn", "attn_proj"],
+            ["mlp_norm"],
+            ["expert_fc1"],
+            ["moe_act"],
+            ["fused_group_mlp"],
+            [
+                "attn_norm",
+                "qkv_linear",
+                "core_attn",
+                "attn_proj",
+                "mlp_norm",
+                "expert_fc1",
+                "moe_act",
+            ],
         ],
     )
-    def test_attention_offload_modules_supported(self, offload_modules, attn_res_impl):
+    def test_all_fine_grained_offload_modules_supported(self, offload_modules, attn_res_impl):
         from megatron.core.transformer.transformer_config import TransformerConfig
 
         TransformerConfig(
@@ -633,32 +646,9 @@ class TestAttnResConfigValidation:
                 attn_res_impl=attn_res_impl,
                 fine_grained_activation_offloading=True,
                 offload_modules=offload_modules,
+                use_transformer_engine_op_fuser="fused_group_mlp" in offload_modules,
             )
         )
-
-    @pytest.mark.parametrize(
-        "offload_module", ["attn_norm", "mlp_norm", "expert_fc1", "fused_group_mlp", "moe_act"]
-    )
-    def test_non_attention_offload_modules_rejected(self, offload_module):
-        from megatron.core.transformer.transformer_config import TransformerConfig
-
-        with pytest.raises(ValueError, match=offload_module):
-            TransformerConfig(
-                **self._base_kwargs(
-                    fine_grained_activation_offloading=True, offload_modules=[offload_module]
-                )
-            )
-
-    def test_mixed_attention_and_non_attention_offload_modules_rejected(self):
-        from megatron.core.transformer.transformer_config import TransformerConfig
-
-        with pytest.raises(ValueError, match="attn_norm"):
-            TransformerConfig(
-                **self._base_kwargs(
-                    fine_grained_activation_offloading=True,
-                    offload_modules=["qkv_linear", "attn_norm"],
-                )
-            )
 
     def test_attn_proj_offload_still_requires_core_attn(self):
         from megatron.core.transformer.transformer_config import TransformerConfig
