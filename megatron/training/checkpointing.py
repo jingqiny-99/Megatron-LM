@@ -1,4 +1,4 @@
-# Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 """Input/output checkpointing."""
 
@@ -471,6 +471,24 @@ class CheckpointType(Enum):
     GLOBAL = auto()
     TORCH_DCP = auto()
     FSDP_DTENSOR = auto()
+
+
+def _validate_attn_res_optimizer_checkpoint(args, checkpoint_args, metadata):
+    """Reject buffer-addressed optimizer loads across the source-query layout split."""
+    source_now = getattr(args, 'attn_res_impl', None) == 'source'
+    source_saved = getattr(checkpoint_args, 'attn_res_impl', None) == 'source'
+    if source_now == source_saved:
+        return
+    sharding_type = (metadata or {}).get('distrib_optim_sharding_type', 'dp_zero_gather_scatter')
+    if sharding_type not in DistributedOptimizer.checkpoint_fully_reshardable_formats:
+        raise RuntimeError(
+            'Changing between source-owned and consumer-owned Attention Residual projections '
+            f'changes distributed optimizer buffers, but this checkpoint uses {sharding_type}. '
+            'Load and save the checkpoint once with its original attn_res_impl and '
+            '--dist-ckpt-optim-fully-reshardable, then change attn_res_impl. '
+            'Model-space optimizer checkpoints preserve parameters and Adam moments across '
+            'this change; buffer-addressed checkpoints require that conversion.'
+        )
 
 
 def _build_sharded_state_dict_metadata(
@@ -2141,6 +2159,11 @@ def load_checkpoint(
         ):
             gen_sd_optim = optimizer
             gen_sd_opt_param_scheduler = opt_param_scheduler
+
+            if args.use_distributed_optimizer or getattr(
+                args, 'use_layer_wise_distributed_optimizer', False
+            ):
+                _validate_attn_res_optimizer_checkpoint(args, ckpt_args, sharded_sd_metadata)
 
             if args.use_distributed_optimizer:
                 if sharded_sd_metadata is None:

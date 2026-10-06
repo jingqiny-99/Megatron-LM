@@ -1084,6 +1084,14 @@ def validate_args(args, defaults={}):
             args.overlap_grad_reduce
         ), 'Must use --overlap-param-gather with --overlap-grad-reduce'
 
+    if getattr(args, 'attn_res_impl', None) == 'source' and (
+        args.use_torch_fsdp2 or args.use_megatron_fsdp
+    ):
+        raise ValueError(
+            "Source-owned AttnRes projections require the standard DDP gradient-publication "
+            "protocol; FSDP projection-gradient publication is not implemented."
+        )
+
     if args.use_torch_fsdp2:
         assert is_torch_min_version("2.4.0"), 'FSDP2 requires PyTorch >= 2.4.0 with FSDP 2 support.'
         assert (

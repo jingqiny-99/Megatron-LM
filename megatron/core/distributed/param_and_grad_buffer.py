@@ -260,6 +260,14 @@ class _ParamAndGradBucketGroup:
                 self.param_to_bucket[param] = bucket
                 self.params.add(param)
 
+        self.externally_managed_params = {
+            param for param in self.params if getattr(param, '_externally_managed_grad', False)
+        }
+        self.pending_external_grads = set(self.externally_managed_params)
+        self.deferred_grad_sync_requested = False
+        self.deferred_grad_sync_force_all_reduce = False
+        self.external_grad_sync_dispatched = False
+
         self.next_param_gather_bucket_group = None
         # Set in DistributedDataParallel.__init__ when reduce_scatter_with_fp32_accumulation is on:
         # points to the bucket group whose grad-reduce was dispatched immediately before mine in
@@ -341,6 +349,36 @@ class _ParamAndGradBucketGroup:
         self.per_param_grad_ready_counts = {}
         self.is_last_microbatch = True
         self.grad_reduce_finished = False
+        self.pending_external_grads = set(self.externally_managed_params)
+        self.deferred_grad_sync_requested = False
+        self.deferred_grad_sync_force_all_reduce = False
+        self.external_grad_sync_dispatched = False
+
+    def register_external_grad_ready(
+        self, param: torch.nn.Parameter, force_all_reduce: bool = False
+    ) -> None:
+        """Complete one externally accumulated parameter once per iteration.
+
+        Call after all contributions have been written to ``main_grad`` and
+        after leaving the schedule's ``no_sync`` context. Early explicit sync
+        requests are replayed only when every external gradient is complete.
+        """
+        assert (
+            param in self.pending_external_grads
+        ), "An external gradient must be completed exactly once per iteration"
+        assert self.is_last_microbatch, "Complete external gradients after leaving no_sync"
+        self.pending_external_grads.remove(param)
+        self.deferred_grad_sync_force_all_reduce |= bool(force_all_reduce)
+        force_all_reduce = self.deferred_grad_sync_force_all_reduce
+        if self.ddp_config.overlap_grad_reduce:
+            self.register_grad_ready(param, force_all_reduce=force_all_reduce)
+        if (
+            not self.pending_external_grads
+            and self.deferred_grad_sync_requested
+            and self.grad_reduce_handle is None
+            and not self.grad_reduce_finished
+        ):
+            self.start_grad_sync(force_all_reduce=force_all_reduce)
 
     def _finalize_layerwise_param_sync(self):
         """Copy gathered LayerWise (non-DistOpt) params back and release the reused grad buffer.
@@ -657,6 +695,15 @@ class _ParamAndGradBucketGroup:
         communication call. When ddp_config.overlap_grad_reduce is set to False, makes
         synchronous call.
         """
+        if self.pending_external_grads:
+            # A chunk can request synchronization before query gradients return
+            # from other PP ranks. Do not read/scale this buffer or wait for PP
+            # here: waiting would block the backward sends that produce them.
+            self.deferred_grad_sync_requested = True
+            self.deferred_grad_sync_force_all_reduce |= bool(force_all_reduce)
+            return
+        if self.externally_managed_params and self.external_grad_sync_dispatched:
+            return
         if self.is_first_batch and self.grad_reduce_handle is not None:
             # Make this start_grad_sync call a no-op if in first batch and collective has
             # already been dispatched.
@@ -682,6 +729,8 @@ class _ParamAndGradBucketGroup:
         assert (
             self.grad_reduce_handle is None
         ), "Should not have multiple communication calls outstanding at once"
+        if self.externally_managed_params:
+            self.external_grad_sync_dispatched = True
 
         # Local CUDA graph replay is asynchronous with respect to the outer
         # autograd hooks. Wait before reading, scaling, or reducing gradients
@@ -847,6 +896,9 @@ class _ParamAndGradBucketGroup:
         non-overlap path preserves its original per-call dispatch+wait behaviour
         because it has no predecessor draining.
         """
+        assert (
+            not self.pending_external_grads
+        ), "Finalize externally managed gradients before finishing gradient synchronization"
         self.param_gather_dispatched = False
         # If overlap_grad_reduce is False, start (and finish) synchronous communication call here.
         if not self.ddp_config.overlap_grad_reduce:
@@ -942,11 +994,13 @@ def group_params_for_buffers(
 ) -> Dict['BufferKey', Tuple[List[torch.nn.Parameter], List[int]]]:
     """Group parameters by buffer identity for buffer allocation.
 
-    Each distinct buffer is identified by a BufferKey with three dimensions:
+    Each distinct buffer is identified by a BufferKey with these dimensions:
     - param_dtype: storage dtype (torch.uint8 for FP8/NVFP4 parameters, else param.dtype).
     - grad_dtype: gradient reduction dtype (torch.float if grad_reduce_in_fp32, else param.dtype).
     - is_expert_parallel: whether the parameter is expert-parallel (param.allreduce == False),
       which requires a separate buffer with a different data-parallel group.
+    - is_managed_by_layer_wise_optimizer: whether the optimizer uses a shard-aligned layout.
+    - is_external_grad_managed: whether gradients arrive through an explicit finalizer.
 
     The param_indices track each parameter's position among same-dtype params (using
     the "fake" high-precision dtype for FP8/NVFP4 params), needed for loading non-native-fp8
@@ -989,7 +1043,11 @@ def group_params_for_buffers(
             param_dtype = param.dtype
 
         key = BufferKey(
-            param_dtype, grad_dtype, is_expert_parallel, is_managed_by_layer_wise_optimizer
+            param_dtype,
+            grad_dtype,
+            is_expert_parallel,
+            is_managed_by_layer_wise_optimizer,
+            getattr(param, '_externally_managed_grad', False),
         )
         param_list = key_to_params.get(key, [])
         param_list.append(param)
@@ -997,6 +1055,8 @@ def group_params_for_buffers(
 
         # Use param.dtype (not param_dtype) so FP8/NVFP4 params share offsets with their
         # logical high-precision dtype, needed for checkpoint compatibility.
+        # External-gradient buffers retain the same dtype index space: changing
+        # when a gradient becomes ready must not renumber checkpoint parameters.
         offset_key = BufferKey(
             param.dtype, grad_dtype, is_expert_parallel, is_managed_by_layer_wise_optimizer
         )
@@ -1846,6 +1906,36 @@ def partition_buckets(
 
     if len(buffers) == 0:
         return []
+
+    # External gradients become ready only after the pipeline has drained.
+    # Preserve their independent communication groups even when VPP disables
+    # ordinary bucketing or FP8 merges small, higher-precision buffers. Buffer
+    # identity already separates these params in both DDP and optimizer layouts.
+    external_buffers = [
+        buffer
+        for buffer in buffers
+        if any(getattr(param, '_externally_managed_grad', False) for param in buffer.params)
+    ]
+    if external_buffers:
+        external_ids = {id(buffer) for buffer in external_buffers}
+        ordinary_buffers = [buffer for buffer in buffers if id(buffer) not in external_ids]
+        groups = partition_buckets(
+            ordinary_buffers,
+            force_single_bucket_group=force_single_bucket_group,
+            reduce_scatter_with_fp32_accumulation=reduce_scatter_with_fp32_accumulation,
+        )
+        for buffer in external_buffers:
+            assert all(getattr(param, '_externally_managed_grad', False) for param in buffer.params)
+            for bucket in buffer.buckets:
+                groups.append(
+                    _ParamAndGradBucketGroup(
+                        [bucket],
+                        buffer.ddp_config,
+                        buffer.data_parallel_group,
+                        buffer.data_parallel_world_size,
+                    )
+                )
+        return groups
 
     # At most one fp8 (uint8) buffer is allowed; Cases 2 and 3 below branch on
     # whether one is present. Non-uint8 dtypes can legitimately appear in

@@ -324,10 +324,12 @@ class _AttnResSourceCache:
 
     def __init__(self):
         self.sources: dict = {}
+        self.projections: dict = {}
 
     def reset(self):
         """Clear all state (called at every schedule entry as a safety net)."""
         self.sources.clear()
+        self.projections.clear()
 
 
 _SOURCE_CACHE = _AttnResSourceCache()
@@ -381,7 +383,17 @@ def attn_res_tap_source(tensor: Tensor) -> Tuple[Tensor, Tensor]:
     """
     cache_leaf = tensor.detach()
     cache_leaf.requires_grad_(True)
-    return _AttnResGradTap.apply(tensor, cache_leaf), cache_leaf
+    in_graph = _AttnResGradTap.apply(tensor, cache_leaf)
+    from .attention_residual_source_state import copy_source_projection
+
+    return (copy_source_projection(tensor, in_graph), copy_source_projection(tensor, cache_leaf))
+
+
+def attn_res_projection_payload_shape(config, seq_length, micro_batch_size, pp_rank, vp_stage=None):
+    """Return the typed source-score companion shape at a pipeline boundary."""
+    from .attention_residual_source_state import attn_res_projection_payload_shape as shape
+
+    return shape(config, seq_length, micro_batch_size, pp_rank, vp_stage)
 
 
 class AttnResStageSources:
@@ -418,6 +430,7 @@ class AttnResStageSources:
         self.pre_process = pre_process
         self.graph_sources: List[Tensor] = []
         self._cache_leaves: List[Tensor] = []
+        self.projection = None
         if self.interleaved:
             assert microbatch_id is not None, (
                 "attention residuals under interleaved VPP require the schedule's "
@@ -445,6 +458,15 @@ class AttnResStageSources:
             microbatch_id=microbatch_id,
             pre_process=pre_process,
         )
+        score_payload = None
+        if getattr(config, 'attn_res_impl', None) == 'source':
+            from .attention_residual_source_state import ProjectionSourceState
+
+            state.projection = ProjectionSourceState(state, layers_before)
+            if not pre_process:
+                if not isinstance(hidden_states, list) or len(hidden_states) != 2:
+                    raise ValueError('Source projection requires a value/score pipeline pair')
+                hidden_states, score_payload = hidden_states
         if pre_process:
             if state.interleaved:
                 cache = get_attn_res_source_cache().sources
@@ -454,6 +476,8 @@ class AttnResStageSources:
                 )
             # The embedding output is the initial partial sum; it becomes depth
             # source b_0 when layer 1 opens the first block.
+            if state.projection is not None:
+                hidden_states = state.projection.enter(hidden_states, score_payload)
             return state, hidden_states
 
         block_layers = config.attn_res_block_layers
@@ -495,16 +519,26 @@ class AttnResStageSources:
                 "is broken"
             )
         nvtx_range_pop(msg="attn_res.unpack_payload")
+        if state.projection is not None:
+            hidden_states = state.projection.enter(hidden_states, score_payload)
         return state, hidden_states
 
     def append_block_start(self, hidden_states: Tensor):
         """Record a completed depth block (the partial sum becomes a source)."""
+        if self.projection is not None:
+            hidden_states = self.projection.complete(hidden_states, len(self.graph_sources))
         if self.interleaved:
             in_graph, leaf = attn_res_tap_source(hidden_states)
             self.graph_sources.append(in_graph)
             self._cache_leaves.append(leaf)
         else:
             self.graph_sources.append(hidden_states)
+
+    def after_layer(self, hidden_states: Tensor, layer_number: int) -> Tensor:
+        """Project newly completed sources on their producing stage."""
+        if self.projection is not None:
+            return self.projection.after_layer(hidden_states, layer_number)
+        return hidden_states
 
     def _update_cache(self):
         """Store or evict this rank's cache entry after the chunk's exit processing."""
@@ -521,14 +555,20 @@ class AttnResStageSources:
 
     def exit_aggregate_values(self, partial: Tensor) -> List[Tensor]:
         """Values for the final output head: all sources plus the trailing partial."""
+        if self.projection is not None:
+            partial = self.projection.complete(partial, len(self.graph_sources))
+            self.projection.finish()
         values = [*self.graph_sources, partial]
         self._update_cache()
         return values
 
-    def exit_pack(self, partial: Tensor) -> Tensor:
+    def exit_pack(self, partial: Tensor) -> Tensor | List[Tensor]:
         """Pack the outgoing pipeline payload (full prefix, or delta+pad under VPP)."""
         if not self.interleaved:
-            return pack_attn_res_payload([*self.graph_sources, partial])
+            payload = pack_attn_res_payload([*self.graph_sources, partial])
+            if self.projection is not None:
+                return self.projection.pack(payload, partial)
+            return payload
         pp_size = self.config.pipeline_model_parallel_size
         recv_pp_rank = (self.pp_rank + 1) % pp_size
         recv_vp_stage = self.vp_stage + (1 if self.pp_rank == pp_size - 1 else 0)
@@ -543,6 +583,8 @@ class AttnResStageSources:
             [*outgoing, partial], pad_to_slices=attn_res_uniform_payload_slices(self.config)
         )
         self._update_cache()
+        if self.projection is not None:
+            return self.projection.pack(payload, partial)
         return payload
 
 
@@ -715,6 +757,9 @@ class AttentionResidual(MegatronModule):
 
     def __init__(self, config: TransformerConfig, layer_number: Optional[int] = None):
         super().__init__(config)
+        self.layer_number = layer_number
+        self.projection_consumer_id = (0, 0, layer_number or config.num_layers + 1, 0)
+        self.projection_stop_source_grad = False
         self.eps = config.layernorm_epsilon
         self.impl = getattr(config, 'attn_res_impl', 'fla')
         self._fla_fused_attnres = _get_fla_fused_attnres() if self.impl == 'fla' else None
@@ -726,6 +771,10 @@ class AttentionResidual(MegatronModule):
         # Zero init is mandatory: uniform initial attention weights.
         self.pseudo_query = mark_keep_in_fp32(nn.Parameter(torch.zeros(config.hidden_size)))
         self.key_norm_weight = mark_keep_in_fp32(nn.Parameter(torch.ones(config.hidden_size)))
+        if self.impl == 'source':
+            from .attention_residual_projection_runtime import mark_attn_res_projection_parameters
+
+            mark_attn_res_projection_parameters(self)
         if config.sequence_parallel:
             setattr(self.pseudo_query, 'sequence_parallel', True)
             setattr(self.key_norm_weight, 'sequence_parallel', True)
@@ -734,7 +783,27 @@ class AttentionResidual(MegatronModule):
         """Aggregate depth sources (+ optional partial sum) into the sublayer input."""
         assert len(values) >= 1, "AttentionResidual requires at least one depth source"
         nvtx_range_push(msg=f"attn_res.aggregate_n{len(values)}")
-        if len(values) == 1:
+        if self.impl == 'source':
+            from .attention_residual_projection_kernels import aggregate_preprojected
+            from .attention_residual_projection_runtime import get_attn_res_projection_runtime
+            from .attention_residual_source_state import source_logits_for_consumer
+
+            runtime = get_attn_res_projection_runtime(self)
+            if runtime is None:
+                raise RuntimeError(
+                    'Prepare the source-projection runtime at pipeline schedule entry '
+                    'before forward'
+                )
+            column = runtime.column(self)
+            logits = [source_logits_for_consumer(value, column) for value in values]
+            out = aggregate_preprojected(
+                values,
+                runtime.effective_weight(self),
+                logits,
+                eps=self.eps,
+                precomputed_value_grad=True,
+            )
+        elif len(values) == 1:
             # A one-source softmax is identically one. Keep explicit zero
             # parameter gradients for DDP's grad-ready accounting, without
             # introducing fused-backward cancellation noise at block 0.

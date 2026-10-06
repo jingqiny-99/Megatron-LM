@@ -1,4 +1,4 @@
-# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 """Parameter layout dataclasses for optimizer-driven buffer layout.
 
@@ -58,12 +58,16 @@ class BufferKey:
             managed by :class:`LayerWiseDistributedOptimizer` (shard-aligned layout
             so each whole param lives in one shard). Non-LayerWise params get
             :class:`DistributedOptimizer`'s byte-level layout in a separate buffer.
+        is_external_grad_managed: Whether gradients are completed explicitly after
+            pipeline backward, rather than by parameter autograd hooks. These
+            buffers must retain independent communication groups.
     """
 
     param_dtype: torch.dtype
     grad_dtype: torch.dtype
     is_expert_parallel: bool
     is_managed_by_layer_wise_optimizer: bool = False
+    is_external_grad_managed: bool = False
 
 
 @dataclass

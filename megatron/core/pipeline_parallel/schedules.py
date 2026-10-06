@@ -13,7 +13,7 @@ from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
     FineGrainedActivationOffloadingInterface as off_interface,
 )
 from megatron.core.pipeline_parallel.multimodule_communicator import MultiModulePipelineCommunicator
-from megatron.core.pipeline_parallel.p2p_communication import P2PCommunicator
+from megatron.core.pipeline_parallel.p2p_communication import P2PCommunicator, PipelineTensorSpec
 from megatron.core.pipeline_parallel.utils import (
     is_pp_first_stage,
     is_pp_last_stage,
@@ -42,7 +42,25 @@ from .combined_1f1b import (
 )
 
 # Types
-Shape = Union[List[int], torch.Size]
+Shape = Union[List[int], tuple[int, ...], torch.Size]
+
+
+def _prepare_attn_res_projection(model, config, pp_group, forward_only):
+    if getattr(config, 'attn_res_impl', None) == 'source':
+        from megatron.core.transformer.attention_residual_projection_runtime import (
+            prepare_attn_res_projection,
+        )
+
+        prepare_attn_res_projection(model, pp_group, forward_only=forward_only)
+
+
+def _finalize_attn_res_projection(model, config, pp_group, forward_only):
+    if not forward_only and getattr(config, 'attn_res_impl', None) == 'source':
+        from megatron.core.transformer.attention_residual_projection_runtime import (
+            finalize_attn_res_projection,
+        )
+
+        finalize_attn_res_projection(model, pp_group)
 
 
 def get_forward_backward_func(
@@ -185,7 +203,7 @@ def deallocate_output_tensor(out, deallocate_pipeline_outputs=False):
         return
 
     # Handle list format
-    if isinstance(out, list):
+    if isinstance(out, (list, tuple)):
         for item in out:
             deallocate_output_tensor(item, deallocate_pipeline_outputs)
         return
@@ -205,21 +223,24 @@ def custom_backward(output, grad_output):
     grad have the same shape, while C++'s 'backward' does not.
     '''
 
-    assert output.numel() == 1, "output should be pseudo-'freed' in schedule, to optimize memory"
-    assert isinstance(output, torch.Tensor), "output == '%s'." % type(output).__name__
-    assert isinstance(grad_output, (torch.Tensor, type(None))), (
-        "grad_output == '%s'." % type(grad_output).__name__
-    )
+    outputs = output if isinstance(output, (list, tuple)) else [output]
+    grads = grad_output if isinstance(grad_output, (list, tuple)) else [grad_output]
+    if len(outputs) != len(grads):
+        raise ValueError("Pipeline outputs and gradients must have equal lengths")
+    prepared_grads = []
+    for tensor, grad in zip(outputs, grads):
+        assert isinstance(tensor, torch.Tensor), "expected Tensor output"
+        assert tensor.numel() == 1, "output should be pseudo-freed by the schedule"
+        assert isinstance(grad, (torch.Tensor, type(None))), "expected Tensor gradient or None"
+        if grad is None:
+            grad = torch.ones_like(tensor, memory_format=torch.preserve_format)
+        prepared_grads.append(grad)
 
-    # Handle scalar output
-    if grad_output is None:
-        assert output.numel() == 1, "implicit grad requires scalar output."
-        grad_output = torch.ones_like(output, memory_format=torch.preserve_format)
-
-    # Call c++ engine [ see torch/csrc/autograd/python_engine.cpp ]
+    # All payload outputs share a graph. One engine invocation accumulates both
+    # direct-value and projected-score gradients before releasing that graph.
     Variable._execution_engine.run_backward(
-        tensors=(output,),
-        grad_tensors=(grad_output,),
+        tensors=tuple(outputs),
+        grad_tensors=tuple(prepared_grads),
         keep_graph=False,
         create_graph=False,
         inputs=tuple(),
@@ -231,7 +252,9 @@ def custom_backward(output, grad_output):
 def get_tensor_device(tensor: Union[torch.Tensor, Dict[str, torch.Tensor]]):
     """Get the device of a tensor or a dictionary of tensors."""
     if isinstance(tensor, dict):
-        return next(iter(tensor.values())).device
+        return get_tensor_device(next(iter(tensor.values())))
+    if isinstance(tensor, (list, tuple)):
+        return get_tensor_device(tensor[0])
     return tensor.device
 
 
@@ -526,7 +549,7 @@ def forward_step(
         is_last_stage,
     )
 
-    if unwrap_output_tensor:
+    if unwrap_output_tensor or isinstance(output_tensor, list):
         return output_tensor, num_tokens
     return [output_tensor], num_tokens
 
@@ -538,10 +561,6 @@ def backward_step(input_tensor, output_tensor, output_tensor_grad, config):
     with respect to stage's output tensor.
 
     Returns gradient of loss with respect to input tensor (None if first stage)."""
-
-    # NOTE: This code currently can handle at most one skip connection. It
-    # needs to be modified slightly to support arbitrary numbers of skip
-    # connections.
 
     if config.timers is not None:
         config.timers('backward-compute', log_level=2).start()
@@ -557,8 +576,12 @@ def backward_step(input_tensor, output_tensor, output_tensor_grad, config):
 
     if not isinstance(output_tensor, list):
         output_tensor = [output_tensor]
-    if not isinstance(output_tensor_grad, list):
+    if output_tensor_grad is None:
+        output_tensor_grad = [None] * len(output_tensor)
+    elif not isinstance(output_tensor_grad, list):
         output_tensor_grad = [output_tensor_grad]
+    if len(output_tensor) != len(output_tensor_grad):
+        raise ValueError("Pipeline outputs and gradients must have equal lengths")
 
     # Backward pass.
     if output_tensor_grad[0] is None and config.grad_scale_func is not None:
@@ -569,11 +592,20 @@ def backward_step(input_tensor, output_tensor, output_tensor_grad, config):
     # will not participate in the computation.
     # This results in a tensor that does not require gradients.
     # In such cases, we intentionally skip the backward pass while preserving zero gradients.
-    if output_tensor[0].requires_grad:
+    differentiable = [
+        (output, grad)
+        for output, grad in zip(output_tensor, output_tensor_grad)
+        if output.requires_grad
+    ]
+    if differentiable:
+        outputs, grads = zip(*differentiable)
         if config.deallocate_pipeline_outputs:
-            custom_backward(output_tensor[0], output_tensor_grad[0])
+            if len(outputs) == 1:
+                custom_backward(outputs[0], grads[0])
+            else:
+                custom_backward(outputs, grads)
         else:
-            torch.autograd.backward(output_tensor[0], grad_tensors=output_tensor_grad[0])
+            torch.autograd.backward(outputs, grad_tensors=grads)
 
     # Collect the grad of the input_tensor.
     input_tensor_grad = [None]
@@ -583,7 +615,12 @@ def backward_step(input_tensor, output_tensor, output_tensor_grad, config):
             if x is None:
                 input_tensor_grad.append(None)
             else:
-                input_tensor_grad.append(x.grad)
+                grad = x.grad
+                if grad is None and getattr(config, 'attn_res_impl', None) == 'source':
+                    # A score channel can be empty or unused at this stage. Its
+                    # zero VJP still has to travel over the matching P2P edge.
+                    grad = torch.zeros_like(x)
+                input_tensor_grad.append(grad)
 
     if unwrap_input_tensor_grad:
         input_tensor_grad = input_tensor_grad[0]
@@ -726,15 +763,16 @@ def forward_backward_no_pipelining(
     ), "adjust_tensor_shapes_fn is not supported for non-pipeline-parallel schedule"
 
     config = get_model_config(model)
+    _prepare_attn_res_projection(model, config, getattr(pg_collection, "pp", None), forward_only)
     if config.timers is not None:
         config.timers('forward-backward', log_level=1).start(barrier=config.barrier_with_L1_time)
 
     if getattr(config, "moe_paged_stash", False):
         paged_stash_reset(enabled=not forward_only, config=config)
-        if getattr(config, 'enable_attention_residuals', False):
-            from megatron.core.transformer.attention_residual import attn_res_source_cache_reset
+    if getattr(config, 'enable_attention_residuals', False):
+        from megatron.core.transformer.attention_residual import attn_res_source_cache_reset
 
-            attn_res_source_cache_reset()
+        attn_res_source_cache_reset()
 
     no_sync_func = config.no_sync_func
     if no_sync_func is None:
@@ -812,6 +850,8 @@ def forward_backward_no_pipelining(
         if not forward_only:
             backward_step(input_tensor, output_tensor, output_tensor_grad, config)
             del output_tensor
+
+    _finalize_attn_res_projection(model, config, getattr(pg_collection, "pp", None), forward_only)
 
     if config.finalize_model_grads_func is not None and not forward_only:
         # Finalize model grads (perform full grad all-reduce / reduce-scatter for
@@ -1178,12 +1218,14 @@ def forward_backward_pipelining_with_interleaving(
         adjust_tensor_shapes_fn is None
     ), "adjust_tensor_shapes_fn is not supported for interleaved pipeline parallelism"
 
+    _prepare_attn_res_projection(model, config, p2p_communicator.pp_group, forward_only)
+
     if getattr(config, "moe_paged_stash", False):
         paged_stash_reset(enabled=not forward_only, config=config)
-        if getattr(config, 'enable_attention_residuals', False):
-            from megatron.core.transformer.attention_residual import attn_res_source_cache_reset
+    if getattr(config, 'enable_attention_residuals', False):
+        from megatron.core.transformer.attention_residual import attn_res_source_cache_reset
 
-            attn_res_source_cache_reset()
+        attn_res_source_cache_reset()
 
     if config.overlap_p2p_comm and config.batch_p2p_comm:
         raise ValueError("Can not use both overlap_p2p_comm and batch_p2p_comm")
@@ -1304,7 +1346,22 @@ def forward_backward_pipelining_with_interleaving(
     if getattr(config, 'enable_attention_residuals', False) and pipeline_parallel_size > 1:
         from megatron.core.transformer.attention_residual import attn_res_uniform_payload_slices
 
+        local_seq_length = tensor_shape[0]
         tensor_shape[0] = tensor_shape[0] * attn_res_uniform_payload_slices(config)
+        if getattr(config, 'attn_res_impl', None) == 'source':
+            from megatron.core.transformer.attention_residual import (
+                attn_res_projection_payload_shape,
+            )
+
+            tensor_shape = [
+                PipelineTensorSpec(tuple(tensor_shape), config.pipeline_dtype),
+                PipelineTensorSpec(
+                    attn_res_projection_payload_shape(
+                        config, local_seq_length, micro_batch_size, pipeline_parallel_rank, 0
+                    ),
+                    torch.float32,
+                ),
+            ]
 
     # Compute number of warmup and remaining microbatches.
     # seems only used for vpp
@@ -2080,13 +2137,15 @@ def forward_backward_pipelining_with_interleaving(
                 bwd_wait_handle.wait()
 
         if are_all_microbatches_in_warmup:
+            # The terminal model output is a local scalar loss, regardless of
+            # how many channels intermediate stages exchange.
+            is_terminal_stage = _is_vp_last_stage(vp_stage=curr_vp_stage) and is_pp_last_stage(
+                pp_group
+            )
             output_tensor_grads[num_model_chunks - 1].append(
-                p2p_communicator.recv_backward(
-                    tensor_shape,
-                    is_last_stage=(
-                        _is_vp_last_stage(vp_stage=curr_vp_stage) and is_pp_last_stage(pp_group)
-                    ),
-                )
+                None
+                if is_terminal_stage
+                else p2p_communicator.recv_backward(tensor_shape, is_last_stage=False)
             )
         for k in range(num_microbatches_remaining, total_num_microbatches):
             cur_model_chunk_id = get_model_chunk_id(k, forward=False)
@@ -2197,6 +2256,10 @@ def forward_backward_pipelining_with_interleaving(
         not recv_next_wait_handles
     ), 'recv_next_wait_handles should be cleared at the end of a step'
 
+    if send_next_wait_handle is not None:
+        send_next_wait_handle.wait()
+    _finalize_attn_res_projection(model, config, p2p_communicator.pp_group, forward_only)
+
     if config.finalize_model_grads_func is not None and not forward_only:
 
         # If defer_embedding_wgrad_compute is enabled we need to do the
@@ -2236,13 +2299,13 @@ def get_tensor_shapes(
     *,
     seq_length: int,
     micro_batch_size: int,
-    decoder_seq_length: int,
+    decoder_seq_length: Optional[int],
     config,
     tp_group: Optional[torch.distributed.ProcessGroup] = None,
     cp_group: Optional[torch.distributed.ProcessGroup] = None,
     pp_group: Optional[torch.distributed.ProcessGroup] = None,
     is_recv: bool = True,
-):
+) -> List[Union[Shape, PipelineTensorSpec]]:
     """Determine tensor shapes for pipeline communication.
 
     For hyper connections (mHC), intermediate pipeline stages communicate n-stream tensors
@@ -2256,7 +2319,7 @@ def get_tensor_shapes(
     Returns [()] for variable_seq_lengths mode (shapes exchanged dynamically),
     or computed shapes for fixed sequence length mode.
     """
-    tensor_shapes = []
+    tensor_shapes: List[Union[Shape, PipelineTensorSpec]] = []
 
     if config.variable_seq_lengths:
         # Shapes exchanged dynamically during P2P communication
@@ -2272,6 +2335,8 @@ def get_tensor_shapes(
 
     # Determine hidden dimension based on hyper connections and pipeline stage
     hidden_size = config.hidden_size
+    local_seq_length = effective_seq_length
+    boundary_recv_rank = None
     # TODO: make this more robust, including flexible VPP layout
     if getattr(config, 'enable_hyper_connections', False) and pp_group is not None:
         pp_rank = pp_group.rank()
@@ -2309,7 +2374,20 @@ def get_tensor_shapes(
                 config, boundary_recv_rank
             )
 
-    tensor_shapes.append((effective_seq_length, micro_batch_size, hidden_size))
+    value_shape = (effective_seq_length, micro_batch_size, hidden_size)
+    tensor_shapes.append(value_shape)
+    if getattr(config, 'attn_res_impl', None) == 'source' and boundary_recv_rank is not None:
+        from megatron.core.transformer.attention_residual import attn_res_projection_payload_shape
+
+        tensor_shapes[0] = PipelineTensorSpec(value_shape, config.pipeline_dtype)
+        tensor_shapes.append(
+            PipelineTensorSpec(
+                attn_res_projection_payload_shape(
+                    config, local_seq_length, micro_batch_size, boundary_recv_rank
+                ),
+                torch.float32,
+            )
+        )
     return tensor_shapes
 
 
@@ -2416,6 +2494,10 @@ def forward_backward_pipelining_without_interleaving(
     else:
         raise ValueError("Provide both p2p_communicator and pg_collection, or neither")
 
+    _prepare_attn_res_projection(
+        model, config, getattr(p2p_communicator, "pp_group", None), forward_only
+    )
+
     # Needed only when gradients are finalized in M-Core
     if config.finalize_model_grads_func is not None and not forward_only:
         embedding_module = clear_embedding_activation_buffer(
@@ -2427,10 +2509,10 @@ def forward_backward_pipelining_without_interleaving(
 
     if getattr(config, "moe_paged_stash", False):
         paged_stash_reset(enabled=not forward_only, config=config)
-        if getattr(config, 'enable_attention_residuals', False):
-            from megatron.core.transformer.attention_residual import attn_res_source_cache_reset
+    if getattr(config, 'enable_attention_residuals', False):
+        from megatron.core.transformer.attention_residual import attn_res_source_cache_reset
 
-            attn_res_source_cache_reset()
+        attn_res_source_cache_reset()
 
     # Disable async grad reductions
     no_sync_func = config.no_sync_func
@@ -2663,6 +2745,10 @@ def forward_backward_pipelining_without_interleaving(
             enable_grad_sync()
             if config.grad_sync_func is not None:
                 config.grad_sync_func(model.parameters())
+
+    _finalize_attn_res_projection(
+        model, config, getattr(p2p_communicator, "pp_group", None), forward_only
+    )
 
     if config.finalize_model_grads_func is not None and not forward_only:
 

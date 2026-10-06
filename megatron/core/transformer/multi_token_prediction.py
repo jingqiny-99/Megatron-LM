@@ -2082,6 +2082,22 @@ class MultiTokenPredictionLayer(MegatronModule):
             # Per-depth AttnRes output head: aggregates the trunk depth history
             # plus this MTP depth's partial sum before its final layernorm.
             self.final_attn_res = AttentionResidual(self.config)
+            for module in self.mtp_model_layer.modules():
+                if isinstance(module, AttentionResidual):
+                    module.projection_consumer_id = (
+                        1,
+                        self.layer_number,
+                        module.layer_number or self.config.num_layers + 1,
+                        module.projection_consumer_id[-1],
+                    )
+                    module.projection_stop_source_grad = self.config.mtp_detach_heads
+            self.final_attn_res.projection_consumer_id = (
+                1,
+                self.layer_number,
+                self.config.num_layers + 1,
+                2,
+            )
+            self.final_attn_res.projection_stop_source_grad = self.config.mtp_detach_heads
 
         self.offload_context = nullcontext()
 
@@ -2987,7 +3003,11 @@ class MultiTokenPredictionBlock(MegatronModule):
             if attn_res_sources is not None:
                 # Keep the detach semantics: MTP depths must not backprop into
                 # the trunk through the depth-source history either.
-                attn_res_sources = tuple(source.detach() for source in attn_res_sources)
+                from .attention_residual_source_state import detach_attn_res_source
+
+                attn_res_sources = tuple(
+                    detach_attn_res_source(source) for source in attn_res_sources
+                )
 
         for iteration in range(self.config.mtp_num_layers):
             layer_idx = 0 if self.mtp_use_repeated_layer else iteration
