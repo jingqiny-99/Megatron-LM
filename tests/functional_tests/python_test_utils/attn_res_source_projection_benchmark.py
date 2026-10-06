@@ -139,7 +139,9 @@ def _clone_inputs(inputs):
 def _production_graph(inputs, case, kernels, eps, backend, *, capture=None):
     effective = inputs.query * inputs.norm
     columns = case.selected_columns
-    query_bank = effective[list(columns)]
+    # Selected columns form a contiguous tail. Keep a fresh allocation without
+    # constructing a CPU index tensor and copying it to CUDA during capture.
+    query_bank = effective.narrow(0, case.queries - len(columns), len(columns)).clone()
     values, scores = [], []
     for source in inputs.sources:
         if columns:

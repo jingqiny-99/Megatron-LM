@@ -142,6 +142,71 @@ def _make_config(pp, vp, layout, block, fraction, bank, mtp):
     )
 
 
+@pytest.mark.parametrize("contiguous", [True, False])
+def test_source_query_selection_preserves_rows_and_gradients(lifecycle, monkeypatch, contiguous):
+    """Contiguous rows use a protected bank view; external ID layouts can still gather."""
+    torch.manual_seed(618)
+    bank = torch.randn(6, 16, requires_grad=True)
+    value = torch.randn(3, 2, 16, requires_grad=True)
+    config = _make_config(1, None, [4], 2, 1.0, bank, False)
+    if contiguous:
+        ids = [(0, 0, layer, slot) for layer in (1, 4) for slot in range(3)]
+        columns = (3, 4, 5)
+    else:
+        # Sorted external semantic IDs can place past and future consumers in
+        # alternating rows when their second ID component differs.
+        ids = [(0, group, layer, 0) for group in range(3) for layer in (1, 4)]
+        columns = (1, 3, 5)
+    config._runtime.consumer_metadata = [
+        dict(column=index, id=identifier, stop_source_grad=False)
+        for index, identifier in enumerate(ids)
+    ]
+    state = lifecycle.source.ProjectionSourceState(
+        types.SimpleNamespace(config=config, interleaved=False), layers_before=2
+    )
+    captured = {}
+    original_project = lifecycle.kernels.project_source
+    original_tensor = torch.tensor
+    index_constructions = []
+
+    def observe_project(source, queries, *args, **kwargs):
+        captured["queries"] = queries
+        return original_project(source, queries, *args, **kwargs)
+
+    def observe_tensor(data, *args, **kwargs):
+        if isinstance(data, tuple) and data == columns and kwargs.get("dtype") == torch.long:
+            index_constructions.append(data)
+            assert not contiguous, "Contiguous query rows must not allocate an index tensor"
+        return original_tensor(data, *args, **kwargs)
+
+    monkeypatch.setattr(lifecycle.kernels, "project_source", observe_project)
+    monkeypatch.setattr(torch, "tensor", observe_tensor)
+    projected = state.complete(value, source_id=1)
+    record = projected._attn_res_source_projection
+    assert record.columns == columns
+    queries = captured["queries"]
+    torch.testing.assert_close(queries, bank[list(columns)], atol=0, rtol=0)
+    assert queries._do_not_offload
+    assert index_constructions == ([] if contiguous else [columns])
+    if contiguous:
+        assert queries.untyped_storage().data_ptr() == bank.untyped_storage().data_ptr()
+
+    upstream = torch.randn_like(record.scores)
+    record.scores.backward(upstream)
+    # An independent FP64 projection verifies both selected-row values and the
+    # mapping of their VJPs back into the canonical bank, including untouched rows.
+    reference_bank = bank.detach().double().requires_grad_()
+    wide = value.detach().double()
+    normalized = wide * (wide.square().mean(-1, keepdim=True) + config.layernorm_epsilon).rsqrt()
+    reference = (normalized.unsqueeze(-2) * reference_bank[list(columns)]).sum(-1)
+    reference.backward(upstream.double())
+    torch.testing.assert_close(record.scores.double(), reference, atol=2e-5, rtol=2e-4)
+    torch.testing.assert_close(bank.grad.double(), reference_bank.grad, atol=2e-5, rtol=2e-4)
+    unselected = [index for index in range(bank.shape[0]) if index not in columns]
+    assert torch.count_nonzero(bank.grad[unselected]) == 0
+    assert value.grad is None  # Producer scores retain only the query-gradient path.
+
+
 def _independent_mix(values, query, eps):
     """Independent ordinary-autograd oracle; no production forward/backward calls."""
     stacked = torch.stack(values).float()

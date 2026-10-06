@@ -189,8 +189,12 @@ class ProjectionSourceState:
         columns = _selected_columns(self.config, source_id)
         value._do_not_offload = True
         if columns:
-            indices = torch.tensor(columns, device=self.runtime.bank.device, dtype=torch.long)
-            queries = self.runtime.bank.index_select(0, indices)
+            # The common interval needs neither a device index copy nor a gather.
+            if columns == tuple(range(columns[0], columns[0] + len(columns))):
+                queries = self.runtime.bank.narrow(0, columns[0], len(columns))
+            else:
+                indices = torch.tensor(columns, device=self.runtime.bank.device, dtype=torch.long)
+                queries = self.runtime.bank.index_select(0, indices)
             queries._do_not_offload = True
             # Consumers combine the direct and score value VJPs before their
             # single BF16 cast. This producer graph owns only query gradients;

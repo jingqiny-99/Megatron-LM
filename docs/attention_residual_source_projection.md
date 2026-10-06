@@ -66,6 +66,13 @@ canonical parameter ready once, including zero gradients and aliases. Other
 parameter groups retain communication overlap. The bank remains differentiable
 even when all source inputs are detached.
 
+Built-in consumer IDs make selected query rows a contiguous suffix. Source
+completion uses a protected bank view for this case, avoiding host-to-device
+index copies and a gather. External metadata can yield noncontiguous rows;
+those retain the general index-select path. This does not enable full-model
+CUDA graphs, which remain rejected by the existing Attention Residual config
+validation.
+
 ## Kernel interfaces
 
 `attention_residual_projection_kernels.py` provides:
@@ -361,6 +368,12 @@ passes 183 cases, and its PP2/VPP2 same-state diagnostic again passes ten steps.
 Independent source-fraction and FLA trajectories still fail on update four;
 the rounding fix does not establish trajectory acceptance.
 
+After adding contiguous query-bank views, all 42 source-lifecycle cases pass,
+including two new contiguous/noncontiguous gradient-mapping regressions. A
+four-GB200 PP2/VPP2, MTP2, detached-history and activation-offload source
+self-control also passes ten independent updates. This checks the shared view's
+lifetime; it remains a same-backend control rather than independent parity.
+
 ### Current operator performance
 
 The final kernel was measured on GB200 with BF16 values, 256 tokens, eight
@@ -369,16 +382,25 @@ the unchanged independent operator gates before timing. Each measurement uses
 ten warmup iterations and three repetitions of fifty complete forward/backward
 iterations, including producer projection and query-gradient work.
 
-| Hidden / sources | Fraction 0 | Fraction .5 | Fraction 1 |
-| --- | ---: | ---: | ---: |
-| 1024 / 3 | 2.037 ms | 2.908 ms | 3.431 ms |
-| 7168 / 9 | 2.509 ms | 7.689 ms | 7.617 ms |
+| Execution | Hidden / sources | Fraction 0 | Fraction .5 | Fraction 1 |
+| --- | --- | ---: | ---: | ---: |
+| Eager | 1024 / 3 | 1.838 ms | 2.665 ms | 3.294 ms |
+| Eager | 7168 / 9 | 2.560 ms | 5.258 ms | 6.832 ms |
+| Operator CUDA Graph replay | 1024 / 3 | 0.165 ms | 0.226 ms | 0.269 ms |
+| Operator CUDA Graph replay | 7168 / 9 | 0.632 ms | 0.892 ms | 1.131 ms |
 
-These are median CUDA-event timings around eager Python execution, including
-launch gaps. They show increased total operator time with source placement,
-not a net speedup. The larger fraction-.5 case has repetition means ranging
-from 5.816 to 8.656 ms, so its ordering against fraction 1 is not meaningful.
-Every source-placement repetition is slower than fraction 0 at its shape.
-The separately measured Torch autograd reference is not FLA. No PP transport,
-bank synchronization, DDP, optimizer or transformer layers are timed here;
-distributed critical-path benefit remains unproven.
+The benchmark uses a contiguous-tail bank slice and clone, preserving its fresh
+bank allocation without a Python-list index transfer. Earlier measurements
+using CPU index copies are superseded. Graph capture covers the complete
+producer/consumer forward and backward; two replays also pass the unchanged
+output, score and gradient gates against eager execution before timing.
+
+All entries are median CUDA-event timings. Eager execution includes Python
+launch gaps. Graph replay removes recurring Python construction/dispatch, but
+full source placement still increases measured GPU execution by about 63% and
+79% at the two shapes. These data show added operator cost, not a net speedup;
+they do not identify the individual kernels responsible. The separately
+measured Torch autograd reference is not FLA. No PP transport, bank
+synchronization, DDP, optimizer or transformer layers are timed here.
+Full-model Attention Residual CUDA graphs remain unsupported, and distributed
+critical-path benefit remains unproven.
