@@ -53,6 +53,20 @@ class _BucketParamReadyCallback:
             ddp._finish_param_sync_for_bucket_group(bucket_group)
 
 
+class _ExternalGradReadyCallback:
+    """Publish a manually accumulated gradient to its owning DDP bucket."""
+
+    def __init__(self, ddp, bucket_group, param):
+        self._ddp = weakref.ref(ddp)
+        self._bucket_group = weakref.ref(bucket_group)
+        self._param = weakref.ref(param)
+
+    def __call__(self) -> None:
+        ddp, bucket_group, param = self._ddp(), self._bucket_group(), self._param()
+        assert ddp is not None and bucket_group is not None and param is not None
+        bucket_group.register_external_grad_ready(param, force_all_reduce=ddp.force_all_reduce)
+
+
 class DistributedDataParallel(_BaseDataParallel):
     """
     DDP wrapper which stores grads in contiguous buffers. Also has option of overlapping
@@ -380,6 +394,12 @@ class DistributedDataParallel(_BaseDataParallel):
                         elif hasattr(param, PARAM_READY_CALLBACK_ATTR):
                             # A re-wrapped model must not retain the previous DDP's callback.
                             delattr(param, PARAM_READY_CALLBACK_ATTR)
+                        if getattr(param, '_externally_managed_grad', False):
+                            param._external_grad_ready_callback = _ExternalGradReadyCallback(
+                                self, bucket_group, param
+                            )
+                        elif hasattr(param, '_external_grad_ready_callback'):
+                            delattr(param, '_external_grad_ready_callback')
 
         # Delete references to weight_tensor if they exist since we don't want two parameter copies
         # if we re-mapped parameters (which happens when we use the distributed optimizer).
@@ -506,6 +526,13 @@ class DistributedDataParallel(_BaseDataParallel):
 
         def hook(*unused):
             if is_graph_capturing():
+                return
+
+            if getattr(param, '_externally_managed_grad', False):
+                assert param.grad is None, (
+                    "Externally managed parameters must receive gradients only through "
+                    "their explicit finalizer, not through parameter autograd hooks"
+                )
                 return
 
             if param in self.param_to_bucket_group:

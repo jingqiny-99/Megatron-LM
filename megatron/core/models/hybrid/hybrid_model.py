@@ -405,6 +405,14 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
         if not isinstance(input_tensor, list):
             input_tensor = [input_tensor]
 
+        if self.config.attn_res_impl == 'source' and self.config.enable_attention_residuals:
+            if all(tensor is None for tensor in input_tensor):
+                self.decoder.set_input_tensor(None)
+            else:
+                if len(input_tensor) != 2:
+                    raise ValueError('Source projection expects value and score pipeline tensors')
+                self.decoder.set_input_tensor(input_tensor)
+            return
         assert len(input_tensor) == 1, 'input_tensor should only be length 1 for gpt/bert'
         self.decoder.set_input_tensor(input_tensor[0])
 

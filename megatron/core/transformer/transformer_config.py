@@ -1362,10 +1362,16 @@ class TransformerConfig(ModelParallelConfig):
       Function with a warning if compilation is unavailable.
     - 'fla': FLA's three-kernel fused training implementation with checkpoint_level=1; requires
       flash-linear-attention.
+    - 'source': source-owned batched projections and typed pipeline score transport.
 
     The eager loop is CPU-dispatch-bound — measured ~3-4 ms of CPU wall per aggregation on GB200
     at small hidden sizes — so 'fla' is the default, with 'compile' as the dependency-free
     optimized path."""
+
+    attn_res_source_projection_fraction: float = 1.0
+    """Fraction of eligible future consumers scored when an immutable source is produced.
+    Source mode selects the latest consumers first. Zero keeps all scoring local, providing
+    a placement control using the same custom aggregation kernels. Only used by 'source'."""
 
     hybrid_layer_pattern: Optional[str] = None
     """Unified hybrid layer pattern string (mirrors --hybrid-layer-pattern; populated
@@ -1604,7 +1610,11 @@ class TransformerConfig(ModelParallelConfig):
         norms, fp32 residual connection) or the static pipeline payload-width
         reasoning (variable sequence lengths with PP/VPP).
         """
+        if not 0.0 <= self.attn_res_source_projection_fraction <= 1.0:
+            raise ValueError("attn_res_source_projection_fraction must be in [0, 1].")
         if not self.enable_attention_residuals:
+            if self.attn_res_impl == 'source':
+                raise ValueError("attn_res_impl='source' requires enable_attention_residuals=True.")
             if self.attn_res_block_layers is not None:
                 raise ValueError("attn_res_block_layers requires enable_attention_residuals=True.")
             return
@@ -1623,9 +1633,9 @@ class TransformerConfig(ModelParallelConfig):
                 "enable_attention_residuals requires attn_res_block_layers to be a "
                 f"positive integer, got {self.attn_res_block_layers!r}."
             )
-        if self.attn_res_impl not in ("eager", "compile", "fla"):
+        if self.attn_res_impl not in ("eager", "compile", "fla", "source"):
             raise ValueError(
-                "attn_res_impl must be 'eager', 'compile', or 'fla', "
+                "attn_res_impl must be 'eager', 'compile', 'fla', or 'source', "
                 f"got {self.attn_res_impl!r}."
             )
         unsupported = []

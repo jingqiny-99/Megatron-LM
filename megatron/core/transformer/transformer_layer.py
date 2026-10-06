@@ -3007,6 +3007,7 @@ class AttnResTransformerLayer(TransformerLayer):
 
         self.self_attention_attn_res = AttentionResidual(self.config, self.layer_number)
         self.mlp_attn_res = AttentionResidual(self.config, self.layer_number)
+        self.mlp_attn_res.projection_consumer_id = (0, 0, self.layer_number, 1)
 
     def forward(self, *args, **kwargs):
         """Forward pass threading the depth-source tuple into both sublayers."""

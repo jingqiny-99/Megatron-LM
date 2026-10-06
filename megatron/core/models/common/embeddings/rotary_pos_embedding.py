@@ -275,6 +275,12 @@ class RotaryEmbedding(nn.Module):
         """
 
         inference_context = deprecate_inference_params(inference_context, inference_params)
+        pipeline_input = transformer.input_tensor if transformer is not None else None
+        if (
+            isinstance(pipeline_input, list)
+            and getattr(transformer_config, 'attn_res_impl', None) == 'source'
+        ):
+            pipeline_input = pipeline_input[0]
 
         if packed_seq_params is not None:
             # max_seqlen are the max sequence length in the packed sequence before being divived
@@ -287,12 +293,12 @@ class RotaryEmbedding(nn.Module):
             input_seq_len = 0
             if transformer_input is not None:
                 input_seq_len = transformer_input.size(0)
-            elif transformer is not None and transformer.input_tensor is not None:
-                input_seq_len = transformer.input_tensor.size(0)
+            elif pipeline_input is not None:
+                input_seq_len = pipeline_input.size(0)
             rotary_seq_len = max(context_max_seq_len, input_seq_len)
         else:
-            if transformer is not None and transformer.input_tensor is not None:
-                rotary_seq_len = transformer.input_tensor.size(0)
+            if pipeline_input is not None:
+                rotary_seq_len = pipeline_input.size(0)
                 if getattr(transformer_config, 'enable_attention_residuals', False) and not getattr(
                     transformer, 'pre_process', False
                 ):

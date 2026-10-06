@@ -1241,7 +1241,7 @@ class HybridStack(MegatronModule):
                     layers_before=self.pp_layer_offset,
                     pp_rank=(
                         torch.distributed.get_rank(self.pp_group)
-                        if self.config.virtual_pipeline_model_parallel_size is not None
+                        if torch.distributed.is_initialized() and self.pp_group is not None
                         else 0
                     ),
                     vp_stage=self.vp_stage,
@@ -1396,6 +1396,10 @@ class HybridStack(MegatronModule):
                     if isinstance(hidden_states, tuple):
                         hidden_states = hidden_states[0]
 
+                    if attn_res_state is not None:
+                        hidden_states = attn_res_state.after_layer(
+                            hidden_states, layer.layer_number
+                        )
                     self._finalize_mhc_recompute_layer(
                         mhc_manager=mhc_manager,
                         hidden_states=hidden_states,
@@ -1456,9 +1460,17 @@ class HybridStack(MegatronModule):
 
         # Ensure that the tensor passed between pipeline parallel stages is
         # viewless. See related notes in TransformerBlock and TransformerLayer
-        hidden_states = make_viewless_tensor(
-            inp=hidden_states, requires_grad=hidden_states.requires_grad, keep_graph=True
-        )
+        if isinstance(hidden_states, list) and self.config.attn_res_impl == 'source':
+            hidden_states = [
+                make_viewless_tensor(
+                    inp=tensor, requires_grad=tensor.requires_grad, keep_graph=True
+                )
+                for tensor in hidden_states
+            ]
+        else:
+            hidden_states = make_viewless_tensor(
+                inp=hidden_states, requires_grad=hidden_states.requires_grad, keep_graph=True
+            )
 
         if mhc_multistream is not None:
             return hidden_states, mhc_multistream

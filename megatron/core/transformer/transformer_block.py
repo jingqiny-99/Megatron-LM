@@ -481,7 +481,15 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
         # p2p_communication.py both produce viewless tensors — but make_viewless_tensor()
         # is a negligible-overhead no-op on already-viewless inputs, so it is kept here
         # defensively for mbs == 1 view-tensor and other corner cases.
-        hidden_states = make_viewless_tensor(inp=hidden_states, requires_grad=True, keep_graph=True)
+        if isinstance(hidden_states, list) and self.config.attn_res_impl == 'source':
+            hidden_states = [
+                make_viewless_tensor(inp=tensor, requires_grad=True, keep_graph=True)
+                for tensor in hidden_states
+            ]
+        else:
+            hidden_states = make_viewless_tensor(
+                inp=hidden_states, requires_grad=True, keep_graph=True
+            )
 
         # Expand hidden states for hyper connections at the start of the block.
         # Only expand at the first PP stage; subsequent stages receive n-stream from previous stage.
@@ -1109,6 +1117,10 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
                             mhc_recompute_manager=mhc_manager,
                             input_ids=input_ids,
                             **attn_res_kwargs,
+                        )
+                    if attn_res_state is not None:
+                        hidden_states = attn_res_state.after_layer(
+                            hidden_states, layer.layer_number
                         )
                     self._finalize_mhc_recompute_layer(
                         mhc_manager=mhc_manager,
