@@ -14,6 +14,9 @@ Examples (run from the Megatron-LM checkout)::
 
 A workload has S-1 immutable sources and one changing partial for each of Q
 consumers. Each immutable source projects the final ceil(fraction*Q) query rows.
+Producer projections read detached values and train their queries; consumers
+compute the complete direct-plus-score value VJP before the activation-dtype
+cast. The original immutable value graph stays connected to every consumer.
 The optional last MTP-like consumer detaches immutable values while training its
 query; its changing partial stays live. S=1 is the exact-identity edge case.
 
@@ -137,27 +140,19 @@ def _production_graph(inputs, case, kernels, eps, backend, *, capture=None):
     effective = inputs.query * inputs.norm
     columns = case.selected_columns
     query_bank = effective[list(columns)]
-    mask = torch.tensor(
-        [not (case.stop_last_consumer and column == case.queries - 1) for column in columns],
-        device=effective.device,
-        dtype=torch.bool,
-    )
     values, scores = [], []
     for source in inputs.sources:
         if columns:
-            value, score = kernels.project_source(
-                source, query_bank, mask, eps=eps, backend=backend
-            )
+            _, score = kernels.project_source(source.detach(), query_bank, eps=eps, backend=backend)
         else:
-            value, score = source, None
-        values.append(value)
+            score = None
+        values.append(source)
         scores.append(score)
     if capture is not None:
         capture.update(
-            proxies=values,
             scores=[score for score in scores if score is not None],
             query_bank=query_bank,
-            live_mask=mask,
+            producer_source_values_detached=True,
         )
     outputs = []
     for column, partial in enumerate(inputs.partials):
@@ -167,7 +162,12 @@ def _production_graph(inputs, case, kernels, eps, backend, *, capture=None):
         logits = [score[:, row] if score is not None and row >= 0 else None for score in scores]
         outputs.append(
             kernels.aggregate_preprojected(
-                consumer_values, effective[column], [*logits, None], eps=eps, backend=backend
+                consumer_values,
+                effective[column],
+                [*logits, None],
+                eps=eps,
+                backend=backend,
+                precomputed_value_grad=True,
             )
         )
     return outputs, [score for score in scores if score is not None]
@@ -178,30 +178,20 @@ def _reference_graph(inputs, case, eps, *, projected, precision):
     effective = inputs.query * inputs.norm
     columns = case.selected_columns if projected else ()
     score_banks = []
-    source_values = []
     for source in inputs.sources:
         if columns:
-            wide = source.to(precision)
-            # This shared wide node combines the direct BF16 proxy VJP with
-            # the score VJP before casting to the source leaf exactly once.
-            source_values.append(wide.to(source.dtype))
+            # Producer scores own only query gradients. In particular, detached
+            # MTP consumers must still train their query through this bank.
+            wide = source.detach().to(precision)
             normalized = wide * (wide.square().mean(-1, keepdim=True) + eps).rsqrt()
-            rows = []
-            for column in columns:
-                activation = (
-                    normalized.detach()
-                    if case.stop_last_consumer and column == case.queries - 1
-                    else normalized
-                )
-                rows.append((activation * effective[column].to(precision)).sum(-1))
+            rows = [(normalized * effective[column].to(precision)).sum(-1) for column in columns]
             score_banks.append(torch.stack(rows, dim=-1).float())
         else:
             score_banks.append(None)
-            source_values.append(source)
     outputs = []
     for column, partial in enumerate(inputs.partials):
         detached = case.stop_last_consumer and column == case.queries - 1
-        values = [value.detach() if detached else value for value in source_values] + [partial]
+        values = [value.detach() if detached else value for value in inputs.sources] + [partial]
         values = [value.to(precision) for value in values]
         query = effective[column].to(precision)
         scores = []
@@ -209,6 +199,14 @@ def _reference_graph(inputs, case, eps, *, projected, precision):
             bank = score_banks[source_index] if source_index < len(score_banks) else None
             if bank is not None and column in columns:
                 score = bank[:, columns.index(column)].to(precision)
+                # Preserve the producer's FP32 score in forward while adding
+                # only its value derivative at this consumer. Sharing `value`
+                # with the weighted sum combines both paths before one cast
+                # into the original source's activation-dtype gradient edge.
+                value_score = (value * query.detach()).sum(-1) * (
+                    value.square().mean(-1) + eps
+                ).rsqrt()
+                score = score + (value_score - value_score.detach())
             else:
                 score = (value * query).sum(-1) * (value.square().mean(-1) + eps).rsqrt()
             scores.append(score)
@@ -305,8 +303,9 @@ def _rounding_diagnostics(case, tokens, device, kernels, eps, seed):
     Float32 inputs preserve the original quantized BF16 values. The ideal
     FP64 graph casts only the final accumulated activation gradient; it removes
     the per-consumer BF16 autograd edges, so it is a diagnostic, not an oracle
-    for a different production interface. For fraction zero, separately inspect
-    each consumer VJP and explicit forward/reverse BF16 accumulation orders.
+    for a different production interface. For every placement fraction, inspect
+    each complete consumer VJP and forward/reverse BF16 accumulation orders.
+    Detached producer projections are checked only for their query-bank VJP.
     """
     inputs = _inputs(case, tokens, device, seed)
 
@@ -325,6 +324,7 @@ def _rounding_diagnostics(case, tokens, device, kernels, eps, seed):
     result = {
         'affects_qualification_status': False,
         'objective_rescaled': False,
+        'backward_contract': 'consumer_complete_dv_detached_producer_dw',
         'fp32_inputs_preserving_bf16_values': _qualify(
             replace(case, dtype='float32'),
             tokens,
@@ -338,7 +338,11 @@ def _rounding_diagnostics(case, tokens, device, kernels, eps, seed):
     backend = 'triton' if device.type == 'cuda' else 'torch'
     capture = {}
     outputs, _ = _production_graph(inputs, case, kernels, eps, backend, capture=capture)
-    intermediates = [*capture['proxies'], *capture['scores']] if case.selected_count else []
+    intermediates = (
+        [*capture['scores'], capture['query_bank']]
+        if case.selected_count and inputs.sources
+        else []
+    )
     gradients = _gradients(outputs, inputs, intermediates)
     actual_gradients = gradients[: len(inputs.leaves)]
     ideal_inputs = convert(torch.float64)
@@ -354,40 +358,45 @@ def _rounding_diagnostics(case, tokens, device, kernels, eps, seed):
     }
     if case.selected_count and inputs.sources:
         count = len(inputs.sources)
-        proxy_gradients = gradients[len(inputs.leaves) : len(inputs.leaves) + count]
-        score_gradients = gradients[len(inputs.leaves) + count :]
+        score_gradients = gradients[len(inputs.leaves) : len(inputs.leaves) + count]
+        bank_gradient = gradients[-1]
         producer_errors = {}
-        for index, (source, proxy_gradient, score_gradient) in enumerate(
-            zip(inputs.sources, proxy_gradients, score_gradients)
-        ):
-            # Independent producer VJP with exactly the incoming gradients that
-            # the production consumer graph produced. This removes BF16 edge
-            # accumulation differences from the source-kernel accuracy check.
-            wide = source.detach().double().requires_grad_()
+        expected_bank_gradients = []
+        producer_value_gradients_absent = []
+        for index, (source, score_gradient) in enumerate(zip(inputs.sources, score_gradients)):
+            # Isolate producer dW using identical incoming dscore. No producer
+            # dV exists in this paired graph; every source dV comes from a
+            # complete consumer VJP and its activation-dtype accumulation.
+            query = capture['query_bank'].detach().clone().requires_grad_()
+            _, score = kernels.project_source(source.detach(), query, eps=eps, backend=backend)
+            actual, value_gradient = torch.autograd.grad(
+                score, (query, source), score_gradient, allow_unused=True
+            )
+            producer_value_gradients_absent.append(value_gradient is None)
+            reference_query = capture['query_bank'].detach().clone().requires_grad_()
+            wide = source.detach().double()
             normalized = wide * (wide.square().mean(-1, keepdim=True) + eps).rsqrt()
-            live = torch.where(
-                capture['live_mask'][None, :, None],
-                normalized[:, None, :],
-                normalized.detach()[:, None, :],
+            reference_score = (
+                (normalized[:, None, :] * reference_query.double()[None, :, :]).sum(-1).float()
             )
-            score = (live * capture['query_bank'].detach().double()).sum(-1).float()
-            (expected,) = torch.autograd.grad(
-                (wide, score), wide, (proxy_gradient.double(), score_gradient)
-            )
-            producer_errors[f'source_{index}'] = _error(
-                actual_gradients[index], expected.to(source.dtype), 'value'
-            )
-        result['producer_vjp_with_identical_incoming_edges'] = producer_errors
-    if case.fraction != 0 or not inputs.sources:
+            (expected,) = torch.autograd.grad(reference_score, reference_query, score_gradient)
+            expected_bank_gradients.append(expected)
+            producer_errors[f'source_{index}'] = _error(actual, expected, 'state')
+        result['producer_query_vjp_with_identical_incoming_scores'] = producer_errors
+        result['detached_producer_value_gradients_absent'] = all(producer_value_gradients_absent)
+        result['combined_producer_query_bank_gradient'] = _error(
+            bank_gradient, torch.stack(expected_bank_gradients).sum(0), 'state'
+        )
+    if not inputs.sources:
         return result
 
-    # With no producer projection the source is the sum of consumer VJPs.
+    # Every source is now the sum of complete consumer VJPs, at every fraction.
     # Computing those VJPs independently separates kernel arithmetic from the
     # graph engine's BF16 accumulation order and its amplification of one ULP.
     reference_inputs = _clone_inputs(inputs)
     outputs, _ = _production_graph(inputs, case, kernels, eps, backend)
     expected, _ = _reference_graph(
-        reference_inputs, case, eps, projected=False, precision=torch.float64
+        reference_inputs, case, eps, projected=True, precision=torch.float64
     )
     actual_edges, reference_edges = [], []
     for column in range(case.queries):
@@ -662,6 +671,8 @@ def main(argv=None):
         'scope': {
             'source_count_includes_changing_partial': True,
             'fractions_select_latest_consumer_columns': True,
+            'backward_contract': 'consumer_complete_dv_detached_producer_dw',
+            'public_primitive_defaults_changed': False,
             'full_training_speed_claim': False,
             'distributed_communication_included': False,
             'oracle_precision': 'float64',

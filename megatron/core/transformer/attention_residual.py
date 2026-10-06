@@ -797,7 +797,11 @@ class AttentionResidual(MegatronModule):
             column = runtime.column(self)
             logits = [source_logits_for_consumer(value, column) for value in values]
             out = aggregate_preprojected(
-                values, runtime.effective_weight(self), logits, eps=self.eps
+                values,
+                runtime.effective_weight(self),
+                logits,
+                eps=self.eps,
+                precomputed_value_grad=True,
             )
         elif len(values) == 1:
             # A one-source softmax is identically one. Keep explicit zero

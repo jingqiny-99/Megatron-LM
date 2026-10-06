@@ -96,6 +96,102 @@ def test_stopped_source_keeps_query_gradient_and_value_proxy():
     assert torch.count_nonzero(query.grad) == 0
 
 
+@pytest.mark.parametrize("device", ["cpu", "cuda"])
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize("fraction", [0.0, 0.5, 1.0])
+@pytest.mark.parametrize("detach_last", [False, True])
+def test_paired_consumer_value_gradient(device, dtype, fraction, detach_last):
+    """Detached producer inputs keep dW live while each consumer owns complete dV."""
+    if device == "cuda" and not torch.cuda.is_available():
+        pytest.skip("requires CUDA/Triton")
+    torch.manual_seed(724)
+    sources = [torch.randn(7, 1024, device=device, dtype=dtype) for _ in range(2)]
+    partials = [torch.randn_like(sources[0]) for _ in range(2)]
+    query = torch.randn(2, 1024, device=device) * 0.02
+    norm = 1 + torch.randn_like(query) * 0.1
+    upstream = [torch.randn_like(sources[0]) for _ in range(2)]
+    count = math_ceil_fraction(fraction, len(sources))
+
+    def run(reference, projected_count=count):
+        values, changing = [_leaf(value) for value in sources], [_leaf(value) for value in partials]
+        q, gamma = _leaf(query), _leaf(norm)
+        effective = q * gamma
+        project = project_source_reference if reference else project_source
+        aggregate = aggregate_preprojected_reference if reference else aggregate_preprojected
+        scores = [
+            project(value.detach(), effective)[1] if index < projected_count else None
+            for index, value in enumerate(values)
+        ]
+        outputs = []
+        for row in range(2):
+            history = [value.detach() if detach_last and row == 1 else value for value in values]
+            outputs.append(
+                aggregate(
+                    [*history, changing[row]],
+                    effective[row],
+                    [*[score[..., row] if score is not None else None for score in scores], None],
+                    precomputed_value_grad=True,
+                )
+            )
+        gradients = torch.autograd.grad(outputs, [*values, *changing, q, gamma], upstream)
+        return outputs, gradients
+
+    actual_outputs, actual_gradients = run(False)
+    expected_outputs, expected_gradients = run(True)
+    for actual, expected in zip(actual_outputs, expected_outputs):
+        _check(actual, expected)
+    for index, (actual, expected) in enumerate(zip(actual_gradients, expected_gradients)):
+        _check(actual, expected, "query" if index == 4 else "norm" if index == 5 else "value")
+    if fraction == 1.0:
+        local_outputs, local_gradients = run(False, projected_count=0)
+        for actual, local in zip(actual_outputs, local_outputs):
+            _check(actual, local)
+        for index, (actual, local) in enumerate(zip(actual_gradients, local_gradients)):
+            _check(actual, local, "query" if index == 4 else "norm" if index == 5 else "value")
+    assert torch.count_nonzero(actual_gradients[-2][1]) > 0
+    assert torch.count_nonzero(actual_gradients[-1][1]) > 0
+
+
+@pytest.mark.parametrize("device", ["cpu", "cuda"])
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_paired_detached_history_trains_query_only(device, dtype):
+    """Detached MTP history has no value VJP but still trains its projected query."""
+    if device == "cuda" and not torch.cuda.is_available():
+        pytest.skip("requires CUDA/Triton")
+    torch.manual_seed(725)
+    source = torch.randn(7, 1024, device=device, dtype=dtype, requires_grad=True)
+    partial = torch.randn_like(source, requires_grad=True)
+    query = (torch.randn(1, 1024, device=device) * 0.02).requires_grad_()
+    _, scores = project_source(source.detach(), query)
+    output = aggregate_preprojected(
+        [source.detach(), partial], query[0], [scores[..., 0], None], precomputed_value_grad=True
+    )
+    output.backward(torch.randn_like(output))
+    assert source.grad is None
+    assert torch.count_nonzero(query.grad) > 0
+    assert torch.count_nonzero(partial.grad) > 0
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA/Triton")
+def test_detached_projection_skips_value_backward_kernel(monkeypatch):
+    """The producer needs only dW when the consumer owns the source-value path."""
+
+    class UnexpectedValueBackward:
+        def __getitem__(self, grid):
+            raise AssertionError("Detached source must not launch its value-backward kernel")
+
+    monkeypatch.setattr(_MODULE, "_source_backward_value", UnexpectedValueBackward())
+    value = torch.randn(7, 1024, device="cuda", dtype=torch.bfloat16)
+    query = (torch.randn(3, 1024, device="cuda") * 0.02).requires_grad_()
+    ref_query = _leaf(query)
+    _, logits = project_source(value, query)
+    _, reference = project_source_reference(value, ref_query)
+    upstream = torch.randn_like(logits)
+    logits.backward(upstream)
+    reference.backward(upstream)
+    _check(query.grad, ref_query.grad, "query")
+
+
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
 @pytest.mark.parametrize("projected", [False, True])
 def test_one_source_identity_and_explicit_zero_gradients(dtype, projected):

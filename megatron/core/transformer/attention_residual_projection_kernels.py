@@ -117,8 +117,9 @@ def aggregate_preprojected_reference(
     logits: Sequence[Tensor | None] | None = None,
     *,
     eps: float = 1e-6,
+    precomputed_value_grad: bool = False,
 ) -> Tensor:
-    """Independent ordinary-autograd softmax/mixing reference using FP64 math."""
+    """Independent FP64 equations, optionally restoring the precomputed value VJP."""
     values, query, logits = _consumer_inputs(values, local_query, logits, eps)
     if len(values) == 1:
         zero = query.sum() * 0
@@ -134,6 +135,13 @@ def aggregate_preprojected_reference(
         )
         for value, logit in zip(expanded, logits)
     ]
+    if precomputed_value_grad:
+        for index, (value, logit) in enumerate(zip(expanded, logits)):
+            if logit is not None:
+                local_score = (value * query.detach().double()).sum(-1) * torch.rsqrt(
+                    value.square().mean(-1) + eps
+                )
+                scores[index] = scores[index] + (local_score - local_score.detach())
     probabilities = torch.softmax(torch.stack(scores), dim=0)
     anchor = expanded[0]
     mixed = anchor + sum(
@@ -301,6 +309,8 @@ if triton is not None:
         S: tl.constexpr,
         PRESENT: tl.constexpr,
         HAS_LOCAL: tl.constexpr,
+        PRECOMPUTED_VALUE_GRAD: tl.constexpr,
+        EPS: tl.constexpr,
         BH: tl.constexpr,
     ):
         token = tl.program_id(0)
@@ -328,13 +338,17 @@ if triton is not None:
             result = probability * gradient
             if PRESENT[source]:
                 tl.store(DLOGITS[source] + token, ds)
-            else:
+            if not PRESENT[source] or PRECOMPUTED_VALUE_GRAD:
                 value = tl.load(VALUES[source] + token * H + h, h < H, other=0).to(tl.float32)
-                rstd = tl.load(RMS + source * T + token)
+                if PRESENT[source]:
+                    rstd = tl.rsqrt(tl.sum(value * value, 0) / H + EPS)
+                else:
+                    rstd = tl.load(RMS + source * T + token)
                 score = tl.load(L + source * T + token)
                 factor = ds * rstd
                 result += factor * query - value * (factor * rstd * score / H)
-                dq += factor * value
+                if not PRESENT[source]:
+                    dq += factor * value
             tl.store(DVALUES[source] + token * H + h, result, h < H)
         if HAS_LOCAL:
             tl.store(DQ_ROWS + token * H + h, dq, h < H)
@@ -401,8 +415,13 @@ class _ProjectSource(torch.autograd.Function):
         value, queries, mask, rstd, logits = ctx.saved_tensors
         hidden, rows = value.shape[-1], queries.shape[0]
         tokens = value.numel() // hidden
+        needs_value_grad = ctx.needs_input_grad[0]
         if grad_logits is None or rows == 0:
-            dv = torch.zeros_like(value) if grad_value is None else grad_value
+            dv = (
+                (torch.zeros_like(value) if grad_value is None else grad_value)
+                if needs_value_grad
+                else None
+            )
             return dv, torch.zeros_like(queries), None, None, None
         grad_logits = grad_logits.reshape(tokens, rows).contiguous()
         if ctx.backend == "torch":
@@ -410,23 +429,25 @@ class _ProjectSource(torch.autograd.Function):
                 value, queries, mask, logits, rstd, grad_value, grad_logits
             )
         else:
-            dv, dq = torch.empty_like(value), torch.empty_like(queries)
-            direct = value if grad_value is None else grad_value.contiguous()
-            _source_backward_value[(tokens,)](
-                value,
-                queries,
-                mask,
-                logits,
-                rstd,
-                direct,
-                grad_logits,
-                dv,
-                hidden,
-                rows,
-                grad_value is not None,
-                triton.next_power_of_2(hidden),
-                num_warps=4 if hidden <= 2048 else 8,
-            )
+            dv = torch.empty_like(value) if needs_value_grad else None
+            dq = torch.empty_like(queries)
+            if needs_value_grad:
+                direct = value if grad_value is None else grad_value.contiguous()
+                _source_backward_value[(tokens,)](
+                    value,
+                    queries,
+                    mask,
+                    logits,
+                    rstd,
+                    direct,
+                    grad_logits,
+                    dv,
+                    hidden,
+                    rows,
+                    grad_value is not None,
+                    triton.next_power_of_2(hidden),
+                    num_warps=4 if hidden <= 2048 else 8,
+                )
             splits = triton.cdiv(tokens, 128)
             partial = torch.empty((splits, rows, hidden), device=value.device, dtype=torch.float32)
             _source_query_partials[(splits, rows, triton.cdiv(hidden, 32))](
@@ -435,7 +456,7 @@ class _ProjectSource(torch.autograd.Function):
             _sum_query_partials[(rows, triton.cdiv(hidden, 64))](
                 partial, dq, splits, hidden, rows, 32, 64, num_warps=4
             )
-        return dv, dq, None, None, None
+        return dv if needs_value_grad else None, dq, None, None, None
 
 
 def _torch_consumer_forward(values, query, precomputed, eps):
@@ -459,7 +480,9 @@ def _torch_consumer_forward(values, query, precomputed, eps):
     return mixed.reshape_as(values[0]).to(values[0].dtype), probabilities, rstds, scores
 
 
-def _torch_consumer_backward(values, query, present, probabilities, rstds, scores, grad):
+def _torch_consumer_backward(
+    values, query, present, probabilities, rstds, scores, grad, eps, precomputed_value_grad
+):
     flat = [value.reshape(-1, value.shape[-1]).float() for value in values]
     gradient = grad.reshape_as(flat[0]).float()
     probabilities = probabilities / probabilities.sum(0, keepdim=True)
@@ -472,24 +495,28 @@ def _torch_consumer_backward(values, query, present, probabilities, rstds, score
         if present[index]:
             dlogits.append(ds[index].reshape(values[index].shape[:-1]))
         else:
-            factor = ds[index] * rstds[index]
+            dlogits.append(None)
+        if not present[index] or precomputed_value_grad:
+            rstd = torch.rsqrt(value.square().mean(-1) + eps) if present[index] else rstds[index]
+            factor = ds[index] * rstd
             derivative += (
                 factor[:, None] * query
-                - value * (factor * rstds[index] * scores[index] / query.numel())[:, None]
+                - value * (factor * rstd * scores[index] / query.numel())[:, None]
             )
-            dq += (factor[:, None] * value).sum(0)
-            dlogits.append(None)
+            if not present[index]:
+                dq += (factor[:, None] * value).sum(0)
         dvs.append(derivative.reshape_as(values[index]).to(values[index].dtype))
     return dq, dvs, dlogits
 
 
 class _AggregatePreprojected(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, query, eps, backend, count, *inputs):
+    def forward(ctx, query, eps, backend, count, precomputed_value_grad, *inputs):
         """Mix source values using precomputed or locally evaluated logits."""
         values, logits = inputs[:count], inputs[count:]
         ctx.present = tuple(logit is not None for logit in logits)
         ctx.count, ctx.backend = count, backend
+        ctx.eps, ctx.precomputed_value_grad = eps, precomputed_value_grad
         ctx.set_materialize_grads(False)
         if count == 1:
             ctx.save_for_backward(query, *values, *[logit for logit in logits if logit is not None])
@@ -545,13 +572,22 @@ class _AggregatePreprojected(torch.autograd.Function):
                 None,
                 None,
                 None,
+                None,
                 grad,
                 dlogit if ctx.present[0] else None,
             )
         probabilities, rstd, scores = saved[ctx.count : ctx.count + 3]
         if ctx.backend == "torch":
             dq, dvs, dlogits = _torch_consumer_backward(
-                values, query, ctx.present, probabilities, rstd, scores, grad
+                values,
+                query,
+                ctx.present,
+                probabilities,
+                rstd,
+                scores,
+                grad,
+                ctx.eps,
+                ctx.precomputed_value_grad,
             )
         else:
             hidden = values[0].shape[-1]
@@ -587,6 +623,8 @@ class _AggregatePreprojected(torch.autograd.Function):
                 ctx.count,
                 ctx.present,
                 has_local,
+                ctx.precomputed_value_grad,
+                ctx.eps,
                 triton.next_power_of_2(hidden),
                 num_warps=4 if hidden <= 2048 else 8,
             )
@@ -594,7 +632,7 @@ class _AggregatePreprojected(torch.autograd.Function):
                 _sum_query_partials[(1, triton.cdiv(hidden, 64))](
                     dq_rows, dq, tokens, hidden, 1, 128, 64, num_warps=4
                 )
-        return dq, None, None, None, *dvs, *dlogits
+        return dq, None, None, None, None, *dvs, *dlogits
 
 
 def project_source(
@@ -629,6 +667,7 @@ def aggregate_preprojected(
     *,
     eps: float = 1e-6,
     backend: str | None = None,
+    precomputed_value_grad: bool = False,
 ) -> Tensor:
     """Mix sources using producer logits and locally scored partial sources.
 
@@ -636,8 +675,21 @@ def aggregate_preprojected(
     ``None`` for a locally scored source. Logical source aliases remain separate
     autograd inputs. One source is an exact identity with explicit zero query
     and preprojected-score gradients. Higher-order derivatives are unsupported.
+
+    With ``precomputed_value_grad=True``, a precomputed score's source-value
+    derivative is evaluated here and combined with the direct value derivative
+    before the source-dtype cast. Its query derivative still travels through the
+    score tensor. Such scores must have been projected from detached sources;
+    otherwise the source-score derivative would be counted twice. This explicit
+    paired contract leaves the default independent-score primitive unchanged.
     """
     values, query, logits = _consumer_inputs(values, local_query, logits, eps)
     return _AggregatePreprojected.apply(
-        query, eps, _backend(values[0], backend), len(values), *values, *logits
+        query,
+        eps,
+        _backend(values[0], backend),
+        len(values),
+        precomputed_value_grad,
+        *values,
+        *logits,
     )

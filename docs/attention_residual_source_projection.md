@@ -10,14 +10,26 @@ and selects the last ceil(fraction * eligible_consumers) consumers for each
 source. Partial residuals are scored at their consumer.
 
 For BF16 or FP32 source V, effective query W=q*gamma, and unweighted RMS
-normalization U, projection is Z=U W^T. Source backward computes dU=G W and
-dW=G^T U. A per-column live-source mask gates G only for dU; detached MTP
-sources must still train their query. Source autograd returns both a value
-proxy and logits, combining the incoming value gradient and score derivative
-in FP32 before the source-dtype cast. Consumer backward computes
-u_i=<dY,V_i>, delta=sum(alpha_i*u_i), dZ_i=alpha_i*(u_i-delta), and the direct
-value gradient alpha_i*dY. Query parameters, statistics, reductions and
-accumulation remain FP32; no TF32 or BF16 query conversion is allowed.
+normalization U, projection is Z=U W^T. The model projects a detached,
+contiguous source snapshot at its producer and keeps the original value graph
+in the value payload. Producer backward owns dW=G^T U; it does not return a
+gradient to that detached source. Consumer backward owns the complete value
+derivative, including both the direct mixing term and the score derivative.
+
+Specifically, for source i, r_i=rsqrt(mean(V_i^2)+eps),
+u_i=<dY,V_i>, delta=sum(alpha_i*u_i), and
+dZ_i=alpha_i*(u_i-delta). The consumer combines
+dV_i=alpha_i*dY+dZ_i*r_i*W-V_i*(dZ_i*r_i^2*Z_i/H) in FP32 before one
+source-dtype cast. Contributions from separate consumers then accumulate
+through the original value graph. This restores the consumer's BF16 rounding
+boundary while retaining producer-owned score projection and query gradients.
+Locally scored partials compute both derivatives at their consumer.
+
+For detached MTP heads, the consumer's history values are detached while their
+score tensors retain the producer query graph. The complete value derivative
+is therefore discarded at the detached value inputs, and query gradients
+remain live. Query parameters, statistics, reductions and accumulation remain
+FP32; no TF32 or BF16 query conversion is allowed.
 
 ## Ownership and runtime API
 
@@ -62,14 +74,39 @@ even when all source inputs are detached.
   backend=None) -> (value_proxy, logits)`, preserving source token dimensions
   and appending the query dimension to logits.
 * `aggregate_preprojected(values, local_query, logits=None, *, eps=1e-6,
-  backend=None) -> output`, where logits is a same-length list of FP32
-  token-shaped tensors or None for locally scored sources.
+  backend=None, precomputed_value_grad=False) -> output`, where logits is a
+  same-length list of FP32 token-shaped tensors or None for locally scored
+  sources.
+
+The public primitive defaults are unchanged. With
+`precomputed_value_grad=False`, provided logits are independent score inputs:
+the consumer returns their dZ and only the direct value contribution, while
+`project_source` can compute source and query derivatives when its value input
+requires gradients. Its optional live-source mask continues to gate only the
+source derivative.
+
+The model explicitly selects `precomputed_value_grad=True`. This is a paired
+contract: each provided score must come from a detached copy of the same value,
+the same effective query and the same normalization epsilon. The consumer
+adds the score's value derivative, but sends its query derivative through the
+provided score tensor only. Using a live source in the producer projection
+with this flag would double-count its score derivative. For precomputed
+sources, the consumer recomputes r_i in backward; locally scored sources reuse
+their saved statistic. One-source identity and exact zero query/score
+derivatives are preserved in both modes.
 
 CUDA uses custom Triton kernels; an explicit Torch implementation and independent
 ordinary-autograd references support correctness testing. No numeric-failure
-fallback is permitted. dU and dW execute when that source's backward becomes
-ready; only cross-PP parameter-gradient communication is delayed to step end.
-No cross-microbatch batching delays the source gradient.
+fallback is permitted. CUDA source backward skips the producer value-gradient
+kernel when its input is detached and executes only the query-gradient kernels.
+The Torch debugging path currently computes and discards that unused producer
+value derivative. Complete dV executes at each consumer's backward; producer
+dW executes when the score graph becomes ready. Only cross-PP parameter-gradient
+communication is delayed to step end. No cross-microbatch batching delays the
+source gradient.
+This placement moves forward score projection and query-gradient work to
+producers; score-induced value-gradient work remains at consumers. Its effect
+on backward rank balance and total iteration time must be measured separately.
 
 ## Pipeline and source lifecycle
 
@@ -98,8 +135,10 @@ projected as soon as its producing block completes, including a completed
 outgoing partial at a PP boundary, before the next block registers it as a
 historical source. Score deltas therefore use completed-source counts rather
 than blindly copying the existing registered-value prefix count. Source and
-score VPP leaves share immutable storage, have separate chunk graphs, and
-drain gradients exactly once into their producer. Cache entries are keyed by
+score VPP leaves retain their immutable storage and separate chunk graphs.
+Value leaves drain complete consumer dV into the original source graph; score
+leaves drain dZ into the detached producer projection's query graph, exactly
+once. Cache entries are keyed by
 microbatch/source and evicted on the last local virtual chunk; backward retains
 captured references. Partial projection requires an explicit zero-VJP anchor
 from the outgoing score payload to each current score tap: a chunk can consume
@@ -114,7 +153,9 @@ groups. They must not be force-released; existing do-not-offload mechanisms
 protect these references. Temporary norm/MLP offload scopes preserve the base
 branch's distinction between aggregate inputs and live partials. This change
 does not introduce shared-source CPU offloading. MTP retains a fixed trunk
-source tuple and a separate partial at every prediction depth.
+source tuple and a separate partial at every prediction depth. Detaching MTP
+history preserves score metadata, so it stops the trunk value graph without
+stopping the corresponding producer-owned query gradients.
 
 ## Validation and delivery
 
@@ -147,7 +188,9 @@ parameters from ordinary parameters. Torch/Megatron FSDP wrappers are rejected
 because their external-gradient publication lifecycle is not implemented.
 Existing Attention Residual limitations remain in force.
 
-Local CPU qualification currently passes:
+The following CPU results were obtained before the consumer-local complete-dV
+integration. They cover the earlier producer-value-gradient contract and must
+not be presented as qualification of the revised model path:
 
 * 27 kernel forward/backward cases and 40 PP/VPP source lifecycle cases,
   including the fraction-.5 orphaned-score-tap regression. These load real
@@ -163,8 +206,9 @@ Local CPU qualification currently passes:
 * 16 runtime/DDP/layout cases plus a real two-process Gloo query publication
   and gradient-SUM run over two optimizer steps.
 
-On October 6, normal CUDA pytest execution passed all 148 operator, source-state,
-and model-contract cases. Four-rank torchrun passed all 18 runtime cases,
+Before the complete-dV integration on October 6, normal CUDA pytest execution
+passed all 148 operator, source-state, and model-contract cases. Four-rank
+torchrun passed all 18 runtime cases,
 including NCCL publication, and both directional NCCL transport regressions.
 These results complement the host checks; full-model numerical acceptance and
 end-to-end speedup remain unqualified. The standalone operator benchmark records strict correctness
@@ -191,7 +235,8 @@ only while loading does not convert an existing checkpoint. The same rule
 applies when disabling source mode. Optimizer moments must never be discarded
 to make a migration appear successful.
 
-The supported-format migration test passed on four GB200 GPUs for both FP32
+Before the complete-dV integration, the supported-format migration test passed
+on four GB200 GPUs for both FP32
 and BF16. It trained the eager backend for ten updates with real MCore DDP and
 DistributedOptimizer, restored the source backend while changing PP1/DP4 to
 PP2/DP2, and verified exact model tensors, master parameters, Adam moments and
@@ -201,7 +246,7 @@ small model is replicated across PP to isolate optimizer DP resharding; this
 evidence does not qualify full-model PP/VPP gradient parity. The test is
 `tests/unit_tests/distributed/test_attn_res_projection_checkpoint.py`.
 
-### Initial GPU operator qualification
+### Earlier producer-value-gradient operator evidence
 
 Six GB200 BF16 cases passed strict forward/all-gradient checks at 256 tokens,
 H1024/H7168, source counts1/3/9, Q8 and fractions0/.5/1. The container used
@@ -221,7 +266,7 @@ and producer VJPs with identical incoming gradients pass; failed BF16 stress
 cases remain explicitly failed and are not timed. This evidence does not waive
 end-to-end model validation.
 
-### October 6 integration diagnostics
+### October 6 diagnostics before the complete-dV integration
 
 The PP2 same-peer ordering regression passed both scalar BF16 and typed
 BF16/FP32 payload cases under real four-rank NCCL on GB200. The repaired
@@ -243,13 +288,12 @@ preserving their public dtype interfaces. Saved source scores and query-bank
 snapshots equal fresh projections bitwise. This validates the captured local
 operators, not multi-consumer accumulation or a complete training trajectory.
 
-The source placement changes a BF16 gradient rounding boundary: direct value
-gradients are rounded at each consumer before the producer combines score
-gradients. Matched CPU captures show identical forward outputs and query/norm
+The earlier source placement changed a BF16 gradient rounding boundary: direct
+value gradients were rounded at each consumer before the producer combined
+score gradients. Matched CPU captures show identical forward outputs and query/norm
 gradient differences around 1e-7 relative, while projected value gradients
-differ by approximately 0.003 relative. A consumer-local complete value VJP
-with producer-owned query VJP is being evaluated as a numerical/compute
-placement tradeoff; it is not yet part of the production contract above.
+differ by approximately 0.003 relative. This motivated the current consumer-local
+complete value VJP with producer-owned query VJP described above.
 
 The current diagnostic container uses Torch 2.12.0a0 (26.04), CUDA 13.2,
 Triton 3.6, fla-core 0.5.1, and nvidia-resiliency-ext 0.6.0, with TF32
@@ -262,10 +306,40 @@ recompute, TP2 with SP, CP2, EP2, repeated MTP, and uneven hybrid layouts. All
 40 per-rank reports pass. Self-controls establish reproducible execution and
 updates, not parity against an independent backend.
 
-The experimental consumer-local complete value VJP remains outside production.
-It passes 16 matched GPU operator captures against its independent reference,
-but its independently evolving placement comparison fails on update five and
-its FLA comparison fails on update four. The existing production path also
-fails a same-parameter-state FLA comparison on update five (query similarity
-0.99889159), so the outstanding issue cannot be attributed solely to divergent
-optimizer trajectories. Acceptance thresholds and failing tests are retained.
+The earlier producer-value-gradient path also fails a same-parameter-state FLA
+comparison on update five (query similarity 0.99889159). Its outstanding
+numerical issue therefore cannot be attributed solely to divergent optimizer
+trajectories.
+
+### Current consumer-local complete-dV integration
+
+The consumer-local complete-dV candidate passed 16 matched GPU operator captures
+against its independent reference. The revised production implementation, with
+no experimental module override, then passed the original loss and gradient
+gates at all ten successive FLA reference parameter states in a four-GB200
+BF16 GPT PP2/VPP2 diagnostic. This reproduces the earlier candidate's ten-step
+same-state result. Before each pair, the diagnostic strictly copies
+all reference parameters into independently stored candidate parameters; only
+the FLA optimizer advances. This establishes same-state forward/backward parity
+for that case. It does not qualify the candidate optimizer, independently
+evolving trajectories, resumed training or other parallel configurations.
+
+The independently evolving candidate placement comparison still fails on update
+five, and its FLA comparison fails on update four. Those failures and the
+original acceptance thresholds are retained. The positive same-state diagnostic
+does not replace the required ten-update and three-resumed-update comparisons.
+
+The current production integration explicitly pairs detached producer projection
+with `precomputed_value_grad=True` in AttentionResidual and in its lifecycle
+tests. New primitive tests cover FP32/BF16, fractions 0/.5/1, mixed local and
+precomputed sources, changing partials, complete value/query/norm gradients,
+detached MTP history, and skipping the CUDA producer dV kernel. Normal CUDA
+pytest execution of the revised production operator, source-state and
+model-contract tests passed all 177 cases, including the 29 new cases. The
+four-rank runtime regressions also passed all 18 cases per rank, including
+real NCCL gradient publication. The independently evolving production FLA/source
+comparison fails on update four: query similarity 0.99881339 and norm-weight
+similarity 0.99872333 against the unchanged 0.999 threshold. Its resume path
+is therefore not reached. Earlier parallel-model self-control and
+checkpoint results above retain their original contract and scope. No
+end-to-end speedup or independent-trajectory qualification is claimed.

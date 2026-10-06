@@ -192,17 +192,13 @@ class ProjectionSourceState:
             indices = torch.tensor(columns, device=self.runtime.bank.device, dtype=torch.long)
             queries = self.runtime.bank.index_select(0, indices)
             queries._do_not_offload = True
-            live_mask = torch.tensor(
-                [
-                    not self.runtime.consumer_metadata[column]['stop_source_grad']
-                    for column in columns
-                ],
-                device=value.device,
-                dtype=torch.bool,
-            )
-            proxy, scores = project_source(
-                value, queries, live_mask, eps=self.config.layernorm_epsilon
-            )
+            # Consumers combine the direct and score value VJPs before their
+            # single BF16 cast. This producer graph owns only query gradients;
+            # the original value graph remains live through the value payload.
+            projection_value = value.detach().contiguous()
+            projection_value._do_not_offload = True
+            _, scores = project_source(projection_value, queries, eps=self.config.layernorm_epsilon)
+            proxy = value.view_as(value)
         else:
             proxy = value.view_as(value)
             scores = value.new_empty((*value.shape[:-1], 0), dtype=torch.float32)

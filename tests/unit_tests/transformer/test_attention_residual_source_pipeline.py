@@ -206,7 +206,7 @@ def _run_pipeline(api, config, embedding, updates, direction, mtp):
         local_scores += sum(score is None for score in logits)
         precomputed_scores += sum(score is not None for score in logits)
         return api.kernels.aggregate_preprojected(
-            values, bank[column], logits, eps=config.layernorm_epsilon
+            values, bank[column], logits, eps=config.layernorm_epsilon, precomputed_value_grad=True
         )
 
     carried = None
