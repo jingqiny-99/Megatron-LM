@@ -343,3 +343,11 @@ similarity 0.99872333 against the unchanged 0.999 threshold. Its resume path
 is therefore not reached. Earlier parallel-model self-control and
 checkpoint results above retain their original contract and scope. No
 end-to-end speedup or independent-trajectory qualification is claimed.
+
+The revised BF16 operator fanout check (H1024, three sources, 64 tokens) passes
+Q8 at fractions 0/.5/1 and Q32 at fractions .5/1. Q32 at fraction 0 and Q64 at
+all three fractions fail the original pointwise source-gradient gate, with
+maximum absolute error .03125 and relative L2 below 9e-5. All failed cases
+remain untimed. A matched-capture probe finds source and local saved RMS/scores
+bitwise identical, while softmax probabilities differ. A narrow rounding-boundary
+experiment is being investigated separately; it is not part of this implementation.
