@@ -350,6 +350,105 @@ class TestAttnResFlaParity:
         for got, want in zip(grads, reference_grads):
             torch.testing.assert_close(got.float(), want.float(), rtol=2e-2, atol=5e-3)
 
+    @staticmethod
+    def _view_backward_count(output):
+        pending = [output.grad_fn]
+        seen = set()
+        while pending:
+            node = pending.pop()
+            if node is None or node in seen:
+                continue
+            seen.add(node)
+            pending.extend(child for child, _ in node.next_functions)
+        return sum(type(node).__name__.startswith("ViewBackward") for node in seen)
+
+    def _compare_public_wrapper(
+        self, shape, layout, n_sources, checkpoint_level=1, with_output_norm=False
+    ):
+        """Wrapper regression; the native arithmetic reference remains a separate test."""
+        from fla.ops.attnres import fused_attnres
+
+        torch.manual_seed(37)
+        hidden_size = shape[-1]
+        storage_shape = (*shape[:-1], 2 * hidden_size) if layout == "strided" else shape
+        if layout == "shared_views":
+            storage_shape = (2, *shape)
+        n_storage = 1 if layout in ("repeated", "shared_views") else n_sources
+        storage = [
+            torch.randn(storage_shape, device="cuda", dtype=torch.bfloat16)
+            for _ in range(n_storage)
+        ]
+        query = torch.randn(hidden_size, device="cuda") * 0.02
+        weight = 1 + torch.randn(hidden_size, device="cuda") * 0.1
+        output_weight = 1 + torch.randn(hidden_size, device="cuda") * 0.1
+        grad_output = torch.randn(shape, device="cuda", dtype=torch.bfloat16)
+
+        results = []
+        for operator in (fused_attnres, _get_fla_fused_attnres()):
+            bases = [value.detach().clone().requires_grad_() for value in storage]
+            q = query.detach().clone().requires_grad_()
+            w = weight.detach().clone().requires_grad_()
+            ow = output_weight.detach().clone().requires_grad_() if with_output_norm else None
+            if layout == "repeated":
+                values = [bases[0]] * n_sources
+            elif layout == "shared_views":
+                # Distinct view objects alias the same storage; the unused bank
+                # must also retain its zero gradient after accumulation.
+                values = [bases[0][0] for _ in range(n_sources)]
+            elif layout == "strided":
+                values = [value[..., ::2] for value in bases]
+            else:
+                values = bases
+            output, probabilities = operator(
+                q,
+                values,
+                w,
+                output_rms_weight=ow,
+                return_weights=True,
+                checkpoint_level=checkpoint_level,
+            )
+            assert output.shape == shape
+            assert probabilities.shape == (n_sources, *shape[:-1])
+            assert not probabilities.requires_grad
+            view_count = self._view_backward_count(output)
+            leaves = [q, w, *bases] + ([ow] if ow is not None else [])
+            gradients = torch.autograd.grad(output, leaves, grad_output)
+            assert gradients[0].dtype == gradients[1].dtype == torch.float32
+            results.append((output, probabilities, gradients, view_count))
+
+        reference, actual = results
+        for got, want in zip(
+            [actual[0], actual[1], *actual[2]], [reference[0], reference[1], *reference[2]]
+        ):
+            torch.testing.assert_close(got, want, rtol=0, atol=0)
+        if layout == "contiguous":
+            # These views are metadata operations, not GPU copies. Their
+            # backward graph nodes are the overhead removed by the adapter.
+            assert reference[3] - actual[3] == n_sources + 1
+
+    @pytest.mark.parametrize("shape", [(128, 1024), (64, 2, 1024)])
+    @pytest.mark.parametrize("layout", ["contiguous", "strided", "repeated", "shared_views"])
+    @pytest.mark.parametrize("n_sources", [1, 2, 3, 6])
+    def test_shape_preserving_wrapper_matches_public(self, shape, layout, n_sources):
+        self._compare_public_wrapper(shape, layout, n_sources)
+
+    @pytest.mark.parametrize("checkpoint_level", [0, 1])
+    @pytest.mark.parametrize("with_output_norm", [False, True])
+    def test_shape_preserving_wrapper_optional_arguments(self, checkpoint_level, with_output_norm):
+        self._compare_public_wrapper(
+            (64, 2, 1024), "contiguous", 3, checkpoint_level, with_output_norm
+        )
+
+    @pytest.mark.parametrize("checkpoint_level", [-1, 2])
+    def test_shape_preserving_wrapper_rejects_invalid_checkpoint(self, checkpoint_level):
+        operator = _get_fla_fused_attnres()
+        with pytest.raises(ValueError, match="checkpoint_level must be 0 or 1"):
+            operator(None, [None], None, checkpoint_level=checkpoint_level)
+
+    def test_shape_preserving_wrapper_rejects_empty_sources(self):
+        with pytest.raises(ValueError, match="residuals must contain at least one source"):
+            _get_fla_fused_attnres()(None, [], None)
+
 
 class TestAttnResSchedule:
 
