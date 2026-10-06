@@ -192,6 +192,40 @@ def test_detached_projection_skips_value_backward_kernel(monkeypatch):
     _check(query.grad, ref_query.grad, "query")
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA/Triton")
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
+@pytest.mark.parametrize("projected_count", [1, 2, 3])
+def test_projection_placement_preserves_probabilities(dtype, projected_count):
+    """Softmax observes the same FP32 score boundary for local and cached scores."""
+    generator = torch.Generator(device="cpu").manual_seed(271828)
+    initial = [torch.randn(128, 1024, generator=generator).to(dtype).cuda() for _ in range(3)]
+    initial_query = (torch.randn(1024, generator=generator) * 0.02).cuda()
+    upstream = torch.randn(128, 1024, generator=generator).to(dtype).cuda()
+
+    def run(count):
+        values = [_leaf(value) for value in initial]
+        query = _leaf(initial_query)
+        scores = [
+            project_source(value.detach(), query[None])[1][..., 0] if index < count else None
+            for index, value in enumerate(values)
+        ]
+        output = aggregate_preprojected(values, query, scores, precomputed_value_grad=True)
+        # Equal stored logits alone do not cover contraction into softmax:
+        # inspect the actual saved probabilities used by the custom backward.
+        saved = output.grad_fn.saved_tensors
+        probabilities, _, logits = saved[len(values) + 1 : len(values) + 4]
+        gradients = torch.autograd.grad(output, [*values, query], upstream)
+        return output, probabilities, logits, gradients
+
+    local, cached = run(0), run(projected_count)
+    for actual, expected in zip(cached[:3], local[:3]):
+        torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+    for actual, expected in zip(cached[3][:-1], local[3][:-1]):
+        _check(actual, expected)
+    # Source-owned query reductions have a different summation order.
+    _check(cached[3][-1], local[3][-1], "query")
+
+
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
 @pytest.mark.parametrize("projected", [False, True])
 def test_one_source_identity_and_explicit_zero_gradients(dtype, projected):

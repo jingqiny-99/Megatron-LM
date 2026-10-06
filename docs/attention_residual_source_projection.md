@@ -349,5 +349,36 @@ Q8 at fractions 0/.5/1 and Q32 at fractions .5/1. Q32 at fraction 0 and Q64 at
 all three fractions fail the original pointwise source-gradient gate, with
 maximum absolute error .03125 and relative L2 below 9e-5. All failed cases
 remain untimed. A matched-capture probe finds source and local saved RMS/scores
-bitwise identical, while softmax probabilities differ. A narrow rounding-boundary
-experiment is being investigated separately; it is not part of this implementation.
+bitwise identical, while softmax probabilities differ. The local consumer now
+uses an explicit FP32 round-to-nearest multiplication for dot-times-rstd. This
+matches the stored producer-score boundary and prevents contraction into the
+following score-minus-maximum operation, while other compiler fusion remains
+enabled. All 16 matched captures then have identical probabilities and outputs.
+Six deterministic CUDA regression cases cover FP32/BF16 and one, two or three
+precomputed sources. A separate pinned-old-kernel negative control reproduces
+the probability mismatch. The final production operator/state/contract suite
+passes 183 cases, and its PP2/VPP2 same-state diagnostic again passes ten steps.
+Independent source-fraction and FLA trajectories still fail on update four;
+the rounding fix does not establish trajectory acceptance.
+
+### Current operator performance
+
+The final kernel was measured on GB200 with BF16 values, 256 tokens, eight
+consumers, and a detached last-consumer history. All six exact workloads pass
+the unchanged independent operator gates before timing. Each measurement uses
+ten warmup iterations and three repetitions of fifty complete forward/backward
+iterations, including producer projection and query-gradient work.
+
+| Hidden / sources | Fraction 0 | Fraction .5 | Fraction 1 |
+| --- | ---: | ---: | ---: |
+| 1024 / 3 | 2.037 ms | 2.908 ms | 3.431 ms |
+| 7168 / 9 | 2.509 ms | 7.689 ms | 7.617 ms |
+
+These are median CUDA-event timings around eager Python execution, including
+launch gaps. They show increased total operator time with source placement,
+not a net speedup. The larger fraction-.5 case has repetition means ranging
+from 5.816 to 8.656 ms, so its ordering against fraction 1 is not meaningful.
+Every source-placement repetition is slower than fraction 0 at its shape.
+The separately measured Torch autograd reference is not FLA. No PP transport,
+bank synchronization, DDP, optimizer or transformer layers are timed here;
+distributed critical-path benefit remains unproven.

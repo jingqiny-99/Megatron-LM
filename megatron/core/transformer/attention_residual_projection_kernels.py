@@ -18,6 +18,7 @@ from torch.autograd.function import once_differentiable
 try:
     import triton
     import triton.language as tl
+    from triton.language.extra.cuda import libdevice
 except ImportError:
     triton = None
     tl = None
@@ -276,7 +277,9 @@ if triton is not None:
             else:
                 value = tl.load(VALUES[source] + token * H + h, h < H, other=0).to(tl.float32)
                 rstd = tl.rsqrt(tl.sum(value * value, 0) / H + EPS)
-                score = tl.sum(value * query, 0) * rstd
+                # Match the FP32 rounding boundary of a stored producer score.
+                # Otherwise this product can contract into score-minus-maximum.
+                score = libdevice.mul_rn(tl.sum(value * query, 0), rstd)
             scores += (score,)
             maximum = tl.maximum(maximum, score)
             tl.store(RMS + source * T + token, rstd)
