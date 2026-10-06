@@ -50,12 +50,52 @@ from megatron.core.utils import nvtx_range_pop, nvtx_range_push
 
 @functools.lru_cache(maxsize=1)
 def _get_fla_fused_attnres():
-    """Import FLA's fused operator only when that backend is selected."""
+    """Load the shape-preserving adapter for the pinned FLA 0.5.1 backend.
+
+    FLA's public wrapper flattens each source and views the output back. Its
+    autograd Function already supports the original shape; calling it directly
+    avoids one ViewBackward per source and output at every consumer. The private
+    API dependency is isolated here; see attnres_shape_preserving_fla.md.
+    """
     try:
-        from fla.ops.attnres import fused_attnres
+        from fla.ops.attnres.fused import FusedAttnresFunction
     except ImportError:
         return None
-    return fused_attnres
+    return functools.partial(_shape_preserving_fla_attnres, FusedAttnresFunction)
+
+
+def _shape_preserving_fla_attnres(
+    function,
+    query,
+    residuals,
+    rms_weight,
+    output_rms_weight=None,
+    rms_eps=1e-6,
+    scale=1.0,
+    return_weights=False,
+    checkpoint_level=1,
+):
+    """Keep FLA's public call contract without its source/output reshape nodes."""
+    if len(residuals) == 0:
+        raise ValueError("residuals must contain at least one source")
+    if checkpoint_level not in (0, 1):
+        raise ValueError(f"checkpoint_level must be 0 or 1, got {checkpoint_level}")
+
+    # Retain copies for noncontiguous sources and their autograd connections.
+    # FLA computes token count from numel / hidden size and preserves this shape
+    # for its output, statistics and source gradients. Kernels are unchanged.
+    sources = tuple(value.contiguous() for value in residuals)
+    output, probabilities = function.apply(
+        query,
+        rms_weight,
+        output_rms_weight,
+        rms_eps,
+        scale,
+        return_weights,
+        checkpoint_level,
+        *sources,
+    )
+    return (output, probabilities) if return_weights else output
 
 
 def is_attn_res_block_start(global_layer_number: int, block_layers: int) -> bool:
