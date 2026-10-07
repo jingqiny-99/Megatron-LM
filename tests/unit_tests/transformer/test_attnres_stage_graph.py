@@ -75,7 +75,9 @@ def surface_block(pre_process=False):
     # No distributed/CUDA constructor is needed to test the graph surface adapter.
     block = TransformerBlock.__new__(TransformerBlock)
     torch.nn.Module.__init__(block)
-    block.config = SimpleNamespace(attn_res_stage_cuda_graph=True)
+    block.config = SimpleNamespace(
+        attn_res_stage_cuda_graph=True, attn_res_vpp_final_chunk_cuda_graph=False
+    )
     block.pre_process = pre_process
     block.input_tensor = torch.randn(12, 1, 4, requires_grad=True)
     return block
