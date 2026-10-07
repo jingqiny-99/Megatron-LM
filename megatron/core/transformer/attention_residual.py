@@ -424,6 +424,23 @@ def attn_res_tap_source(tensor: Tensor) -> Tuple[Tensor, Tensor]:
     return _AttnResGradTap.apply(tensor, cache_leaf), cache_leaf
 
 
+class _AttnResGraphSourceTap(torch.autograd.Function):
+    """Expose a later-chunk gradient at the original source's BF16 addition point."""
+
+    @staticmethod
+    def forward(ctx, tensor):
+        """Keep local consumers and an explicit differentiable export on separate edges."""
+        ctx.set_materialize_grads(False)
+        return tensor.view_as(tensor), tensor.view_as(tensor)
+
+    @staticmethod
+    def backward(ctx, local_gradient, external_gradient):
+        """Perform exactly the original local-plus-cache-gradient addition."""
+        if local_gradient is None or external_gradient is None:
+            raise RuntimeError("An exported AttnRes source requires local and external gradients.")
+        return local_gradient + external_gradient
+
+
 class AttnResStageSources:
     """Depth-source bookkeeping for one stage (or virtual chunk) forward pass.
 
@@ -457,16 +474,29 @@ class AttnResStageSources:
         self.vp_stage = vp_stage or 0
         self.microbatch_id = microbatch_id
         self.pre_process = pre_process
-        # Pure captured final-chunk bodies receive explicit sources. Their real forward
+        # Pure captured chunk bodies receive explicit sources. Their real forward
         # caller retains responsibility for the original cache entry/exit effects.
         self.manage_cache = manage_cache
         if not manage_cache and not (
-            config.attn_res_vpp_final_chunk_cuda_graph
-            and self.interleaved
-            and self.vp_stage == config.virtual_pipeline_model_parallel_size - 1
+            self.interleaved
+            and (
+                config.attn_res_vpp_cuda_graph
+                or (
+                    config.attn_res_vpp_final_chunk_cuda_graph
+                    and self.vp_stage == config.virtual_pipeline_model_parallel_size - 1
+                )
+            )
         ):
-            raise ValueError("External cache lifecycle is restricted to final-VP stage graphs.")
+            raise ValueError(
+                "External cache lifecycle is restricted to final-VP or full-VPP stage graphs."
+            )
+        self.export_graph_sources = (
+            not manage_cache
+            and config.attn_res_vpp_cuda_graph
+            and self.vp_stage < config.virtual_pipeline_model_parallel_size - 1
+        )
         self.graph_sources: List[Tensor] = []
+        self.graph_source_exports: List[Tensor] = []
         self._cache_leaves: List[Tensor] = []
         if self.interleaved:
             assert microbatch_id is not None, (
@@ -549,7 +579,11 @@ class AttnResStageSources:
 
     def append_block_start(self, hidden_states: Tensor):
         """Record a completed depth block (the partial sum becomes a source)."""
-        if self.interleaved:
+        if self.export_graph_sources:
+            in_graph, exported = _AttnResGraphSourceTap.apply(hidden_states)
+            self.graph_sources.append(in_graph)
+            self.graph_source_exports.append(exported)
+        elif self.interleaved:
             in_graph, leaf = attn_res_tap_source(hidden_states)
             self.graph_sources.append(in_graph)
             self._cache_leaves.append(leaf)
