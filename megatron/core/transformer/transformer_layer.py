@@ -572,7 +572,11 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
 
         assert self.config.cuda_graph_impl == "local"
 
-        if config.attn_res_stage_cuda_graph or config.attn_res_vpp_final_chunk_cuda_graph:
+        if (
+            config.attn_res_stage_cuda_graph
+            or config.attn_res_vpp_final_chunk_cuda_graph
+            or config.attn_res_vpp_cuda_graph
+        ):
             # The enclosing decoder owns all source fan-out/fan-in in one graph.
             return
 

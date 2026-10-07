@@ -106,6 +106,38 @@ class _AttnResGraphInputGradientOwner(torch.autograd.Function):
         return gradient.clone()
 
 
+class _AttnResGraphOutputBridge(torch.autograd.Function):
+    """Drain fresh host cache leaves into explicit graph-output gradient surfaces."""
+
+    @staticmethod
+    def forward(ctx, cache_leaves, source_ids, microbatch_id, vp_stage, payload, *exports):
+        """Retain this invocation's leaves even after the forward cache entry is evicted."""
+        if not exports or len(exports) != len(cache_leaves) or len(exports) != len(source_ids):
+            raise RuntimeError("AttnRes graph exports do not match their host cache leaves.")
+        ctx.set_materialize_grads(False)
+        ctx.cache_leaves = tuple(cache_leaves)
+        ctx.source_ids = tuple(source_ids)
+        ctx.microbatch_id = microbatch_id
+        ctx.vp_stage = vp_stage
+        ctx.drained = False
+        return payload.view_as(payload)
+
+    @staticmethod
+    def backward(ctx, gradient):
+        """Supply each later-chunk gradient once, before the native runner stages it."""
+        if ctx.drained:
+            raise RuntimeError("AttnRes graph source gradients were already drained.")
+        external_gradients = tuple(leaf.grad for leaf in ctx.cache_leaves)
+        if gradient is None or any(value is None for value in external_gradients):
+            raise RuntimeError("AttnRes graph backward requires every later-chunk source gradient.")
+        # Validate all leaves before clearing any. The returned tensors own ordinary storage;
+        # native replay copies them into its static output-gradient surfaces before backward.
+        for leaf in ctx.cache_leaves:
+            leaf.grad = None
+        ctx.drained = True
+        return (None, None, None, None, gradient, *external_gradients)
+
+
 def get_num_layers_to_build(
     config: TransformerConfig, vp_stage: Optional[int] = None, pp_rank: Optional[int] = None
 ) -> int:
@@ -361,7 +393,11 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
         self._build_layers()
         self.num_layers_per_pipeline_rank = len(self.layers)
 
-        if config.attn_res_stage_cuda_graph or config.attn_res_vpp_final_chunk_cuda_graph:
+        if (
+            config.attn_res_stage_cuda_graph
+            or config.attn_res_vpp_final_chunk_cuda_graph
+            or config.attn_res_vpp_cuda_graph
+        ):
             if not self.layers or any(
                 getattr(pg_collection, name).size() != 1 for name in ("tp", "cp", "ep", "dp")
             ):
@@ -371,11 +407,24 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
             self.is_first_layer = self.is_last_layer = True
             if config.attn_res_stage_cuda_graph:
                 self.cudagraph_manager.func = self._forward_attn_res_stage_graph
-            elif self.vp_stage == config.virtual_pipeline_model_parallel_size - 1:
-                self.cudagraph_manager.func = self._forward_attn_res_final_vp_graph
+            elif (
+                config.attn_res_vpp_cuda_graph
+                or self.vp_stage == config.virtual_pipeline_model_parallel_size - 1
+            ):
                 self._attn_res_graph_entry_source_count = self.layers[0].attn_res_num_sources - int(
                     self.layers[0].attn_res_is_block_start
                 )
+                if self.vp_stage == config.virtual_pipeline_model_parallel_size - 1:
+                    self.cudagraph_manager.func = self._forward_attn_res_final_vp_graph
+                else:
+                    self.cudagraph_manager.func = self._forward_attn_res_earlier_vp_graph
+                    self._attn_res_graph_export_source_ids = tuple(
+                        layer.attn_res_num_sources - 1
+                        for layer in self.layers
+                        if layer.attn_res_is_block_start
+                    )
+                    if not self._attn_res_graph_export_source_ids:
+                        raise ValueError("Each earlier AttnRes graph chunk must export a source.")
             else:
                 # Earlier chunks keep their original eager source publication and GradTap drain.
                 del self.cudagraph_manager
@@ -869,7 +918,7 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
         return False
 
     def __call__(self, *args, **kwargs):
-        if (
+        if self.config.attn_res_vpp_cuda_graph or (
             self.config.attn_res_vpp_final_chunk_cuda_graph
             and self.vp_stage == self.config.virtual_pipeline_model_parallel_size - 1
         ):
@@ -938,11 +987,9 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
             self.input_tensor = original_input
 
     def _call_attn_res_final_vp_graph(self, hidden_states, attention_mask=None, **kwargs):
-        """Keep real VPP cache effects outside the final local chunk's replay boundary."""
-        if not self.training or not torch.is_grad_enabled() or self.pre_process:
-            raise ValueError(
-                "Final-VP stage graphs require a nonfirst training chunk with gradients."
-            )
+        """Keep actual VPP cache publication, eviction and drains outside graph replay."""
+        if not self.training or not torch.is_grad_enabled():
+            raise ValueError("VPP stage graphs require a training chunk with gradients.")
         for name, value in kwargs.items():
             if name != "rotary_pos_emb" and value is not None:
                 raise ValueError(f"Final-VP stage graph does not support {name}={type(value)}.")
@@ -958,7 +1005,7 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
             pp_rank=get_pg_rank(self.pg_collection.pp),
             vp_stage=self.vp_stage,
             microbatch_id=microbatch_id,
-            pre_process=False,
+            pre_process=self.pre_process,
         )
         if len(state.graph_sources) != self._attn_res_graph_entry_source_count:
             raise RuntimeError("Final-VP stage graph source count differs from its layer plan.")
@@ -975,16 +1022,54 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
             }
         )
         outputs = self.cudagraph_manager(self, (), graph_kwargs)
-        # The final local visit evicts metadata only. Its original leaves remain owned
-        # by this call's autograd inputs and the earlier chunk's existing GradTap nodes.
+        if self.vp_stage < self.config.virtual_pipeline_model_parallel_size - 1:
+            if not isinstance(outputs, tuple):
+                raise RuntimeError("An earlier AttnRes graph must return payload and exports.")
+            output, *exports = outputs
+            source_ids = self._attn_res_graph_export_source_ids
+            expected_ids = tuple(
+                range(len(state.graph_sources), len(state.graph_sources) + len(exports))
+            )
+            if source_ids != expected_ids:
+                raise RuntimeError("AttnRes graph export order differs from its source plan.")
+            # Graph-output buffers can be recycled after replay. Later chunks consume owning
+            # detached leaves, while the bridge keeps their gradients live until this backward.
+            leaves = tuple(value.detach().clone().requires_grad_(True) for value in exports)
+            state.graph_sources.extend(exports)
+            state._cache_leaves.extend(leaves)
+            output = _AttnResGraphOutputBridge.apply(
+                leaves, source_ids, microbatch_id, self.vp_stage, output, *exports
+            )
+        else:
+            output = outputs[0] if isinstance(outputs, tuple) else outputs
+        # Final visits evict metadata only; outstanding backward nodes retain their leaves.
         state._update_cache()
-        output = outputs[0] if isinstance(outputs, tuple) else outputs
         return output.clone() if output._base is not None else output
 
     def _forward_attn_res_final_vp_graph(
         self, hidden_states, attention_mask, rotary_pos_emb, microbatch_id, **sources
     ):
         """Capture the original final-chunk consumers with explicit, owning source inputs."""
+        output, _ = self._forward_attn_res_vp_graph_body(
+            hidden_states, attention_mask, rotary_pos_emb, microbatch_id, **sources
+        )
+        return output
+
+    def _forward_attn_res_earlier_vp_graph(
+        self, hidden_states, attention_mask, rotary_pos_emb, microbatch_id, **sources
+    ):
+        """Export each locally formed source on its own differentiable output edge."""
+        output, state = self._forward_attn_res_vp_graph_body(
+            hidden_states, attention_mask, rotary_pos_emb, microbatch_id, **sources
+        )
+        if len(state.graph_source_exports) != len(self._attn_res_graph_export_source_ids):
+            raise RuntimeError("AttnRes graph created a different number of source exports.")
+        return (output, *state.graph_source_exports)
+
+    def _forward_attn_res_vp_graph_body(
+        self, hidden_states, attention_mask, rotary_pos_emb, microbatch_id, **sources
+    ):
+        """Run the original decoder with explicit sources and no captured cache effects."""
         if len(sources) != self._attn_res_graph_entry_source_count:
             raise RuntimeError("Final-VP graph source arity changed.")
         state = AttnResStageSources(
@@ -992,16 +1077,17 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
             pp_rank=get_pg_rank(self.pg_collection.pp),
             vp_stage=self.vp_stage,
             microbatch_id=microbatch_id,
-            pre_process=False,
+            pre_process=self.pre_process,
             manage_cache=False,
         )
         state.graph_sources = [sources[f"source_{index}"].clone() for index in range(len(sources))]
-        return self.forward(
+        output = self.forward(
             hidden_states=hidden_states.clone(),
             attention_mask=attention_mask,
             rotary_pos_emb=rotary_pos_emb,
             _attn_res_stage_state=state,
         )
+        return output, state
 
     def _build_mhc_recompute_layer_plan(
         self, use_mhc_recompute: bool
@@ -1132,11 +1218,16 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
         if _attn_res_stage_state is None:
             hidden_states = self.preprocess_for_layer_schedule(hidden_states)
         elif not (
-            self.config.attn_res_vpp_final_chunk_cuda_graph
-            and self.vp_stage == self.config.virtual_pipeline_model_parallel_size - 1
+            (
+                self.config.attn_res_vpp_cuda_graph
+                or (
+                    self.config.attn_res_vpp_final_chunk_cuda_graph
+                    and self.vp_stage == self.config.virtual_pipeline_model_parallel_size - 1
+                )
+            )
             and not _attn_res_stage_state.manage_cache
         ):
-            raise ValueError("Explicit source state is restricted to the captured final VP chunk.")
+            raise ValueError("Explicit source state is restricted to captured VPP chunks.")
 
         # Attention residuals: recover (depth sources, partial sum) for this stage.
         # On the first stage the embedding output is the initial partial sum (it

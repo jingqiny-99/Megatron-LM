@@ -112,6 +112,7 @@ def test_final_chunk_body_owns_every_saved_source_and_partial():
     block = TransformerBlock.__new__(TransformerBlock)
     torch.nn.Module.__init__(block)
     block.config = vpp_config()
+    block.pre_process = False
     block.vp_stage = 1
     block.pg_collection = SimpleNamespace(pp=None)
     block._attn_res_graph_entry_source_count = 2
