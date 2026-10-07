@@ -13,7 +13,7 @@ from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
     FineGrainedActivationOffloadingInterface as off_interface,
 )
 from megatron.core.pipeline_parallel.multimodule_communicator import MultiModulePipelineCommunicator
-from megatron.core.pipeline_parallel.p2p_communication import P2PCommunicator
+from megatron.core.pipeline_parallel.p2p_communication import P2PCommunicator, PipelineTensorSpec
 from megatron.core.pipeline_parallel.utils import (
     is_pp_first_stage,
     is_pp_last_stage,
@@ -43,6 +43,46 @@ from .combined_1f1b import (
 
 # Types
 Shape = Union[List[int], torch.Size]
+
+
+def _prepare_attn_res_forward_step(model, config, pg_collection):
+    """Publish one model-owned snapshot before the first pipeline receive."""
+    if not getattr(config, 'attn_res_forward_projection', False):
+        return None
+    from megatron.core.transformer.attention_residual import attn_res_source_cache_reset
+    from megatron.core.transformer.attention_residual_forward_state import (
+        prepare_attn_res_forward_projection,
+    )
+
+    if isinstance(pg_collection, MultiModuleProcessGroupCollection):
+        raise ValueError('Forward projection requires a single dense pipeline model')
+    if config.variable_seq_lengths:
+        raise ValueError('Forward projection requires static pipeline tensor shapes')
+    chunks = model if isinstance(model, list) else [model]
+    if not getattr(config, 'moe_paged_stash', False):
+        # The existing paged-stash entry path already resets this cache.
+        attn_res_source_cache_reset()
+    snapshot = prepare_attn_res_forward_projection(
+        chunks, pg_collection.pp, data_parallel_size=pg_collection.dp_cp.size()
+    )
+    for chunk in chunks:
+        get_attr_wrapped_model(chunk, 'set_attn_res_forward_snapshot')(snapshot)
+    return snapshot
+
+
+def _attn_res_forward_tensor_specs(config, value_shape, local_seq_length, micro_batch_size):
+    """Describe the original value channel and a uniform forward-only FP32 prefix."""
+    from megatron.core.transformer.attention_residual_forward_state import ForwardProjectionPlan
+
+    plan = ForwardProjectionPlan.from_config(config)
+    return [
+        PipelineTensorSpec(tuple(value_shape), config.pipeline_dtype),
+        PipelineTensorSpec(
+            plan.payload_shape(local_seq_length, micro_batch_size),
+            torch.float32,
+            requires_grad=False,
+        ),
+    ]
 
 
 def get_forward_backward_func(
@@ -526,6 +566,21 @@ def forward_step(
         is_last_stage,
     )
 
+    if getattr(config, 'attn_res_forward_projection', False) and not is_last_stage:
+        if (
+            not isinstance(output_tensor, list)
+            or len(output_tensor) != 2
+            or not all(isinstance(value, torch.Tensor) for value in output_tensor)
+            or output_tensor[1].dtype != torch.float32
+            or output_tensor[1].requires_grad
+        ):
+            raise ValueError(
+                'Forward projection must return [value, nondifferentiable FP32 auxiliary]'
+            )
+        # The typed channel list is already flat, including on the first rank
+        # where input_tensor began as None. Do not wrap it into a nested list.
+        return output_tensor, num_tokens
+
     if unwrap_output_tensor:
         return output_tensor, num_tokens
     return [output_tensor], num_tokens
@@ -552,13 +607,21 @@ def backward_step(input_tensor, output_tensor, output_tensor_grad, config):
         input_tensor = [input_tensor]
         unwrap_input_tensor_grad = True
     for x in input_tensor:
-        if x is not None:
+        if x is not None and x.requires_grad:
             x.retain_grad()
 
     if not isinstance(output_tensor, list):
         output_tensor = [output_tensor]
     if not isinstance(output_tensor_grad, list):
         output_tensor_grad = [output_tensor_grad]
+
+    if getattr(config, 'attn_res_forward_projection', False) and len(output_tensor) == 2:
+        if (
+            output_tensor[1].requires_grad
+            or len(output_tensor_grad) != 2
+            or output_tensor_grad[1] is not None
+        ):
+            raise ValueError('Forward-only auxiliary outputs must have a structural None gradient')
 
     # Backward pass.
     if output_tensor_grad[0] is None and config.grad_scale_func is not None:
@@ -580,7 +643,7 @@ def backward_step(input_tensor, output_tensor, output_tensor_grad, config):
     if input_tensor is not None:
         input_tensor_grad = []
         for x in input_tensor:
-            if x is None:
+            if x is None or not x.requires_grad:
                 input_tensor_grad.append(None)
             else:
                 input_tensor_grad.append(x.grad)
@@ -1188,6 +1251,8 @@ def forward_backward_pipelining_with_interleaving(
     if config.overlap_p2p_comm and config.batch_p2p_comm:
         raise ValueError("Can not use both overlap_p2p_comm and batch_p2p_comm")
 
+    _prepare_attn_res_forward_step(model, config, pg_collection)
+
     # Needed only when gradients are finalized in M-Core
     if config.finalize_model_grads_func is not None and not forward_only:
         # vp is ignored for clear_embedding_activation_buffer
@@ -1295,6 +1360,7 @@ def forward_backward_pipelining_with_interleaving(
     tensor_shape[0] = tensor_shape[0] // cp_group.size()
     if config.sequence_parallel:
         tensor_shape[0] = tensor_shape[0] // tp_group.size()
+    local_seq_length = tensor_shape[0]
 
     # Attention residuals: every boundary carries a delta of depth sources plus
     # the running partial sum, padded to one uniform slice count so the single
@@ -1305,6 +1371,11 @@ def forward_backward_pipelining_with_interleaving(
         from megatron.core.transformer.attention_residual import attn_res_uniform_payload_slices
 
         tensor_shape[0] = tensor_shape[0] * attn_res_uniform_payload_slices(config)
+
+    if getattr(config, 'attn_res_forward_projection', False):
+        tensor_shape = _attn_res_forward_tensor_specs(
+            config, tensor_shape, local_seq_length, micro_batch_size
+        )
 
     # Compute number of warmup and remaining microbatches.
     # seems only used for vpp
@@ -2259,6 +2330,8 @@ def get_tensor_shapes(
     tensor_shapes = []
 
     if config.variable_seq_lengths:
+        if getattr(config, 'attn_res_forward_projection', False):
+            raise ValueError('Forward projection requires static pipeline tensor shapes')
         # Shapes exchanged dynamically during P2P communication
         tensor_shapes.append(())
         return tensor_shapes
@@ -2269,6 +2342,7 @@ def get_tensor_shapes(
 
     if config.sequence_parallel:
         effective_seq_length = effective_seq_length // tp_group.size()
+    local_seq_length = effective_seq_length
 
     # Determine hidden dimension based on hyper connections and pipeline stage
     hidden_size = config.hidden_size
@@ -2310,6 +2384,10 @@ def get_tensor_shapes(
             )
 
     tensor_shapes.append((effective_seq_length, micro_batch_size, hidden_size))
+    if getattr(config, 'attn_res_forward_projection', False):
+        return _attn_res_forward_tensor_specs(
+            config, tensor_shapes[0], local_seq_length, micro_batch_size
+        )
     return tensor_shapes
 
 
@@ -2432,6 +2510,8 @@ def forward_backward_pipelining_without_interleaving(
 
             attn_res_source_cache_reset()
 
+    _prepare_attn_res_forward_step(model, config, pg_collection)
+
     # Disable async grad reductions
     no_sync_func = config.no_sync_func
     if no_sync_func is None:
@@ -2501,9 +2581,21 @@ def forward_backward_pipelining_without_interleaving(
         is_recv=False,
     )
     if adjust_tensor_shapes_fn is not None:
+        if getattr(config, 'attn_res_forward_projection', False):
+            raise ValueError('Forward projection requires its unchanged static channel schema')
         recv_tensor_shapes, send_tensor_shapes = adjust_tensor_shapes_fn(
             recv_tensor_shapes, send_tensor_shapes
         )
+    forward_send_kwargs = (
+        {'tensor_shapes': send_tensor_shapes}
+        if getattr(config, 'attn_res_forward_projection', False)
+        else {}
+    )
+    backward_send_kwargs = (
+        {'tensor_shapes': recv_tensor_shapes}
+        if getattr(config, 'attn_res_forward_projection', False)
+        else {}
+    )
 
     # Input, output tensors only need to be saved when doing backward passes
     input_tensors = None
@@ -2544,7 +2636,9 @@ def forward_backward_pipelining_without_interleaving(
             current_microbatch=i,
             is_last_stage=p2p_communicator.is_pp_last_stage,
         )
-        p2p_communicator.send_forward(output_tensor, p2p_communicator.is_pp_last_stage)
+        p2p_communicator.send_forward(
+            output_tensor, p2p_communicator.is_pp_last_stage, **forward_send_kwargs
+        )
         total_num_tokens += num_tokens
 
         if not forward_only:
@@ -2592,7 +2686,9 @@ def forward_backward_pipelining_without_interleaving(
         total_num_tokens += num_tokens
 
         if forward_only:
-            p2p_communicator.send_forward(output_tensor, p2p_communicator.is_pp_last_stage)
+            p2p_communicator.send_forward(
+                output_tensor, p2p_communicator.is_pp_last_stage, **forward_send_kwargs
+            )
             if not last_iteration:
                 input_tensor = p2p_communicator.recv_forward(
                     recv_tensor_shapes, p2p_communicator.is_pp_first_stage
@@ -2625,7 +2721,7 @@ def forward_backward_pipelining_without_interleaving(
             if last_iteration:
                 input_tensor = None
                 p2p_communicator.send_backward(
-                    input_tensor_grad, p2p_communicator.is_pp_first_stage
+                    input_tensor_grad, p2p_communicator.is_pp_first_stage, **backward_send_kwargs
                 )
             else:
                 input_tensor = p2p_communicator.send_backward_recv_forward(
@@ -2656,7 +2752,9 @@ def forward_backward_pipelining_without_interleaving(
                 input_tensor, output_tensor, output_tensor_grad, config
             )
 
-            p2p_communicator.send_backward(input_tensor_grad, p2p_communicator.is_pp_first_stage)
+            p2p_communicator.send_backward(
+                input_tensor_grad, p2p_communicator.is_pp_first_stage, **backward_send_kwargs
+            )
 
         # Launch any remaining grad reductions.
         if no_sync_context is not None:

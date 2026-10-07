@@ -25,7 +25,9 @@ from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.random import MHCCheckpointManager
 from megatron.core.transformer.attention_residual import (
     AttentionResidual,
+    AttnResForwardProjectionStage,
     AttnResStageSources,
+    attn_res_num_payload_slices,
     is_attn_res_block_start,
 )
 from megatron.core.transformer.cuda_graphs import annotate_first_last_layer
@@ -501,6 +503,7 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
                 # Final AttnRes output head: aggregates all depth sources plus the
                 # trailing partial block right before the final layernorm.
                 self.final_attn_res = AttentionResidual(self.config)
+                self.final_attn_res.forward_projection_consumer_id = 2 * self.config.num_layers
         else:
             self.final_layernorm = None  # Either this or nn.Identity
 
@@ -650,7 +653,12 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
                     # output slot mHC uses for its multistream (mutually exclusive).
                     mhc_multistream = tuple(attn_res_values)
                 nvtx_range_push(msg="attn_res.final_aggregate")
-                hidden_states = self.final_attn_res(attn_res_values)
+                hidden_states = self.final_attn_res(
+                    attn_res_values,
+                    forward_projection_state=getattr(
+                        attn_res_state, "forward_projection_state", None
+                    ),
+                )
                 nvtx_range_pop(msg="attn_res.final_aggregate")
             else:
                 # Not the final stage: pack the pipeline payload (full prefix, or
@@ -934,12 +942,65 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
             return super().__call__(*args, **kwargs)[0]
         return super().__call__(*args, **kwargs)
 
+    def _forward_projection_host_args(self, snapshot, payload):
+        """Authorize the current model snapshot before passing flat nondifferentiable inputs."""
+        enabled = getattr(self.config, "attn_res_forward_projection", False)
+        if not enabled:
+            if snapshot is not None or payload is not None:
+                raise ValueError("Forward projection inputs require the explicit config flag.")
+            return {}
+        if snapshot is None:
+            raise ValueError("Forward projection requires a prepared model-scoped snapshot.")
+        snapshot.validate(snapshot.epoch, snapshot.plan)
+        for module in self.modules():
+            if isinstance(module, AttentionResidual):
+                snapshot.validate_module(module.forward_projection_consumer_id, module)
+        if self.pre_process != (payload is None):
+            raise ValueError("Forward metadata must follow the original PP stage boundary.")
+        if payload is not None and (payload.dtype != torch.float32 or payload.requires_grad):
+            raise ValueError("Forward metadata must be a nondifferentiable FP32 tensor.")
+        return dict(
+            forward_query_bank=snapshot.query_bank,
+            forward_gamma_bank=snapshot.gamma_bank,
+            forward_payload=payload,
+        )
+
+    def _new_forward_projection_state(self, query_bank, gamma_bank, payload, partial):
+        """Construct pure captured bookkeeping using explicit owning graph inputs."""
+        if query_bank is None:
+            if getattr(self.config, "attn_res_forward_projection", False):
+                raise ValueError("The graph omitted its explicit projection bank.")
+            return None
+        from .attention_residual_forward_state import ForwardProjectionPlan
+
+        plan = ForwardProjectionPlan.from_config(self.config, data_parallel_size=1)
+        global_stage = (self.vp_stage or 0) * plan.pp_size + get_pg_rank(self.pg_collection.pp)
+        consumers = tuple(
+            module.forward_projection_consumer_id
+            for module in self.modules()
+            if isinstance(module, AttentionResidual)
+        )
+        return AttnResForwardProjectionStage(
+            plan,
+            global_stage,
+            query_bank.clone(),
+            gamma_bank.clone(),
+            payload.clone() if payload is not None else None,
+            partial.shape[0],
+            partial.shape[1],
+            consumers,
+        )
+
     def _call_attn_res_stage_graph(self, hidden_states, attention_mask=None, **kwargs):
         """Expose the actual PP payload as a graph input, including on nonfirst ranks."""
         if not self.training or not torch.is_grad_enabled():
             raise ValueError(
                 "AttnRes stage CUDA graphs currently support training with gradients only."
             )
+        projection_args = self._forward_projection_host_args(
+            kwargs.pop("forward_projection_snapshot", None),
+            kwargs.pop("forward_projection_payload", None),
+        )
         for name, value in kwargs.items():
             if name != "rotary_pos_emb" and value is not None:
                 raise ValueError(f"AttnRes stage CUDA graph does not support {name}={type(value)}.")
@@ -959,14 +1020,28 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
                 hidden_states=hidden_states,
                 attention_mask=attention_mask,
                 rotary_pos_emb=rotary_pos_emb,
+                **projection_args,
             ),
         )
         output = outputs[0] if isinstance(outputs, tuple) else outputs
         # The recording autograd node returns an alias. The schedule requires a viewless
         # tensor for pseudo-deallocation; replay already returns the runner's boundary clone.
-        return output.clone() if output._base is not None else output
+        output = output.clone() if output._base is not None else output
+        if projection_args and not self.post_process:
+            if len(outputs) != 2 or outputs[1].requires_grad:
+                raise RuntimeError("The projection graph must export nondifferentiable metadata.")
+            return output, outputs[1].detach().clone()
+        return output
 
-    def _forward_attn_res_stage_graph(self, hidden_states, attention_mask, rotary_pos_emb):
+    def _forward_attn_res_stage_graph(
+        self,
+        hidden_states,
+        attention_mask,
+        rotary_pos_emb,
+        forward_query_bank=None,
+        forward_gamma_bank=None,
+        forward_payload=None,
+    ):
         """Run the original decoder body with the runner's static input during capture."""
         if self.pre_process:
             # The local runner weakens its input surface's storage after capturing forward.
@@ -974,14 +1049,35 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
             # captured owning copy prevents a later live microbatch from recycling b_0.
             # Nonfirst stages unpack views, which already own their input storage separately.
             hidden_states = hidden_states.clone()
+        projection = None
+        if forward_query_bank is not None:
+            slices = (
+                1
+                if self.pre_process
+                else attn_res_num_payload_slices(
+                    self.layers[0].layer_number - 1, self.config.attn_res_block_layers
+                )
+            )
+            partial = hidden_states[: hidden_states.shape[0] // slices]
+            projection = self._new_forward_projection_state(
+                forward_query_bank, forward_gamma_bank, forward_payload, partial
+            )
+        elif getattr(self.config, "attn_res_forward_projection", False):
+            raise ValueError("The graph omitted its explicit projection bank.")
         original_input = self.input_tensor
         try:
             if not self.pre_process:
                 self.input_tensor = hidden_states
-            return self.forward(
+            output = self.forward(
                 hidden_states=hidden_states,
                 attention_mask=attention_mask,
                 rotary_pos_emb=rotary_pos_emb,
+                **({"_attn_res_forward_state": projection} if projection is not None else {}),
+            )
+            return (
+                (output, projection.pack_exit())
+                if projection is not None and not self.post_process
+                else output
             )
         finally:
             self.input_tensor = original_input
@@ -990,6 +1086,10 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
         """Keep actual VPP cache publication, eviction and drains outside graph replay."""
         if not self.training or not torch.is_grad_enabled():
             raise ValueError("VPP stage graphs require a training chunk with gradients.")
+        projection_args = self._forward_projection_host_args(
+            kwargs.pop("forward_projection_snapshot", None),
+            kwargs.pop("forward_projection_payload", None),
+        )
         for name, value in kwargs.items():
             if name != "rotary_pos_emb" and value is not None:
                 raise ValueError(f"Final-VP stage graph does not support {name}={type(value)}.")
@@ -1014,6 +1114,7 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
             attention_mask=attention_mask,
             rotary_pos_emb=rotary_pos_emb,
             microbatch_id=microbatch_id,
+            **projection_args,
         )
         graph_kwargs.update(
             {
@@ -1022,6 +1123,12 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
             }
         )
         outputs = self.cudagraph_manager(self, (), graph_kwargs)
+        forward_payload_out = None
+        if projection_args and not self.post_process:
+            if not isinstance(outputs, tuple) or len(outputs) < 2 or outputs[1].requires_grad:
+                raise RuntimeError("The projection graph must export nondifferentiable metadata.")
+            forward_payload_out = outputs[1].detach().clone()
+            outputs = (outputs[0], *outputs[2:])
         if self.vp_stage < self.config.virtual_pipeline_model_parallel_size - 1:
             if not isinstance(outputs, tuple):
                 raise RuntimeError("An earlier AttnRes graph must return payload and exports.")
@@ -1044,16 +1151,22 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
             output = outputs[0] if isinstance(outputs, tuple) else outputs
         # Final visits evict metadata only; outstanding backward nodes retain their leaves.
         state._update_cache()
-        return output.clone() if output._base is not None else output
+        output = output.clone() if output._base is not None else output
+        return (output, forward_payload_out) if forward_payload_out is not None else output
 
     def _forward_attn_res_final_vp_graph(
         self, hidden_states, attention_mask, rotary_pos_emb, microbatch_id, **sources
     ):
         """Capture the original final-chunk consumers with explicit, owning source inputs."""
-        output, _ = self._forward_attn_res_vp_graph_body(
+        output, state = self._forward_attn_res_vp_graph_body(
             hidden_states, attention_mask, rotary_pos_emb, microbatch_id, **sources
         )
-        return output
+        projection = getattr(state, "forward_projection_state", None)
+        return (
+            (output, projection.pack_exit())
+            if projection is not None and not self.post_process
+            else output
+        )
 
     def _forward_attn_res_earlier_vp_graph(
         self, hidden_states, attention_mask, rotary_pos_emb, microbatch_id, **sources
@@ -1064,10 +1177,20 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
         )
         if len(state.graph_source_exports) != len(self._attn_res_graph_export_source_ids):
             raise RuntimeError("AttnRes graph created a different number of source exports.")
-        return (output, *state.graph_source_exports)
+        projection = getattr(state, "forward_projection_state", None)
+        auxiliary = (projection.pack_exit(),) if projection is not None else ()
+        return (output, *auxiliary, *state.graph_source_exports)
 
     def _forward_attn_res_vp_graph_body(
-        self, hidden_states, attention_mask, rotary_pos_emb, microbatch_id, **sources
+        self,
+        hidden_states,
+        attention_mask,
+        rotary_pos_emb,
+        microbatch_id,
+        forward_query_bank=None,
+        forward_gamma_bank=None,
+        forward_payload=None,
+        **sources,
     ):
         """Run the original decoder with explicit sources and no captured cache effects."""
         if len(sources) != self._attn_res_graph_entry_source_count:
@@ -1081,11 +1204,17 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
             manage_cache=False,
         )
         state.graph_sources = [sources[f"source_{index}"].clone() for index in range(len(sources))]
+        hidden_states = hidden_states.clone()
+        projection = self._new_forward_projection_state(
+            forward_query_bank, forward_gamma_bank, forward_payload, hidden_states
+        )
+        state.forward_projection_state = projection
         output = self.forward(
-            hidden_states=hidden_states.clone(),
+            hidden_states=hidden_states,
             attention_mask=attention_mask,
             rotary_pos_emb=rotary_pos_emb,
             _attn_res_stage_state=state,
+            **({"_attn_res_forward_state": projection} if projection is not None else {}),
         )
         return output, state
 
@@ -1150,6 +1279,7 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
         inference_params: Optional[BaseInferenceContext] = None,
         dynamic_inference_decode_only: Optional[bool] = None,
         _attn_res_stage_state: Optional[AttnResStageSources] = None,
+        _attn_res_forward_state=None,
     ):
         """
         Perform the forward pass through the transformer block.
@@ -1252,6 +1382,15 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
                 pre_process=self.pre_process,
             )
 
+        if _attn_res_forward_state is not None:
+            if attn_res_state is None:
+                raise RuntimeError(
+                    "Projection metadata requires the original AttnRes source state."
+                )
+            attn_res_state.forward_projection_state = _attn_res_forward_state
+            if self.pre_process:
+                _attn_res_forward_state.complete_source(0, hidden_states)
+
         if self.config.sequence_parallel:
             rng_context = tensor_parallel.get_cuda_rng_tracker().fork()
         else:
@@ -1347,6 +1486,8 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
                             # depth source; the layer starts a fresh partial sum.
                             attn_res_state.append_block_start(hidden_states)
                         attn_res_kwargs["attn_res_sources"] = tuple(attn_res_state.graph_sources)
+                        if _attn_res_forward_state is not None:
+                            attn_res_kwargs["attn_res_forward_state"] = _attn_res_forward_state
 
                     with self.offload_context, inner_quantization_context:
                         hidden_states, context = layer(
@@ -1367,6 +1508,8 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
                             input_ids=input_ids,
                             **attn_res_kwargs,
                         )
+                    if _attn_res_forward_state is not None:
+                        _attn_res_forward_state.after_layer(layer.layer_number, hidden_states)
                     self._finalize_mhc_recompute_layer(
                         mhc_manager=mhc_manager,
                         hidden_states=hidden_states,

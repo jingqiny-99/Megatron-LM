@@ -630,6 +630,145 @@ class AttnResStageSources:
         return payload
 
 
+class AttnResForwardProjectionStage:
+    """Pure captured forward metadata for one authorized decoder invocation.
+
+    Host snapshot validation certifies that raw bank rows mirror each canonical
+    consumer. This state binds carried statistics to current owning value copies;
+    it never changes the BF16 source taps or canonical gradient ownership.
+    """
+
+    def __init__(
+        self,
+        plan,
+        global_stage,
+        query_bank,
+        gamma_bank,
+        payload,
+        sequence_length,
+        micro_batch_size,
+        authorized_consumers,
+    ):
+        from .attention_residual_forward_state import unpack_forward_rows
+
+        self.plan = plan
+        self.global_stage = global_stage
+        self.query_bank = query_bank
+        self.gamma_bank = gamma_bank
+        self.sequence_length = sequence_length
+        self.micro_batch_size = micro_batch_size
+        self.authorized_consumers = frozenset(authorized_consumers)
+        expected_bank = (2 * plan.num_layers + 1, plan.hidden_size)
+        for bank in (query_bank, gamma_bank):
+            if (
+                bank.shape != expected_bank
+                or bank.dtype != torch.float32
+                or bank.requires_grad
+                or not bank.is_contiguous()
+            ):
+                raise ValueError("Projection banks must be explicit nondifferentiable FP32 rows.")
+        if global_stage == 0:
+            if payload is not None:
+                raise ValueError("The first projection stage must not receive auxiliary metadata.")
+            self.rows = {}
+        else:
+            if payload is None:
+                raise ValueError("A nonfirst projection stage requires its auxiliary payload.")
+            self.rows = unpack_forward_rows(
+                plan, global_stage, payload, sequence_length, micro_batch_size
+            )
+
+    def complete_source(self, source_id, value):
+        """Project a completed block once, including completions at a stage exit."""
+        from .attention_residual_forward_projection import project_forward_source
+        from .attention_residual_forward_state import ForwardProjectionRow
+
+        selected = self.plan.selected_consumers(source_id)
+        if not selected:
+            return
+        keys = (ForwardProjectionRow(source_id, None),) + tuple(
+            ForwardProjectionRow(source_id, consumer_id) for consumer_id in selected
+        )
+        present = tuple(key in self.rows for key in keys)
+        if any(present):
+            if not all(present):
+                raise RuntimeError("A source has only part of its required projection metadata.")
+            return
+        if tuple(selected) != tuple(range(selected[0], selected[-1] + 1)):
+            raise ValueError("This projection primitive requires a contiguous consumer suffix.")
+        caches = project_forward_source(
+            value,
+            self.query_bank[selected[0] : selected[-1] + 1],
+            self.gamma_bank[selected[0] : selected[-1] + 1],
+            eps=self.plan.eps,
+        )
+        self.rows[keys[0]] = caches[0].rstd
+        for key, cache in zip(keys[1:], caches):
+            self.rows[key] = cache.dot
+
+    def after_layer(self, layer_number, partial):
+        """Complete blocks before a PP send, without moving original source registration."""
+        if layer_number < self.plan.num_layers and layer_number % self.plan.block_layers == 0:
+            self.complete_source(layer_number // self.plan.block_layers, partial)
+
+    def caches_for(self, module, values):
+        """Bind certified source/query identities to the primitive's strict local contract."""
+        from .attention_residual_forward_projection import ForwardSourceCache, _binding
+        from .attention_residual_forward_state import ForwardProjectionRow
+
+        consumer_id = module.forward_projection_consumer_id
+        if consumer_id not in self.authorized_consumers:
+            raise ValueError("The projection snapshot did not authorize this consumer.")
+        layer = self.plan.consumer_layer(consumer_id)
+        historical = (min(layer, self.plan.num_layers) - 1) // self.plan.block_layers + 1
+        if len(values) not in (historical, historical + 1):
+            raise RuntimeError("Projection source order disagrees with the original depth plan.")
+        result = []
+        for source_id, value in enumerate(values):
+            if source_id >= historical or consumer_id not in self.plan.selected_consumers(
+                source_id
+            ):
+                result.append(None)
+                continue
+            dot_key = ForwardProjectionRow(source_id, consumer_id)
+            rms_key = ForwardProjectionRow(source_id, None)
+            if dot_key not in self.rows or rms_key not in self.rows:
+                raise RuntimeError(
+                    "A selected projection is missing from the current source prefix."
+                )
+            dot, rstd = self.rows[dot_key], self.rows[rms_key]
+            query, norm = module.pseudo_query, module.key_norm_weight
+            result.append(
+                ForwardSourceCache(
+                    dot,
+                    rstd,
+                    value,
+                    query,
+                    norm,
+                    _binding(value),
+                    _binding(query),
+                    _binding(norm),
+                    _binding(dot),
+                    _binding(rstd),
+                    self.plan.eps,
+                )
+            )
+        return tuple(result) if any(cache is not None for cache in result) else None
+
+    def pack_exit(self):
+        """Export the full future-needed prefix in the plan's fixed padded FP32 layout."""
+        from .attention_residual_forward_state import pack_forward_rows
+
+        return pack_forward_rows(
+            self.plan,
+            self.global_stage + 1,
+            self.rows,
+            self.sequence_length,
+            self.micro_batch_size,
+            self.query_bank.device,
+        )
+
+
 def _attn_res_autograd_math(pseudo_query, key_norm_weight, eps, values):
     """Plain PyTorch AttnRes used behind ``torch.compile``.
 
@@ -814,7 +953,7 @@ class AttentionResidual(MegatronModule):
             setattr(self.pseudo_query, 'sequence_parallel', True)
             setattr(self.key_norm_weight, 'sequence_parallel', True)
 
-    def forward(self, values: Sequence[Tensor]) -> Tensor:
+    def forward(self, values: Sequence[Tensor], *, forward_projection_state=None) -> Tensor:
         """Aggregate depth sources (+ optional partial sum) into the sublayer input."""
         assert len(values) >= 1, "AttentionResidual requires at least one depth source"
         nvtx_range_push(msg=f"attn_res.aggregate_n{len(values)}")
@@ -824,6 +963,25 @@ class AttentionResidual(MegatronModule):
             # introducing fused-backward cancellation noise at block 0.
             zero = (self.pseudo_query.sum() + self.key_norm_weight.sum()) * 0.0
             out = values[0] + zero.to(values[0].dtype)
+        elif forward_projection_state is not None:
+            from .attention_residual_forward_projection import aggregate_with_forward_cache
+
+            caches = forward_projection_state.caches_for(self, values)
+            if caches is None:
+                out = self._fla_fused_attnres(
+                    self.pseudo_query,
+                    values,
+                    self.key_norm_weight,
+                    output_rms_weight=None,
+                    rms_eps=self.eps,
+                    scale=1.0,
+                    return_weights=False,
+                    checkpoint_level=1,
+                )
+            else:
+                out = aggregate_with_forward_cache(
+                    self.pseudo_query, self.key_norm_weight, values, caches, eps=self.eps
+                )
         elif self.impl == 'fla':
             assert self._fla_fused_attnres is not None
             out = self._fla_fused_attnres(

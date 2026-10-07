@@ -635,8 +635,20 @@ class _CudagraphReplayNode(torch.autograd.Function):
             outputs = tuple(torch.clone(t) for t in runner.fwd_graph_output_surface)
             for output in outputs:
                 output.can_skip_replay_copy = False
-            return outputs
-        return runner.fwd_graph_output_surface
+        else:
+            outputs = runner.fwd_graph_output_surface
+
+        # Autograd Functions otherwise make every floating-point output differentiable.
+        # Mark the actual returned tensors, including any copies above, using the
+        # captured contract rather than their requires_grad state inside this forward.
+        ctx.mark_non_differentiable(
+            *(
+                output
+                for output, requires_grad in zip(outputs, runner.fwd_graph_output_requires_grad)
+                if not requires_grad
+            )
+        )
+        return outputs
 
     @staticmethod
     def backward(ctx, *grads):
@@ -990,6 +1002,9 @@ class _CudaGraphRunner(torch.nn.Module):
         # save cudagraph output buffer
         self.fwd_graph_outputs = fwd_graph_outputs
         self.fwd_graph_output_surface = self.get_tensors(fwd_graph_outputs)
+        self.fwd_graph_output_requires_grad = tuple(
+            output.requires_grad for output in self.fwd_graph_output_surface
+        )
 
         for fwd_graph_out, o in zip(
             self.get_tensors(fwd_graph_outputs), self.get_arg_metas(self.outputs)

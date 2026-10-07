@@ -3015,11 +3015,14 @@ class AttnResTransformerLayer(TransformerLayer):
 
         self.self_attention_attn_res = AttentionResidual(self.config, self.layer_number)
         self.mlp_attn_res = AttentionResidual(self.config, self.layer_number)
+        self.self_attention_attn_res.forward_projection_consumer_id = 2 * (self.layer_number - 1)
+        self.mlp_attn_res.forward_projection_consumer_id = 2 * (self.layer_number - 1) + 1
 
     def forward(self, *args, **kwargs):
         """Forward pass threading the depth-source tuple into both sublayers."""
         kwargs.pop("dynamic_inference_decode_only", None)
         attn_res_sources = kwargs.pop("attn_res_sources", None)
+        forward_state = kwargs.pop("attn_res_forward_state", None)
         if attn_res_sources is None:
             raise RuntimeError(
                 "AttnResTransformerLayer requires the attn_res_sources keyword; it is "
@@ -3038,7 +3041,7 @@ class AttnResTransformerLayer(TransformerLayer):
         )
 
         hidden_states, context = self._forward_attention(
-            *args, attn_res_sources=attn_res_sources, **kwargs
+            *args, attn_res_sources=attn_res_sources, attn_res_forward_state=forward_state, **kwargs
         )
         output = self._forward_mlp(
             hidden_states,
@@ -3047,6 +3050,7 @@ class AttnResTransformerLayer(TransformerLayer):
             input_ids=kwargs.get("input_ids", None),
             packed_seq_params=kwargs.get("packed_seq_params", None),
             attn_res_sources=attn_res_sources,
+            attn_res_forward_state=forward_state,
         )
         return output, context
 
@@ -3068,6 +3072,7 @@ class AttnResTransformerLayer(TransformerLayer):
         input_ids: Optional[Tensor] = None,
         *,
         attn_res_sources: Tuple[Tensor, ...] = (),
+        attn_res_forward_state=None,
         inference_params: Optional[Any] = None,
     ):
         """Attention sublayer with AttnRes residual handling.
@@ -3081,7 +3086,9 @@ class AttnResTransformerLayer(TransformerLayer):
         values = list(attn_res_sources) if partial is None else [*attn_res_sources, partial]
 
         nvtx_range_push(suffix="self_attention_attn_res")
-        aggregated = self.self_attention_attn_res(values)
+        aggregated = self.self_attention_attn_res(
+            values, forward_projection_state=attn_res_forward_state
+        )
         nvtx_range_pop(suffix="self_attention_attn_res")
 
         attention_output_with_bias, attn_norm_manager, attn_norm_input = (
@@ -3132,6 +3139,7 @@ class AttnResTransformerLayer(TransformerLayer):
         packed_seq_params: Optional[PackedSeqParams] = None,
         *,
         attn_res_sources: Tuple[Tensor, ...] = (),
+        attn_res_forward_state=None,
     ):
         """MLP sublayer with AttnRes residual handling.
 
@@ -3142,7 +3150,7 @@ class AttnResTransformerLayer(TransformerLayer):
         values = [*attn_res_sources, partial]
 
         nvtx_range_push(suffix="mlp_attn_res")
-        aggregated = self.mlp_attn_res(values)
+        aggregated = self.mlp_attn_res(values, forward_projection_state=attn_res_forward_state)
         nvtx_range_pop(suffix="mlp_attn_res")
 
         # The aggregated input belongs to the norm offload group, while the BDA
