@@ -92,6 +92,20 @@ else:
 logger = logging.getLogger(__name__)
 
 
+class _AttnResGraphInputGradientOwner(torch.autograd.Function):
+    """Keep returned graph gradients alive until an earlier virtual chunk drains them."""
+
+    @staticmethod
+    def forward(ctx, tensor):
+        """Preserve the original source's autograd edge and forward storage."""
+        return tensor.view_as(tensor)
+
+    @staticmethod
+    def backward(ctx, gradient):
+        """Escape the graph pool with an owning, numerically identical gradient copy."""
+        return gradient.clone()
+
+
 def get_num_layers_to_build(
     config: TransformerConfig, vp_stage: Optional[int] = None, pp_rank: Optional[int] = None
 ) -> int:
@@ -347,7 +361,7 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
         self._build_layers()
         self.num_layers_per_pipeline_rank = len(self.layers)
 
-        if config.attn_res_stage_cuda_graph:
+        if config.attn_res_stage_cuda_graph or config.attn_res_vpp_final_chunk_cuda_graph:
             if not self.layers or any(
                 getattr(pg_collection, name).size() != 1 for name in ("tp", "cp", "ep", "dp")
             ):
@@ -355,7 +369,16 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
             # Keep existing runner/DDP integration, including captured main_grad accumulation,
             # replay-complete events and the last-boundary output preservation copy.
             self.is_first_layer = self.is_last_layer = True
-            self.cudagraph_manager.func = self._forward_attn_res_stage_graph
+            if config.attn_res_stage_cuda_graph:
+                self.cudagraph_manager.func = self._forward_attn_res_stage_graph
+            elif self.vp_stage == config.virtual_pipeline_model_parallel_size - 1:
+                self.cudagraph_manager.func = self._forward_attn_res_final_vp_graph
+                self._attn_res_graph_entry_source_count = self.layers[0].attn_res_num_sources - int(
+                    self.layers[0].attn_res_is_block_start
+                )
+            else:
+                # Earlier chunks keep their original eager source publication and GradTap drain.
+                del self.cudagraph_manager
 
     def _build_layers(self):
         # Transformer layers.
@@ -846,6 +869,11 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
         return False
 
     def __call__(self, *args, **kwargs):
+        if (
+            self.config.attn_res_vpp_final_chunk_cuda_graph
+            and self.vp_stage == self.config.virtual_pipeline_model_parallel_size - 1
+        ):
+            return self._call_attn_res_final_vp_graph(*args, **kwargs)
         if self.config.attn_res_stage_cuda_graph:
             return self._call_attn_res_stage_graph(*args, **kwargs)
         if self._should_call_local_cudagraph(*args, **kwargs):
@@ -909,6 +937,72 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
         finally:
             self.input_tensor = original_input
 
+    def _call_attn_res_final_vp_graph(self, hidden_states, attention_mask=None, **kwargs):
+        """Keep real VPP cache effects outside the final local chunk's replay boundary."""
+        if not self.training or not torch.is_grad_enabled() or self.pre_process:
+            raise ValueError(
+                "Final-VP stage graphs require a nonfirst training chunk with gradients."
+            )
+        for name, value in kwargs.items():
+            if name != "rotary_pos_emb" and value is not None:
+                raise ValueError(f"Final-VP stage graph does not support {name}={type(value)}.")
+        rotary_pos_emb = kwargs.get("rotary_pos_emb")
+        if rotary_pos_emb is not None and not isinstance(rotary_pos_emb, Tensor):
+            raise ValueError("Final-VP stage graph currently supports a single RoPE tensor.")
+        payload = self.preprocess_for_layer_schedule(hidden_states)
+        microbatch_id = getattr(self.layers[0], "current_microbatch", None)
+        state, partial = AttnResStageSources.enter(
+            self.config,
+            payload,
+            layers_before=self.layers[0].layer_number - 1,
+            pp_rank=get_pg_rank(self.pg_collection.pp),
+            vp_stage=self.vp_stage,
+            microbatch_id=microbatch_id,
+            pre_process=False,
+        )
+        if len(state.graph_sources) != self._attn_res_graph_entry_source_count:
+            raise RuntimeError("Final-VP stage graph source count differs from its layer plan.")
+        graph_kwargs = dict(
+            hidden_states=_AttnResGraphInputGradientOwner.apply(partial),
+            attention_mask=attention_mask,
+            rotary_pos_emb=rotary_pos_emb,
+            microbatch_id=microbatch_id,
+        )
+        graph_kwargs.update(
+            {
+                f"source_{index}": _AttnResGraphInputGradientOwner.apply(source)
+                for index, source in enumerate(state.graph_sources)
+            }
+        )
+        outputs = self.cudagraph_manager(self, (), graph_kwargs)
+        # The final local visit evicts metadata only. Its original leaves remain owned
+        # by this call's autograd inputs and the earlier chunk's existing GradTap nodes.
+        state._update_cache()
+        output = outputs[0] if isinstance(outputs, tuple) else outputs
+        return output.clone() if output._base is not None else output
+
+    def _forward_attn_res_final_vp_graph(
+        self, hidden_states, attention_mask, rotary_pos_emb, microbatch_id, **sources
+    ):
+        """Capture the original final-chunk consumers with explicit, owning source inputs."""
+        if len(sources) != self._attn_res_graph_entry_source_count:
+            raise RuntimeError("Final-VP graph source arity changed.")
+        state = AttnResStageSources(
+            self.config,
+            pp_rank=get_pg_rank(self.pg_collection.pp),
+            vp_stage=self.vp_stage,
+            microbatch_id=microbatch_id,
+            pre_process=False,
+            manage_cache=False,
+        )
+        state.graph_sources = [sources[f"source_{index}"].clone() for index in range(len(sources))]
+        return self.forward(
+            hidden_states=hidden_states.clone(),
+            attention_mask=attention_mask,
+            rotary_pos_emb=rotary_pos_emb,
+            _attn_res_stage_state=state,
+        )
+
     def _build_mhc_recompute_layer_plan(
         self, use_mhc_recompute: bool
     ) -> Tuple[List[Optional[MHCCheckpointManager]], List[bool]]:
@@ -969,6 +1063,7 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
         *,
         inference_params: Optional[BaseInferenceContext] = None,
         dynamic_inference_decode_only: Optional[bool] = None,
+        _attn_res_stage_state: Optional[AttnResStageSources] = None,
     ):
         """
         Perform the forward pass through the transformer block.
@@ -1034,7 +1129,14 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
             self.config, self.vp_stage, get_pg_rank(pp_group)
         )
 
-        hidden_states = self.preprocess_for_layer_schedule(hidden_states)
+        if _attn_res_stage_state is None:
+            hidden_states = self.preprocess_for_layer_schedule(hidden_states)
+        elif not (
+            self.config.attn_res_vpp_final_chunk_cuda_graph
+            and self.vp_stage == self.config.virtual_pipeline_model_parallel_size - 1
+            and not _attn_res_stage_state.manage_cache
+        ):
+            raise ValueError("Explicit source state is restricted to the captured final VP chunk.")
 
         # Attention residuals: recover (depth sources, partial sum) for this stage.
         # On the first stage the embedding output is the initial partial sum (it
@@ -1042,8 +1144,8 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
         # stages unpack the seq-dim-concatenated payload from the previous stage.
         # Under interleaved VPP the payload is a padded delta and the rest of
         # the prefix comes from the rank-local source cache.
-        attn_res_state: Optional[AttnResStageSources] = None
-        if self.config.enable_attention_residuals:
+        attn_res_state = _attn_res_stage_state
+        if self.config.enable_attention_residuals and attn_res_state is None:
             current_microbatch = None
             if self.config.virtual_pipeline_model_parallel_size is not None:
                 current_microbatch = (

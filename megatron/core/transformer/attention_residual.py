@@ -449,6 +449,7 @@ class AttnResStageSources:
         vp_stage: Optional[int],
         microbatch_id: Optional[int],
         pre_process: bool,
+        manage_cache: bool = True,
     ):
         self.config = config
         self.interleaved = config.virtual_pipeline_model_parallel_size is not None
@@ -456,6 +457,15 @@ class AttnResStageSources:
         self.vp_stage = vp_stage or 0
         self.microbatch_id = microbatch_id
         self.pre_process = pre_process
+        # Pure captured final-chunk bodies receive explicit sources. Their real forward
+        # caller retains responsibility for the original cache entry/exit effects.
+        self.manage_cache = manage_cache
+        if not manage_cache and not (
+            config.attn_res_vpp_final_chunk_cuda_graph
+            and self.interleaved
+            and self.vp_stage == config.virtual_pipeline_model_parallel_size - 1
+        ):
+            raise ValueError("External cache lifecycle is restricted to final-VP stage graphs.")
         self.graph_sources: List[Tensor] = []
         self._cache_leaves: List[Tensor] = []
         if self.interleaved:
@@ -548,7 +558,7 @@ class AttnResStageSources:
 
     def _update_cache(self):
         """Store or evict this rank's cache entry after the chunk's exit processing."""
-        if not self.interleaved:
+        if not self.interleaved or not self.manage_cache:
             return
         cache = get_attn_res_source_cache().sources
         vp_size = self.config.virtual_pipeline_model_parallel_size

@@ -1376,6 +1376,14 @@ class TransformerConfig(ModelParallelConfig):
     This owns the decoder graph and suppresses child layer graph managers.
     """
 
+    attn_res_vpp_final_chunk_cuda_graph: bool = False
+    """Experimental PP2/VP2 graph for the final local virtual chunk only.
+
+    Earlier chunks and their source-cache gradient drains remain eager. Cache effects and
+    incoming source taps run outside capture; the final chunk receives explicit source inputs.
+    Shares the strict BF16/FLA dense pure-PP restrictions of attn_res_stage_cuda_graph.
+    """
+
     hybrid_layer_pattern: Optional[str] = None
     """Unified hybrid layer pattern string (mirrors --hybrid-layer-pattern; populated
     automatically by the argument bridge). Consumed by config-only consumers that need the
@@ -1615,7 +1623,7 @@ class TransformerConfig(ModelParallelConfig):
         reasoning (variable sequence lengths with PP/VPP).
         """
         if not self.enable_attention_residuals:
-            if self.attn_res_stage_cuda_graph:
+            if self.attn_res_stage_cuda_graph or self.attn_res_vpp_final_chunk_cuda_graph:
                 raise ValueError(
                     "attn_res_stage_cuda_graph requires enable_attention_residuals=True."
                 )
@@ -1663,12 +1671,23 @@ class TransformerConfig(ModelParallelConfig):
             unsupported.append(
                 "interleaved VPP together with account_for_embedding/loss_in_pipeline_split"
             )
-        if self.attn_res_stage_cuda_graph:
+        if self.attn_res_stage_cuda_graph or self.attn_res_vpp_final_chunk_cuda_graph:
             stage_requirements = {
+                "one explicit stage graph mode": not (
+                    self.attn_res_stage_cuda_graph and self.attn_res_vpp_final_chunk_cuda_graph
+                ),
                 "cuda_graph_impl='local'": self.cuda_graph_impl == "local",
                 "full decoder graph scope": self.cuda_graph_modules in ("full", [], ()),
-                "ordinary PP with at least two ranks": self.pipeline_model_parallel_size > 1
-                and self.virtual_pipeline_model_parallel_size is None,
+                "ordinary PP or the explicit PP2/VP2 final-chunk mode": (
+                    self.attn_res_stage_cuda_graph
+                    and self.pipeline_model_parallel_size > 1
+                    and self.virtual_pipeline_model_parallel_size is None
+                )
+                or (
+                    self.attn_res_vpp_final_chunk_cuda_graph
+                    and self.pipeline_model_parallel_size == 2
+                    and self.virtual_pipeline_model_parallel_size == 2
+                ),
                 "TP=CP=EP=1": self.tensor_model_parallel_size == 1
                 and self.context_parallel_size == 1
                 and self.expert_model_parallel_size == 1,
