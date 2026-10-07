@@ -1367,6 +1367,15 @@ class TransformerConfig(ModelParallelConfig):
     at small hidden sizes — so 'fla' is the default, with 'compile' as the dependency-free
     optimized path."""
 
+    attn_res_stage_cuda_graph: bool = False
+    """Experimental training-only local graph of one complete dense AttnRes decoder stage.
+
+    Requires BF16, fixed shapes, ordinary pure PP (no VPP), zero dropout, FLA aggregation,
+    and no recompute/offloading/MoE/MTP/low-precision or gradient accumulation fusion.
+    Embedding, output head, loss, P2P, gradient finalization and optimizer remain eager.
+    This owns the decoder graph and suppresses child layer graph managers.
+    """
+
     hybrid_layer_pattern: Optional[str] = None
     """Unified hybrid layer pattern string (mirrors --hybrid-layer-pattern; populated
     automatically by the argument bridge). Consumed by config-only consumers that need the
@@ -1598,13 +1607,18 @@ class TransformerConfig(ModelParallelConfig):
         that live inside a sublayer (e.g. core_attn), MoE (incl. shared-expert
         overlap), fine-grained activation offloading, and MTP in the standard
         or hybrid last-stage placement. Everything rejected below either has no
-        mechanism yet (CUDA graphs, full recompute, EP-overlap fine-grained
+        mechanism yet (CUDA graphs outside the experimental ordinary-PP decoder
+        stage mode, full recompute, EP-overlap fine-grained
         schedule, zero-layer virtual chunks) or
         would silently bypass the AttnRes residual interception (fused residual
         norms, fp32 residual connection) or the static pipeline payload-width
         reasoning (variable sequence lengths with PP/VPP).
         """
         if not self.enable_attention_residuals:
+            if self.attn_res_stage_cuda_graph:
+                raise ValueError(
+                    "attn_res_stage_cuda_graph requires enable_attention_residuals=True."
+                )
             if self.attn_res_block_layers is not None:
                 raise ValueError("attn_res_block_layers requires enable_attention_residuals=True.")
             return
@@ -1649,7 +1663,37 @@ class TransformerConfig(ModelParallelConfig):
             unsupported.append(
                 "interleaved VPP together with account_for_embedding/loss_in_pipeline_split"
             )
-        if self.cuda_graph_impl != "none":
+        if self.attn_res_stage_cuda_graph:
+            stage_requirements = {
+                "cuda_graph_impl='local'": self.cuda_graph_impl == "local",
+                "full decoder graph scope": self.cuda_graph_modules in ("full", [], ()),
+                "ordinary PP with at least two ranks": self.pipeline_model_parallel_size > 1
+                and self.virtual_pipeline_model_parallel_size is None,
+                "TP=CP=EP=1": self.tensor_model_parallel_size == 1
+                and self.context_parallel_size == 1
+                and self.expert_model_parallel_size == 1,
+                "dense GPT": not self.is_hybrid_model and self.num_moe_experts is None,
+                "BF16 parameters and pipeline": self.bf16
+                and self.params_dtype == torch.bfloat16
+                and self.pipeline_dtype == torch.bfloat16,
+                "FLA aggregation": self.attn_res_impl == "fla",
+                "zero dropout": self.hidden_dropout == 0 and self.attention_dropout == 0,
+                "fixed sequence lengths": not has_variable_sequences,
+                "no activation offloading": not self.cpu_offloading
+                and not self.fine_grained_activation_offloading,
+                "no recompute": self.recompute_granularity is None,
+                "no MTP": self.mtp_num_layers is None,
+                "no FP8/FP4": not self.fp8 and not self.fp4,
+                "no gradient accumulation fusion": not self.gradient_accumulation_fusion,
+                "no deprecated graph flags": not self.enable_cuda_graph
+                and not self.external_cuda_graph,
+            }
+            unsupported.extend(
+                "attn_res_stage_cuda_graph requires " + requirement
+                for requirement, satisfied in stage_requirements.items()
+                if not satisfied
+            )
+        elif self.cuda_graph_impl != "none":
             unsupported.append(f"cuda_graph_impl={self.cuda_graph_impl!r}")
         if self.recompute_granularity == "full":
             unsupported.append("recompute_granularity='full'")
