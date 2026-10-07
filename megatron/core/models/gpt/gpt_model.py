@@ -128,6 +128,8 @@ class GPTModel(LanguageModule):
         self.share_embeddings_and_output_weights = share_embeddings_and_output_weights
         self.vp_stage = vp_stage
         self.disable_param_offloading = True
+        self._attn_res_forward_snapshot = None
+        self._attn_res_forward_payload = None
 
         if hasattr(self.config, 'position_embedding_type'):
             self.position_embedding_type = self.config.position_embedding_type
@@ -302,6 +304,15 @@ class GPTModel(LanguageModule):
                 quant_config = get_quant_config_or_none(name, self.config.quant_recipe)
                 module.finish_init(quant_config)
 
+    def set_attn_res_forward_snapshot(self, snapshot) -> None:
+        """Install this schedule's host-validated forward projection snapshot."""
+        if not self.config.attn_res_forward_projection:
+            raise RuntimeError("Forward projection snapshots require the configured feature")
+        if snapshot is None:
+            raise ValueError("The forward projection schedule requires a current snapshot")
+        snapshot.validate(epoch=snapshot.epoch, plan=snapshot.plan)
+        self._attn_res_forward_snapshot = snapshot
+
     def set_input_tensor(self, input_tensor: Tensor) -> None:
         """Sets input tensor to the model.
 
@@ -314,6 +325,31 @@ class GPTModel(LanguageModule):
         # gives us non-lists or None
         if not isinstance(input_tensor, list):
             input_tensor = [input_tensor]
+
+        if self.config.attn_res_forward_projection:
+            self._attn_res_forward_payload = None
+            if self.pre_process:
+                if len(input_tensor) not in (1, 2) or any(
+                    tensor is not None for tensor in input_tensor
+                ):
+                    raise ValueError("The first projection stage cannot receive a PP payload")
+                self.decoder.set_input_tensor(None)
+                return
+            if len(input_tensor) != 2:
+                raise ValueError("Forward projection requires a value and metadata PP payload")
+            value, metadata = input_tensor
+            if (
+                not isinstance(value, Tensor)
+                or value.dtype != torch.bfloat16
+                or not isinstance(metadata, Tensor)
+                or metadata.dtype != torch.float32
+                or metadata.requires_grad
+                or metadata.device != value.device
+            ):
+                raise ValueError("Expected BF16 values and nondifferentiable FP32 metadata")
+            self._attn_res_forward_payload = metadata
+            self.decoder.set_input_tensor(value)
+            return
 
         assert len(input_tensor) == 1, 'input_tensor should only be length 1 for gpt/bert'
         self.decoder.set_input_tensor(input_tensor[0])
@@ -605,6 +641,17 @@ class GPTModel(LanguageModule):
 
         # Pass input_ids to decoder for hash-based MoE routing
         decoder_extra_block_kwargs = extra_block_kwargs or {}
+        if self.config.attn_res_forward_projection:
+            if self._attn_res_forward_snapshot is None:
+                raise RuntimeError("The PP schedule must publish projections before model forward")
+            decoder_extra_block_kwargs = dict(decoder_extra_block_kwargs)
+            for key in ("forward_projection_snapshot", "forward_projection_payload"):
+                if key in decoder_extra_block_kwargs:
+                    raise ValueError(f"{key} is owned by the forward projection schedule")
+            decoder_extra_block_kwargs.update(
+                forward_projection_snapshot=self._attn_res_forward_snapshot,
+                forward_projection_payload=self._attn_res_forward_payload,
+            )
         if self.config.moe_n_hash_layers > 0 and input_ids is not None:
             decoder_extra_block_kwargs['input_ids'] = input_ids
 
@@ -622,6 +669,10 @@ class GPTModel(LanguageModule):
             padding_mask=padding_mask,
             **decoder_extra_block_kwargs,
         )
+        if self.config.attn_res_forward_projection and not self.post_process:
+            if not isinstance(decoder_output, tuple) or len(decoder_output) != 2:
+                raise RuntimeError("The projection decoder must export values and metadata")
+            return list(decoder_output)
         # When mHC + MTP, the decoder returns (contracted, multi-stream); when
         # AttnRes + MTP, it returns (aggregated, depth-source tuple). MTP needs
         # the extra stream; lm_head needs the first element. mHC and AttnRes are

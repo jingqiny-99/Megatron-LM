@@ -1367,6 +1367,21 @@ class TransformerConfig(ModelParallelConfig):
     at small hidden sizes — so 'fla' is the default, with 'compile' as the dependency-free
     optimized path."""
 
+    attn_res_forward_projection: bool = False
+    """Experimental producer-side forward projections with complete consumer FLA backward.
+
+    Uses an explicit FP32 query snapshot and forward-only pipeline statistics. Canonical
+    query parameters keep their ordinary gradient, optimizer and checkpoint ownership.
+    Restricted to fixed-shape dense BF16 PP2/VP1-or-2 with TP=CP=EP=DP=1.
+    """
+
+    attn_res_forward_projection_fraction: float = 1.0
+    """Fraction of eligible future consumers projected at each completed source.
+
+    Selects the last ceil(fraction * eligible_consumers) consumers. The running partial
+    remains locally scored. Fraction zero retains the enabled snapshot/transport control.
+    """
+
     attn_res_stage_cuda_graph: bool = False
     """Experimental training-only local graph of one complete dense AttnRes decoder stage.
 
@@ -1631,6 +1646,10 @@ class TransformerConfig(ModelParallelConfig):
         reasoning (variable sequence lengths with PP/VPP).
         """
         if not self.enable_attention_residuals:
+            if self.attn_res_forward_projection:
+                raise ValueError(
+                    "attn_res_forward_projection requires enable_attention_residuals=True."
+                )
             if (
                 self.attn_res_stage_cuda_graph
                 or self.attn_res_vpp_final_chunk_cuda_graph
@@ -1666,6 +1685,30 @@ class TransformerConfig(ModelParallelConfig):
         has_variable_sequences = (
             self.variable_seq_lengths or self.sequence_packing_scheduler is not None
         )
+        if self.attn_res_forward_projection:
+            from .attention_residual_forward_state import ForwardProjectionPlan
+
+            # Actual DP size is checked again with the schedule's explicit group.
+            ForwardProjectionPlan.from_config(self)
+            requirements = {
+                "BF16 parameters and pipeline": self.bf16
+                and self.params_dtype == torch.bfloat16
+                and self.pipeline_dtype == torch.bfloat16,
+                "zero dropout": self.hidden_dropout == 0 and self.attention_dropout == 0,
+                "fixed sequence lengths": not has_variable_sequences,
+                "no activation recompute": self.recompute_granularity is None,
+                "no FP8/FP4": not self.fp8 and not self.fp4,
+                "no gradient accumulation fusion": not self.gradient_accumulation_fusion,
+                "ordinary or full VPP graphs": (
+                    self.attn_res_stage_cuda_graph or self.attn_res_vpp_cuda_graph
+                )
+                and not self.attn_res_vpp_final_chunk_cuda_graph,
+            }
+            unsupported.extend(
+                "attn_res_forward_projection requires " + requirement
+                for requirement, satisfied in requirements.items()
+                if not satisfied
+            )
         if has_variable_sequences and (
             self.pipeline_model_parallel_size > 1
             or self.virtual_pipeline_model_parallel_size is not None
@@ -2693,7 +2736,7 @@ class TransformerConfig(ModelParallelConfig):
                 invalid_modules = set(self.recompute_modules) - allowed_modules
                 assert not invalid_modules, (
                     f"Invalid choices for recompute_modules: {invalid_modules}. "
-                    f"Allowed modules are: {allowed_modules}"
+                    f'Allowed modules are: {allowed_modules}'
                 )
 
             if "moe_act" in self.recompute_modules and not self.moe_grouped_gemm:
