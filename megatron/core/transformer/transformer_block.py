@@ -347,6 +347,16 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
         self._build_layers()
         self.num_layers_per_pipeline_rank = len(self.layers)
 
+        if config.attn_res_stage_cuda_graph:
+            if not self.layers or any(
+                getattr(pg_collection, name).size() != 1 for name in ("tp", "cp", "ep", "dp")
+            ):
+                raise ValueError("AttnRes stage graphs require nonempty stages and TP=CP=EP=DP=1.")
+            # Keep existing runner/DDP integration, including captured main_grad accumulation,
+            # replay-complete events and the last-boundary output preservation copy.
+            self.is_first_layer = self.is_last_layer = True
+            self.cudagraph_manager.func = self._forward_attn_res_stage_graph
+
     def _build_layers(self):
         # Transformer layers.
         # @jcasper can we improve how we deal with layer_number?
@@ -836,6 +846,8 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
         return False
 
     def __call__(self, *args, **kwargs):
+        if self.config.attn_res_stage_cuda_graph:
+            return self._call_attn_res_stage_graph(*args, **kwargs)
         if self._should_call_local_cudagraph(*args, **kwargs):
             kwargs['hidden_states'] = (
                 kwargs['hidden_states'].unwrap()
@@ -844,6 +856,58 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
             )
             return super().__call__(*args, **kwargs)[0]
         return super().__call__(*args, **kwargs)
+
+    def _call_attn_res_stage_graph(self, hidden_states, attention_mask=None, **kwargs):
+        """Expose the actual PP payload as a graph input, including on nonfirst ranks."""
+        if not self.training or not torch.is_grad_enabled():
+            raise ValueError(
+                "AttnRes stage CUDA graphs currently support training with gradients only."
+            )
+        for name, value in kwargs.items():
+            if name != "rotary_pos_emb" and value is not None:
+                raise ValueError(f"AttnRes stage CUDA graph does not support {name}={type(value)}.")
+        if not self.pre_process:
+            hidden_states = self.input_tensor
+        if isinstance(hidden_states, WrappedTensor):
+            hidden_states = hidden_states.unwrap()
+        if not isinstance(hidden_states, Tensor) or not hidden_states.requires_grad:
+            raise ValueError("AttnRes stage graph requires a differentiable tensor input.")
+        rotary_pos_emb = kwargs.get("rotary_pos_emb")
+        if rotary_pos_emb is not None and not isinstance(rotary_pos_emb, Tensor):
+            raise ValueError("AttnRes stage graph currently supports a single RoPE tensor.")
+        outputs = self.cudagraph_manager(
+            self,
+            (),
+            dict(
+                hidden_states=hidden_states,
+                attention_mask=attention_mask,
+                rotary_pos_emb=rotary_pos_emb,
+            ),
+        )
+        output = outputs[0] if isinstance(outputs, tuple) else outputs
+        # The recording autograd node returns an alias. The schedule requires a viewless
+        # tensor for pseudo-deallocation; replay already returns the runner's boundary clone.
+        return output.clone() if output._base is not None else output
+
+    def _forward_attn_res_stage_graph(self, hidden_states, attention_mask, rotary_pos_emb):
+        """Run the original decoder body with the runner's static input during capture."""
+        if self.pre_process:
+            # The local runner weakens its input surface's storage after capturing forward.
+            # AttnRes keeps b_0 directly through FLA's raw source tuple until backward. A
+            # captured owning copy prevents a later live microbatch from recycling b_0.
+            # Nonfirst stages unpack views, which already own their input storage separately.
+            hidden_states = hidden_states.clone()
+        original_input = self.input_tensor
+        try:
+            if not self.pre_process:
+                self.input_tensor = hidden_states
+            return self.forward(
+                hidden_states=hidden_states,
+                attention_mask=attention_mask,
+                rotary_pos_emb=rotary_pos_emb,
+            )
+        finally:
+            self.input_tensor = original_input
 
     def _build_mhc_recompute_layer_plan(
         self, use_mhc_recompute: bool

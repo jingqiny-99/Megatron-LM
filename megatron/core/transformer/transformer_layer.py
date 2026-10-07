@@ -572,6 +572,10 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
 
         assert self.config.cuda_graph_impl == "local"
 
+        if config.attn_res_stage_cuda_graph:
+            # The enclosing decoder owns all source fan-out/fan-in in one graph.
+            return
+
         from megatron.core.transformer.cuda_graphs import CudaGraphManager
 
         # If full scope (no specific sub-scope), cudagraph the entire layer.
