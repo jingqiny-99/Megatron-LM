@@ -184,10 +184,11 @@ replay copies or establish the complete gradient-error propagation chain.
 
 Four saved real-input cases reproduce original/candidate outputs and statistics
 exactly in an isolated replay. Freshly generated producer statistics are bitwise
-equal to carried statistics. All original primitive/model gates pass for these
-cases under an explicitly synthetic BF16 upstream gradient, including original
-FLA and independent FP64 comparisons. This narrows the arithmetic question but
-does not reproduce the failing model's actual upstream gradient or trajectory.
+equal to carried statistics. The isolated primitive checks and original
+tensor-comparison thresholds pass for these cases under an explicitly synthetic
+BF16 upstream gradient, including original FLA and independent FP64 comparisons.
+This narrows the arithmetic question but does not reproduce the failing model's
+actual upstream gradient or trajectory.
 
 A separate diagnostic producer using a logical `[BL,H]` query-row tile also
 passes its strict isolated gates, but does **not** make projected logits bitwise
