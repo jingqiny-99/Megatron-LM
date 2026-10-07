@@ -148,7 +148,7 @@ A separate two-update profiler capture shows host kernel calls falling from
 6200 to 440 on rank0 and 6529 to 593 on rank1, with 32 graph launches per rank
 and update. FLA forward/dV/dqdw counts remain 120 on rank0 and 136 on rank1.
 The original 48 Work.wait calls per rank/update remain; device kernel counts
-increase by 56/96 because the ownership copies execute real work. The gain
-comes from reduced host dispatch and autograd overhead across both chunks.
+increase by 56/96, including ownership copies and native graph-runtime work.
+The gain comes from reduced host dispatch and autograd overhead across both chunks.
 Intrinsic pipeline fill/drain and stage compute imbalance remain. Profiled
 durations do not determine the unprofiled speedup above.
