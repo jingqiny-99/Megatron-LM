@@ -2170,6 +2170,7 @@ def preprocess_common_state_dict(common_state_dict):
             if "param_groups" not in inner_optimizer:
                 return
             param_groups = inner_optimizer["param_groups"]
+
             # Treat missing and explicit None identifier values as equivalent.
             # Wrap each component so None never compares directly with floats or strings.
             def key_fn(pg):
@@ -2177,6 +2178,7 @@ def preprocess_common_state_dict(common_state_dict):
                     (value is not None, value)
                     for value in (pg.get(key) for key in param_group_identifier_keys)
                 ]
+
             param_groups.sort(key=key_fn)
             inner_optimizer["param_groups"] = param_groups
 
@@ -4356,7 +4358,13 @@ def training_log(
             # Report memory after optimizer state has been initialized.
             if torch.distributed.get_rank() == 0:
                 num_microbatches = get_num_microbatches()
-                report_theoretical_memory(args, num_microbatches=num_microbatches, verbose=True)
+                if getattr(args, "loop_architecture", "none") == "none":
+                    report_theoretical_memory(args, num_microbatches=num_microbatches, verbose=True)
+                else:
+                    print_rank_0(
+                        "Static-depth theoretical memory is unavailable for loop models; "
+                        "measured CUDA peaks follow."
+                    )
             report_memory(
                 f'(after {iteration} iterations)',
                 process_group=pg_collection.dp if pg_collection is not None else None,
@@ -5410,9 +5418,13 @@ def train(
             vision_merged_tokens_in_batch,
         ) = consume_vision_model_flops_stats(getattr(args, "count_vision_model_flops", False))
         if getattr(args, "loop_architecture", "none") != "none":
-            args._loop_flops_in_batch = batch_size * args.seq_length * sum(
-                float(loss_dict.get(f"loop {phase} flops per token", 0.0))
-                for phase in ("forward", "backward", "recompute")
+            args._loop_flops_in_batch = (
+                batch_size
+                * args.seq_length
+                * sum(
+                    float(loss_dict.get(f"loop {phase} flops per token", 0.0))
+                    for phase in ("forward", "backward", "recompute")
+                )
             )
         num_floating_point_operations_in_batch = num_floating_point_operations(
             args,
@@ -5892,8 +5904,10 @@ def evaluate_and_print_results(
         string = f' validation{suffix} loss at {prefix} | '
         for key in total_loss_dict:
             string += '{} value: {:.6E} | '.format(key, total_loss_dict[key].item())
-            ppl = math.exp(min(20, total_loss_dict[key].item()))
-            string += '{} PPL: {:.6E} | '.format(key, ppl)
+            is_loop_metric = key.startswith(("loop ", "depth "))
+            if not is_loop_metric:
+                ppl = math.exp(min(20, total_loss_dict[key].item()))
+                string += '{} PPL: {:.6E} | '.format(key, ppl)
             if writer:
                 writer.add_scalar(
                     '{} validation{}'.format(key, suffix), total_loss_dict[key].item(), iteration
@@ -5903,7 +5917,7 @@ def evaluate_and_print_results(
                     total_loss_dict[key].item(),
                     args.consumed_train_samples,
                 )
-                if args.log_validation_ppl_to_tensorboard:
+                if args.log_validation_ppl_to_tensorboard and not is_loop_metric:
                     writer.add_scalar('{} validation{} ppl'.format(key, suffix), ppl, iteration)
                     writer.add_scalar(
                         '{} validation{} ppl vs samples'.format(key, suffix),
