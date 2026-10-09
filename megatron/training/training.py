@@ -1591,6 +1591,11 @@ def num_floating_point_operations(
             result (with a one-time warning) rather than estimated from
             nominal architecture metadata.
     """
+    # Physical depth cannot describe recurrent execution. Training aggregates
+    # token-weighted forward/BPTT/replay work recorded by the loop decoder.
+    if getattr(args, "loop_architecture", "none") != "none":
+        return getattr(args, "_loop_flops_in_batch", 0.0)
+
     # Multimodal --seq-length describes the encoder, while the language model
     # runs at --decoder-seq-length. Plain language models leave the latter unset.
     llm_seq_length = (
@@ -6983,6 +6988,11 @@ def train(
             vision_seqlen_squared_sum_in_batch,
             vision_merged_tokens_in_batch,
         ) = consume_vision_model_flops_stats(getattr(args, "count_vision_model_flops", False))
+        if getattr(args, "loop_architecture", "none") != "none":
+            args._loop_flops_in_batch = batch_size * args.seq_length * sum(
+                float(loss_dict.get(f"loop {phase} flops per token", 0.0))
+                for phase in ("forward", "backward", "recompute")
+            )
         num_floating_point_operations_in_batch = num_floating_point_operations(
             args,
             batch_size,
