@@ -209,7 +209,7 @@ class LoopTransformerBlock(TransformerBlock):
                 ffn = c.ffn_hidden_size
             work = work + (6 if c.gated_linear_unit else 4) * tokens * h * ffn
         self._work[0] = self._work[0] + work
-        if backward:
+        if backward and torch.is_grad_enabled():
             self._work[1] = self._work[1] + 2 * work
             if recompute:
                 self._work[2] = self._work[2] + work
@@ -286,7 +286,11 @@ class LoopTransformerBlock(TransformerBlock):
                 float(tokens * depth * self.config.loop_core_layers), device=device
             ),
             "loop backward token layers": torch.tensor(
-                float(tokens * min(depth, differentiated) * self.config.loop_core_layers),
+                (
+                    float(tokens * min(depth, differentiated) * self.config.loop_core_layers)
+                    if torch.is_grad_enabled()
+                    else 0.0
+                ),
                 device=device,
             ),
         }
@@ -384,7 +388,9 @@ class LoopTransformerBlock(TransformerBlock):
         self.loop_metrics = {
             "loop depth": counts.sum() / valid.sum().clamp_min(1),
             "loop active token layers": counts.sum() * self.config.loop_core_layers,
-            "loop backward token layers": counts.sum() * self.config.loop_core_layers,
+            "loop backward token layers": counts.sum()
+            * self.config.loop_core_layers
+            * int(torch.is_grad_enabled()),
         }
         for index, fraction in enumerate(frequency.detach()):
             self.loop_metrics[f"depth fraction {index + 1}"] = fraction

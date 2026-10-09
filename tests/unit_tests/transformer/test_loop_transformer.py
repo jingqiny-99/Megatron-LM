@@ -55,14 +55,15 @@ def make_block(
     execution="compact",
     dtype=torch.float32,
     untie=False,
+    production_shape=False,
 ):
     config = TransformerConfig(
         num_layers=2 + 2 * depth if untie else 4,
-        hidden_size=128,
-        num_attention_heads=2,
-        num_query_groups=1,
-        kv_channels=64,
-        ffn_hidden_size=256,
+        hidden_size=2048 if production_shape else 128,
+        num_attention_heads=16 if production_shape else 2,
+        num_query_groups=4 if production_shape else 1,
+        kv_channels=128 if production_shape else 64,
+        ffn_hidden_size=5632 if production_shape else 256,
         normalization="RMSNorm",
         layernorm_epsilon=1e-6,
         gated_linear_unit=True,
@@ -167,6 +168,23 @@ class NativeDecoder(nn.Module):
         probability = scores.softmax(-1).to(x.dtype)
         attended = torch.einsum("bhst,tbhc->sbhc", probability, v).flatten(2)
         x = x + F.linear(attended, self.w(prefix + "self_attention.linear_proj.weight"))
+        if (prefix + "mlp.router.weight").replace(".", "__") in self.weights:
+            y = self.norm(x, prefix + "pre_mlp_layernorm.weight")
+            logits = F.linear(y, self.w(prefix + "mlp.router.weight"))
+            values, indices = logits.topk(c.moe_router_topk, dim=-1)
+            probabilities = values.float().softmax(-1).to(y.dtype)
+            scores = torch.zeros_like(logits).scatter(-1, indices, probabilities)
+            update = torch.zeros_like(x)
+            for expert in range(c.num_moe_experts):
+                expert_prefix = prefix + "mlp.experts."
+                gate, value = F.linear(
+                    y, self.w(expert_prefix + f"linear_fc1.weight{expert}")
+                ).chunk(2, -1)
+                weighted = F.silu(gate) * value * scores[..., expert, None]
+                update = update + F.linear(
+                    weighted, self.w(expert_prefix + f"linear_fc2.weight{expert}")
+                )
+            return x + update
         y = self.norm(x, prefix + "mlp.linear_fc1.layer_norm_weight")
         gate, value = F.linear(y, self.w(prefix + "mlp.linear_fc1.weight")).chunk(2, -1)
         return x + F.linear(F.silu(gate) * value, self.w(prefix + "mlp.linear_fc2.weight"))
@@ -264,6 +282,49 @@ def test_untied_unroll_native_parity():
     check_native(make_block(depth=4, untie=True), torch.float32)
 
 
+@pytest.mark.parametrize("architecture", ["huginn", "mor"])
+def test_production_width_native_parity(architecture):
+    block = make_block(architecture, depth=2, dtype=torch.bfloat16, production_shape=True)
+    check_native(block, torch.bfloat16)
+
+
+@pytest.mark.parametrize("architecture", ["huginn", "mor"])
+@pytest.mark.parametrize("recompute", [False, True])
+def test_moe_native_parity(architecture, recompute):
+    # Independent expert equations; auxiliary-loss collective coverage is in
+    # test_moe_collective_order_and_empty_local_active_sets with coeff=0.01.
+    config = replace(
+        make_block(architecture, execution="masked", recompute=recompute).config,
+        num_moe_experts=4,
+        moe_router_topk=2,
+        moe_ffn_hidden_size=256,
+        moe_layer_freq=[0, 1, 1, 0],
+        moe_grouped_gemm=True,
+        moe_token_dispatcher_type="alltoall",
+        moe_aux_loss_coeff=0.0,
+    )
+    block = LoopTransformerBlock(
+        config=config,
+        spec=get_gpt_decoder_block_spec(config, use_transformer_engine=True),
+        pre_process=True,
+        post_process=True,
+    ).cuda()
+    check_native(block, torch.float32)
+
+
+@pytest.mark.parametrize("architecture", ["huginn", "mor"])
+def test_evaluation_work_excludes_backward_and_recompute(architecture):
+    block = make_block(architecture, recompute=True, dtype=torch.bfloat16).eval()
+    x = torch.randn(16, 2, 128, device="cuda", dtype=torch.bfloat16)
+    rope = RotaryEmbedding(64, rotary_percent=1.0)(16).cuda()
+    with torch.no_grad():
+        block(x, attention_mask=None, rotary_pos_emb=rope)
+    assert block.loop_metrics["loop forward flops per token"] > 0
+    assert block.loop_metrics["loop backward flops per token"] == 0
+    assert block.loop_metrics["loop recompute flops per token"] == 0
+    assert block.loop_metrics["loop backward token layers"] == 0
+
+
 def check_native(block, dtype):
     native = NativeDecoder(block).cuda()
     logits = []
@@ -277,9 +338,11 @@ def check_native(block, dtype):
     # so relative BF16 gradient similarity measures roundoff instead of signal.
     # FP32 also tests the cancellation-prone unit-variance regime.
     input_scale = block.config.init_method_std if dtype == torch.bfloat16 else 1.0
-    x = (torch.randn(16, 2, 128, device="cuda", dtype=dtype) * input_scale).requires_grad_(True)
+    x = (
+        torch.randn(16, 2, block.config.hidden_size, device="cuda", dtype=dtype) * input_scale
+    ).requires_grad_(True)
     reference_x = x.detach().clone().requires_grad_(True)
-    rope = RotaryEmbedding(64, rotary_percent=1.0)(16).cuda()
+    rope = RotaryEmbedding(block.config.kv_channels, rotary_percent=1.0)(16).cuda()
     y = block(x, attention_mask=None, rotary_pos_emb=rope)
     reference = native(reference_x)
     if logits:
