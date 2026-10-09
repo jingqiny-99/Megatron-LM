@@ -2230,6 +2230,11 @@ def _check_arg_is_not_none(args, arg):
 
 def core_transformer_config_from_args(args, config_class=None):
 
+    if getattr(args, 'loop_architecture', 'none') != 'none' and (
+        args.use_megatron_fsdp or args.use_torch_fsdp2
+    ):
+        raise ValueError("Loop decoder currently supports DDP/distributed optimizer, not FSDP")
+
     # Config class.
     config_class = config_class or TransformerConfig
 

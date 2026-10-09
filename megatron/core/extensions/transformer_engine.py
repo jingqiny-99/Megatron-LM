@@ -1910,6 +1910,7 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
         self.kept_packed_seq_params.discard("tokens_per_sample")
         self.kept_packed_seq_params.discard("cp_partition_mode")
         self.kept_packed_seq_params.discard("cp_partition_route")
+        self.kept_packed_seq_params.discard("rotary_position_ids")
 
         if config.qk_clip or config.log_max_attention_logit:
             # qk-clip is only supported in TE 2.9.0 and later

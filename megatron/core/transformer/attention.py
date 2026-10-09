@@ -1648,7 +1648,31 @@ class Attention(MegatronModule, ABC):
                 cu_seqlens_q = cu_seqlens_kv = None
                 rope_max_seqlen_q = rope_max_seqlen_kv = None
 
-            if split_qkv:
+            original_positions = (
+                packed_seq_params.rotary_position_ids if packed_seq_params is not None else None
+            )
+            if original_positions is not None:
+                if not split_qkv or self.config.context_parallel_size != 1:
+                    raise ValueError("Explicit compact RoPE positions require split QKV and CP=1")
+                if packed_seq_params.qkv_format != 'thd' or inference_context is not None:
+                    raise ValueError("Explicit compact RoPE positions require THD training")
+                # Restore a dummy batch axis to use SBHD RoPE with selected original
+                # positions. THD RoPE would restart positions at each compact segment.
+                query = apply_rotary_pos_emb(
+                    query.unsqueeze(1),
+                    q_pos_emb.index_select(0, original_positions),
+                    config=self.config,
+                    mscale=self._yarn_concentration_factor,
+                    cp_group=self.pg_collection.cp,
+                ).squeeze(1)
+                key = apply_rotary_pos_emb(
+                    key.unsqueeze(1),
+                    k_pos_emb.index_select(0, original_positions),
+                    config=self.config,
+                    mscale=self._yarn_concentration_factor,
+                    cp_group=self.pg_collection.cp,
+                ).squeeze(1)
+            elif split_qkv:
                 if q_pos_emb is not None:
                     # TODO VIJAY: simplify
                     if inference_context is None or inference_context.is_static_batching():

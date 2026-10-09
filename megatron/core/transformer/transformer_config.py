@@ -75,6 +75,27 @@ class TransformerConfig(ModelParallelConfig):
     num_layers: int = field(default=0, metadata={"argparse_meta": {"default": None}})
     """Number of transformer layers in a transformer block."""
 
+    loop_architecture: Literal["none", "huginn", "mor"] = "none"
+    """Experimental shared-depth decoder; num_layers counts physical layers."""
+
+    loop_prelude_layers: int = 2
+    loop_core_layers: int = 4
+    loop_iterations: int = 4
+    loop_untie_core: bool = False
+    """Fixed-depth compute baseline with a separate physical core for each iteration."""
+    loop_sample_depth: bool = False
+    """Sample one depth uniformly from {1, 2, 4, 8}, shared by the TP/EP domain."""
+
+    loop_bptt_iterations: int = 0
+    """Differentiate the last K iterations; zero means full BPTT."""
+
+    loop_recompute: bool = False
+    """Checkpoint individual recurrences with non-reentrant autograd."""
+
+    loop_token_execution: Literal["masked", "compact"] = "compact"
+    loop_router_balance_coeff: float = 0.01
+    loop_router_z_loss_coeff: float = 0.001
+
     mtp_num_layers: Optional[int] = None
     """Number of Multi-Token Prediction (MTP) Layers.
     MTP extends the prediction scope to multiple future tokens at each position.
@@ -1631,6 +1652,29 @@ class TransformerConfig(ModelParallelConfig):
         details.
         """
         super().__post_init__()
+        if self.loop_architecture != "none":
+            if self.loop_iterations < 1 or self.loop_core_layers < 1:
+                raise ValueError("Loop iterations and core layers must be positive")
+            if not 0 <= self.loop_prelude_layers <= self.num_layers - self.loop_core_layers:
+                raise ValueError("Loop prelude/core must fit in physical num_layers")
+            if self.loop_bptt_iterations < 0:
+                raise ValueError("loop_bptt_iterations must be nonnegative")
+            if self.loop_untie_core:
+                if (
+                    self.loop_architecture != "huginn"
+                    or self.loop_sample_depth
+                    or self.loop_bptt_iterations
+                ):
+                    raise ValueError("Untied loop baseline requires fixed-depth Huginn")
+                if (
+                    self.loop_prelude_layers + self.loop_core_layers * self.loop_iterations
+                    > self.num_layers
+                ):
+                    raise ValueError("Untied core banks must fit in physical num_layers")
+            if self.loop_architecture == "mor" and (
+                self.loop_sample_depth or self.loop_bptt_iterations
+            ):
+                raise ValueError("MoR uses token-choice depth and full BPTT")
         # Dynamic CP can assign a multi-rank group even when configured CP is one.
         has_context_parallelism = self.context_parallel_size > 1 or self.dynamic_context_parallel
 

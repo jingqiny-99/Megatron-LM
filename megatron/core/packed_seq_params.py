@@ -37,6 +37,8 @@ class PackedSeqParams:
     cp_partition_mode: Literal["zigzag", "contiguous"] = "zigzag"
     tokens_per_sample: int = None
     cp_partition_route: Optional["ThdCpRoute"] = None
+    rotary_position_ids: Optional[Tensor] = None
+    """Original positions for compacted THD self-attention (CP=1 only)."""
 
     def __post_init__(self):
         """Pre-compute seq_idx for Mamba mixer CUDA graph compatibility.
