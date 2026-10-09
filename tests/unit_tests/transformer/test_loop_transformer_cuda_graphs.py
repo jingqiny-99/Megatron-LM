@@ -118,8 +118,10 @@ def test_shared_graph_native_updates(dtype, production_shape, fusion):
                 except AssertionError as error:
                     raise AssertionError(f"Step {step}, gradient {name}") from error
                 parameter.grad = parameter.main_grad.to(parameter.dtype).clone()
+            adapter_before = block.loop_adapter.weight.detach().clone()
             optimizer.step()
             reference_optimizer.step()
+            assert torch.any(block.loop_adapter.weight != adapter_before)
             for name, parameter in block.named_parameters():
                 compare(parameter, native.w(name), dtype)
     finally:
