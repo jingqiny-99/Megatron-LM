@@ -142,6 +142,8 @@ class LoopTransformerBlock(TransformerBlock):
         enabled = [name for name, value in unsupported.items() if value]
         if enabled:
             raise ValueError("Loop decoder does not support: " + ", ".join(enabled))
+        if config.cuda_graph_impl not in ("none", "local"):
+            raise ValueError("Loop decoder supports only local CUDA graphs")
         if config.loop_architecture == "mor" and config.cuda_graph_impl != "none":
             raise ValueError("Token-choice loops currently require eager execution")
         if config.cuda_graph_impl != "none" and (
@@ -173,6 +175,12 @@ class LoopTransformerBlock(TransformerBlock):
                         x = x + update
                 else:
                     x, _ = self.layers[physical](hidden_states=x, **kwargs)
+        if self.config.cuda_graph_impl == "local" and end > start:
+            # The prelude injection and recurrence norm are eager consumers.
+            # Local layer graphs return graph-pool views whose lifetime only
+            # covers captured consumers. Own the segment output outside that
+            # pool before a later graph reuses its storage.
+            x = x.clone()
         return x
 
     def _record_work(
