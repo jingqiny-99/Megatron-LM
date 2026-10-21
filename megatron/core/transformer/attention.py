@@ -1743,7 +1743,7 @@ class Attention(MegatronModule, TwoStageAttentionLayer, ABC):
                 packed_seq_params.rotary_position_ids if packed_seq_params is not None else None
             )
             if original_positions is not None:
-                if not split_qkv or self.config.context_parallel_size != 1:
+                if not split_qkv or (runtime_cp_group is not None and runtime_cp_group.size() > 1):
                     raise ValueError("Explicit compact RoPE positions require split QKV and CP=1")
                 if packed_seq_params.qkv_format != 'thd' or inference_context is not None:
                     raise ValueError("Explicit compact RoPE positions require THD training")
@@ -1754,14 +1754,14 @@ class Attention(MegatronModule, TwoStageAttentionLayer, ABC):
                     q_pos_emb.index_select(0, original_positions),
                     config=self.config,
                     mscale=self._yarn_concentration_factor,
-                    cp_group=self.pg_collection.cp,
+                    cp_group=runtime_cp_group,
                 ).squeeze(1)
                 key = apply_rotary_pos_emb(
                     key.unsqueeze(1),
                     k_pos_emb.index_select(0, original_positions),
                     config=self.config,
                     mscale=self._yarn_concentration_factor,
-                    cp_group=self.pg_collection.cp,
+                    cp_group=runtime_cp_group,
                 ).squeeze(1)
             elif split_qkv:
                 if q_pos_emb is not None:

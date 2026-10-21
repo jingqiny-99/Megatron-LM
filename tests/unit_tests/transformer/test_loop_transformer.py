@@ -23,6 +23,7 @@ from megatron.core.models.gpt.gpt_layer_specs import (
     get_gpt_decoder_block_spec,
     get_gpt_layer_with_transformer_engine_spec,
 )
+from megatron.core.tensor_observation import capture_tensor_observations
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.enums import AttnBackend
 from megatron.core.transformer.loop_transformer_block import LoopTransformerBlock
@@ -47,7 +48,7 @@ def parallel_environment(monkeypatch):
     torch.backends.cuda.matmul.allow_tf32 = old_tf32
 
 
-def make_block(
+def make_config(
     architecture="huginn",
     depth=2,
     bptt=0,
@@ -56,8 +57,9 @@ def make_block(
     dtype=torch.float32,
     untie=False,
     production_shape=False,
+    **overrides,
 ):
-    config = TransformerConfig(
+    return TransformerConfig(
         num_layers=2 + 2 * depth if untie else 4,
         hidden_size=2048 if production_shape else 128,
         num_attention_heads=16 if production_shape else 2,
@@ -87,9 +89,13 @@ def make_block(
         loop_bptt_iterations=bptt,
         loop_recompute=recompute,
         loop_token_execution=execution,
+        **overrides,
     )
+
+
+def make_block(*args, **kwargs):
     return LoopTransformerBlock(
-        config=config,
+        config=make_config(*args, **kwargs),
         spec=get_gpt_layer_with_transformer_engine_spec(),
         pre_process=True,
         post_process=True,
@@ -310,6 +316,59 @@ def test_moe_native_parity(architecture, recompute):
         post_process=True,
     ).cuda()
     check_native(block, torch.float32)
+
+
+HASH_MOE = dict(num_moe_experts=4, moe_ffn_hidden_size=256, hash_moe_vocab_size=128)
+
+
+@pytest.mark.parametrize(
+    "overrides,feature",
+    [
+        (dict(HASH_MOE, moe_num_hash_layers=1), "hash-routed MoE"),
+        # The legacy alias is folded into moe_num_hash_layers by the config.
+        (dict(HASH_MOE, moe_n_hash_layers=1), "hash-routed MoE"),
+        (dict(tensor_parallel_num_weight_shards=2), "GTP weight remat"),
+        (
+            dict(
+                num_moe_experts=4,
+                moe_ffn_hidden_size=256,
+                expert_tensor_parallel_num_weight_shards=2,
+            ),
+            "GTP weight remat",
+        ),
+    ],
+)
+@pytest.mark.parametrize("architecture", ["huginn", "mor"])
+def test_rejects_unsupported_dev_features(overrides, feature, architecture):
+    # Validation precedes layer construction, so no layer is built or moved to GPU.
+    config = make_config(architecture, **overrides)
+    with pytest.raises(ValueError, match=feature):
+        LoopTransformerBlock(
+            config=config,
+            spec=get_gpt_layer_with_transformer_engine_spec(),
+            pre_process=True,
+            post_process=True,
+        )
+
+
+@pytest.mark.parametrize("architecture", ["huginn", "mor"])
+@pytest.mark.parametrize("recompute", [False, True])
+def test_layer_residuals_observed_once_per_layer_call(architecture, recompute):
+    block = make_block(architecture, depth=2, recompute=recompute, execution="masked")
+    x = torch.randn(16, 2, 128, device="cuda", requires_grad=True)
+    rope = RotaryEmbedding(64, rotary_percent=1.0)(16).cuda()
+    seen = []
+
+    def observer(owner, name, kind, tensor, *dims):
+        seen.append((owner.layer_number, kind))
+
+    kinds = frozenset({"residual_accumulator", "residual_contribution"})
+    with capture_tensor_observations(observer, kinds):
+        block(x, attention_mask=None, rotary_pos_emb=rope).sum().backward()
+    # Prelude layer 1 and coda layer 4 once; shared core layers 2-3 per
+    # iteration. Recompute replays during backward must not observe again.
+    calls = [1, 2, 3, 2, 3, 4]
+    assert seen == [(n, k) for n in calls for k in sorted(kinds)]
 
 
 @pytest.mark.parametrize("architecture", ["huginn", "mor"])

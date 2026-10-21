@@ -5521,15 +5521,28 @@ def training_log(
         elapsed_time_per_iteration = elapsed_time / total_iterations
         llm_world_size = getattr(args, 'mimo_llm_world_size', args.world_size)
 
-        throughput = num_floating_point_operations(
-            args,
-            batch_size,
-            seqlen_squared_sum_in_batch=seqlen_squared_sum_in_batch,
-            total_real_tokens_in_batch=total_real_tokens_in_batch,
-            vision_total_tokens_in_batch=vision_total_tokens_in_batch,
-            vision_seqlen_squared_sum_in_batch=vision_seqlen_squared_sum_in_batch,
-            vision_merged_tokens_in_batch=vision_merged_tokens_in_batch,
-        ) / (elapsed_time_per_iteration * 10**12 * llm_world_size)
+        if getattr(args, "loop_architecture", "none") != "none":
+            # Loop work varies per iteration (sampled depth, token-choice MoR).
+            # Average the FLOPs over the same interval as the time, rather than
+            # pairing the last iteration's work with the interval-average time.
+            loop_flops_per_iteration = (
+                getattr(args, "_loop_flops_in_log_interval", 0.0) / total_iterations
+            )
+            if should_reset:
+                args._loop_flops_in_log_interval = 0.0
+            throughput = loop_flops_per_iteration / (
+                elapsed_time_per_iteration * 10**12 * llm_world_size
+            )
+        else:
+            throughput = num_floating_point_operations(
+                args,
+                batch_size,
+                seqlen_squared_sum_in_batch=seqlen_squared_sum_in_batch,
+                total_real_tokens_in_batch=total_real_tokens_in_batch,
+                vision_total_tokens_in_batch=vision_total_tokens_in_batch,
+                vision_seqlen_squared_sum_in_batch=vision_seqlen_squared_sum_in_batch,
+                vision_merged_tokens_in_batch=vision_merged_tokens_in_batch,
+            ) / (elapsed_time_per_iteration * 10**12 * llm_world_size)
 
         one_logger_utils.track_e2e_metrics(cfg.logger.log_throughput, throughput)
 
@@ -7002,6 +7015,10 @@ def train(
                     float(loss_dict.get(f"loop {phase} flops per token", 0.0))
                     for phase in ("forward", "backward", "recompute")
                 )
+            )
+            # training_log divides by the interval's iteration count and resets this.
+            args._loop_flops_in_log_interval = (
+                getattr(args, "_loop_flops_in_log_interval", 0.0) + args._loop_flops_in_batch
             )
         num_floating_point_operations_in_batch = num_floating_point_operations(
             args,

@@ -1039,6 +1039,7 @@ def _triton_backward(dout, q, k, v, out, lse, meta, causal, sm_scale):
 class _TritonMaskedKVAttention(torch.autograd.Function):
     @staticmethod
     def forward(ctx, q, k, v, q_perm, q_count, q_excl, k_perm, k_count, k_incl, causal, scale):
+        """Run the Triton forward and save its inputs, output, and LSE for backward."""
         meta = MaskedKVMetadata(q_perm, q_count, q_excl, k_perm, k_count, k_incl)
         out, lse = _triton_forward(q, k, v, meta, causal, scale)
         ctx.save_for_backward(q, k, v, out, lse, *meta)
@@ -1049,6 +1050,7 @@ class _TritonMaskedKVAttention(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, dout, _dlse):
+        """Return query/key/value gradients; the metadata and flags are not differentiable."""
         q, k, v, out, lse, *meta = ctx.saved_tensors
         dq, dk, dv = _triton_backward(
             dout, q, k, v, out, lse, MaskedKVMetadata(*meta), ctx.causal, ctx.scale

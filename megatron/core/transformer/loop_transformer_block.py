@@ -6,7 +6,7 @@ No inference cache, pipeline schedule, or activation sharing is implied by
 parameter sharing.
 """
 
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 
 import torch
 import torch.distributed as dist
@@ -15,6 +15,7 @@ from torch import nn
 from torch.utils.checkpoint import checkpoint
 
 from megatron.core.packed_seq_params import PackedSeqParams
+from megatron.core.tensor_observation import observe_layer_residuals, suspend_tensor_observations
 from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.transformer_block import TransformerBlock
 
@@ -28,6 +29,7 @@ class LoopRMSNorm(nn.Module):
         self.eps = eps
 
     def forward(self, x):
+        """Normalize the last dimension in FP32 and apply the learned scale."""
         y = x.float() * torch.rsqrt(x.float().square().mean(-1, keepdim=True) + self.eps)
         return y.to(x.dtype) * self.weight
 
@@ -58,6 +60,17 @@ def active_causal_mask(active):
         ~active_bs[:, :, None]
     )
     return ~allowed[:, None]
+
+
+@contextmanager
+def recompute_context(name):
+    """Profile an activation-checkpoint replay without re-observing its tensors.
+
+    The original forward already notified the tensor observer, so the replay
+    is suppressed the same way MCore's own checkpoint implementations do.
+    """
+    with torch.profiler.record_function(name), suspend_tensor_observations():
+        yield
 
 
 def compact_metadata(active):
@@ -138,6 +151,13 @@ class LoopTransformerBlock(TransformerBlock):
             "MoE communication overlap": config.overlap_moe_expert_parallel_comm,
             "dropout": bool(config.hidden_dropout or config.attention_dropout),
             "multi-latent attention": config.multi_latent_attention,
+            # Hash routing needs per-token input ids in every MoE layer; compact
+            # MoR would also have to gather them. HybridStack owns that path.
+            "hash-routed MoE (use the HybridStack loop path)": config.moe_num_hash_layers > 0,
+            # GTP prefetches weights along a static next-weight chain, which a
+            # shared core revisited R times per microbatch breaks.
+            "GTP weight remat": config.gtp_weight_remat_size > 1
+            or config.expert_gtp_weight_remat_size > 1,
         }
         enabled = [name for name, value in unsupported.items() if value]
         if enabled:
@@ -157,16 +177,19 @@ class LoopTransformerBlock(TransformerBlock):
 
     @property
     def core_start(self):
+        """Index of the first shared core layer."""
         return self.config.loop_prelude_layers
 
     @property
     def core_end(self):
+        """Index one past the last core layer (all untied banks)."""
         banks = self.config.loop_iterations if self.config.loop_untie_core else 1
         return self.core_start + self.config.loop_core_layers * banks
 
     def _layers(self, x, start, end, label, **kwargs):
         for physical in range(start, end):
             with torch.profiler.record_function(f"{label}/layer={physical}"):
+                residual_accumulator = x
                 if x.shape[0] == 0:
                     # A rank with no queries still receives EP tokens. Keep its
                     # MLP dispatch/combine and backward in the collective order.
@@ -175,6 +198,10 @@ class LoopTransformerBlock(TransformerBlock):
                         x = x + update
                 else:
                     x, _ = self.layers[physical](hidden_states=x, **kwargs)
+                # Same per-layer-call site as TransformerBlock.forward: outside
+                # any per-layer CUDA graph, once per layer call (R times for a
+                # shared core layer).
+                observe_layer_residuals(self.layers[physical], residual_accumulator, x)
         if self.config.cuda_graph_impl == "local" and end > start:
             # The prelude injection and recurrence norm are eager consumers.
             # Local layer graphs return graph-pool views whose lifetime only
@@ -279,9 +306,7 @@ class LoopTransformerBlock(TransformerBlock):
                             torch.profiler.record_function(
                                 f"{label}/loop={step + 1}/phase=forward"
                             ),
-                            torch.profiler.record_function(
-                                f"{label}/loop={step + 1}/phase=recompute"
-                            ),
+                            recompute_context(f"{label}/loop={step + 1}/phase=recompute"),
                         ),
                     )
                 else:
@@ -379,7 +404,7 @@ class LoopTransformerBlock(TransformerBlock):
                     use_reentrant=False,
                     context_fn=lambda loop_label=loop_label: (
                         torch.profiler.record_function(f"{loop_label}/phase=forward"),
-                        torch.profiler.record_function(f"{loop_label}/phase=recompute"),
+                        recompute_context(f"{loop_label}/phase=recompute"),
                     ),
                 )
             else:
@@ -428,6 +453,7 @@ class LoopTransformerBlock(TransformerBlock):
         inference_params=None,
         dynamic_inference_decode_only=None,
     ):
+        """Run prelude, recurrent core, and coda; same signature as TransformerBlock."""
         if inference_context is not None or inference_params is not None:
             raise ValueError("Loop decoder implements training, without an inference KV cache")
         if packed_seq_params is not None or context is not None or extract_layer_indices:
