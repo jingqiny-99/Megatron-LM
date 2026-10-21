@@ -151,9 +151,9 @@ class LoopTransformerBlock(TransformerBlock):
             "MoE communication overlap": config.overlap_moe_expert_parallel_comm,
             "dropout": bool(config.hidden_dropout or config.attention_dropout),
             "multi-latent attention": config.multi_latent_attention,
-            # Hash routing needs per-token input ids in every MoE layer; compact
-            # MoR would also have to gather them. HybridStack owns that path.
-            "hash-routed MoE (use the HybridStack loop path)": config.moe_num_hash_layers > 0,
+            # Hash routing needs per-token input ids in every MoE layer, and compact
+            # MoR would also have to gather them. Not supported yet.
+            "hash-routed MoE": config.moe_num_hash_layers > 0,
             # GTP prefetches weights along a static next-weight chain, which a
             # shared core revisited R times per microbatch breaks.
             "GTP weight remat": config.gtp_weight_remat_size > 1

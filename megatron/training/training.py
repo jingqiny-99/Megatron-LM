@@ -6388,6 +6388,9 @@ def train(
 
     # Tracking loss.
     total_loss_dict = {}
+    if getattr(args, "loop_architecture", "none") != "none":
+        # Loop FLOPs share the log interval of total_loss_dict; start it empty too.
+        args._loop_flops_in_log_interval = 0.0
 
     # Iterations.
     iteration = args.iteration
