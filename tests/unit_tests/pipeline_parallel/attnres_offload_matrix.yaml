@@ -1,6 +1,8 @@
 # Requested K3 AttnRes/MTP acceptance targets; not a passing-support declaration.
 # Apply each ARGS mapping to the same K3 model and base training recipe.
 # linear_qkv in the request is the qkv_linear offload selector in MCore.
+# moe_latent_proj is not a TransformerConfig recompute module on this branch (dev only
+# has it as a gtp_remat_opt_in_modules entry), so these ARGS fail validation as written.
 nonfused:
   ENV_VARS:
     NVTE_CPU_OFFLOAD_V1: "1"

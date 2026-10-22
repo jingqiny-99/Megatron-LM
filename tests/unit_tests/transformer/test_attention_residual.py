@@ -655,6 +655,32 @@ class TestAttnResConfigValidation:
             )
         )
 
+    @pytest.mark.parametrize(
+        "offload_module,extra_kwargs",
+        [
+            ("gdp_qkv", {}),
+            (
+                "shortcut_post_norm",
+                dict(moe_shortcut_connection=True, moe_shortcut_post_norm=True, num_moe_experts=4),
+            ),
+        ],
+    )
+    def test_unvalidated_offload_modules_rejected(self, offload_module, extra_kwargs):
+        from megatron.core.transformer.transformer_config import TransformerConfig
+
+        with pytest.raises(
+            ValueError,
+            match=f"fine-grained activation offloading for unsupported modules "
+            f"\\['{offload_module}'\\]",
+        ):
+            TransformerConfig(
+                **self._base_kwargs(
+                    fine_grained_activation_offloading=True,
+                    offload_modules=[offload_module],
+                    **extra_kwargs,
+                )
+            )
+
     def test_attn_proj_offload_still_requires_core_attn(self):
         from megatron.core.transformer.transformer_config import TransformerConfig
 
@@ -1302,3 +1328,116 @@ def test_gpt_experimental_attention_variant_spec_rejects_attention_residuals():
     )
     with pytest.raises(NotImplementedError, match="experimental_attention_variant"):
         get_transformer_layer_with_experimental_attention_variant_spec(config)
+
+
+class _RecordingNormOffloadManager:
+    """Stands in for the mlp_norm offload group and records what it would release."""
+
+    def __init__(self):
+        self.forced_released_tensors = None
+
+    def group_offload(self, tensor, forced_released_tensors=None, delay_offload=False):
+        self.forced_released_tensors = forced_released_tensors
+        return tensor
+
+
+class TestAttnResMlpNormOwnership:
+    """The MLP-norm offload group must release the aggregated norm input.
+
+    For AttnRes the BDA residual is the running partial sum, which later sublayers
+    still read; force-releasing it (resize_(0) after the D2H copy) would silently
+    corrupt the forward and backward.
+    """
+
+    def _fake_layer(self, manager, legacy_forward_post_mlp=None):
+        from types import SimpleNamespace
+
+        from megatron.core.fusions.fused_bias_dropout import get_bias_dropout_add
+
+        return SimpleNamespace(
+            _legacy_forward_post_mlp=legacy_forward_post_mlp,
+            config=SimpleNamespace(
+                inference_fuse_tp_communication=False, bias_dropout_fusion=False
+            ),
+            _get_mlp_residual_connection=lambda: None,
+            recompute_pre_mlp_layernorm=False,
+            bias_dropout_add_exec_handler=torch.enable_grad,
+            mlp_bda=get_bias_dropout_add,
+            hidden_dropout=0.0,
+            training=True,
+            mlp_norm_manager=manager,
+        )
+
+    def test_default_releases_residual(self):
+        from megatron.core.transformer.transformer_layer import TransformerLayer
+
+        manager = _RecordingNormOffloadManager()
+        layer = self._fake_layer(manager)
+        mlp_output, residual = torch.randn(4, 2, 8), torch.randn(4, 2, 8)
+        TransformerLayer._apply_mlp_bda_step(layer, (mlp_output, None), residual)
+        assert len(manager.forced_released_tensors) == 1
+        assert manager.forced_released_tensors[0] is residual
+        assert layer.mlp_norm_manager is None
+
+    def test_mlp_norm_input_is_released_instead_of_residual(self):
+        from megatron.core.transformer.transformer_layer import TransformerLayer
+
+        manager = _RecordingNormOffloadManager()
+        layer = self._fake_layer(manager)
+        mlp_output, partial, norm_input = (torch.randn(4, 2, 8) for _ in range(3))
+        output = TransformerLayer._apply_mlp_bda_step(
+            layer, (mlp_output, None), partial, mlp_norm_input=norm_input
+        )
+        assert len(manager.forced_released_tensors) == 1
+        assert manager.forced_released_tensors[0] is norm_input
+        torch.testing.assert_close(output, mlp_output + partial)
+
+    def test_legacy_forward_post_mlp_rejects_mlp_norm_input(self):
+        """Dev's legacy `_forward_post_mlp` shim drops `mlp_norm_input` and would release
+        the AttnRes partial sum, so the plumbing must refuse to route through it."""
+        from megatron.core.transformer.transformer_layer import TransformerLayer
+
+        def legacy(self, mlp_output_with_bias, residual):
+            raise AssertionError("the legacy hook would drop mlp_norm_input")
+
+        layer = self._fake_layer(_RecordingNormOffloadManager(), legacy)
+        with pytest.raises(RuntimeError, match="mlp_norm_input"):
+            TransformerLayer._apply_mlp_bda_step(
+                layer,
+                (torch.randn(4, 2, 8), None),
+                torch.randn(4, 2, 8),
+                mlp_norm_input=torch.randn(4, 2, 8),
+            )
+
+    def test_attn_res_mlp_passes_aggregated_norm_input(self):
+        from types import SimpleNamespace
+
+        from megatron.core.transformer.transformer_layer import AttnResTransformerLayer
+
+        source, partial, aggregated, mlp_output = (torch.randn(4, 2, 8) for _ in range(4))
+        recorded = {}
+
+        def aggregate(values):
+            recorded["values"] = values
+            return aggregated
+
+        def mlp_output_with_bias(hidden_states, **kwargs):
+            recorded["mlp_input"] = hidden_states
+            return (mlp_output, None), hidden_states
+
+        def apply_mlp_bda_step(mlp_output_with_bias, residual, **kwargs):
+            recorded["residual"] = residual
+            recorded["bda_kwargs"] = kwargs
+            return residual
+
+        layer = SimpleNamespace(
+            mlp_attn_res=aggregate,
+            _forward_mlp_output_with_bias=mlp_output_with_bias,
+            _apply_mlp_bda_step=apply_mlp_bda_step,
+        )
+        AttnResTransformerLayer._forward_mlp(layer, partial, attn_res_sources=(source,))
+
+        assert recorded["values"][0] is source and recorded["values"][1] is partial
+        assert recorded["mlp_input"] is aggregated
+        assert recorded["residual"] is partial
+        assert recorded["bda_kwargs"]["mlp_norm_input"] is aggregated

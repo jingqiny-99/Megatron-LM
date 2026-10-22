@@ -152,7 +152,7 @@ Offloading and recomputation are complementary:
 |---|---|
 | PP / Interleaved PP / PP=1 | Yes |
 | Fine-grained recomputation | Yes |
-| Attention Residuals | Attention scopes are supported; broader module coverage is experimental and awaits the offloading follow-up validation matrix |
+| Attention Residuals | Attention scopes are supported; broader module coverage is experimental and awaits the offloading follow-up validation matrix; `gdp_qkv` and `shortcut_post_norm` are rejected |
 | FP8 training | Yes |
 | MTP (Multi-Token Prediction) | Yes |
 | Mixed dense & MoE layers | Yes |

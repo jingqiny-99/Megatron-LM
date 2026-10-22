@@ -1699,6 +1699,12 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
                 "Hybrid AttnRes layer deltas are not supported with a legacy "
                 "_forward_post_mlp override."
             )
+        if mlp_norm_input is not None and self._legacy_forward_post_mlp is not None:
+            # The legacy hook would release `residual` (the AttnRes partial sum)
+            # instead of the separately owned norm input.
+            raise RuntimeError(
+                "mlp_norm_input is not supported with a legacy _forward_post_mlp override."
+            )
         if self._legacy_forward_post_mlp is not None:
             warnings.warn(
                 "TransformerLayer._forward_post_mlp has been renamed to "

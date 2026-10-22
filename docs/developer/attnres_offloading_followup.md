@@ -1,8 +1,17 @@
 # AttnRes activation offloading follow-up (isolated WIP)
 
-Base: `64fbfe3c22edca24c94146bad12a12b473738dc5` (PR #6840).
+Base: `dc619f559cd7c614de5ea664f800e3a8d290c1ad` (PR #6840 rebased onto dev
+`ff4fbc9f3a0e0f390d2acda51c641b3f2bc495d4`).
 Branch: `jingqiny/attention-residuals-offload-followup`.
+Pre-rebase base: `64fbfe3c22edca24c94146bad12a12b473738dc5`.
 Original split base: `2fa542825268deaa77d353cc821a9d9d849e4f5e`.
+
+After the dev rebase, `TransformerLayer._forward_post_mlp` is
+`_apply_mlp_bda_step`; `mlp_norm_input` is a keyword on that method. The
+AttnRes offload allowlist is kept and extended to `attn_norm`, `qkv_linear`,
+`core_attn`, `attn_proj`, `mlp_norm`, `expert_fc1`, `moe_act`, and
+`fused_group_mlp`, so the dev-only `gdp_qkv` and `shortcut_post_norm` scopes
+stay rejected until validated.
 
 This draft follow-up preserves the unfinished expansion from attention-only
 offloading to all fine-grained offload modules. It is stacked on the K3 AttnRes
@@ -44,6 +53,10 @@ Recorded allocation: 2971338, node lyris0035, 2026-09-09.
 - Fused-group, expanded MTP, and recompute combinations have not completed the
   runtime acceptance matrix. Earlier dependency/assertion failures are retained
   in the v1/v2 logs; they are not passing runtime evidence.
+
+All recorded runtime evidence predates the dev rebase. Dev changed offload byte
+accounting (whole base storages for views, bytes actually copied) and
+checkpoint input saving, so the recorded memory deltas no longer apply.
 
 Do not weaken tolerances or remove validation to declare this work complete.
 ## Requested fine-grained validation matrix
