@@ -58,7 +58,20 @@ from ..utils import (
 
 logger = logging.getLogger(__name__)
 
-_ATTN_RES_SUPPORTED_OFFLOAD_MODULES = frozenset({"qkv_linear", "core_attn", "attn_proj"})
+# Fine-grained offload scopes validated with AttnRes. Dev-only scopes outside this set
+# (gdp_qkv, shortcut_post_norm) have not been validated with the depth aggregation.
+_ATTN_RES_SUPPORTED_OFFLOAD_MODULES = frozenset(
+    {
+        "attn_norm",
+        "qkv_linear",
+        "core_attn",
+        "attn_proj",
+        "mlp_norm",
+        "expert_fc1",
+        "moe_act",
+        "fused_group_mlp",
+    }
+)
 
 try:
     from packaging.version import Version as PkgVersion
@@ -2141,11 +2154,11 @@ class TransformerConfig(ModelParallelConfig):
         uniform width plus a rank-local source cache — see
         attention_residual.AttnResStageSources), selective recompute of modules
         that live inside a sublayer (e.g. core_attn), MoE (incl. shared-expert
-        overlap), attention-scope fine-grained activation offloading
-        (qkv_linear, core_attn, and attn_proj), and MTP in the standard or
-        hybrid last-stage placement. Everything rejected below either has no mechanism
-        yet (CUDA graphs, full recompute, EP-overlap fine-grained schedule,
-        non-attention activation offloading, zero-layer virtual chunks) or
+        overlap), fine-grained activation offloading (except the unvalidated
+        gdp_qkv and shortcut_post_norm scopes), and MTP in the standard or
+        hybrid last-stage placement. Everything rejected below either has no
+        mechanism yet (CUDA graphs, full recompute, EP-overlap fine-grained
+        schedule, zero-layer virtual chunks) or
         would silently bypass the AttnRes residual interception (fused residual
         norms, fp32 residual connection) or the static pipeline payload-width
         reasoning (variable sequence lengths with PP/VPP).
