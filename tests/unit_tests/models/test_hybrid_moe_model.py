@@ -265,6 +265,7 @@ GOLDEN_CONFIG: Dict[str, Any] = {
     "moe_paged_stash_buffer_size_factor_cpu": 0.0,
     "moe_paged_stash_buffer_size_factor_cuda": 1.1,
     "moe_paged_stash_page_size": 64,
+    "moe_cuda_graph_static_budget_without_paged_stash": False,
     "moe_per_layer_logging": False,
     "moe_permute_fusion": False,
     "moe_permute_fusion_into_hybridep": False,
@@ -437,6 +438,19 @@ GOLDEN_CONFIG: Dict[str, Any] = {
     "head_wise_attn_gate": False,
     "moe_hybridep_pad_variable_tokens": False,
     "moe_hybridep_pad_uneven_dispatch_inputs": False,
+    "loop_architecture": "none",
+    "loop_prelude_layers": 2,
+    "loop_core_layers": 4,
+    "loop_iterations": 4,
+    "loop_untie_core": False,
+    "loop_sample_depth": False,
+    "loop_bptt_iterations": 0,
+    "loop_recompute": False,
+    "loop_token_execution": "compact",
+    "loop_router_balance_coeff": 0.01,
+    "loop_router_z_loss_coeff": 0.001,
+    "loop_prelude_sublayers": None,
+    "loop_coda_sublayers": None,
 }
 # Fields to ignore entirely (ephemeral, environment-specific, very large).
 SKIP_FIELDS = set()

@@ -26,7 +26,7 @@ import re
 import socket
 import subprocess
 from pathlib import Path
-from types import SimpleNamespace
+from types import MethodType, SimpleNamespace
 
 import pytest
 import torch
@@ -211,6 +211,9 @@ def test_hybrid_padding_mask_sp_scatter_uses_model_tp_group(monkeypatch, input_p
         mtp_process=mtp_enabled,
         mtp=FakeMTP(),
     )
+    # HybridModel.forward calls its stages through self; bind them onto the stub.
+    for name in ("embed", "rope_ctx", "head_loss"):
+        setattr(model, name, MethodType(getattr(hybrid_model.HybridModel, name), model))
     output = hybrid_model.HybridModel.forward(
         model,
         input_ids=input_ids,

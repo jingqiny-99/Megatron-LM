@@ -103,6 +103,16 @@ class TransformerConfig(ModelParallelConfig):
     loop_router_balance_coeff: float = 0.01
     loop_router_z_loss_coeff: float = 0.001
 
+    loop_prelude_sublayers: Optional[int] = None
+    """Hybrid loop: number of sublayers (symbols of the main hybrid layer pattern, without
+    '|' and the MTP part) that run once before the shared core. Set together with
+    loop_coda_sublayers; the core is the remaining sublayers. Replaces loop_prelude_layers /
+    loop_core_layers, which apply to the GPT loop only."""
+
+    loop_coda_sublayers: Optional[int] = None
+    """Hybrid loop: number of sublayers of the main hybrid layer pattern that run once after
+    the shared core. Set together with loop_prelude_sublayers."""
+
     mtp_num_layers: Optional[int] = None
     """Number of Multi-Token Prediction (MTP) Layers.
     MTP extends the prediction scope to multiple future tokens at each position.
@@ -1927,6 +1937,16 @@ class TransformerConfig(ModelParallelConfig):
     Same sign convention as moe_paged_stash_buffer_size_factor_cuda: positive = avg-based,
     negative = actual-max; scale = abs(factor)."""
 
+    moe_cuda_graph_static_budget_without_paged_stash: bool = False
+    """Opt in to Transformer Engine whole-MoE CUDA graphs on sync-free HybridEP with rank
+    capacity but without the paged stash (requires moe_paged_stash=False). The static
+    budget makes the capture sync-free, but nothing retries a step whose tokens exceed it:
+    the caller must check the token dispatcher's over-budget flag
+    (``check_over_budget()``) every step, as only the paged-stash runner does otherwise.
+    The other prerequisites are those of the paged-stash path (transformer_engine impl,
+    flex dispatcher with the hybridep backend, moe_expert_rank_capacity_factor,
+    use_transformer_engine_op_fuser)."""
+
     @classmethod
     def from_config(cls, config: "TransformerConfig") -> Self:
         """Create this config type from an existing normalized transformer config.
@@ -2107,16 +2127,55 @@ class TransformerConfig(ModelParallelConfig):
                 f"tensor-parallel size, got {self.tensor_model_parallel_size}."
             )
 
+    def _validate_hybrid_loop_roles(self) -> None:
+        """Validate loop_prelude_sublayers / loop_coda_sublayers of a hybrid loop config.
+
+        The pattern-dependent role rules (block-boundary cuts, hash layers in the prelude,
+        supported sublayers) are checked when the loop stack is built.
+        """
+        prelude, coda = self.loop_prelude_sublayers, self.loop_coda_sublayers
+        if prelude is None or coda is None:
+            raise ValueError("loop_prelude_sublayers and loop_coda_sublayers must be set together")
+        if prelude < 0 or coda < 0:
+            raise ValueError("loop_prelude_sublayers and loop_coda_sublayers must be nonnegative")
+        if self.num_layers > 0 and prelude + coda >= self.num_layers:
+            raise ValueError(
+                f"Hybrid loop roles leave an empty core: loop_prelude_sublayers ({prelude}) + "
+                f"loop_coda_sublayers ({coda}) must be less than num_layers ({self.num_layers})"
+            )
+        if self.loop_untie_core:
+            raise ValueError(
+                "loop_untie_core is a GPT-loop baseline; it is not supported with "
+                "loop_prelude_sublayers / loop_coda_sublayers"
+            )
+        # Refuse the GPT layer counts rather than ignore them silently. Passing their
+        # defaults explicitly cannot be told apart from not passing them, and is harmless.
+        gpt_defaults = (TransformerConfig.loop_prelude_layers, TransformerConfig.loop_core_layers)
+        if (self.loop_prelude_layers, self.loop_core_layers) != gpt_defaults:
+            raise ValueError(
+                "Loop does not support: GPT loop layer counts in role mode "
+                "(loop_prelude_layers / loop_core_layers are GPT-loop fields; "
+                "use loop_prelude_sublayers / loop_coda_sublayers)"
+            )
+
     def __post_init__(self):
         """Python dataclass method that is used to modify attributes after initialization.
         See https://docs.python.org/3/library/dataclasses.html#post-init-processing for more
         details.
         """
         super().__post_init__()
+        hybrid_loop_roles = (
+            self.loop_prelude_sublayers is not None or self.loop_coda_sublayers is not None
+        )
         if self.loop_architecture != "none":
-            if self.loop_iterations < 1 or self.loop_core_layers < 1:
+            # Hybrid loops count roles in sublayers of the hybrid pattern
+            # (loop_prelude_sublayers / loop_coda_sublayers); the GPT layer counts
+            # (loop_prelude_layers / loop_core_layers) apply only without them.
+            if self.loop_iterations < 1 or (not hybrid_loop_roles and self.loop_core_layers < 1):
                 raise ValueError("Loop iterations and core layers must be positive")
-            if not 0 <= self.loop_prelude_layers <= self.num_layers - self.loop_core_layers:
+            if hybrid_loop_roles:
+                self._validate_hybrid_loop_roles()
+            elif not 0 <= self.loop_prelude_layers <= self.num_layers - self.loop_core_layers:
                 raise ValueError("Loop prelude/core must fit in physical num_layers")
             if self.loop_bptt_iterations < 0:
                 raise ValueError("loop_bptt_iterations must be nonnegative")
@@ -2136,6 +2195,22 @@ class TransformerConfig(ModelParallelConfig):
                 self.loop_sample_depth or self.loop_bptt_iterations
             ):
                 raise ValueError("MoR uses token-choice depth and full BPTT")
+            # Imported lazily: module.py imports this file.
+            from megatron.core.transformer.module import is_first_microbatch_tracked
+
+            if is_first_microbatch_tracked(self) and not self.disable_parameter_transpose_cache:
+                # With is_first_microbatch tracked, TE overwrites (instead of accumulating)
+                # the weight gradient on the first call of each step, and a loop calls its
+                # core layers several times per step.
+                raise ValueError(
+                    "Loop does not support: quantized loop without "
+                    "disable_parameter_transpose_cache (FP8 / FP4 / kitchen / quant_recipe "
+                    "loop configs must set disable_parameter_transpose_cache=True)"
+                )
+        elif hybrid_loop_roles:
+            raise ValueError(
+                "loop_prelude_sublayers / loop_coda_sublayers require loop_architecture"
+            )
         # Dynamic CP can assign a multi-rank group even when configured CP is one.
         has_context_parallelism = self.context_parallel_size > 1 or self.dynamic_context_parallel
 
@@ -3842,6 +3917,13 @@ class TransformerConfig(ModelParallelConfig):
             assert not invalid, (
                 f"Invalid choices for gtp_remat_opt_in_modules: {invalid}. "
                 f"Allowed modules are: {_allowed_gtp_remat_opt_in_modules}"
+            )
+
+        if self.moe_cuda_graph_static_budget_without_paged_stash and self.moe_paged_stash:
+            raise ValueError(
+                "moe_cuda_graph_static_budget_without_paged_stash is the static budget without "
+                "the paged stash; set moe_paged_stash=False (the paged-stash path needs no "
+                "opt-in)."
             )
 
         if self.moe_paged_stash:

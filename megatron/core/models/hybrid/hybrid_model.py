@@ -269,6 +269,10 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
         )
 
         parsed = parse_hybrid_pattern(self.hybrid_layer_pattern)
+        if self.config.loop_architecture != "none":
+            from megatron.core.transformer.loop.guards import validate_hybrid_loop_pattern
+
+            validate_hybrid_loop_pattern(self.config, parsed.main_pattern or '', parsed.mtp_pattern)
         self.mtp_pattern = parsed.mtp_pattern
         self.mtp_num_depths = parsed.mtp_num_depths
         hash_moe_layer_threshold = _get_hash_moe_layer_threshold(
@@ -443,6 +447,13 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
             hash_moe_layer_threshold=hash_moe_layer_threshold or None,
             name="decoder",
         )
+        if self.config.loop_architecture != "none":
+            from megatron.core.transformer.loop.guards import validate_loop_decoder
+
+            # A loop config needs the loop decoder (e.g. loop_hybrid_stack_spec); the loop
+            # decoder also reports the output layer and MTP FLOPs.
+            validate_loop_decoder(self.config, self.decoder)
+            self.decoder.set_loop_head_flops(self.vocab_size, self.mtp_pattern, self.mtp_num_depths)
 
         # MTP block - uses mtp_block_spec from hybrid_stack_spec.submodules
         if self.mtp_process:
@@ -606,6 +617,11 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
 
         It either returns the Loss values if labels are given or the final hidden units
 
+        The stages are also callable on their own: in training, ``embed`` -> ``rope_ctx`` ->
+        ``self.decoder`` -> ``head_loss`` computes what this forward computes (forward adds the
+        offload / paged-stash preprocessing, the inference input wrap and the frozen-backbone
+        context around the decoder).
+
         Args:
             compute_mtp_loss (bool): Whether to compute the non-inference MTP auxiliary
                 objective. Disabling it skips the MTP branch while leaving its parameters
@@ -630,7 +646,111 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
         if in_inference_mode:
             assert runtime_gather_output, "Inference must always gather TP logits"
 
-        use_precomputed_mtp_embeddings = decoder_input is not None
+        # Caller-supplied embeddings also feed the MTP block (the same object: embed() passes a
+        # given decoder_input through untouched).
+        mtp_decoder_input = decoder_input
+
+        decoder_input, decoder_padding_mask, hash_input_ids = self.embed(
+            input_ids,
+            position_ids,
+            decoder_input=decoder_input,
+            padding_mask=padding_mask,
+            inference_context=inference_context,
+        )
+
+        rotary_pos_emb = self.rope_ctx(
+            decoder_input,
+            position_ids,
+            packed_seq_params=packed_seq_params,
+            inference_context=inference_context,
+        )
+
+        # Wrap decoder_input to allow the decoder (HybridStack) to delete the
+        # reference held by this caller function, enabling early garbage collection
+        # for inference.
+        if in_inference_mode:
+            decoder_input = WrappedTensor(decoder_input)
+
+        # The following assert will currently fail when running inference.
+        # Commented out for now.
+        # TODO (duncan/rwaleffe): (1) confirm that the externally-generated
+        #   attention mask is not needed and is ignored by the model in
+        #   inference mode, (2) reduce the size of the externally-generated
+        #   attention mask to prevent CPU OOM (as we did for training), (3)
+        #   force the attention mask passed to the model in inference mode to
+        #   be None, so this assert will succeed.
+        # assert attention_mask is None, "The attention mask is ignored and should be set to None"
+
+        packed_seq_params_by_layout = (
+            cp_batch.packed_seq_params_by_layout if cp_batch is not None else None
+        )
+        cp_layout_plan = cp_batch.thd_plan if cp_batch is not None else None
+
+        # Run decoder.
+        backbone_context = (
+            torch.no_grad()
+            if self.config.freeze_base_model_for_mtp and self.training
+            else nullcontext()
+        )
+        with backbone_context:
+            decoder_output = self.decoder(
+                hidden_states=decoder_input,
+                attention_mask=attention_mask,
+                inference_context=inference_context,
+                rotary_pos_emb=rotary_pos_emb,
+                packed_seq_params=packed_seq_params,
+                padding_mask=decoder_padding_mask,
+                packed_seq_params_by_layout=packed_seq_params_by_layout,
+                cp_layout_plan=cp_layout_plan,
+                input_ids=hash_input_ids,
+            )
+        if isinstance(decoder_output, tuple):
+            hidden_states, mhc_multistream = decoder_output
+        else:
+            hidden_states = decoder_output
+            mhc_multistream = None
+
+        return self.head_loss(
+            hidden_states,
+            mhc_multistream,
+            input_ids=input_ids,
+            position_ids=position_ids,
+            attention_mask=attention_mask,
+            labels=labels,
+            loss_mask=loss_mask,
+            mtp_input_mask=mtp_input_mask,
+            mtp_decoder_input=mtp_decoder_input,
+            packed_seq_params=packed_seq_params,
+            padding_mask=padding_mask,
+            cp_batch=cp_batch,
+            inference_context=inference_context,
+            inference_params=inference_params,
+            rotary_pos_emb=rotary_pos_emb,
+            runtime_gather_output=runtime_gather_output,
+            compute_mtp_loss=compute_mtp_loss,
+        )
+
+    def embed(
+        self,
+        input_ids: Tensor,
+        position_ids: Tensor,
+        *,
+        decoder_input: Optional[Tensor] = None,
+        padding_mask: Optional[Tensor] = None,
+        inference_context: Optional[BaseInferenceContext] = None,
+    ) -> tuple[Optional[Tensor], Optional[Tensor], Optional[Tensor]]:
+        """Embed the input tokens for the decoder (the first stage of ``forward``).
+
+        A given ``decoder_input`` is returned untouched (``input_ids`` then only feed hash
+        routing). On a non-first pipeline stage the decoder reads its input from
+        ``set_input_tensor`` and the returned ``decoder_input`` is None.
+
+        Returns:
+            ``(decoder_input, decoder_padding_mask, hash_input_ids)``: the decoder input
+            (sequence-parallel scattered when SP is on), the padding mask aligned with it, and
+            the token IDs for hash-routed MoE layers (None without hash layers).
+        """
+        in_inference_mode = InferenceMode.is_active()
 
         # Decoder embedding. Under sequence parallelism the decoder gets the padding mask scattered
         # along the sequence like its hidden states; the post-process keeps the caller's full-length
@@ -718,6 +838,23 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
                 .contiguous()
             )
 
+        return decoder_input, decoder_padding_mask, hash_input_ids
+
+    def rope_ctx(
+        self,
+        decoder_input: Optional[Tensor],
+        position_ids: Optional[Tensor],
+        *,
+        packed_seq_params: Optional[PackedSeqParams] = None,
+        inference_context: Optional[BaseInferenceContext] = None,
+    ) -> Optional[Tensor]:
+        """Build the model-level rotary embedding passed to the decoder and the MTP block.
+
+        Returns None unless the model owns RoPE: ``rope`` / ``mrope`` without MLA, or ``yarn``
+        (built even under MLA). MLA-style attention (including DSv4) applies RoPE internally.
+        """
+        in_inference_mode = InferenceMode.is_active()
+
         rotary_pos_emb = None
         # Model-level rotary_pos_emb is only for regular attention. Regular
         # attention uses the default zigzag CP RoPE layout; MLA/CSA/DSv4-style
@@ -765,50 +902,53 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
                     "MultimodalRotaryEmbedding yet."
                 )
 
-        # Wrap decoder_input to allow the decoder (HybridStack) to delete the
-        # reference held by this caller function, enabling early garbage collection
-        # for inference.
-        if in_inference_mode:
-            decoder_input = WrappedTensor(decoder_input)
+        return rotary_pos_emb
 
-        # The following assert will currently fail when running inference.
-        # Commented out for now.
-        # TODO (duncan/rwaleffe): (1) confirm that the externally-generated
-        #   attention mask is not needed and is ignored by the model in
-        #   inference mode, (2) reduce the size of the externally-generated
-        #   attention mask to prevent CPU OOM (as we did for training), (3)
-        #   force the attention mask passed to the model in inference mode to
-        #   be None, so this assert will succeed.
-        # assert attention_mask is None, "The attention mask is ignored and should be set to None"
+    def head_loss(
+        self,
+        hidden_states: Tensor,
+        mhc_multistream: Optional[Tensor],
+        *,
+        input_ids: Tensor,
+        position_ids: Tensor,
+        attention_mask: Optional[Tensor],
+        labels: Optional[Tensor] = None,
+        loss_mask: Optional[Tensor] = None,
+        mtp_input_mask: Optional[Tensor] = None,
+        mtp_decoder_input: Optional[Tensor] = None,
+        packed_seq_params: Optional[PackedSeqParams] = None,
+        padding_mask: Optional[Tensor] = None,
+        cp_batch: ContextParallelBatch | None = None,
+        inference_context: Optional[BaseInferenceContext] = None,
+        inference_params: Optional[BaseInferenceContext] = None,
+        rotary_pos_emb: Optional[Tensor] = None,
+        runtime_gather_output: Optional[bool] = None,
+        compute_mtp_loss: bool = True,
+    ) -> Tensor:
+        """Run the model head on the decoder output (the last stage of ``forward``).
 
+        Runs the MTP block (fed the pre-contraction mHC streams when given), then the output
+        layer and the language-model loss on post-process stages.
+
+        Args:
+            hidden_states: Decoder output.
+            mhc_multistream: The decoder's pre-contraction mHC streams, or None.
+            mtp_decoder_input: Caller-supplied precomputed embeddings for the MTP block, or
+                None to embed ``input_ids`` / ``position_ids`` inside MTP.
+            padding_mask: The caller's full-length padding mask (not the SP-scattered one).
+            inference_params: Deprecated alias of ``inference_context``, forwarded to MTP as
+                given.
+            Other arguments are those of ``forward``.
+
+        Returns:
+            The loss when ``labels`` are given on a post-process stage, the ``[b, s, v]``
+            logits without labels, and the hidden states on other stages.
+        """
+        in_inference_mode = InferenceMode.is_active()
         packed_seq_params_by_layout = (
             cp_batch.packed_seq_params_by_layout if cp_batch is not None else None
         )
         cp_layout_plan = cp_batch.thd_plan if cp_batch is not None else None
-
-        # Run decoder.
-        backbone_context = (
-            torch.no_grad()
-            if self.config.freeze_base_model_for_mtp and self.training
-            else nullcontext()
-        )
-        with backbone_context:
-            decoder_output = self.decoder(
-                hidden_states=decoder_input,
-                attention_mask=attention_mask,
-                inference_context=inference_context,
-                rotary_pos_emb=rotary_pos_emb,
-                packed_seq_params=packed_seq_params,
-                padding_mask=decoder_padding_mask,
-                packed_seq_params_by_layout=packed_seq_params_by_layout,
-                cp_layout_plan=cp_layout_plan,
-                input_ids=hash_input_ids,
-            )
-        if isinstance(decoder_output, tuple):
-            hidden_states, mhc_multistream = decoder_output
-        else:
-            hidden_states = decoder_output
-            mhc_multistream = None
 
         output_weight = None
         if self.share_embeddings_and_output_weights:
@@ -835,7 +975,7 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
                 input_ids=input_ids,
                 position_ids=position_ids,
                 hidden_states=hidden_states,
-                decoder_input=decoder_input if use_precomputed_mtp_embeddings else None,
+                decoder_input=mtp_decoder_input,
                 mhc_multistream=mhc_multistream,
                 labels=labels,
                 loss_mask=loss_mask,

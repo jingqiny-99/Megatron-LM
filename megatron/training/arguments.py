@@ -781,6 +781,14 @@ def validate_args(args, defaults={}):
     parsed_hybrid_pattern = parse_hybrid_pattern(args.hybrid_layer_pattern)
 
     if args.hybrid_layer_pattern is not None:
+        # A loop model counts its roles over the whole main pattern; reject '|' stages before
+        # they set the pipeline layout and VPP below.
+        from megatron.core.transformer.loop.guards import reject_pipe_in_loop_pattern
+
+        reject_pipe_in_loop_pattern(
+            getattr(args, 'loop_architecture', 'none'), args.hybrid_layer_pattern
+        )
+
         # Derive num_layers from pattern; hybrid_layer_pattern always overrides --num-layers when
         # both are present (e.g. when loading from checkpoint with --use-checkpoint-args).
         num_layers_in_pattern = get_hybrid_total_layer_count(args.hybrid_layer_pattern)

@@ -158,6 +158,9 @@ class LoopTransformerBlock(TransformerBlock):
             # shared core revisited R times per microbatch breaks.
             "GTP weight remat": config.gtp_weight_remat_size > 1
             or config.expert_gtp_weight_remat_size > 1,
+            "hybrid loop role fields (use loop_prelude_layers / loop_core_layers)": (
+                config.loop_prelude_sublayers is not None or config.loop_coda_sublayers is not None
+            ),
         }
         enabled = [name for name, value in unsupported.items() if value]
         if enabled:

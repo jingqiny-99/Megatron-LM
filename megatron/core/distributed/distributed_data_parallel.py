@@ -142,6 +142,11 @@ class DistributedDataParallel(_BaseDataParallel):
             ddp_config.bucket_size = None
 
         self.ddp_config = ddp_config
+        if getattr(config, "loop_architecture", "none") != "none":
+            from megatron.core.transformer.loop.guards import validate_loop_ddp_config
+
+            # No-op unless the config is a hybrid loop (loop role fields set).
+            validate_loop_ddp_config(config, self.ddp_config)
         log_single_rank(
             logger,
             logging.INFO,
@@ -738,6 +743,12 @@ class DistributedDataParallel(_BaseDataParallel):
             # Because in CUDA Graph it no longer has the opportunity to set it back
             # to True, and there will be a double-GA.
             for param in self.params_with_grad:
+                if getattr(param, 'graph_managed_main_grad', False):
+                    # The same rule per parameter: its graph's backward accumulates into
+                    # main_grad and cannot set grad_added_to_main_grad again on replay, so
+                    # resetting it would add the dummy param.grad on top (double-GA). Set by
+                    # whoever captures such a graph for a subset of the parameters.
+                    continue
                 param.grad_added_to_main_grad = False
         for buffer in self.buffers + self.expert_parallel_buffers:
             buffer.reset()

@@ -278,13 +278,22 @@ def _build_cached_logits_loss_func(
 
 
 def loss_func(
-    loss_mask: torch.Tensor, output_tensor: torch.Tensor, model: Optional[HybridModel] = None
+    loss_mask: torch.Tensor,
+    output_tensor: torch.Tensor,
+    model: Optional[HybridModel] = None,
+    loop_losses=None,
+    loop_metrics=None,
 ):
     """Loss function.
 
     Args:
         loss_mask (torch.Tensor): Used to mask out some portions of the loss
         output_tensor (torch.Tensor): The tensor with the losses
+        model (HybridModel, optional): The model (can be wrapped)
+        loop_losses (dict, optional): Auxiliary losses of a loop decoder for this microbatch
+            (MoR router losses), added per token.
+        loop_metrics (dict, optional): Loop decoder metrics for this microbatch (depth,
+            token layers, FLOPs per token), reported token-weighted.
 
     Returns:
         the loss scalar for this micro-batch
@@ -312,6 +321,14 @@ def loss_func(
 
         num_tokens = loss_mask.sum().clone().detach().to(torch.int)
         report = {'lm loss': torch.cat([loss.clone().detach().view(1), num_tokens.view(1)])}
+
+    # Capture these tensors with the forward's loss closure, so another
+    # microbatch cannot overwrite its depth-router objective.
+    for name, auxiliary in (loop_losses or {}).items():
+        loss = loss + num_tokens * auxiliary
+        report[name] = torch.stack((auxiliary.detach() * num_tokens, num_tokens))
+    for name, metric in (loop_metrics or {}).items():
+        report[name] = torch.stack((metric.detach() * num_tokens, num_tokens))
 
     # Check individual rank losses are not NaN prior to DP all-reduce.
     rerun_state_machine = get_rerun_state_machine()
@@ -394,7 +411,18 @@ def forward_step(data_iterator, model: HybridModel):
         )
 
     # [ModelOpt]: model is needed to access ModelOpt distillation losses
-    return output_tensor, partial(loss_func, loss_mask, model=model)
+    decoder = (
+        get_attr_wrapped_model(model, "decoder")
+        if getattr(args, "loop_architecture", "none") != "none"
+        else None
+    )
+    return output_tensor, partial(
+        loss_func,
+        loss_mask,
+        model=model,
+        loop_losses=getattr(decoder, "loop_losses", None),
+        loop_metrics=getattr(decoder, "loop_metrics", None),
+    )
 
 
 def is_dataset_built_on_rank(vp_stage=None, is_packed_sequence=False):
