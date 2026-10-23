@@ -292,6 +292,72 @@ def _get_experimental_attention_variant_loss_scale_func(config):
     return None
 
 
+def set_auxiliary_loss_scales(
+    config,
+    device_fn: Callable[[], torch.device],
+    *,
+    num_microbatches: int,
+    cp_group_size: Optional[int],
+) -> None:
+    """Set the MoE aux-loss, MTP and attention-variant (indexer) loss scales.
+
+    The scales are read in backward by the process-global ``MoEAuxLossAutoScaler``,
+    ``MTPLossAutoScaler`` and the attention variant's scaler hook (e.g.
+    ``DSAIndexerLossAutoScaler``). ``forward_step_calc_loss`` calls this after every
+    microbatch's loss; a schedule that computes losses itself (the loop RSBF executor) calls it
+    once per step. With ``calculate_per_token_loss=True`` ``num_microbatches`` and
+    ``cp_group_size`` are unused. ``device_fn`` is called only by the branches that build a
+    scale tensor, so callers without MoE, MTP or an attention-variant loss never evaluate it.
+    """
+    from megatron.core.transformer.multi_token_prediction import MTPLossAutoScaler
+
+    # Set the loss scale for the auxiliary loss of the MoE layer.
+    # Since we use a trick to do backward on the auxiliary loss, we need to set the scale
+    # explicitly.
+    if hasattr(config, 'num_moe_experts') and config.num_moe_experts is not None:
+        device = device_fn()
+        loss_scale = _get_moe_loss_scale(config, device)
+        # Set the loss scale
+        if config.calculate_per_token_loss:
+            MoEAuxLossAutoScaler.set_loss_scale(loss_scale)
+        else:
+            # See https://github.com/NVIDIA/Megatron-LM/pull/2217 for detailed explanation
+            # of scaling by cp_group_size
+            cp_size_for_scaling = cp_group_size if cp_group_size is not None else 1
+            MoEAuxLossAutoScaler.set_loss_scale(loss_scale * cp_size_for_scaling / num_microbatches)
+
+    # Set the loss scale for Multi-Token Prediction (MTP) loss.
+    if hasattr(config, 'mtp_num_layers') and config.mtp_num_layers is not None:
+        # Calculate the loss scale based on mtp_grad_scale_func if available,
+        # else fall back to grad_scale_func, else default to 1.
+        device = device_fn()
+        loss_scale = _get_mtp_loss_scale(config, device)
+        # Set the loss scale
+        if config.calculate_per_token_loss:
+            MTPLossAutoScaler.set_loss_scale(loss_scale)
+        else:
+            MTPLossAutoScaler.set_loss_scale(loss_scale / num_microbatches)
+
+    # Set the loss scale for any experimental attention-variant auxiliary loss.
+    experimental_attention_variant_loss_scale_func = (
+        _get_experimental_attention_variant_loss_scale_func(config)
+    )
+    if experimental_attention_variant_loss_scale_func is not None:
+        device = device_fn()
+        loss_scale = _compute_loss_scale(config, device)
+        if config.calculate_per_token_loss:
+            experimental_attention_variant_loss_scale_func(loss_scale)
+        else:
+            # TODO: This path assumes static CP across outstanding pipeline microbatches.
+            # Hybrid/dynamic CP currently requires per-token loss and no PP; if that
+            # changes, carry the scale per autograd context instead of via a
+            # process-wide scaler hook.
+            cp_size_for_scaling = cp_group_size if cp_group_size is not None else 1
+            experimental_attention_variant_loss_scale_func(
+                loss_scale * cp_size_for_scaling / num_microbatches
+            )
+
+
 def forward_step_calc_loss(
     model,
     output_tensor,
@@ -305,8 +371,6 @@ def forward_step_calc_loss(
     is_last_stage=None,
 ):
     """Calculate the loss and number of tokens for forward_step()"""
-
-    from megatron.core.transformer.multi_token_prediction import MTPLossAutoScaler
 
     model_vp_stage = getattr(model, "vp_stage", None)
     if vp_stage is not None and model_vp_stage is not None:
@@ -352,51 +416,12 @@ def forward_step_calc_loss(
     if config.timers is not None:
         config.timers('forward-compute').stop()
 
-    # Set the loss scale for the auxiliary loss of the MoE layer.
-    # Since we use a trick to do backward on the auxiliary loss, we need to set the scale
-    # explicitly.
-    if hasattr(config, 'num_moe_experts') and config.num_moe_experts is not None:
-        device = get_tensor_device(output_tensor)
-        loss_scale = _get_moe_loss_scale(config, device)
-        # Set the loss scale
-        if config.calculate_per_token_loss:
-            MoEAuxLossAutoScaler.set_loss_scale(loss_scale)
-        else:
-            # See https://github.com/NVIDIA/Megatron-LM/pull/2217 for detailed explanation
-            # of scaling by cp_group_size
-            cp_size_for_scaling = cp_group_size if cp_group_size is not None else 1
-            MoEAuxLossAutoScaler.set_loss_scale(loss_scale * cp_size_for_scaling / num_microbatches)
-
-    # Set the loss scale for Multi-Token Prediction (MTP) loss.
-    if hasattr(config, 'mtp_num_layers') and config.mtp_num_layers is not None:
-        # Calculate the loss scale based on mtp_grad_scale_func if available,
-        # else fall back to grad_scale_func, else default to 1.
-        device = get_tensor_device(output_tensor)
-        loss_scale = _get_mtp_loss_scale(config, device)
-        # Set the loss scale
-        if config.calculate_per_token_loss:
-            MTPLossAutoScaler.set_loss_scale(loss_scale)
-        else:
-            MTPLossAutoScaler.set_loss_scale(loss_scale / num_microbatches)
-
-    # Set the loss scale for any experimental attention-variant auxiliary loss.
-    experimental_attention_variant_loss_scale_func = (
-        _get_experimental_attention_variant_loss_scale_func(config)
+    set_auxiliary_loss_scales(
+        config,
+        lambda: get_tensor_device(output_tensor),
+        num_microbatches=num_microbatches,
+        cp_group_size=cp_group_size,
     )
-    if experimental_attention_variant_loss_scale_func is not None:
-        device = get_tensor_device(output_tensor)
-        loss_scale = _compute_loss_scale(config, device)
-        if config.calculate_per_token_loss:
-            experimental_attention_variant_loss_scale_func(loss_scale)
-        else:
-            # TODO: This path assumes static CP across outstanding pipeline microbatches.
-            # Hybrid/dynamic CP currently requires per-token loss and no PP; if that
-            # changes, carry the scale per autograd context instead of via a
-            # process-wide scaler hook.
-            cp_size_for_scaling = cp_group_size if cp_group_size is not None else 1
-            experimental_attention_variant_loss_scale_func(
-                loss_scale * cp_size_for_scaling / num_microbatches
-            )
 
     return output_tensor, num_tokens
 

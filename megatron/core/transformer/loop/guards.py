@@ -21,6 +21,9 @@ Where each group runs:
 * ``validate_loop_decoder``: ``HybridModel.__init__``, after the decoder is built.
 * ``validate_hybrid_loop_inputs``: the start of the loop stack's layer loop, every forward.
 * ``validate_loop_ddp_config``: ``DistributedDataParallel.__init__``.
+* ``validate_rsbf_config`` (``"Loop RSBF does not support: ..."``):
+  ``TransformerConfig.__post_init__`` with ``loop_schedule='rsbf'``, and the RSBF schedule.
+* ``validate_rsbf_data_parallel``: the RSBF executor, every step, on the model it runs.
 
 The role-field checks themselves (both set or neither, nonnegative, non-empty core) and the
 quantized-loop weight-cache rule are in ``TransformerConfig.__post_init__``.
@@ -384,3 +387,118 @@ def validate_loop_ddp_config(
         OVERLAP_PARAM_GATHER: ddp_config.overlap_param_gather,
     }
     _raise_if_any([name for name, value in unsupported.items() if value])
+
+
+# RSBF rule names (``validate_rsbf_config``), as they appear in the error message.
+RSBF_WITHOUT_HYBRID_ROLES = "RSBF without hybrid loop roles"
+RSBF_MOR = "MoR under the RSBF schedule"
+RSBF_SUM_LOSS = "calculate_per_token_loss=False"
+RSBF_TRUNCATED_BPTT = "truncated BPTT under RSBF"
+RSBF_SAMPLE_DEPTH = "loop_sample_depth under RSBF"
+RSBF_LOOP_RECOMPUTE = "loop_recompute under RSBF"
+RSBF_TP_EP = "tensor / expert parallelism under one-EU RSBF"
+RSBF_STATIC_BUDGET_MOE = "static-budget MoE under RSBF"
+RSBF_FREEZE_FOR_MTP = "freeze_base_model_for_mtp under RSBF"
+RSBF_QUANTILE_BALANCING = "quantile-balancing router under RSBF"
+RSBF_DEPTH_PROBS = "loop_depth_probs mismatch"
+RSBF_MIN_ROUNDS = "loop_min_rounds out of range"
+RSBF_WAVES = "loop_rsbf_waves < 1"
+RSBF_GLOBAL_AUX_LOSS = "global aux loss under RSBF"
+RSBF_AUTOCAST = "autocast under RSBF"
+RSBF_SHARDED_DP = "sharded data parallelism (Megatron FSDP / torch FSDP2) under RSBF"
+
+
+def _load_balancing_types(config: Any) -> Sequence[str]:
+    types = getattr(config, "moe_router_load_balancing_type", None)
+    if types is None:
+        return ()
+    return (types,) if isinstance(types, str) else tuple(types)
+
+
+def _depth_probs_valid(probs: Optional[Sequence[float]], max_rounds: int) -> bool:
+    return (
+        probs is not None
+        and len(probs) == max_rounds
+        and all(p >= 0 for p in probs)
+        and abs(sum(probs) - 1.0) <= 1e-6
+    )
+
+
+def validate_rsbf_config(config: "TransformerConfig") -> None:
+    """Reject configs the one-EU RSBF executor (``loop_schedule='rsbf'``) cannot run.
+
+    Called by ``TransformerConfig.__post_init__`` when ``loop_schedule == 'rsbf'`` and again by
+    the RSBF schedule. Collects every violation and raises one ``ValueError``
+    (``"Loop RSBF does not support: <name>, <name>"``). The eager hybrid-loop guards
+    (``validate_hybrid_loop_config``, the DDP guards) still apply.
+    """
+    moe = getattr(config, "num_moe_experts", None) is not None
+    balancing = _load_balancing_types(config)
+    sampled = config.loop_exit_criterion == "sampled"
+    unsupported = {
+        # The executor drives LoopHybridStack cells: a hybrid Huginn loop with role fields.
+        RSBF_WITHOUT_HYBRID_ROLES: not is_hybrid_loop_config(config),
+        # MoR (token-level exit) stays on the eager path.
+        RSBF_MOR: config.loop_architecture == "mor",
+        # Per-sample backward seeds are loss sums; finalize divides by the token count.
+        RSBF_SUM_LOSS: not config.calculate_per_token_loss,
+        RSBF_TRUNCATED_BPTT: config.loop_bptt_iterations > 0,
+        RSBF_SAMPLE_DEPTH: config.loop_sample_depth,
+        # RSBF always checkpoints round inputs; a set flag would be silently ignored.
+        RSBF_LOOP_RECOMPUTE: config.loop_recompute,
+        # Ranks run different item sequences: no collective inside a step may span more than
+        # one rank (with TP = 1, ETP > 1 builds expert-TP groups across DP ranks).
+        RSBF_TP_EP: config.tensor_model_parallel_size > 1
+        or config.expert_model_parallel_size > 1
+        or (config.expert_tensor_parallel_size or 1) > 1,
+        RSBF_STATIC_BUDGET_MOE: getattr(config, "moe_expert_rank_capacity_factor", None)
+        is not None,
+        RSBF_FREEZE_FOR_MTP: config.freeze_base_model_for_mtp,
+        # Its histograms are not replay-gated.
+        RSBF_QUANTILE_BALANCING: moe and "quantile_balancing" in balancing,
+        RSBF_DEPTH_PROBS: (
+            not _depth_probs_valid(config.loop_depth_probs, config.loop_iterations)
+            if sampled
+            else config.loop_depth_probs is not None
+        ),
+        RSBF_MIN_ROUNDS: not 1 <= config.loop_min_rounds <= config.loop_iterations,
+        RSBF_WAVES: config.loop_rsbf_waves < 1,
+        # A tp_dp_cp all-reduce on every grad-mode router call (ranks with different depths
+        # would issue different counts) and a running average advanced by every forward.
+        RSBF_GLOBAL_AUX_LOSS: moe and "global_aux_loss" in balancing,
+        # forward_step's autocast region; the cells do not replicate it.
+        RSBF_AUTOCAST: config.enable_autocast,
+    }
+    violations = [name for name, value in unsupported.items() if value]
+    if violations:
+        raise ValueError("Loop RSBF does not support: " + ", ".join(violations))
+
+
+def validate_rsbf_data_parallel(model: Any) -> None:
+    """Reject a sharded data-parallel wrapper around a model run by the RSBF executor.
+
+    The executor's DP correctness rests on no collective spanning more than one rank inside a
+    step (ranks run different item counts). Megatron FSDP and torch FSDP2 all-gather
+    parameters and reduce-scatter gradients in per-module hooks, which fire on every cell call
+    and item, so ranks with different sampled depths would issue different numbers of
+    collectives. Megatron ``DistributedDataParallel`` (without ``use_megatron_fsdp``) and a bare
+    module pass. Walks the ``.module`` chain of the wrappers.
+    """
+    import torch
+
+    from megatron.core.distributed.data_parallel_base import _BaseDataParallel
+    from megatron.core.distributed.distributed_data_parallel import DistributedDataParallel
+
+    try:
+        from torch.distributed.fsdp import FSDPModule as fsdp_module
+    except ImportError:  # torch < 2.6 or no distributed build
+        fsdp_module = None
+    module = model
+    while isinstance(module, torch.nn.Module):
+        sharded = isinstance(module, _BaseDataParallel) and (
+            not isinstance(module, DistributedDataParallel)
+            or getattr(getattr(module, "ddp_config", None), "use_megatron_fsdp", False)
+        )
+        if sharded or (fsdp_module is not None and isinstance(module, fsdp_module)):
+            raise ValueError("Loop RSBF does not support: " + RSBF_SHARDED_DP)
+        module = getattr(module, "module", None)

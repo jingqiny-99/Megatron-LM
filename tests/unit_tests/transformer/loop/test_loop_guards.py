@@ -722,3 +722,125 @@ def test_hybrid_model_checks_the_loop_pattern(model_parallel, rule, pattern, ove
             hybrid_layer_pattern=pattern,
         )
     assert _reported(excinfo) == [rule]
+
+
+# ---------------------------------------------------------------------------------------------
+# RSBF rules (validate_rsbf_config, loop_schedule='rsbf')
+# ---------------------------------------------------------------------------------------------
+
+_RSBF_PREFIX = "Loop RSBF does not support: "
+_RSBF = dict(loop_schedule="rsbf", calculate_per_token_loss=True)
+
+
+def _rsbf_reported(excinfo):
+    message = str(excinfo.value)
+    assert message.startswith(_RSBF_PREFIX), message
+    return message[len(_RSBF_PREFIX) :].split(", ")
+
+
+_RSBF_RULES = [
+    (guards.RSBF_WITHOUT_HYBRID_ROLES, dict(loop_architecture="none")),
+    (guards.RSBF_WITHOUT_HYBRID_ROLES, dict(loop_prelude_sublayers=None, loop_coda_sublayers=None)),
+    (guards.RSBF_MOR, dict(loop_architecture="mor")),
+    (guards.RSBF_SUM_LOSS, dict(calculate_per_token_loss=False)),
+    (guards.RSBF_TRUNCATED_BPTT, dict(loop_bptt_iterations=1)),
+    (guards.RSBF_SAMPLE_DEPTH, dict(loop_sample_depth=True)),
+    (guards.RSBF_LOOP_RECOMPUTE, dict(loop_recompute=True)),
+    (guards.RSBF_TP_EP, dict(tensor_model_parallel_size=2, expert_tensor_parallel_size=2)),
+    (guards.RSBF_TP_EP, dict(expert_model_parallel_size=2)),
+    (guards.RSBF_TP_EP, dict(expert_tensor_parallel_size=2)),
+    (guards.RSBF_STATIC_BUDGET_MOE, dict(moe_expert_rank_capacity_factor=1.0)),
+    (guards.RSBF_FREEZE_FOR_MTP, dict(freeze_base_model_for_mtp=True)),
+    (guards.RSBF_QUANTILE_BALANCING, dict(moe_router_load_balancing_type="quantile_balancing")),
+    (
+        guards.RSBF_QUANTILE_BALANCING,
+        dict(moe_router_load_balancing_type=["aux_loss", "quantile_balancing"]),
+    ),
+    (guards.RSBF_DEPTH_PROBS, dict(loop_exit_criterion="sampled")),
+    (guards.RSBF_DEPTH_PROBS, dict(loop_exit_criterion="sampled", loop_depth_probs=[0.5, 0.5])),
+    (
+        guards.RSBF_DEPTH_PROBS,
+        dict(loop_exit_criterion="sampled", loop_depth_probs=[0.5, 0.5, 0.5, -0.5]),
+    ),
+    (guards.RSBF_DEPTH_PROBS, dict(loop_depth_probs=[0.25, 0.25, 0.25, 0.25])),
+    (guards.RSBF_MIN_ROUNDS, dict(loop_min_rounds=0)),
+    (guards.RSBF_MIN_ROUNDS, dict(loop_min_rounds=5)),
+    (guards.RSBF_WAVES, dict(loop_rsbf_waves=0)),
+    (guards.RSBF_GLOBAL_AUX_LOSS, dict(moe_router_load_balancing_type="global_aux_loss")),
+    (
+        guards.RSBF_GLOBAL_AUX_LOSS,
+        dict(
+            moe_router_load_balancing_type=["aux_loss", "global_aux_loss"],
+            moe_aux_loss_coeff=[1e-3, 1e-3],
+        ),
+    ),
+    (guards.RSBF_AUTOCAST, dict(enable_autocast=True)),
+]
+
+
+@pytest.mark.parametrize(
+    "rule,fields", _RSBF_RULES, ids=[f"{rule}-{'-'.join(fields)}" for rule, fields in _RSBF_RULES]
+)
+def test_rsbf_rule_is_reported_alone(rule, fields):
+    """Each rule on a copy of a passing RSBF config (dense, or DSv4-like for the MoE rules)
+    that differs in that rule's fields only."""
+    moe = any(name.startswith("moe_") for name in fields)
+    base = _dsv4_config(**_RSBF) if moe else _dense_config(**_RSBF)
+    config = _violating(base, **fields)
+    with pytest.raises(ValueError) as excinfo:
+        guards.validate_rsbf_config(config)
+    assert _rsbf_reported(excinfo) == [rule]
+
+
+def test_rsbf_configs_pass_and_rules_collect():
+    guards.validate_rsbf_config(_dense_config(**_RSBF))
+    guards.validate_rsbf_config(_dsv4_config(**_RSBF))
+    guards.validate_rsbf_config(
+        _dense_config(
+            **_RSBF,
+            loop_exit_criterion="sampled",
+            loop_depth_probs=[0.25, 0.25, 0.25, 0.25],
+            loop_min_rounds=2,
+            loop_rsbf_waves=2,
+            loop_rsbf_fill="sample_order",
+        )
+    )
+    # Quantile balancing and global aux loss on a dense model: no router, nothing rejected.
+    guards.validate_rsbf_config(
+        _violating(_dense_config(**_RSBF), moe_router_load_balancing_type="global_aux_loss")
+    )
+    config = _violating(_dense_config(**_RSBF), calculate_per_token_loss=False, loop_recompute=True)
+    with pytest.raises(ValueError) as excinfo:
+        guards.validate_rsbf_config(config)
+    assert _rsbf_reported(excinfo) == [guards.RSBF_SUM_LOSS, guards.RSBF_LOOP_RECOMPUTE]
+
+
+def test_rsbf_config_is_validated_at_construction():
+    with pytest.raises(ValueError) as excinfo:
+        _dense_config(loop_schedule="rsbf")
+    assert _rsbf_reported(excinfo) == [guards.RSBF_SUM_LOSS]
+    with pytest.raises(ValueError) as excinfo:
+        TransformerConfig(
+            num_layers=2,
+            hidden_size=64,
+            num_attention_heads=4,
+            loop_schedule="rsbf",
+            calculate_per_token_loss=True,
+        )
+    assert _rsbf_reported(excinfo) == [guards.RSBF_WITHOUT_HYBRID_ROLES]
+
+
+@pytest.mark.parametrize(
+    "fields",
+    [
+        dict(loop_exit_criterion="sampled", loop_depth_probs=[0.25, 0.25, 0.25, 0.25]),
+        dict(loop_depth_probs=[0.25, 0.25, 0.25, 0.25]),
+        dict(loop_min_rounds=2),
+        dict(loop_rsbf_waves=2),
+        dict(loop_rsbf_fill="sample_order"),
+    ],
+)
+def test_rsbf_fields_require_the_rsbf_schedule(fields):
+    with pytest.raises(ValueError, match="require loop_schedule='rsbf'") as excinfo:
+        _dense_config(**fields)
+    assert set(str(excinfo.value).split(" require")[0].split(", ")) == set(fields)

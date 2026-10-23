@@ -16,7 +16,6 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from megatron.core.models.backends import LocalSpecProvider
 from megatron.core.models.hybrid.hybrid_block import HybridStack
 from megatron.core.models.hybrid.hybrid_layer_allocation import validate_segment_layers
 from megatron.core.models.hybrid.hybrid_model import HybridModel
@@ -31,18 +30,13 @@ from megatron.core.transformer.loop.hybrid_specs import (
 )
 from megatron.core.transformer.loop.hybrid_stack import LoopHybridStack, LoopStreamRMSNorm
 from megatron.core.transformer.loop_transformer_block import LoopRMSNorm
-from megatron.core.transformer.multi_token_prediction import (
-    MultiTokenPredictionBlock,
-    MultiTokenPredictionBlockSubmodules,
-    get_mtp_layer_spec_for_backend,
-)
-from megatron.core.transformer.spec_utils import ModuleSpec
 from tests.unit_tests.transformer.loop import hybrid_loop_utils
 from tests.unit_tests.transformer.loop.hybrid_loop_utils import (
     BATCH,
     CUDA,
     HIDDEN,
     SEQ,
+    build_local_loop_model,
     build_local_loop_stack,
     device,
     hybrid_loop_config,
@@ -51,8 +45,9 @@ from tests.unit_tests.transformer.loop.hybrid_loop_utils import (
     rope,
 )
 
-# The CPU mHC fixture, made visible to pytest in this module.
+# The CPU mHC and MTP fixtures, made visible to pytest in this module.
 mhc_on_this_device = hybrid_loop_utils.mhc_on_this_device
+cpu_mtp = hybrid_loop_utils.cpu_mtp
 
 DENSE = "*-*-*-*-"  # prelude '*-', core '*-*-', coda '*-'
 MHC = dict(enable_mhc_connections=True, mhc_num_residual_streams=4, mhc_sinkhorn_iterations=5)
@@ -711,56 +706,13 @@ def test_pretrain_hybrid_loss_func_adds_loop_losses(monkeypatch):
 # ---------------------------------------------------------------------------
 
 
-@pytest.fixture
-def cpu_mtp(monkeypatch):
-    """Without TE the MTP layer's inference-linear isinstance check raises and the MTP loss
-    logger allocates on CUDA (environment limitations, not the code under test)."""
-    if not CUDA:
-        from megatron.core.transformer import multi_token_prediction as mtp_module
-
-        monkeypatch.setattr(mtp_module, "is_inference_column_parallel_linear", lambda module: False)
-        monkeypatch.setattr(
-            mtp_module.MTPLossLoggingHelper,
-            "save_loss_to_tracker",
-            staticmethod(lambda *args, **kwargs: None),
-        )
-
-
-def _local_model_spec(module):
-    mtp_layer = get_mtp_layer_spec_for_backend(None, LocalSpecProvider(), rms_norm=True)
-    submodules = local_hybrid_submodules()
-    submodules.mtp_block_spec = ModuleSpec(
-        module=MultiTokenPredictionBlock,
-        submodules=MultiTokenPredictionBlockSubmodules(layer_specs=[mtp_layer]),
-    )
-    # No TE final norm on CPU.
-    return ModuleSpec(module=module, params={"post_layer_norm": False}, submodules=submodules)
-
-
-def _local_model(pattern, module, **overrides):
-    main, *mtp = pattern.split("/")
-    if mtp:
-        overrides.update(mtp_num_layers=len(mtp), mtp_loss_scaling_factor=0.1)
-    config = hybrid_loop_config(main, 2, 2, **overrides)
-    torch.manual_seed(1234)
-    model = HybridModel(
-        config=config,
-        hybrid_stack_spec=_local_model_spec(module),
-        vocab_size=128,
-        max_sequence_length=SEQ,
-        hybrid_layer_pattern=pattern,
-        position_embedding_type="none",
-    )
-    return model.to(device())
-
-
 def test_hybrid_model_requires_the_loop_stack():
     with pytest.raises(ValueError, match=guards.NON_LOOP_DECODER):
-        _local_model(DENSE, HybridStack)
+        build_local_loop_model(DENSE, HybridStack)
 
 
 def test_hybrid_model_trains_a_loop_with_mtp(cpu_mtp):
-    model = _local_model(DENSE + "/*-", LoopHybridStack)
+    model = build_local_loop_model(DENSE + "/*-", LoopHybridStack)
     assert type(model.decoder) is LoopHybridStack
     assert type(model.mtp.layers[0].mtp_model_layer) is HybridStack
     assert model.decoder._loop_head == (128, ("*", "-"), 1)

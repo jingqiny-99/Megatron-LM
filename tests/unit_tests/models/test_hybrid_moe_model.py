@@ -451,6 +451,13 @@ GOLDEN_CONFIG: Dict[str, Any] = {
     "loop_router_z_loss_coeff": 0.001,
     "loop_prelude_sublayers": None,
     "loop_coda_sublayers": None,
+    "loop_schedule": "standard",
+    "loop_rsbf_waves": 1,
+    "loop_rsbf_fill": "drain",
+    "loop_exit_criterion": "fixed",
+    "loop_depth_probs": None,
+    "loop_min_rounds": 1,
+    "loop_depth_seed": 0,
 }
 # Fields to ignore entirely (ephemeral, environment-specific, very large).
 SKIP_FIELDS = set()

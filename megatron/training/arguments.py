@@ -462,6 +462,34 @@ def _normalize_dynamic_context_parallel_args(args):
         args.hybrid_context_parallel = False
 
 
+def _validate_loop_rsbf_waves(args):
+    """``--loop-rsbf-waves`` must divide the microbatches per step of every step: checked here
+    rather than at the first step; a batch-size schedule (whose microbatch count changes during
+    the run) is rejected with more than one wave."""
+    waves = getattr(args, 'loop_rsbf_waves', 1)
+    if getattr(args, 'loop_schedule', 'standard') != 'rsbf' or waves == 1:
+        return
+    if getattr(args, 'step_batch_size_schedule', None) is not None or getattr(
+        args, 'decrease_batch_size_if_needed', False
+    ):
+        raise ValueError(
+            '--loop-rsbf-waves > 1 does not support --step-batch-size-schedule or '
+            '--decrease-batch-size-if-needed (the microbatch count must stay divisible)'
+        )
+    # The same divisor as the microbatch calculator (data_parallel_size excludes the
+    # GTP-remat axis).
+    per_step = (
+        args.micro_batch_size * args.data_parallel_size * getattr(args, 'gtp_weight_remat_size', 1)
+    )
+    num_microbatches = args.global_batch_size // per_step
+    if num_microbatches % waves:
+        raise ValueError(
+            f'--loop-rsbf-waves ({waves}) must divide the microbatches per step '
+            f'({num_microbatches} = global_batch_size {args.global_batch_size} // '
+            f'(micro_batch_size x data_parallel_size x gtp_weight_remat_size = {per_step}))'
+        )
+
+
 def validate_args(args, defaults={}):
     _normalize_dynamic_context_parallel_args(args)
     # Preserve dev's padded hash-table checkpoint shape when its legacy flag is used.
@@ -728,6 +756,7 @@ def validate_args(args, defaults={}):
         f"eval_micro_batch_size ({args.eval_micro_batch_size}) * data_parallel_size ({args.data_parallel_size})"
         f" * gtp_weight_remat_size ({args.gtp_weight_remat_size})"
     )
+    _validate_loop_rsbf_waves(args)
 
     # === Hybrid layer pattern: deprecation handling and validation ===
 

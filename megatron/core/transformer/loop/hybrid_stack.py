@@ -348,33 +348,62 @@ class LoopHybridStack(HybridStack):
         Called outside activation checkpoints (a replay must not record again), so backward
         and recompute are attributed when the pass is issued, as on the GPT loop.
         """
+        work = self.range_forward_flops(
+            start,
+            end,
+            tokens,
+            squared_lengths,
+            sequence,
+            arbitrary_mask=arbitrary_mask,
+            extra=extra,
+        )
+        self._add_work(work, backward=backward, recompute=recompute)
+
+    def _record_head(self, tokens, squared_lengths, sequence):
+        """Record the output layer and the MTP depths (set by ``set_loop_head_flops``)."""
+        for work, backward_factor in self.head_work_terms(tokens, squared_lengths, sequence):
+            self._add_work(work, backward_factor=backward_factor)
+
+    def range_forward_flops(
+        self, start, end, tokens, squared_lengths, sequence, *, arbitrary_mask=False, extra=0
+    ):
+        """Forward FLOPs of one pass over sublayers ``[start, end)`` (the per-symbol table),
+        accumulated onto ``extra`` (e.g. the round's adapter work) in sublayer order."""
         work = extra
         for index in range(start, end):
             work = work + self._layer_forward_flops(
                 index, tokens, squared_lengths, sequence, arbitrary_mask
             )
-        self._add_work(work, backward=backward, recompute=recompute)
+        return work
 
-    def _record_head(self, tokens, squared_lengths, sequence):
-        """Record the output layer and the MTP depths (set by ``set_loop_head_flops``)."""
+    def round_extra_forward_flops(self, tokens):
+        """Forward FLOPs of one Huginn round outside the core sublayers: the adapter on every
+        mHC stream."""
+        return flops.huginn_adapter_forward_flops(
+            tokens, self.config.hidden_size, self.loop_num_streams
+        )
+
+    def head_work_terms(self, tokens, squared_lengths, sequence):
+        """``(forward work, backward factor)`` of the output layer and the MTP depths, in the
+        order the FLOP sums add them: the logits, the MTP depth sublayers, the MTP logits
+        (backward factor 1 under ``mtp_detach_heads``: no wgrad, the training FLOP
+        convention). Empty when ``set_loop_head_flops`` was not called."""
         if self._loop_head is None:
-            return
+            return []
         vocab_size, mtp_symbols, mtp_depths = self._loop_head
         hidden = self.config.hidden_size
         logits = flops.logits_forward_flops(tokens, hidden, vocab_size)
-        self._add_work(logits)
+        terms = [(logits, 2)]
         if not mtp_depths:
-            return
+            return terms
         depth_work = flops.mtp_depth_extra_forward_flops(tokens, hidden)
         for symbol in mtp_symbols:
             depth_work = depth_work + flops.sublayer_forward_flops(
                 symbol, self.config, tokens, squared_lengths, sequence
             )
-        self._add_work(mtp_depths * depth_work)
-        # mtp_detach_heads removes the MTP logits' wgrad (the training FLOP convention).
-        self._add_work(
-            mtp_depths * logits, backward_factor=1 if self.config.mtp_detach_heads else 2
-        )
+        terms.append((mtp_depths * depth_work, 2))
+        terms.append((mtp_depths * logits, 1 if self.config.mtp_detach_heads else 2))
+        return terms
 
     def _depth(self, device):
         if not self.config.loop_sample_depth or not self.training:
@@ -441,9 +470,7 @@ class LoopHybridStack(HybridStack):
                 sequence,
                 backward=step >= first_grad,
                 recompute=self.config.loop_recompute,
-                extra=flops.huginn_adapter_forward_flops(
-                    tokens, self.config.hidden_size, self.loop_num_streams
-                ),
+                extra=self.round_extra_forward_flops(tokens),
             )
             alive = None
             round_ctx = ctx

@@ -15,6 +15,7 @@ from megatron.core.tensor_observation import is_observing_tensor, observe_tensor
 from megatron.core.transformer.custom_layers.batch_invariant_kernels import (
     is_batch_invariant_mode_enabled,
 )
+from megatron.core.transformer.forward_replay import in_forward_replay
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.moe.fused_a2a import HAVE_HYBRIDEP_DENSE_ROUTING
 from megatron.core.transformer.moe.moe_logging import get_moe_metrics_tracker
@@ -1255,8 +1256,10 @@ class TopKRouter(Router):
                     with_padding_mask=padding_mask is not None,
                 )
 
-        # Optionally apply expert bias
-        self._apply_expert_bias(routing_map, padding_mask=padding_mask)
+        # Optionally apply expert bias. An activation-recompute replay runs with grad enabled
+        # too, so the counts are gated on the replay marker (counted once per forward).
+        if not in_forward_replay():
+            self._apply_expert_bias(routing_map, padding_mask=padding_mask)
 
         return probs, routing_map
 

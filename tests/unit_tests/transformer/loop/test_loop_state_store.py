@@ -1,0 +1,541 @@
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+
+"""Tests for the RSBF round-input checkpoint store (``loop/state_store.py``).
+
+Pure tensor bookkeeping: no model and no process group. Every case runs on CPU and, when a GPU
+is present, on CUDA.
+"""
+
+import weakref
+
+import pytest
+import torch
+
+from megatron.core.transformer.loop.state_store import (
+    HBMOnlyPlacement,
+    LoopStateStore,
+    StateStoreError,
+    StateTier,
+    StoreKey,
+)
+
+DEVICES = ["cpu"] + (["cuda"] if torch.cuda.is_available() else [])
+
+S, C, NH, K = 8, 1, 16, 2
+
+
+@pytest.fixture(params=DEVICES)
+def dev(request):
+    return torch.device(request.param)
+
+
+def _state(dev, value=1.0, dtype=torch.float32, rows=C):
+    return torch.full((S, rows, NH), value, dtype=dtype, device=dev)
+
+
+def _crit(dev, k=K, rows=C):
+    return torch.arange(rows * k, dtype=torch.float32, device=dev).reshape(rows, k)
+
+
+def _store(dev, **kwargs):
+    store = LoopStateStore(device=dev, **kwargs)
+    store.begin_wave(0)
+    return store
+
+
+def _nbytes(t):
+    return t.untyped_storage().nbytes()
+
+
+def test_put_get_free_round_trip(dev):
+    store = _store(dev)
+    e, s1, c0 = _state(dev, 0.5), _state(dev, 1.5), _crit(dev)
+    store.put_injection(0, e)
+    store.put_crit(0, 0, c0)
+    store.put_state(0, 1, s1)
+    assert store.get_state(0, 0) is None  # s_0 is built by the core cell
+    assert torch.equal(store.get_injection(0), e)
+    assert torch.equal(store.get_crit(0, 0), c0)
+    assert torch.equal(store.get_state(0, 1), s1)
+    # Reads do not release.
+    assert torch.equal(store.get_state(0, 1), s1)
+    stats = store.stats()
+    assert stats.live_entries == 3
+    assert stats.live_bytes == _nbytes(e) + _nbytes(s1) + _nbytes(c0)
+    assert stats.wave == 0
+    store.free_state(0, 1)
+    store.free_crit(0, 0)
+    store.free_injection(0)
+    final = store.end_wave()
+    assert final.live_entries == 0 and final.live_bytes == 0
+    assert final.peak_bytes == _nbytes(e) + _nbytes(s1) + _nbytes(c0)
+    assert store.wave is None
+
+
+def test_keys_are_per_sample_and_round(dev):
+    store = _store(dev)
+    for sample in range(3):
+        store.put_injection(sample, _state(dev, 10.0 + sample))
+        for r in range(1, 4):
+            store.put_state(sample, r, _state(dev, 100.0 * sample + r))
+    for sample in range(3):
+        assert store.get_injection(sample)[0, 0, 0].item() == 10.0 + sample
+        for r in range(1, 4):
+            assert store.get_state(sample, r)[0, 0, 0].item() == 100.0 * sample + r
+    store.reset()
+
+
+def test_duplicate_put_raises_with_key(dev):
+    store = _store(dev)
+    store.put_state(2, 3, _state(dev))
+    with pytest.raises(StateStoreError, match=r"s\[sample 2, round 3\]: already stored"):
+        store.put_state(2, 3, _state(dev))
+    store.put_injection(2, _state(dev))
+    with pytest.raises(StateStoreError, match=r"e\[sample 2\]: already stored"):
+        store.put_injection(2, _state(dev))
+
+
+def test_write_once_per_wave_even_after_free(dev):
+    store = _store(dev)
+    store.put_state(0, 1, _state(dev))
+    store.free_state(0, 1)
+    with pytest.raises(StateStoreError, match=r"already freed this wave"):
+        store.put_state(0, 1, _state(dev))
+    store.end_wave()
+    # A new wave starts clean.
+    store.begin_wave(1)
+    store.put_state(0, 1, _state(dev))
+    store.free_state(0, 1)
+    store.end_wave()
+
+
+def test_double_free_and_use_after_free(dev):
+    store = _store(dev)
+    store.put_state(1, 2, _state(dev))
+    store.put_crit(1, 2, _crit(dev))
+    store.put_injection(1, _state(dev))
+    store.free_state(1, 2)
+    store.free_crit(1, 2)
+    store.free_injection(1)
+    with pytest.raises(StateStoreError, match=r"sample 1, round 2\]: cannot free, already freed"):
+        store.free_state(1, 2)
+    with pytest.raises(StateStoreError, match=r"crit\[sample 1, round 2\]: cannot free"):
+        store.free_crit(1, 2)
+    with pytest.raises(StateStoreError, match=r"e\[sample 1\]: cannot free, already freed"):
+        store.free_injection(1)
+    with pytest.raises(StateStoreError, match=r"use after free"):
+        store.get_state(1, 2)
+    with pytest.raises(StateStoreError, match=r"use after free"):
+        store.get_crit(1, 2)
+    with pytest.raises(StateStoreError, match=r"use after free"):
+        store.get_injection(1)
+    with pytest.raises(StateStoreError, match=r"cannot take, already freed"):
+        store.take_state(1, 2)
+
+
+def test_missing_entries(dev):
+    store = _store(dev)
+    with pytest.raises(StateStoreError, match=r"s\[sample 0, round 1\]: never stored"):
+        store.get_state(0, 1)
+    with pytest.raises(StateStoreError, match=r"crit\[sample 0, round 0\]: never stored"):
+        store.get_crit(0, 0)
+    with pytest.raises(StateStoreError, match=r"never stored"):
+        store.free_state(0, 1)
+    with pytest.raises(StateStoreError, match=r"never stored"):
+        store.take_state(0, 1)
+    with pytest.raises(StateStoreError, match=r"never stored"):
+        store.get_injection(5)
+
+
+def test_round_ranges(dev):
+    store = _store(dev)
+    with pytest.raises(StateStoreError, match=r"state round must be >= 1"):
+        store.put_state(0, 0, _state(dev))
+    with pytest.raises(StateStoreError, match=r"state round must be >= 0"):
+        store.get_state(0, -1)
+    with pytest.raises(StateStoreError, match=r"state round must be >= 1"):
+        store.free_state(0, 0)
+    with pytest.raises(StateStoreError, match=r"state round must be >= 1"):
+        store.take_state(0, 0)
+    with pytest.raises(StateStoreError, match=r"crit round must be >= 0"):
+        store.put_crit(0, -1, _crit(dev))
+    store.put_crit(0, 0, _crit(dev))  # crit_0 is stored
+    store.free_crit(0, 0)
+
+
+def test_take_state_removes_and_never_poisons(dev):
+    store = _store(dev, poison_on_free=True)
+    s = _state(dev, 3.0)
+    store.put_state(0, 1, s)
+    taken = store.take_state(0, 1)
+    assert torch.equal(taken, s)  # not poisoned
+    assert taken.untyped_storage().data_ptr() == s.untyped_storage().data_ptr()
+    assert store.stats().live_entries == 0 and store.stats().live_bytes == 0
+    with pytest.raises(StateStoreError, match=r"already taken \(ownership moved"):
+        store.get_state(0, 1)
+    with pytest.raises(StateStoreError, match=r"cannot take, already taken"):
+        store.take_state(0, 1)
+    with pytest.raises(StateStoreError, match=r"cannot free, already taken"):
+        store.free_state(0, 1)
+    with pytest.raises(StateStoreError, match=r"already taken this wave"):
+        store.put_state(0, 1, s)
+    store.end_wave()
+    assert torch.equal(taken, s)
+
+
+def test_check_recompute_style_wave_ends_empty(dev):
+    """The executor's check_recompute path (design 7.4) for two samples of depths 2 and 1:
+    the consumer of s_r takes it into the chain record, CORE(i, r) compares and drops it."""
+    store = _store(dev, poison_on_free=True)
+    depths = {0: 2, 1: 1}
+    sweep = {}
+    for i, d in depths.items():  # prelude sweep, core sweeps
+        store.put_injection(i, _state(dev, 0.25 + i))
+        store.put_crit(i, 0, _crit(dev, k=0))
+        for r in range(1, d + 1):
+            sweep[(i, r)] = _state(dev, 10.0 * i + r)
+            store.put_state(i, r, sweep[(i, r)].clone())
+            store.put_crit(i, r, _crit(dev, k=0))
+    for i, d in depths.items():
+        # CODA: takes s_d into the chain record, frees crit_d.
+        expected = store.take_state(i, d)
+        store.free_crit(i, d)
+        for r in range(d, 0, -1):
+            # CORE(i, r): recompute s_r from s_{r-1}; compare with the record, drop it.
+            assert torch.equal(sweep[(i, r)], expected)
+            # Take + compare + drop leaves no reference: the store kept none.
+            dropped = weakref.ref(expected)
+            del expected
+            assert dropped() is None
+            expected = store.take_state(i, r - 1) if r > 1 else None
+            store.get_injection(i)
+            store.get_crit(i, r - 1)
+            store.free_crit(i, r - 1)
+        assert expected is None
+        store.get_injection(i)  # PRELUDE item: compares e, then frees it
+        store.free_injection(i)
+    stats = store.end_wave()
+    assert stats.live_entries == 0 and stats.live_bytes == 0
+    with pytest.raises(StateStoreError, match=r"never stored"):
+        store.get_state(0, 2)  # end_wave forgot everything; the next wave starts clean
+
+
+def test_end_wave_with_live_entries(dev):
+    store = _store(dev)
+    store.put_injection(3, _state(dev))
+    store.put_state(3, 1, _state(dev))
+    with pytest.raises(StateStoreError, match=r"wave 0 ends with 2 live entries: .*sample 3"):
+        store.end_wave()
+    # The wave stays open; releasing the entries lets it end.
+    store.free_state(3, 1)
+    store.free_injection(3)
+    store.end_wave()
+
+
+def test_wave_protocol(dev):
+    store = LoopStateStore(device=dev)
+    with pytest.raises(StateStoreError, match=r"put outside a wave"):
+        store.put_state(0, 1, _state(dev))
+    with pytest.raises(StateStoreError, match=r"end_wave without an open wave"):
+        store.end_wave()
+    store.begin_wave(0)
+    with pytest.raises(StateStoreError, match=r"wave 1 begins while wave 0 is open"):
+        store.begin_wave(1)
+    store.put_state(0, 1, _state(dev))
+    store.reset()  # error recovery: drops the entry, closes the wave
+    assert store.wave is None and store.stats().live_entries == 0
+    assert store.stats().live_bytes == 0
+    store.begin_wave(1)
+    store.end_wave()
+
+
+def test_crit_with_zero_width(dev):
+    """k = 0: the entry holds no bytes but keeps its lifetime checks."""
+    store = _store(dev)
+    store.put_injection(0, _state(dev))
+    before = store.stats().live_bytes
+    crit = _crit(dev, k=0)
+    store.put_crit(0, 0, crit)
+    assert store.stats().live_bytes == before
+    assert store.stats().live_entries == 2
+    got = store.get_crit(0, 0)
+    assert got.shape == (C, 0) and got.dtype == torch.float32
+    store.free_crit(0, 0)
+    with pytest.raises(StateStoreError, match=r"cannot free, already freed"):
+        store.free_crit(0, 0)
+    store.free_injection(0)
+    store.end_wave()
+
+
+def test_poison_on_free(dev):
+    store = _store(dev, poison_on_free=True)
+    s, crit = _state(dev, 2.0), _crit(dev)
+    alias_s, alias_c = s.view(-1), crit.view(-1)  # a stale alias held past the free
+    store.put_state(0, 1, s)
+    store.put_crit(0, 1, crit)
+    store.free_state(0, 1)
+    store.free_crit(0, 1)
+    assert torch.isnan(alias_s).all() and torch.isnan(alias_c).all()
+    store.end_wave()
+
+    # Without poison_on_free the freed tensor is untouched.
+    store = _store(dev)
+    s = _state(dev, 2.0)
+    store.put_state(0, 1, s)
+    store.free_state(0, 1)
+    assert torch.equal(s, _state(dev, 2.0))
+    store.end_wave()
+
+
+def test_poison_spares_storage_of_live_entries(dev):
+    """A criterion may pass crit_{r-1} through unchanged: crit_r then aliases crit_{r-1}. Freeing
+    crit_{r-1} must not poison the still-live crit_r; the bytes count once."""
+    store = _store(dev, poison_on_free=True)
+    crit = _crit(dev)
+    store.put_crit(0, 0, crit)
+    store.put_crit(0, 1, crit)
+    assert store.stats().live_bytes == _nbytes(crit)
+    store.free_crit(0, 0)
+    assert torch.equal(store.get_crit(0, 1), _crit(dev))
+    assert store.stats().live_bytes == _nbytes(crit)
+    store.free_crit(0, 1)  # the last reference: poisoned now
+    assert torch.isnan(crit).all()
+    assert store.stats().live_bytes == 0
+
+    # A storage taken by a caller is never poisoned through another entry.
+    s = _state(dev, 4.0)
+    store.put_state(0, 1, s)
+    store.put_state(0, 2, s)
+    taken = store.take_state(0, 2)
+    store.free_state(0, 1)
+    assert torch.equal(taken, _state(dev, 4.0))
+    store.end_wave()
+
+
+def test_detached_storage(dev):
+    store = _store(dev)
+    leaf = torch.ones(S, C, NH, device=dev, requires_grad=True)
+    state = leaf * 2.0  # non-leaf with a graph
+    store.put_state(0, 1, state)
+    stored = store.get_state(0, 1)
+    assert not stored.requires_grad and stored.grad_fn is None
+    assert stored.untyped_storage().data_ptr() == state.untyped_storage().data_ptr()
+    # The executor's fresh leaf from the stored value does not reach the sweep's graph.
+    fresh = stored.detach().requires_grad_()
+    fresh.sum().backward()
+    assert leaf.grad is None
+    store.free_state(0, 1)
+    store.end_wave()
+
+
+def test_dtype_shape_and_device_checks(dev):
+    store = _store(dev, act_dtype=torch.bfloat16)
+    with pytest.raises(
+        StateStoreError, match=r"s\[sample 0, round 1\]: dtype .*is not torch.bfloat16"
+    ):
+        store.put_state(0, 1, _state(dev, dtype=torch.float32))
+    with pytest.raises(StateStoreError, match=r"e\[sample 0\]: dtype"):
+        store.put_injection(0, _state(dev, dtype=torch.float16))
+    with pytest.raises(StateStoreError, match=r"crit\[sample 0, round 0\]: dtype .* not fp32"):
+        store.put_crit(0, 0, _crit(dev).to(torch.bfloat16))
+    with pytest.raises(StateStoreError, match=r"is not \[S, c, nH\]"):
+        store.put_state(0, 1, torch.zeros(S, NH, dtype=torch.bfloat16, device=dev))
+    with pytest.raises(StateStoreError, match=r"is not \[c, k\]"):
+        store.put_crit(0, 0, torch.zeros(K, dtype=torch.float32, device=dev))
+    store.put_injection(0, _state(dev, dtype=torch.bfloat16))
+    with pytest.raises(
+        StateStoreError, match=r"shape \(9, 1, 16\) is not \(8, 1, 16\) of e\[sample 0\]"
+    ):
+        store.put_state(0, 1, torch.zeros(S + 1, C, NH, dtype=torch.bfloat16, device=dev))
+    with pytest.raises(StateStoreError, match=r"2 rows, e\[sample 0\] has 1"):
+        store.put_crit(0, 0, _crit(dev, rows=2))
+    with pytest.raises(StateStoreError, match=r"expected a tensor"):
+        store.put_state(0, 1, [1.0])
+    # Rejected puts store nothing.
+    assert store.stats().live_entries == 1
+    store.put_state(0, 1, _state(dev, dtype=torch.bfloat16))
+    store.put_crit(0, 0, _crit(dev))
+    store.reset()
+
+    # Without act_dtype any floating dtype is accepted, integers are not.
+    store = _store(dev)
+    store.put_state(0, 1, _state(dev, dtype=torch.bfloat16))
+    with pytest.raises(StateStoreError, match=r"is not floating"):
+        store.put_state(0, 2, torch.zeros(S, C, NH, dtype=torch.int64, device=dev))
+    store.reset()
+
+    other = torch.device("meta")
+    store = _store(dev)
+    with pytest.raises(StateStoreError, match=r"device meta is not"):
+        store.put_state(0, 1, torch.zeros(S, C, NH, device=other))
+    store.reset()
+
+
+def test_hbm_placement_and_grace_interface(dev):
+    assert HBMOnlyPlacement().tier(0, 1, "state") is StateTier.HBM
+    store = _store(dev)
+    store.put_state(0, 1, _state(dev))
+    stats = store.stats()
+    assert stats.peak_bytes_by_tier[StateTier.HBM] == stats.peak_bytes > 0
+    assert stats.peak_bytes_by_tier[StateTier.GRACE] == 0
+    store.prefetch(0, 1)  # a no-op for an HBM entry
+    store.prefetch(0, 0)  # s_0 needs nothing
+    with pytest.raises(StateStoreError, match=r"never stored"):
+        store.prefetch(0, 2)
+    # Injections and crit states have tiers too.
+    store.put_injection(0, _state(dev))
+    store.put_crit(0, 0, _crit(dev))
+    store.prefetch(0, 0, kind="injection")
+    store.prefetch(0, 0, kind="crit")
+    with pytest.raises(StateStoreError, match=r"crit\[sample 0, round 1\]: never stored"):
+        store.prefetch(0, 1, kind="crit")
+    with pytest.raises(StateStoreError, match=r"e\[sample 1\]: never stored"):
+        store.prefetch(1, 0, kind="injection")
+    with pytest.raises(StateStoreError, match=r"unknown entry kind"):
+        store.prefetch(0, 0, kind="other")
+    store.reset()
+
+    class GracePlacement:
+        def tier(self, sample, r, kind):
+            return StateTier.GRACE if kind == "state" else StateTier.HBM
+
+    store = _store(dev, placement=GracePlacement())
+    store.put_injection(0, _state(dev))
+    with pytest.raises(NotImplementedError, match=r"interface only"):
+        store.put_state(0, 1, _state(dev))
+    assert store.stats().live_entries == 1
+    store.reset()
+
+
+def test_per_wave_peaks(dev):
+    store = LoopStateStore(device=dev)
+    unit = _nbytes(_state(dev))
+
+    # Wave 0: three states live at once.
+    store.begin_wave(0)
+    for r in range(1, 4):
+        store.put_state(0, r, _state(dev))
+    assert store.stats().peak_bytes == 3 * unit
+    for r in range(1, 4):
+        store.free_state(0, r)
+    assert store.stats().live_bytes == 0 and store.stats().peak_bytes == 3 * unit
+    wave0 = store.end_wave()
+
+    # Wave 1: at most two live at once; the peak is the wave's own.
+    store.begin_wave(1)
+    store.put_state(0, 1, _state(dev))
+    store.put_state(0, 2, _state(dev))
+    store.free_state(0, 1)
+    store.put_state(0, 3, _state(dev))
+    store.free_state(0, 2)
+    store.free_state(0, 3)
+    wave1 = store.end_wave()
+
+    assert (wave0.wave, wave0.peak_bytes) == (0, 3 * unit)
+    assert (wave1.wave, wave1.peak_bytes) == (1, 2 * unit)
+    assert wave1.peak_bytes_by_tier == {StateTier.HBM: 2 * unit, StateTier.GRACE: 0}
+
+
+def test_unindexed_device_accepts_indexed_tensors():
+    """Tensors report an indexed device (``cuda:0``); a store built with ``cpu:0`` or ``cuda``
+    must accept them."""
+    store = LoopStateStore(device=torch.device("cpu", 0))
+    assert store.device == torch.device("cpu")
+    store.begin_wave(0)
+    store.put_state(0, 1, _state("cpu"))
+    store.free_state(0, 1)
+    store.end_wave()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+def test_unindexed_cuda_device_accepts_current_device_tensor():
+    index = torch.cuda.current_device()
+    for device in ("cuda", torch.device("cuda")):
+        store = LoopStateStore(device=device)
+        assert store.device == torch.device("cuda", index)
+        store.begin_wave(0)
+        store.put_state(0, 1, _state(torch.device("cuda", index)))
+        store.put_crit(0, 1, _crit("cuda"))
+        store.free_state(0, 1)
+        store.free_crit(0, 1)
+        store.end_wave()
+
+
+def test_release_uses_storage_recorded_at_put(dev):
+    """A storage resized or reallocated after the put (an offload path) still releases its
+    bookkeeping; the changed storage is not poisoned."""
+    store = _store(dev, poison_on_free=True)
+    shrunk, moved = _state(dev), _state(dev)
+    store.put_state(0, 1, shrunk)
+    store.put_state(0, 2, moved)
+    assert store.stats().live_bytes == 2 * _nbytes(_state(dev))
+    shrunk.untyped_storage().resize_(0)
+    moved.untyped_storage().resize_(4096)
+    store.free_state(0, 1)
+    store.free_state(0, 2)
+    assert store.stats().live_bytes == 0 and store.stats().live_entries == 0
+    store.end_wave()
+
+
+def test_in_place_change_after_put_raises(dev):
+    store = _store(dev)
+    s, crit = _state(dev), _crit(dev)
+    store.put_state(0, 1, s)
+    store.put_crit(0, 1, crit)
+    store.get_state(0, 1)  # unchanged: fine
+    s.add_(1.0)
+    with pytest.raises(StateStoreError, match=r"s\[sample 0, round 1\]: modified in place"):
+        store.get_state(0, 1)
+    with pytest.raises(StateStoreError, match=r"s\[sample 0, round 1\]: modified in place"):
+        store.free_state(0, 1)
+    with pytest.raises(StateStoreError, match=r"s\[sample 0, round 1\]: modified in place"):
+        store.take_state(0, 1)
+    crit.view(-1)[0] = 7.0  # through a view: same version counter
+    with pytest.raises(StateStoreError, match=r"crit\[sample 0, round 1\]: modified in place"):
+        store.get_crit(0, 1)
+    assert store.stats().live_entries == 2  # a failed release keeps the entry
+    store.reset()
+
+    # Inference tensors have no version counter: stored and released without the check.
+    store = _store(dev)
+    with torch.inference_mode():
+        state = _state(dev)
+    store.put_state(0, 1, state)
+    store.free_state(0, 1)
+    store.end_wave()
+
+
+def test_shape_checks_are_order_independent(dev):
+    # crit before the injection: the injection's c must match the crit rows.
+    store = _store(dev)
+    store.put_crit(0, 0, _crit(dev, rows=3))
+    with pytest.raises(
+        StateStoreError, match=r"e\[sample 0\]: 1 rows, crit\[sample 0, round 0\] has 3"
+    ):
+        store.put_injection(0, _state(dev))
+    with pytest.raises(
+        StateStoreError, match=r"crit\[sample 0, round 1\]: 1 rows, crit\[sample 0, round 0\]"
+    ):
+        store.put_crit(0, 1, _crit(dev, rows=1))
+    store.put_injection(0, _state(dev, rows=3))
+    store.reset()
+
+    # A state before the injection: the injection must match the state.
+    store = _store(dev)
+    store.put_state(0, 1, _state(dev))
+    with pytest.raises(StateStoreError, match=r"e\[sample 0\]: shape .* of s\[sample 0, round 1\]"):
+        store.put_injection(0, torch.zeros(S + 1, C, NH, device=dev))
+    with pytest.raises(
+        StateStoreError, match=r"crit\[sample 0, round 0\]: 2 rows, s\[sample 0, round 1\] has 1"
+    ):
+        store.put_crit(0, 0, _crit(dev, rows=2))
+    store.put_injection(0, _state(dev))
+    # Other samples are independent.
+    store.put_state(1, 1, _state(dev, rows=2))
+    store.reset()
+
+
+def test_store_key_text():
+    assert str(StoreKey("state", 4, 2)) == "s[sample 4, round 2]"
+    assert str(StoreKey("crit", 4, 0)) == "crit[sample 4, round 0]"
+    assert str(StoreKey("injection", 4, 0)) == "e[sample 4]"

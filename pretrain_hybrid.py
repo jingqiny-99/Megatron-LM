@@ -37,6 +37,11 @@ from megatron.core.parallel_state import (
 )
 from megatron.core.rerun_state_machine import get_rerun_state_machine
 from megatron.core.tokenizers.utils.build_tokenizer import build_tokenizer
+from megatron.core.transformer.loop.rsbf_executor import (
+    RSBF_BATCH_FUNC_ATTR,
+    RSBF_LOSS_VALIDATOR_ATTR,
+    LoopMicrobatch,
+)
 from megatron.core.transformer.multi_token_prediction import (
     mtp_on_this_rank as mtp_on_this_rank_func,
 )
@@ -277,12 +282,54 @@ def _build_cached_logits_loss_func(
     )
 
 
+def validate_loss(loss: torch.Tensor) -> None:
+    """The rerun-state-machine checks of a local loss: NaN and Inf (fatal, with
+    ``check_for_nan_in_loss_and_grad``) and spiky loss (non-fatal, with ``check_for_spiky_loss``).
+
+    ``loss_func`` runs them per microbatch; the loop RSBF schedule runs them once per step on
+    the step's summed loss divided by its microbatch count (the mean per-microbatch sum, a
+    host tensor, so the checks add no device sync).
+    """
+    args = get_args()
+    # Check individual rank losses are not NaN prior to DP all-reduce.
+    rerun_state_machine = get_rerun_state_machine()
+    if args.check_for_nan_in_loss_and_grad:
+        rerun_state_machine.validate_result(
+            result=loss,
+            rejection_func=torch.isnan,
+            message="found NaN in local forward loss calculation",
+            tolerance=0.0,  # forward pass calculations are deterministic
+            fatal=True,
+        )
+        rerun_state_machine.validate_result(
+            result=loss,
+            rejection_func=torch.isinf,
+            message="found Inf in local forward loss calculation",
+            tolerance=0.0,  # forward pass calculations are deterministic
+            fatal=True,
+        )
+    # Check for spiky loss
+    if args.check_for_spiky_loss:
+        rerun_state_machine.validate_result(
+            result=loss,
+            rejection_func=partial(
+                rerun_state_machine.is_unexpectedly_large,
+                threshold=SPIKY_LOSS_FACTOR,
+                context="loss",
+            ),
+            message="Spiky loss",
+            tolerance=0.0,  # forward pass calculations are deterministic
+            fatal=False,
+        )
+
+
 def loss_func(
     loss_mask: torch.Tensor,
     output_tensor: torch.Tensor,
     model: Optional[HybridModel] = None,
     loop_losses=None,
     loop_metrics=None,
+    validate: bool = True,
 ):
     """Loss function.
 
@@ -294,6 +341,9 @@ def loss_func(
             (MoR router losses), added per token.
         loop_metrics (dict, optional): Loop decoder metrics for this microbatch (depth,
             token layers, FLOPs per token), reported token-weighted.
+        validate (bool): Run the rerun-state-machine checks (NaN / Inf / spiky loss,
+            ``validate_loss``) on this loss. The loop RSBF schedule passes False and validates
+            the step once instead (no host sync per sample; see ``validate_loss``).
 
     Returns:
         the loss scalar for this micro-batch
@@ -330,36 +380,8 @@ def loss_func(
     for name, metric in (loop_metrics or {}).items():
         report[name] = torch.stack((metric.detach() * num_tokens, num_tokens))
 
-    # Check individual rank losses are not NaN prior to DP all-reduce.
-    rerun_state_machine = get_rerun_state_machine()
-    if args.check_for_nan_in_loss_and_grad:
-        rerun_state_machine.validate_result(
-            result=loss,
-            rejection_func=torch.isnan,
-            message="found NaN in local forward loss calculation",
-            tolerance=0.0,  # forward pass calculations are deterministic
-            fatal=True,
-        )
-        rerun_state_machine.validate_result(
-            result=loss,
-            rejection_func=torch.isinf,
-            message="found Inf in local forward loss calculation",
-            tolerance=0.0,  # forward pass calculations are deterministic
-            fatal=True,
-        )
-    # Check for spiky loss
-    if args.check_for_spiky_loss:
-        rerun_state_machine.validate_result(
-            result=loss,
-            rejection_func=partial(
-                rerun_state_machine.is_unexpectedly_large,
-                threshold=SPIKY_LOSS_FACTOR,
-                context="loss",
-            ),
-            message="Spiky loss",
-            tolerance=0.0,  # forward pass calculations are deterministic
-            fatal=False,
-        )
+    if validate:
+        validate_loss(loss)
 
     return loss, num_tokens, report
 
@@ -423,6 +445,57 @@ def forward_step(data_iterator, model: HybridModel):
         loop_losses=getattr(decoder, "loop_losses", None),
         loop_metrics=getattr(decoder, "loop_metrics", None),
     )
+
+
+def loop_rsbf_batch(data_iterator, model: HybridModel) -> LoopMicrobatch:
+    """One microbatch for the loop RSBF schedule (``loop_schedule='rsbf'``): the batch of
+    ``forward_step`` without the model call.
+
+    The schedule runs the model as per-sample cells and calls the returned ``loss_func`` once
+    per sample with that sample's ``loss_mask`` and per-token loss. The loss function does not
+    validate (no host sync per sample); the schedule runs ``validate_loss`` once per step on
+    the mean per-microbatch loss sum (``forward_step.loop_rsbf_validate_loss``).
+
+    Args:
+        data_iterator: Input data iterator
+        model (HybridModel): The Hybrid Model (can be wrapped)
+    """
+    args = get_args()
+    timers = get_timers()
+    if getattr(args, "logits_load_dir", None) is not None:
+        # The cached-logit reader pairs logits with microbatches by call order; RSBF calls the
+        # loss function per sample in backward-item order.
+        raise ValueError("loop_schedule='rsbf' does not support --logits-load-dir")
+    if has_nvidia_modelopt and getattr(args, "modelopt_enabled", False):
+        raise ValueError("loop_schedule='rsbf' does not support ModelOpt losses")
+
+    timers('batch-generator', log_level=2).start()
+    with stimer(bdata=True):
+        vp_stage = get_attr_wrapped_model(model, "vp_stage")
+        cp_batch = get_batch(data_iterator, vp_stage)
+        batch = cp_batch.get_batch()
+        if cp_batch.get_packed_seq_params() is not None or batch.get("cu_seqlens") is not None:
+            raise ValueError(
+                "loop_schedule='rsbf' does not support packed (THD) input; it runs SBHD rows"
+            )
+        microbatch = LoopMicrobatch(
+            tokens=batch.get("tokens"),
+            position_ids=batch.get("position_ids"),
+            labels=batch.get("labels"),
+            loss_mask=batch.get("loss_mask"),
+            attention_mask=batch.get("attention_mask"),
+            padding_mask=batch.get("padding_mask"),
+            # No loop_losses / loop_metrics: the schedule reports per-sample records.
+            loss_func=partial(loss_func, model=model, validate=False),
+        )
+    timers('batch-generator').stop()
+    return microbatch
+
+
+# The loop RSBF schedule's hooks (precedent: train_valid_test_datasets_provider.is_distributed):
+# the batch without the model call, and the once-per-step loss validation.
+setattr(forward_step, RSBF_BATCH_FUNC_ATTR, loop_rsbf_batch)
+setattr(forward_step, RSBF_LOSS_VALIDATOR_ATTR, validate_loss)
 
 
 def is_dataset_built_on_rank(vp_stage=None, is_packed_sequence=False):

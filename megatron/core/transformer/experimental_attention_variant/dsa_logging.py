@@ -11,6 +11,7 @@ from megatron.core.process_groups_config import (
     MultiModuleProcessGroupCollection,
     ProcessGroupCollection,
 )
+from megatron.core.transformer.forward_replay import in_forward_replay, statistics_weight
 from megatron.core.utils import get_pg_size
 
 
@@ -102,6 +103,9 @@ class DSAIndexerLossLoggingHelper:
         # Skip indexer loss logging if layer_number is None.
         if layer_number is None:
             return
+        # An activation-recompute replay repeats a forward that already recorded.
+        if in_forward_replay():
+            return
 
         tracker = DSAIndexerLossLoggingHelper.tracker
         # Tracker must be at least max(num_layers, layer_number) so hybrid MTP layers
@@ -111,7 +115,11 @@ class DSAIndexerLossLoggingHelper:
         # lifecycle initialization retain lazy growth for backward compatibility.
         needed = max(num_layers, layer_number)
         DSAIndexerLossLoggingHelper.ensure_tracker_size(needed)
-        tracker["values"][layer_number - 1] += loss.detach()
+        weight = statistics_weight()
+        if weight == 1.0:
+            tracker["values"][layer_number - 1] += loss.detach()
+        else:
+            tracker["values"][layer_number - 1] += loss.detach() * weight
         tracker["reduce_group"] = reduce_group
         tracker["avg_group"] = avg_group
 

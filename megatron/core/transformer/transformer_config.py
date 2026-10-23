@@ -113,6 +113,41 @@ class TransformerConfig(ModelParallelConfig):
     """Hybrid loop: number of sublayers of the main hybrid layer pattern that run once after
     the shared core. Set together with loop_prelude_sublayers."""
 
+    loop_schedule: Literal["standard", "rsbf"] = "standard"
+    """Training schedule of a hybrid Huginn loop. 'rsbf' runs training steps through the
+    round-synchronous breadth-first executor (forward_backward_loop_rsbf: per-sample exit,
+    round-input checkpoints, per-round backward items); evaluation keeps the standard
+    schedule. The other loop_rsbf_* / loop_exit_criterion / loop_depth_* / loop_min_rounds
+    fields require 'rsbf'. Under 'rsbf' every cell call has batch 1, so the MoE aux and DSA
+    indexer loss gradients are the standard schedule's at micro_batch_size 1 whatever the
+    micro_batch_size (at MBS b the standard schedule averages them over the b rows of a
+    microbatch, a 1/b smaller coefficient); their logged values match the standard schedule's
+    logs at the same micro_batch_size."""
+
+    loop_rsbf_waves: int = 1
+    """RSBF: passes (waves) per optimizer step; gradients accumulate across waves. Must divide
+    the number of microbatches per step."""
+
+    loop_rsbf_fill: Literal["drain", "sample_order"] = "drain"
+    """RSBF: when a sample's backward chain runs. 'drain': in the backward phase of the slot
+    after its exit; 'sample_order': every chain after the last forward round, in sample order
+    (the eager reference's accumulation order)."""
+
+    loop_exit_criterion: Literal["fixed", "sampled"] = "fixed"
+    """RSBF: per-sample exit. 'fixed': every sample runs loop_iterations rounds. 'sampled':
+    each sample's depth is drawn from loop_depth_probs with a counter-based generator keyed by
+    (loop_depth_seed, iteration, global sample index)."""
+
+    loop_depth_probs: Optional[List[float]] = None
+    """RSBF, 'sampled' exit: P(depth = 1..loop_iterations); loop_iterations nonnegative values
+    summing to 1."""
+
+    loop_min_rounds: int = 1
+    """RSBF: no exit before this round (1 <= loop_min_rounds <= loop_iterations)."""
+
+    loop_depth_seed: int = 0
+    """RSBF, 'sampled' exit: seed of the counter-based depth generator."""
+
     mtp_num_layers: Optional[int] = None
     """Number of Multi-Token Prediction (MTP) Layers.
     MTP extends the prediction scope to multiple future tokens at each position.
@@ -2211,6 +2246,25 @@ class TransformerConfig(ModelParallelConfig):
             raise ValueError(
                 "loop_prelude_sublayers / loop_coda_sublayers require loop_architecture"
             )
+        if self.loop_schedule == "rsbf":
+            # Imported lazily: the guards module imports model code.
+            from megatron.core.transformer.loop.guards import validate_rsbf_config
+
+            validate_rsbf_config(self)
+        else:
+            rsbf_only = [
+                name
+                for name, is_set in (
+                    ("loop_exit_criterion", self.loop_exit_criterion != "fixed"),
+                    ("loop_depth_probs", self.loop_depth_probs is not None),
+                    ("loop_min_rounds", self.loop_min_rounds != 1),
+                    ("loop_rsbf_waves", self.loop_rsbf_waves != 1),
+                    ("loop_rsbf_fill", self.loop_rsbf_fill != "drain"),
+                )
+                if is_set
+            ]
+            if rsbf_only:
+                raise ValueError(f"{', '.join(rsbf_only)} require loop_schedule='rsbf'")
         # Dynamic CP can assign a multi-rank group even when configured CP is one.
         has_context_parallelism = self.context_parallel_size > 1 or self.dynamic_context_parallel
 

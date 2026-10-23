@@ -28,6 +28,7 @@ import torch
 
 from megatron.core import parallel_state
 from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.transformer.forward_replay import in_forward_replay, statistics_weight
 
 
 @dataclass
@@ -486,12 +487,19 @@ class MoEMetricsTracker:
         """
         if layer_number is None:
             return
+        # An activation-recompute replay repeats a forward that already recorded.
+        if in_forward_replay():
+            return
 
         if name not in self._metrics:
             self._metrics[name] = MetricEntry(values=torch.zeros(num_layers, device=value.device))
 
         entry = self._metrics[name]
-        entry.values[layer_number - 1] += value.detach()
+        weight = statistics_weight()
+        if weight == 1.0:
+            entry.values[layer_number - 1] += value.detach()
+        else:
+            entry.values[layer_number - 1] += value.detach() * weight
         entry.reduce_group = reduce_group
         entry.avg_group = avg_group
         entry.needs_dp_avg = needs_dp_avg

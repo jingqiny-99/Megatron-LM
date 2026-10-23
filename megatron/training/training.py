@@ -6217,6 +6217,50 @@ def checkpoint_and_decide_exit(
     return False
 
 
+def get_loop_rsbf_forward_backward_func(config, args):
+    """The loop RSBF schedule when the model config opts in (``loop_schedule='rsbf'``), else
+    None.
+
+    The RSBF schedule (``forward_backward_loop_rsbf``) replaces the standard schedule for
+    training steps only; ``evaluate()`` keeps the standard one. Rejected here:
+
+    * the full-iteration CUDA graph and paged-stash wrappers of ``train()`` (the loop guards
+      reject CUDA graphs and static-budget MoE);
+    * sharded data parallelism (Megatron FSDP, torch FSDP2): its per-module all-gathers and
+      reduce-scatters would run once per cell call, a different count on each DP rank (the
+      executor also checks the model it runs);
+    * the debug-save hooks of ``train_step`` (activations, dgrads, tokens per expert): they
+      would also record the executor's replays (the sweep, then the recompute of every
+      backward item).
+    """
+    if getattr(config, "loop_schedule", "standard") != "rsbf":
+        return None
+    debug_saves = (
+        "save_activations_interval",
+        "save_dgrads_interval",
+        "save_tokens_per_expert_interval",
+    )
+    unsupported = [
+        name
+        for name, applies in (
+            ("cuda_graph_impl=full_iteration", args.cuda_graph_impl == "full_iteration"),
+            (
+                "moe_expert_rank_capacity_factor",
+                getattr(args, "moe_expert_rank_capacity_factor", None) is not None,
+            ),
+            ("use_megatron_fsdp", getattr(args, "use_megatron_fsdp", False)),
+            ("use_torch_fsdp2", getattr(args, "use_torch_fsdp2", False)),
+            *((name, getattr(args, name, None) is not None) for name in debug_saves),
+        )
+        if applies
+    ]
+    if unsupported:
+        raise ValueError(f"loop_schedule='rsbf' does not support {', '.join(unsupported)}")
+    from megatron.core.transformer.loop.rsbf_executor import get_loop_rsbf_schedule
+
+    return get_loop_rsbf_schedule()
+
+
 def train(
     forward_step_func,
     model,
@@ -6512,6 +6556,11 @@ def train(
     eval_iterations = 0
     # Wrap forward_backward_func for Full iteration CUDA graph
     forward_backward_func = get_forward_backward_func(schedule_pg_collection=pg_collection)
+    # Hybrid loop with per-sample exit: training steps run through the RSBF executor (the
+    # wrappers below cannot apply; the helper checks).
+    loop_rsbf_schedule = get_loop_rsbf_forward_backward_func(config, args)
+    if loop_rsbf_schedule is not None:
+        forward_backward_func = loop_rsbf_schedule
     if args.cuda_graph_impl == "full_iteration":
         forward_backward_func = FullCudaGraphWrapper(
             forward_backward_func,
@@ -6854,6 +6903,9 @@ def train(
                 ) as _step_span,
             ):
                 ft_integration.on_training_step_start()
+                if loop_rsbf_schedule is not None:
+                    # Sampled depths are keyed by (seed, iteration, global sample index).
+                    loop_rsbf_schedule.set_iteration(iteration)
                 (
                     loss_dict,
                     skipped_iter,

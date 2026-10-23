@@ -22,6 +22,7 @@ from megatron.core.transformer.custom_layers.batch_invariant_kernels import (
     is_batch_invariant_mode_enabled,
 )
 from megatron.core.transformer.enums import CudaGraphModule
+from megatron.core.transformer.forward_replay import in_forward_replay
 from megatron.core.transformer.moe.batch_invariant import (
     build_inverse_permutation_map as build_batch_invariant_inverse_permutation_map,
 )
@@ -1279,8 +1280,10 @@ class RecordDispatchTokenCountsFunction(torch.autograd.Function):
 
         balanced = local_balanced_token_count.detach().to(device=tensor.device, dtype=torch.float32)
 
-        tracker = get_moe_overload_factor_tracker()
-        tracker.record_fwd(layer_number, tokens_on_rank, balanced)
+        # A recompute replay's forward is not recorded again; its backward still is (once per
+        # backward), so the forward / backward records pair.
+        if not in_forward_replay():
+            get_moe_overload_factor_tracker().record_fwd(layer_number, tokens_on_rank, balanced)
 
         ctx.save_for_backward(tokens_on_rank, balanced)
         return tensor
@@ -1288,8 +1291,11 @@ class RecordDispatchTokenCountsFunction(torch.autograd.Function):
     @staticmethod
     def backward(ctx, grad_output):
         """Backward pass: append negated actual and balanced count for paired cumsums."""
-        if ctx.saved_tensors:
-            tokens_on_rank, balanced = ctx.saved_tensors
+        # Read ctx.saved_tensors once: under non-reentrant activation checkpointing each read
+        # unpacks the saved tensors, and a second unpack raises CheckpointError.
+        saved = ctx.saved_tensors
+        if saved:
+            tokens_on_rank, balanced = saved
             get_moe_overload_factor_tracker().record_bwd(tokens_on_rank, balanced)
         return grad_output, None, None, None
 

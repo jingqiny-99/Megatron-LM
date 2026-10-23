@@ -20,15 +20,22 @@ import torch.nn.functional as F
 from torch.nn.attention import SDPBackend, sdpa_kernel
 
 from megatron.core import parallel_state
+from megatron.core.models.backends import LocalSpecProvider
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_local_submodules
 from megatron.core.models.hybrid.hybrid_block import HybridStackSubmodules
 from megatron.core.models.hybrid.hybrid_layer_allocation import validate_segment_layers
+from megatron.core.models.hybrid.hybrid_model import HybridModel
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.ssm.mlp_layer import MLPLayer
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.enums import AttnBackend
 from megatron.core.transformer.loop.hybrid_stack import LoopHybridStack
 from megatron.core.transformer.module import MegatronModule
+from megatron.core.transformer.multi_token_prediction import (
+    MultiTokenPredictionBlock,
+    MultiTokenPredictionBlockSubmodules,
+    get_mtp_layer_spec_for_backend,
+)
 from megatron.core.transformer.spec_utils import ModuleSpec
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.transformer_layer import TransformerLayer, TransformerLayerSubmodules
@@ -231,6 +238,80 @@ def build_local_loop_stack(pattern, prelude, coda, *, seed=1234, **overrides):
         pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
     )
     return stack.to(device())
+
+
+@pytest.fixture
+def cpu_mtp(monkeypatch):
+    """Without TE the MTP layer's inference-linear isinstance check raises and the MTP loss
+    logger allocates on CUDA (environment limitations, not the code under test)."""
+    if not CUDA:
+        from megatron.core.transformer import multi_token_prediction as mtp_module
+
+        monkeypatch.setattr(mtp_module, "is_inference_column_parallel_linear", lambda module: False)
+        monkeypatch.setattr(
+            mtp_module.MTPLossLoggingHelper,
+            "save_loss_to_tracker",
+            staticmethod(lambda *args, **kwargs: None),
+        )
+
+
+@pytest.fixture
+def cpu_rope(monkeypatch):
+    """``RotaryEmbedding`` moves its CPU-initialized ``inv_freq`` to
+    ``torch.cuda.current_device()`` on first use; on CPU, keep it on the CPU."""
+    if not CUDA:
+        from megatron.core.models.common.embeddings import rotary_pos_embedding
+
+        monkeypatch.setattr(rotary_pos_embedding.torch.cuda, "current_device", lambda: "cpu")
+
+
+VOCAB = 128
+
+
+def local_model_spec(module, *, hyper_connections=False):
+    """A local-layer hybrid stack spec of ``module`` with a local MTP block, no final norm.
+
+    ``hyper_connections`` gives the MTP layer the mHC projections (``e_proj`` / ``h_proj``)
+    instead of ``eh_proj``; it must match the config's ``enable_mhc_connections``.
+    """
+    mtp_layer = get_mtp_layer_spec_for_backend(
+        None, LocalSpecProvider(), enable_hyper_connections=hyper_connections, rms_norm=True
+    )
+    submodules = local_hybrid_submodules()
+    submodules.mtp_block_spec = ModuleSpec(
+        module=MultiTokenPredictionBlock,
+        submodules=MultiTokenPredictionBlockSubmodules(layer_specs=[mtp_layer]),
+    )
+    # No TE final norm on CPU.
+    return ModuleSpec(module=module, params={"post_layer_norm": False}, submodules=submodules)
+
+
+def build_local_loop_model(
+    pattern,
+    module=LoopHybridStack,
+    *,
+    prelude=2,
+    coda=2,
+    position_embedding_type="none",
+    **overrides,
+):
+    """A ``HybridModel`` of local layers (``pattern`` may carry an MTP part after '/'), on the
+    test device. Without TE, MTP needs the ``cpu_mtp`` fixture on CPU and RoPE the
+    ``cpu_rope`` fixture."""
+    main, *mtp = pattern.split("/")
+    if mtp:
+        overrides.update(mtp_num_layers=len(mtp), mtp_loss_scaling_factor=0.1)
+    config = hybrid_loop_config(main, prelude, coda, **overrides)
+    torch.manual_seed(1234)
+    model = HybridModel(
+        config=config,
+        hybrid_stack_spec=local_model_spec(module, hyper_connections=config.enable_mhc_connections),
+        vocab_size=VOCAB,
+        max_sequence_length=SEQ,
+        hybrid_layer_pattern=pattern,
+        position_embedding_type=position_embedding_type,
+    )
+    return model.to(device())
 
 
 def rope(seq=SEQ, dim=KV_CHANNELS, dev=None):

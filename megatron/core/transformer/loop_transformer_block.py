@@ -17,6 +17,7 @@ from torch.utils.checkpoint import checkpoint
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.tensor_observation import observe_layer_residuals, suspend_tensor_observations
 from megatron.core.transformer.enums import AttnMaskType
+from megatron.core.transformer.forward_replay import forward_replay
 from megatron.core.transformer.transformer_block import TransformerBlock
 
 
@@ -67,9 +68,11 @@ def recompute_context(name):
     """Profile an activation-checkpoint replay without re-observing its tensors.
 
     The original forward already notified the tensor observer, so the replay
-    is suppressed the same way MCore's own checkpoint implementations do.
+    is suppressed the same way MCore's own checkpoint implementations do. The
+    replay is also marked as a forward replay, so forward statistics (router
+    expert-bias counts, loss trackers) count the round once.
     """
-    with torch.profiler.record_function(name), suspend_tensor_observations():
+    with torch.profiler.record_function(name), suspend_tensor_observations(), forward_replay():
         yield
 
 
