@@ -111,6 +111,22 @@ CHAIN_PORTS: tuple[Port, ...] = (
     Port("grad_injection", "in", ("S", "c", "nH"), "act", False, "chain_record", optional=True),
     Port("grad_crit", "in", ("c", "k"), "fp32", False, "chain_record", optional=True),
     Port("expected_state", "in", ("S", "c", "nH"), "act", False, "chain_record", optional=True),
+    # Multi-EU: the sample's loss record packed for a chain transfer, int32
+    # [2 + 2 K_rep] = (loss fp32 bits, num_tokens, the report values' fp32 bits); it rides the
+    # chain until PRELUDE runs at the sample's home EU.
+    Port("loss_record", "in", ("*",), "int32", False, "chain_record", optional=True),
+)
+
+# Multi-EU sample and item moves (``rsbf_plan`` slot names): the checkpoint ports above
+# (``round_input``, ``crit_state``, ``injection``; state store -> state store), the batch ports
+# on a sample's first arrival on an EU (executor -> executor), and the device exit flags.
+MOVE_PORTS: tuple[Port, ...] = (
+    Port("round_input", "in", ("S", "c", "nH"), "act", False, "state_store"),
+    Port("crit_state", "in", ("c", "k"), "fp32", False, "state_store"),
+    Port("injection", "in", ("S", "c", "nH"), "act", False, "state_store", optional=True),
+    # (exited, exit_round) of the sample, int32: a copy of the executor's device flags.
+    Port("exit_flags", "in", ("*",), "int32", False, "executor"),
+    *_BATCH_IN,
 )
 
 

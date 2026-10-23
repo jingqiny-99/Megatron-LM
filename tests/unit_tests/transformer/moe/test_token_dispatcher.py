@@ -884,6 +884,70 @@ def test_hybridep_dropless_excludes_padding_rows(monkeypatch):
     torch.testing.assert_close(manager.token_probs[:3], probs[:3])
 
 
+def _bare_hybridep_manager(*, rank_capacity_factor, capacity_factor=None):
+    manager = object.__new__(_HybridEPManager)
+    manager.config = SimpleNamespace(
+        moe_hybridep_pad_variable_tokens=False,
+        moe_hybridep_routing_map_mode="bool",
+        moe_router_topk=1,
+        # Rank capacity with HybridEP requires the op fuser or grouped tensors (256 alignment).
+        use_transformer_engine_op_fuser=True,
+        moe_use_grouped_tensor=False,
+        fp8=None,
+        fp4=None,
+    )
+    manager.group = SimpleNamespace(size=lambda: 1)
+    manager.num_experts = 2
+    manager.num_local_experts = 2
+    manager.router_topk = 1
+    manager.moe_expert_rank_capacity_factor = rank_capacity_factor
+    manager.capacity_factor = capacity_factor
+    manager.drop_and_pad = False
+    manager.dense_routing_supported = False
+    manager.use_dense_routing_for_bool_map = False
+    return manager
+
+
+def test_hybridep_rank_capacity_excludes_padding_rows(monkeypatch):
+    """Under the per-rank static budget (moe_expert_rank_capacity_factor) padding rows are
+    excluded from dispatch as in dropless mode, so padding (and the RSBF loop's frozen / null
+    rows) takes no static budget; the budget itself stays a function of the row count (the
+    same with and without a padding mask)."""
+    monkeypatch.setattr(token_dispatcher, "HAVE_HYBRIDEP_DENSE_ROUTING", False)
+    # s=2, b=2 -> 4 tokens in sequence-first order (s0b0, s0b1, s1b0, s1b1).
+    routing_map = torch.tensor([[True, False], [False, True], [True, False], [False, True]])
+    probs = torch.tensor([[0.9, 0.1], [0.2, 0.8], [0.7, 0.3], [0.4, 0.6]])
+    padding_mask = torch.tensor([[False, False], [False, True]])
+
+    unpadded = _bare_hybridep_manager(rank_capacity_factor=1.5)
+    unpadded.setup_metadata(routing_map, probs)
+    manager = _bare_hybridep_manager(rank_capacity_factor=1.5)
+    manager.setup_metadata(routing_map, probs, padding_mask=padding_mask)
+
+    expected_map = routing_map.clone()
+    expected_map[3] = False
+    assert torch.equal(manager.routing_map, expected_map)
+    assert torch.count_nonzero(manager.token_probs[3]) == 0
+    torch.testing.assert_close(manager.token_probs[:3], probs[:3])
+    # The static budget: rows x topk x factor (4 x 1 x 1.5 = 6, padding included), rounded up
+    # to the 256-token alignment of the op fuser.
+    assert manager.num_permuted_tokens == unpadded.num_permuted_tokens == 256
+    assert torch.equal(unpadded.routing_map, routing_map)
+
+
+def test_hybridep_expert_capacity_keeps_padding_rows(monkeypatch):
+    """Per-expert capacity modes keep the fixed-route layout: padding rows stay routed (the
+    capacity accounts for them)."""
+    monkeypatch.setattr(token_dispatcher, "HAVE_HYBRIDEP_DENSE_ROUTING", False)
+    routing_map = torch.tensor([[True, False], [False, True], [True, False], [False, True]])
+    probs = torch.tensor([[0.9, 0.1], [0.2, 0.8], [0.7, 0.3], [0.4, 0.6]])
+    padding_mask = torch.tensor([[False, False], [False, True]])
+    manager = _bare_hybridep_manager(rank_capacity_factor=None, capacity_factor=2.0)
+    manager.setup_metadata(routing_map, probs, padding_mask=padding_mask)
+    assert torch.equal(manager.routing_map, routing_map)
+    torch.testing.assert_close(manager.token_probs, probs)
+
+
 def test_hybridep_indices_mode_keeps_bool_map_with_pad_to_capacity(monkeypatch):
     """With pad-to-capacity the routing map is the capacity mask (a token can carry more than
     topk assignments); the indices-mode topk reconstruction would drop the padded assignments

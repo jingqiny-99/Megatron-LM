@@ -83,6 +83,9 @@ class LoopHybridStack(HybridStack):
     dicts; ``loop_metrics`` carries ``loop {forward,backward,recompute} flops per token``
     (per-symbol FLOP table, ``flops.py``) for the training FLOP counter. The token-layer
     metrics count **sublayers**: a dense ``*-`` model reports twice the GPT loop's values.
+    ``loop_metric_populations`` (also rebound per forward) holds the population size of each
+    metric not defined over the issued tokens (the MoR metrics: valid tokens); the loss
+    function reports every loop metric by ``loop/reporting.py``'s rule.
     """
 
     def __init__(
@@ -181,6 +184,7 @@ class LoopHybridStack(HybridStack):
                         attention.attn_mask_type = AttnMaskType.arbitrary
         self.loop_losses = {}
         self.loop_metrics = {}
+        self.loop_metric_populations = {}
         self._microbatch_id = 0
         self._loop_depths: Optional[Tensor] = None
         self._loop_head = None
@@ -261,6 +265,7 @@ class LoopHybridStack(HybridStack):
         # microbatch must not mutate an earlier one's.
         self.loop_losses = {}
         self.loop_metrics = {}
+        self.loop_metric_populations = {}
         self._work = [0.0, 0.0, 0.0]
         label = f"loop_hybrid/mb={self._microbatch_id}"
         self._microbatch_id += 1
@@ -640,6 +645,13 @@ class LoopHybridStack(HybridStack):
         }
         for index, fraction in enumerate(frequency.detach()):
             self.loop_metrics[f"depth fraction {index + 1}"] = fraction
+        # The MoR metrics are means over the valid tokens (loop/reporting.py).
+        valid_tokens = valid.sum()
+        self.loop_metric_populations = {
+            name: valid_tokens
+            for name in self.loop_metrics
+            if name == "loop depth" or name.startswith("depth fraction ")
+        }
         # Gate gradients reduce over hidden channels and can nearly cancel
         # after the final RMSNorm. Accumulate the weighted residual in FP32,
         # rather than rounding the gate and its reduction to BF16.

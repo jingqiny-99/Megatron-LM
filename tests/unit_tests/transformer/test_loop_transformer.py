@@ -26,6 +26,7 @@ from megatron.core.models.gpt.gpt_layer_specs import (
 from megatron.core.tensor_observation import capture_tensor_observations
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.enums import AttnBackend
+from megatron.core.transformer.loop.reporting import loop_metric_report
 from megatron.core.transformer.loop_transformer_block import LoopTransformerBlock
 from megatron.core.transformer.transformer_config import TransformerConfig
 from tests.unit_tests.test_utilities import Utils
@@ -382,6 +383,34 @@ def test_evaluation_work_excludes_backward_and_recompute(architecture):
     assert block.loop_metrics["loop backward flops per token"] == 0
     assert block.loop_metrics["loop recompute flops per token"] == 0
     assert block.loop_metrics["loop backward token layers"] == 0
+
+
+@pytest.mark.parametrize("architecture", ["huginn", "mor"])
+def test_loop_metric_populations(architecture):
+    """Huginn's metrics are per issued token (no populations); MoR's depth metrics are means
+    over the valid tokens, whose count the block exposes for the loss function's report
+    (megatron/core/transformer/loop/reporting.py)."""
+    block = make_block(architecture, depth=3)
+    x = torch.randn(16, 2, 128, device="cuda")
+    rope = RotaryEmbedding(64, rotary_percent=1.0)(16).cuda()
+    kwargs = {}
+    if architecture == "mor":
+        padding = torch.zeros(2, 16, dtype=torch.bool, device="cuda")
+        padding[1, -4:] = True
+        kwargs["padding_mask"] = padding
+    block(x, attention_mask=None, rotary_pos_emb=rope, **kwargs)
+    populations = block.loop_metric_populations
+    if architecture == "huginn":
+        assert populations == {}
+        return
+    fractions = {f"depth fraction {index}" for index in (1, 2, 3)}
+    assert set(populations) == {"loop depth", *fractions}
+    assert all(int(count) == 28 for count in populations.values())
+    report = loop_metric_report(block.loop_metrics, issued_tokens=32, populations=populations)
+    rounds = block.loop_metrics["loop active token layers"] / block.config.loop_core_layers
+    torch.testing.assert_close(report["loop depth"][0], rounds.float(), rtol=1e-6, atol=0)
+    assert report["loop depth"][1].item() == 28
+    assert report["loop active token layers"][1].item() == 32
 
 
 def check_native(block, dtype):

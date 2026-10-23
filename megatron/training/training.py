@@ -6222,10 +6222,12 @@ def get_loop_rsbf_forward_backward_func(config, args):
     None.
 
     The RSBF schedule (``forward_backward_loop_rsbf``) replaces the standard schedule for
-    training steps only; ``evaluate()`` keeps the standard one. Rejected here:
+    training steps only; ``evaluate()`` keeps the standard one. Under a static per-rank MoE
+    budget (``moe_expert_rank_capacity_factor``) ``train()`` does not wrap the RSBF schedule in
+    ``PagedStashRunner``: the executor reads and reduces the over-budget flags itself
+    (``loop_rsbf_over_budget``). Rejected here:
 
-    * the full-iteration CUDA graph and paged-stash wrappers of ``train()`` (the loop guards
-      reject CUDA graphs and static-budget MoE);
+    * the full-iteration CUDA graph wrapper of ``train()`` (the loop guards reject CUDA graphs);
     * sharded data parallelism (Megatron FSDP, torch FSDP2): its per-module all-gathers and
       reduce-scatters would run once per cell call, a different count on each DP rank (the
       executor also checks the model it runs);
@@ -6244,10 +6246,6 @@ def get_loop_rsbf_forward_backward_func(config, args):
         name
         for name, applies in (
             ("cuda_graph_impl=full_iteration", args.cuda_graph_impl == "full_iteration"),
-            (
-                "moe_expert_rank_capacity_factor",
-                getattr(args, "moe_expert_rank_capacity_factor", None) is not None,
-            ),
             ("use_megatron_fsdp", getattr(args, "use_megatron_fsdp", False)),
             ("use_torch_fsdp2", getattr(args, "use_torch_fsdp2", False)),
             *((name, getattr(args, name, None) is not None) for name in debug_saves),
@@ -6259,6 +6257,19 @@ def get_loop_rsbf_forward_backward_func(config, args):
     from megatron.core.transformer.loop.rsbf_executor import get_loop_rsbf_schedule
 
     return get_loop_rsbf_schedule()
+
+
+def loop_rsbf_status_group(args):
+    """The Gloo data-parallel group for the multi-EU RSBF status exchange, or None without
+    data parallelism or without Gloo process groups (known-depth criteria, the only ones the
+    config builds, never exchange status)."""
+    if not (torch.distributed.is_initialized() and mpu.model_parallel_is_initialized()):
+        return None
+    if mpu.get_data_parallel_world_size() <= 1 or not getattr(
+        args, "use_gloo_process_groups", True
+    ):
+        return None
+    return mpu.get_data_parallel_group_gloo(with_context_parallel=False)
 
 
 def train(
@@ -6561,6 +6572,9 @@ def train(
     loop_rsbf_schedule = get_loop_rsbf_forward_backward_func(config, args)
     if loop_rsbf_schedule is not None:
         forward_backward_func = loop_rsbf_schedule
+        # Data-parallel ranks are the executor's EUs; online exit criteria and plan checks
+        # exchange over a Gloo group of the same ranks.
+        loop_rsbf_schedule.configure(status_group=loop_rsbf_status_group(args))
     if args.cuda_graph_impl == "full_iteration":
         forward_backward_func = FullCudaGraphWrapper(
             forward_backward_func,
@@ -6568,7 +6582,8 @@ def train(
             use_single_mempool=config.cuda_graph_use_single_mempool,
         )
     # Wrap forward_backward_func for overflow handling with moe_expert_rank_capacity_factor
-    if args.moe_expert_rank_capacity_factor is not None:
+    # (the RSBF executor checks the static budget itself, reduced over its domain).
+    if args.moe_expert_rank_capacity_factor is not None and loop_rsbf_schedule is None:
         copy_main_params = args.reuse_grad_buf_for_mxfp8_param_ag and args.overlap_param_gather
         forward_backward_func = PagedStashRunner(
             config, copy_main_params, model, optimizer, forward_backward_func

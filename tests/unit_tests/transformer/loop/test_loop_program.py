@@ -1072,6 +1072,53 @@ def test_prepare_forward_is_pure(request, name):
             assert a == b, field.name
 
 
+@pytest.mark.parametrize("name", ["dense_padded", "mhc", "mtp_rope"])
+def test_build_context_equals_the_sweep_context(request, name):
+    """C10: a sample arriving on another EU rebuilds its activation-free metadata without
+    the prelude (``PreludeCell.build_context``): the decoder padding mask, hash IDs, rotary
+    embedding and every layer-context field equal the sweep's, and a core round and the coda
+    run on the rebuilt context give the sweep context's outputs bitwise."""
+    model = _model(name, request)
+    program = _program(model, depths=(2, 2))
+    batch = _batch(2, padded=name.endswith("padded"))
+    swept, arrived = _sample(batch, 1), _sample(batch, 1)
+    prelude = program.prelude(swept, phase=LoopPhase.SWEEP)
+    program.prelude.build_context(arrived)
+    for field_name in ("decoder_padding_mask", "hash_input_ids", "rotary_pos_emb"):
+        a, b = getattr(swept, field_name), getattr(arrived, field_name)
+        assert (a is None and b is None) or torch.equal(a, b), field_name
+    if name == "mtp_rope":
+        assert arrived.rotary_pos_emb is not None
+    if name.endswith("padded"):
+        assert arrived.decoder_padding_mask.any()
+    for field in dataclasses.fields(swept.ctx):
+        a, b = getattr(swept.ctx, field.name), getattr(arrived.ctx, field.name)
+        if isinstance(a, torch.Tensor):
+            assert torch.equal(a, b), field.name
+        elif callable(a) or isinstance(a, contextlib.AbstractContextManager):
+            assert type(a) is type(b), field.name
+        elif isinstance(a, list):
+            assert len(a) == len(b) and [type(x) for x in a] == [type(x) for x in b], field.name
+        else:
+            assert a == b, field.name
+    outputs = []
+    for sample in (swept, arrived):
+        out = program.core(
+            None,
+            prelude.injection.detach(),
+            sample,
+            r=1,
+            phase=LoopPhase.SWEEP,
+            crit_state=prelude.crit_state.detach(),
+            exited=_exited(1),
+            depth=torch.tensor([2], dtype=torch.int32, device=device()),
+        )
+        coda = program.coda(out.state.detach(), sample)
+        outputs.append((out.state, coda.loss))
+    assert torch.equal(outputs[0][0], outputs[1][0])
+    assert torch.equal(outputs[0][1], outputs[1][1])
+
+
 # ---------------------------------------------------------------------------
 # C9: backward plans
 # ---------------------------------------------------------------------------

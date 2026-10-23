@@ -539,3 +539,84 @@ def test_store_key_text():
     assert str(StoreKey("state", 4, 2)) == "s[sample 4, round 2]"
     assert str(StoreKey("crit", 4, 0)) == "crit[sample 4, round 0]"
     assert str(StoreKey("injection", 4, 0)) == "e[sample 4]"
+
+
+# ---------------------------------------------------------------------------
+# Multi-EU moves: send_* / put_received_* (S1-S3)
+# ---------------------------------------------------------------------------
+
+
+def test_send_then_receive_round_trip(dev):
+    """S1: an entry that left by a move is released as "sent"; a copy that arrives later
+    (an item move back to a former sample-move source) is installed; a received injection
+    copy lives like an origin one; the wave still ends empty."""
+    source = _store(dev)
+    s1, c1 = _state(dev, 1.5), _crit(dev)
+    source.put_state(4, 1, s1)
+    source.put_crit(4, 1, c1)
+    source.put_injection(4, _state(dev, 0.5))
+    source.send_state(4, 1)
+    source.send_crit(4, 1)
+    assert source.stats().live_entries == 1
+    with pytest.raises(StateStoreError, match=r"s\[sample 4, round 1\]: sent to another EU"):
+        source.get_state(4, 1)
+    with pytest.raises(StateStoreError, match=r"cannot send, sent to another EU"):
+        source.send_state(4, 1)
+    # The checkpoint comes back by a later move.
+    source.put_received_state(4, 1, s1.clone())
+    source.put_received_crit(4, 1, c1.clone())
+    assert torch.equal(source.get_state(4, 1), s1)
+    source.free_state(4, 1)
+    source.free_crit(4, 1)
+    assert source.holds_injection(4)
+    source.free_injection(4)
+    assert not source.holds_injection(4)
+    source.end_wave()
+
+    destination = _store(dev)
+    destination.put_received_state(4, 1, s1)
+    destination.put_received_crit(4, 1, c1)
+    destination.put_received_injection(4, _state(dev, 0.5))
+    assert destination.holds_injection(4)
+    assert torch.equal(destination.get_crit(4, 1), c1)
+    destination.take_state(4, 1)
+    destination.free_crit(4, 1)
+    destination.free_injection(4)
+    destination.end_wave()
+
+
+def test_receive_after_consumption_raises(dev):
+    """S2: an entry consumed here ("taken") or evicted ("freed") can never come back."""
+    store = _store(dev)
+    store.put_state(0, 2, _state(dev))
+    store.take_state(0, 2)
+    with pytest.raises(StateStoreError, match=r"already taken this wave .*only an entry sent"):
+        store.put_received_state(0, 2, _state(dev))
+    store.put_crit(0, 2, _crit(dev))
+    store.free_crit(0, 2)
+    with pytest.raises(StateStoreError, match=r"already freed this wave"):
+        store.put_received_crit(0, 2, _crit(dev))
+    store.put_injection(0, _state(dev))
+    store.free_injection(0)
+    with pytest.raises(StateStoreError, match=r"e\[sample 0\]: already freed"):
+        store.put_received_injection(0, _state(dev))
+    store.put_received_state(1, 1, _state(dev))
+    with pytest.raises(StateStoreError, match=r"already stored"):
+        store.put_received_state(1, 1, _state(dev))
+    store.free_state(1, 1)
+    store.end_wave()
+
+
+def test_origin_write_after_send_raises(dev):
+    """S3: origin writes stay strictly write-once, also after a send."""
+    store = _store(dev, poison_on_free=True)
+    state = _state(dev, 3.0)
+    alias = state.view(-1)
+    store.put_state(0, 1, state)
+    store.send_state(0, 1)
+    assert torch.isnan(alias).all()  # released bytes are poisoned like a free
+    with pytest.raises(
+        StateStoreError, match=r"already sent this wave \(an entry is written once\)"
+    ):
+        store.put_state(0, 1, _state(dev))
+    store.end_wave()

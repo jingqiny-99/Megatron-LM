@@ -1,12 +1,15 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
-"""DDP tests of the one-EU RSBF executor (GPU, every rank one EU; run with WORLD_SIZE = 2, the
-M1 "DP = 2" gate, and with 8).
+"""DDP tests of the multi-EU RSBF executor (GPU, every DP rank one EU of the domain = the DP
+group; run with WORLD_SIZE = 2, 4 and 8: the M2 "W EUs against one EU" GPU gates).
 
-Each DP rank runs its slice of one fixed global batch through RSBF under
+Each DP rank loads its slice of one fixed global batch and runs it through RSBF under
 ``DistributedDataParallel`` (``overlap_grad_reduce=False``, fp32 ``main_grad``), with
-prescribed depths chosen so the ranks run different numbers of items; finalize is the step's
-only cross-rank communication. After finalize, ``main_grad`` must equal
+prescribed depths for every sample of the global batch (known-depth criteria must cover the
+domain's wave), chosen so the ranks' work differs: rebalancing moves samples between ranks
+(NCCL ``batch_isend_irecv``), and without it the ranks run different numbers of items.
+Per-sample losses equal the single-rank reference's bitwise. After finalize, ``main_grad``
+must equal
 
 * a single-rank RSBF reference: the same model under DDP over a one-rank DP group running the
   whole global batch (the gradient scale does not depend on the DP size: the token normalizer
@@ -18,7 +21,14 @@ at rtol 1e-5 with an absolute floor of 1e-6 x max |g| (fp32; the executor sums p
 gradients in a different association than the eager graph). The distributed optimizer's
 reduce-scatter is checked by gathering the reduced shards back.
 
-* D1 + D2 drive ``LoopRSBFExecutor.run_step`` directly (local layers).
+* D1 + D2 drive ``LoopRSBFExecutor.run_step`` directly (local layers), with rebalancing (moves
+  happen) and without (item counts differ between ranks).
+* D4: waves 2 and 4 against one pass (per-sample losses bitwise, gradients within the gate).
+* D5: the sync budget at W > 1: known depths under ``set_sync_debug_mode('error')`` (one host
+  sync, no status exchange); an online criterion with the Gloo status group (one status
+  exchange per forward round, one host sync per round plus one).
+* D6: a buggy host plan (the same on every rank) is raised by every rank naming the EU that
+  ran the bad sweep; the next step runs (no poisoned communicator).
 * D3 drives the path ``train()`` uses: the module schedule (``get_loop_rsbf_schedule()``)
   with ``pg_collection=None`` (the default collection), a ``forward_step_func`` carrying the
   batch-function and loss-validator hooks, the executor cache over two steps and finalize
@@ -35,6 +45,7 @@ import pytest
 import torch
 import torch.distributed as dist
 
+from megatron.core import parallel_state
 from megatron.core.distributed import (
     DistributedDataParallel,
     DistributedDataParallelConfig,
@@ -47,10 +58,12 @@ from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel import layers as tensor_parallel_layers
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.enums import AttnBackend
+from megatron.core.transformer.loop.dispatcher import RSBFGroups
 from megatron.core.transformer.loop.program import LoopProgram, PrescribedDepthCriterion
 from megatron.core.transformer.loop.rsbf_executor import (
     RSBF_BATCH_FUNC_ATTR,
     RSBF_LOSS_VALIDATOR_ATTR,
+    SWEEP_AFTER_EXIT,
     LoopMicrobatch,
     LoopRSBFExecutor,
     get_loop_rsbf_schedule,
@@ -63,6 +76,11 @@ from tests.unit_tests.transformer.loop.hybrid_loop_utils import (
     VOCAB,
     build_local_loop_model,
     hybrid_loop_config,
+)
+from tests.unit_tests.transformer.loop.rsbf_test_criteria import (
+    HaltingHead,
+    OnlineHaltingCriterion,
+    retire_late,
 )
 
 pytestmark = pytest.mark.skipif(
@@ -92,6 +110,7 @@ def _model_parallel():
     try:
         yield
     finally:
+        get_loop_rsbf_schedule().reset()
         Utils.destroy_model_parallel()
 
 
@@ -233,10 +252,19 @@ def _spy_finalize(config, record):
     return real
 
 
-def _rsbf_step(ddp, samples, pg_collection, record=None):
-    depths = {index: sample["depth"] for index, sample in samples}
-    program = LoopProgram(ddp, exit_criterion=PrescribedDepthCriterion(depths))
-    executor = LoopRSBFExecutor(program, pg_collection=pg_collection)
+def _criterion(batch):
+    """Prescribed depths of every sample of the global batch (the domain's wave)."""
+    return PrescribedDepthCriterion({index: sample["depth"] for index, sample in enumerate(batch)})
+
+
+def _rsbf_step(
+    ddp, samples, pg_collection, batch, record=None, criterion=None, executor=None, **kwargs
+):
+    """One RSBF step of ``samples``; a new program and executor unless ``executor`` is given
+    (reused, as ``train()`` reuses its cached executor across steps)."""
+    if executor is None:
+        program = LoopProgram(ddp, exit_criterion=criterion or _criterion(batch))
+        executor = LoopRSBFExecutor(program, pg_collection=pg_collection, **kwargs)
     microbatches = iter(_microbatch(sample) for _, sample in samples)
     config = ddp.module.config
     real = _spy_finalize(config, record) if record is not None else None
@@ -250,13 +278,32 @@ def _rsbf_step(ddp, samples, pg_collection, record=None):
     return reports, executor
 
 
-def _single_rank_reference(batch, single_rank_groups, *, te=False):
-    """RSBF over the whole global batch under DDP over a one-rank group."""
+def _losses(reports, executor):
+    """{global index: the sample's 'lm loss' report} of this rank's (home) samples."""
+    return {
+        record.key.global_index: report["lm loss"]
+        for record, report in zip(executor.stats.loss_records, reports)
+    }
+
+
+def _single_rank_reference(batch, single_rank_groups, *, te=False, with_losses=False):
+    """RSBF over the whole global batch under DDP over a one-rank group (one EU)."""
     reference = _ddp_model(single_rank_groups, te=te)
     tokens = []
-    _rsbf_step(reference, list(enumerate(batch)), single_rank_groups, record=tokens)
+    reports, executor = _rsbf_step(
+        reference, list(enumerate(batch)), single_rank_groups, batch, record=tokens
+    )
+    assert executor.num_eus == 1
     assert tokens[0].item() == sum(int(sample["loss_mask"].sum()) for sample in batch)
+    if with_losses:
+        return _main_grads(reference), _losses(reports, executor)
     return _main_grads(reference)
+
+
+def _assert_losses_equal(losses, reference):
+    assert losses
+    for index, loss in losses.items():
+        assert torch.equal(loss, reference[index]), (index, loss, reference[index])
 
 
 def _eager_reference(local, *, distributed_optimizer=False, te=False):
@@ -312,31 +359,63 @@ def _assert_item_counts_differ(executor):
     assert len({int(count) for count in all_items}) > 1, "ranks should run different item counts"
 
 
+@pytest.mark.parametrize("move_transport", ["p2p", "all_to_all"])
+@pytest.mark.parametrize("rebalance", [True, False], ids=["rebalance", "no_rebalance"])
 @pytest.mark.parametrize("distributed_optimizer", [False, True])
 def test_dp_ranks_with_different_item_counts_match_the_references(
-    single_rank_groups, distributed_optimizer
+    single_rank_groups, distributed_optimizer, rebalance, move_transport
 ):
-    """D1 + D2: ranks run different item counts and the step completes; after finalize
-    main_grad equals the single-rank RSBF reference over the whole global batch and the
-    standard schedule under the same DDP wrap; finalize receives the local token count."""
+    """D1 + D2 (G1): W EUs over the DP group; with rebalancing samples move between ranks,
+    without it (and without tail item moves) the ranks run different item counts. Per-sample
+    losses equal the single-rank RSBF reference bitwise; after finalize main_grad equals the
+    single-rank reference over the whole global batch and the standard schedule under the same
+    DDP wrap; finalize receives the local (home) token count; one host sync per step. Both
+    move transports: NCCL ``batch_isend_irecv`` on the non-empty pairs, and
+    ``all_to_all_single`` on every rank in every move phase (zero splits for the pairs and
+    ranks without a transfer)."""
     batch = _global_batch(dist.get_world_size())
     local = _local_slice(batch)
 
-    # The DP arm: each rank one EU on its slice.
+    # The DP arm: each rank one EU of the domain, loading its slice.
     ddp = _ddp_model(distributed_optimizer=distributed_optimizer)
     seen_tokens = []
     reports, executor = _rsbf_step(
-        ddp, local, ProcessGroupCollection.use_mpu_process_groups(), record=seen_tokens
+        ddp,
+        local,
+        ProcessGroupCollection.use_mpu_process_groups(),
+        batch,
+        record=seen_tokens,
+        rebalance=rebalance,
+        tail_item_moves=rebalance,
+        move_transport=move_transport,
     )
     if distributed_optimizer:
         _gather_reduced_shards(ddp)
     dp_grads = _main_grads(ddp)
-    _assert_item_counts_differ(executor)
+    stats = executor.stats
+    assert executor.num_eus == dist.get_world_size()
+    assert stats.host_syncs == 1 and stats.status_exchanges == 0
+    if rebalance:
+        assert stats.moves["sample"] > 0
+        # all_to_all runs on every rank in every move phase; p2p only posts on the pairs.
+        transport = executor.dispatcher.stats
+        if move_transport == "all_to_all":
+            assert transport.all_to_alls > 0 and transport.p2p_ops == 0
+        else:
+            assert transport.all_to_alls == 0
+    else:
+        assert stats.moves == {"sample": 0, "chain": 0, "item": 0}
+        _assert_item_counts_differ(executor)
     local_tokens = sum(int(sample["loss_mask"].sum()) for _, sample in local)
     assert len(seen_tokens) == 1 and seen_tokens[0].item() == local_tokens
     assert sum(int(report["lm loss"][1]) for report in reports) == local_tokens
+    assert sorted(_losses(reports, executor)) == [index for index, _ in local]
 
-    _assert_close(dp_grads, _single_rank_reference(batch, single_rank_groups))
+    reference_grads, reference_losses = _single_rank_reference(
+        batch, single_rank_groups, with_losses=True
+    )
+    _assert_losses_equal(_losses(reports, executor), reference_losses)
+    _assert_close(dp_grads, reference_grads)
     _assert_close(dp_grads, _eager_reference(local, distributed_optimizer=distributed_optimizer))
 
 
@@ -367,7 +446,7 @@ def test_train_path_schedule_at_dp(single_rank_groups, full_precision_gemms, te)
     eager = _eager_reference(local, te=te)
 
     ddp = _ddp_model(te=te)
-    criterion = PrescribedDepthCriterion({index: sample["depth"] for index, sample in local})
+    criterion = _criterion(batch)
     validated = []
 
     def forward_step(data_iterator, model):  # pragma: no cover - the schedule uses the hooks
@@ -406,7 +485,8 @@ def test_train_path_schedule_at_dp(single_rank_groups, full_precision_gemms, te)
             assert len(validated) == step + 1
             assert validated[-1].device.type == "cpu"
             assert validated[-1].item() == pytest.approx(step_loss / PER_RANK, rel=1e-6)
-            _assert_item_counts_differ(executors[-1])
+            # The default config rebalances: samples move between the ranks.
+            assert executors[-1].stats.moves["sample"] > 0
             grads = _main_grads(ddp)
             _assert_close(grads, single_rank)
             _assert_close(grads, eager)
@@ -415,3 +495,118 @@ def test_train_path_schedule_at_dp(single_rank_groups, full_precision_gemms, te)
         schedule.set_iteration(0)
     assert executors[0] is executors[1]  # cached; the default collection is refreshed per call
     assert executors[1].pg_collection.dp is not None
+
+
+def test_waves_match_one_pass():
+    """D4 (G4): waves 2 and 4 against one pass over the same W EUs: per-sample losses bitwise,
+    main_grad after finalize within the gate."""
+    batch = _global_batch(dist.get_world_size())
+    local = _local_slice(batch)
+    pg_collection = ProcessGroupCollection.use_mpu_process_groups()
+    results = {}
+    for waves in (1, 2, 4):
+        ddp = _ddp_model()
+        reports, executor = _rsbf_step(ddp, local, pg_collection, batch, waves=waves)
+        assert len(executor.stats.store_peaks) == waves and executor.stats.host_syncs == 1
+        results[waves] = (_losses(reports, executor), _main_grads(ddp))
+    base_losses, base_grads = results[1]
+    for losses, grads in results.values():
+        _assert_losses_equal(losses, base_losses)
+        _assert_close(grads, base_grads)
+
+
+def test_sync_budget_at_w_eus(single_rank_groups):
+    """D5 (G5): known depths, W EUs, under ``set_sync_debug_mode('error')`` (which only the
+    executor's own end-of-step read lowers): one host sync and no status exchange per step.
+    The program and executor are built once, before error mode, and reused for the warm-up
+    and the checked step (as ``train()`` reuses its cached executor; the program constructor
+    copies host constants to the device). An online criterion over the Gloo status group: one
+    status exchange per forward round, one host sync per round plus one per step, and the
+    one-EU run's depths and losses."""
+    batch = _global_batch(dist.get_world_size())
+    local = _local_slice(batch)
+    pg_collection = ProcessGroupCollection.use_mpu_process_groups()
+    ddp = _ddp_model()
+    executor = LoopRSBFExecutor(
+        LoopProgram(ddp, exit_criterion=_criterion(batch)), pg_collection=pg_collection
+    )
+    # One step first: NCCL creates the pair communicators of the moves lazily; finalize
+    # (outside the executor) is not part of the budget.
+    _rsbf_step(ddp, local, pg_collection, batch, executor=executor)
+    ddp.zero_grad_buffer()
+    config = ddp.module.config
+    real, config.finalize_model_grads_func = config.finalize_model_grads_func, None
+    torch.cuda.synchronize()
+    torch.cuda.set_sync_debug_mode("error")
+    try:
+        _, checked = _rsbf_step(ddp, local, pg_collection, batch, executor=executor)
+    finally:
+        torch.cuda.set_sync_debug_mode(0)
+        config.finalize_model_grads_func = real
+    assert checked is executor
+    assert executor.stats.host_syncs == 1 and executor.stats.status_exchanges == 0
+    assert executor.stats.moves["sample"] > 0
+
+    head = HaltingHead(1, ddp.module.config.hidden_size, device=torch.device("cuda"), seed=3)
+    criterion = OnlineHaltingCriterion(head, tau=1.4)
+    reference = _ddp_model(single_rank_groups)
+    ref_reports, ref_executor = _rsbf_step(
+        reference, list(enumerate(batch)), single_rank_groups, batch, criterion=criterion
+    )
+    ddp = _ddp_model()
+    groups = RSBFGroups(
+        domain=pg_collection.dp, status=parallel_state.get_data_parallel_group_gloo()
+    )
+    reports, executor = _rsbf_step(
+        ddp, local, pg_collection, batch, criterion=criterion, groups=groups, check_plan=True
+    )
+    stats = executor.stats
+    rounds = sum(stats.rounds_by_wave)
+    assert stats.status_exchanges == rounds and stats.host_syncs == rounds + 1
+    assert stats.depths == ref_executor.stats.depths
+    _assert_losses_equal(_losses(reports, executor), _losses(ref_reports, ref_executor))
+
+
+@pytest.mark.parametrize("case", ["home", "moved"])
+def test_buggy_plan_raises_on_every_rank(monkeypatch, case):
+    """D6 (G7): a host plan that sweeps sample 0 one round after its exit (the same plan on
+    every rank) is caught by the after-exit counter of the EU that swept it; the end-of-step
+    flags all-reduce makes every rank raise the same error naming that EU, and the next step
+    on the same communicators runs. ``moved``: every sample exits at round 1 except sample W
+    (3 rounds), so the rebalancer moves the late-retired sample 0 from EU 0 to EU 1 before
+    its extra sweep, and only the exit flags of the move tell EU 1 that it already exited."""
+    world = dist.get_world_size()
+    batch = _global_batch(world)
+    local = _local_slice(batch)
+    pg_collection = ProcessGroupCollection.use_mpu_process_groups()
+    ddp = _ddp_model()
+    criterion = None
+    if case == "moved":
+        criterion = PrescribedDepthCriterion(
+            {index: 3 if index == world else 1 for index in range(len(batch))}
+        )
+    original = LoopRSBFExecutor._newly_exited
+    monkeypatch.setattr(LoopRSBFExecutor, "_newly_exited", retire_late(original, sample=0))
+    program = LoopProgram(ddp, exit_criterion=criterion or _criterion(batch))
+    executor = LoopRSBFExecutor(program, pg_collection=pg_collection)
+    message = None
+    try:
+        executor.run_step(
+            lambda iterator, model: next(iterator),
+            iter(_microbatch(sample) for _, sample in local),
+            len(local),
+            model=ddp,
+        )
+    except RuntimeError as error:
+        message = str(error)
+    monkeypatch.setattr(LoopRSBFExecutor, "_newly_exited", original)
+    messages = [None] * world
+    dist.all_gather_object(messages, message)
+    assert all(text is not None and SWEEP_AFTER_EXIT in text for text in messages), messages
+    assert len(set(messages)) == 1 and "on domain EUs" in messages[0]
+    if case == "moved":
+        assert executor._moves_of[0] > 0, executor.stats.moves
+        assert "on domain EUs [1]" in messages[0], messages
+    ddp.zero_grad_buffer()
+    _, executor = _rsbf_step(ddp, local, pg_collection, batch)
+    assert executor.program.after_exit_violations.item() == 0

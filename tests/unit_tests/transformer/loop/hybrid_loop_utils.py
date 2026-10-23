@@ -268,16 +268,19 @@ def cpu_rope(monkeypatch):
 VOCAB = 128
 
 
-def local_model_spec(module, *, hyper_connections=False):
+def local_model_spec(module, *, hyper_connections=False, moe_layer=None):
     """A local-layer hybrid stack spec of ``module`` with a local MTP block, no final norm.
 
     ``hyper_connections`` gives the MTP layer the mHC projections (``e_proj`` / ``h_proj``)
     instead of ``eh_proj``; it must match the config's ``enable_mhc_connections``.
+    ``moe_layer`` is the spec of the 'E' sublayers (e.g. a test stub; none by default).
     """
     mtp_layer = get_mtp_layer_spec_for_backend(
         None, LocalSpecProvider(), enable_hyper_connections=hyper_connections, rms_norm=True
     )
     submodules = local_hybrid_submodules()
+    if moe_layer is not None:
+        submodules.moe_layer = moe_layer
     submodules.mtp_block_spec = ModuleSpec(
         module=MultiTokenPredictionBlock,
         submodules=MultiTokenPredictionBlockSubmodules(layer_specs=[mtp_layer]),
@@ -293,11 +296,12 @@ def build_local_loop_model(
     prelude=2,
     coda=2,
     position_embedding_type="none",
+    moe_layer=None,
     **overrides,
 ):
     """A ``HybridModel`` of local layers (``pattern`` may carry an MTP part after '/'), on the
     test device. Without TE, MTP needs the ``cpu_mtp`` fixture on CPU and RoPE the
-    ``cpu_rope`` fixture."""
+    ``cpu_rope`` fixture. ``moe_layer``: the 'E' sublayer spec (``local_model_spec``)."""
     main, *mtp = pattern.split("/")
     if mtp:
         overrides.update(mtp_num_layers=len(mtp), mtp_loss_scaling_factor=0.1)
@@ -305,7 +309,9 @@ def build_local_loop_model(
     torch.manual_seed(1234)
     model = HybridModel(
         config=config,
-        hybrid_stack_spec=local_model_spec(module, hyper_connections=config.enable_mhc_connections),
+        hybrid_stack_spec=local_model_spec(
+            module, hyper_connections=config.enable_mhc_connections, moe_layer=moe_layer
+        ),
         vocab_size=VOCAB,
         max_sequence_length=SEQ,
         hybrid_layer_pattern=pattern,

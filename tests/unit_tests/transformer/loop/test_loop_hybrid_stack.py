@@ -29,6 +29,7 @@ from megatron.core.transformer.loop.hybrid_specs import (
     loop_hybrid_stack_spec,
 )
 from megatron.core.transformer.loop.hybrid_stack import LoopHybridStack, LoopStreamRMSNorm
+from megatron.core.transformer.loop.reporting import loop_metric_report
 from megatron.core.transformer.loop_transformer_block import LoopRMSNorm
 from tests.unit_tests.transformer.loop import hybrid_loop_utils
 from tests.unit_tests.transformer.loop.hybrid_loop_utils import (
@@ -663,12 +664,44 @@ def test_loss_and_metric_dicts_are_new_every_forward():
     x, _ = _inputs()
     _forward(stack, x)
     losses, metrics = stack.loop_losses, stack.loop_metrics
+    populations = stack.loop_metric_populations
     snapshot = {name: value.detach().clone() for name, value in metrics.items()}
     _forward(stack, x * 2)
     assert stack.loop_losses is not losses and stack.loop_metrics is not metrics
+    assert stack.loop_metric_populations is not populations
     assert set(losses) == {"depth balance loss", "depth z loss"}
     for name, value in snapshot.items():
         assert torch.equal(metrics[name], value), name
+
+
+@pytest.mark.parametrize("architecture", ["huginn", "mor"])
+def test_metric_populations_name_the_valid_tokens_of_mor_metrics(architecture):
+    """Huginn's metrics are per issued token (no populations); MoR's depth metrics are means
+    over the valid tokens, whose count the stack exposes for the loss function's report
+    (loop/reporting.py): ``[mean x valid, valid]`` sums the executed rounds."""
+    overrides = dict(loop_iterations=3)
+    if architecture == "mor":
+        overrides.update(loop_architecture="mor", loop_token_execution="masked")
+    stack = _stack(**overrides)
+    x, _ = _inputs()
+    padding = torch.zeros(BATCH, SEQ, dtype=torch.bool, device=device())
+    padding[1, -3:] = True
+    stack(x, attention_mask=None, rotary_pos_emb=rope(), padding_mask=padding)
+    populations, metrics = stack.loop_metric_populations, stack.loop_metrics
+    if architecture == "huginn":
+        assert populations == {}
+        return
+    valid = BATCH * SEQ - 3
+    fractions = {f"depth fraction {index}" for index in (1, 2, 3)}
+    assert set(populations) == {"loop depth", *fractions}
+    assert all(int(count) == valid for count in populations.values())
+    report = loop_metric_report(metrics, issued_tokens=BATCH * SEQ, populations=populations)
+    # Executed rounds summed over the valid tokens = active token layers / core sublayers.
+    rounds = metrics["loop active token layers"] / stack.loop_roles.core
+    assert report["loop depth"][0].item() == pytest.approx(rounds.item(), rel=1e-6)
+    assert report["loop depth"][1].item() == valid
+    assert sum(report[name][0].item() for name in fractions) == pytest.approx(valid)
+    assert report["loop active token layers"][1].item() == BATCH * SEQ
 
 
 def test_pretrain_hybrid_loss_func_adds_loop_losses(monkeypatch):

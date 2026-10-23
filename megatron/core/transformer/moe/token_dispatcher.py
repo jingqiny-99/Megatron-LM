@@ -1235,11 +1235,15 @@ class _HybridEPManager(_DispatchManager):
 
         probs = probs.reshape(num_tokens, self.num_experts)
 
-        # Dropless HybridEP consumes the routing metadata directly, so padding rows must be
-        # excluded here or they are dispatched to experts. Capacity-based modes keep their
-        # fixed-route layout, where padded rows are already accounted for by the capacity.
-        dropless = self.capacity_factor is None and self.moe_expert_rank_capacity_factor is None
-        if padding_mask is not None and dropless:
+        # HybridEP consumes the routing metadata directly, so padding rows must be excluded here
+        # or they are dispatched to experts. That holds for dropless dispatch and for the
+        # per-rank static budget (moe_expert_rank_capacity_factor) alike: excluded rows send
+        # nothing, so padding (and frozen / null rows that are marked as padding) never takes
+        # static budget; the budget below stays a function of the row count. Per-expert
+        # capacity modes keep their fixed-route layout, where padded rows are already accounted
+        # for by the capacity.
+        excludes_padding = self.capacity_factor is None
+        if padding_mask is not None and excludes_padding:
             # The mask is batch-first [b, s] while tokens are flattened from sequence-first
             # [s, b, h] hidden states, so transpose before flattening to line up token rows.
             padding_rows = padding_mask.transpose(0, 1).reshape(-1)

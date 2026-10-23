@@ -746,10 +746,33 @@ _RSBF_RULES = [
     (guards.RSBF_TRUNCATED_BPTT, dict(loop_bptt_iterations=1)),
     (guards.RSBF_SAMPLE_DEPTH, dict(loop_sample_depth=True)),
     (guards.RSBF_LOOP_RECOMPUTE, dict(loop_recompute=True)),
-    (guards.RSBF_TP_EP, dict(tensor_model_parallel_size=2, expert_tensor_parallel_size=2)),
-    (guards.RSBF_TP_EP, dict(expert_model_parallel_size=2)),
-    (guards.RSBF_TP_EP, dict(expert_tensor_parallel_size=2)),
-    (guards.RSBF_STATIC_BUDGET_MOE, dict(moe_expert_rank_capacity_factor=1.0)),
+    (guards.RSBF_TP, dict(tensor_model_parallel_size=2, expert_tensor_parallel_size=1)),
+    (guards.RSBF_ETP, dict(expert_tensor_parallel_size=2)),
+    (
+        guards.RSBF_STATIC_BUDGET_MOE,
+        dict(
+            moe_token_dispatcher_type="flex",
+            moe_flex_dispatcher_backend="ncclep",
+            moe_expert_rank_capacity_factor=1.0,
+        ),
+    ),
+    # The all-to-all dispatcher ignores the static budget (the backend field alone is not
+    # enough).
+    (
+        guards.RSBF_STATIC_BUDGET_MOE,
+        dict(
+            moe_token_dispatcher_type="alltoall",
+            moe_flex_dispatcher_backend="hybridep",
+            moe_expert_rank_capacity_factor=1.0,
+            use_transformer_engine_op_fuser=True,
+        ),
+    ),
+    (guards.RSBF_MOE_RECOMPUTE, dict(recompute_granularity="selective", recompute_modules=["moe"])),
+    (guards.RSBF_CAPACITY_MOE, dict(moe_expert_capacity_factor=1.0)),
+    (
+        guards.RSBF_CAPACITY_MOE,
+        dict(moe_expert_capacity_factor=1.0, moe_pad_expert_input_to_capacity=True),
+    ),
     (guards.RSBF_FREEZE_FOR_MTP, dict(freeze_base_model_for_mtp=True)),
     (guards.RSBF_QUANTILE_BALANCING, dict(moe_router_load_balancing_type="quantile_balancing")),
     (
@@ -784,7 +807,7 @@ _RSBF_RULES = [
 def test_rsbf_rule_is_reported_alone(rule, fields):
     """Each rule on a copy of a passing RSBF config (dense, or DSv4-like for the MoE rules)
     that differs in that rule's fields only."""
-    moe = any(name.startswith("moe_") for name in fields)
+    moe = rule == guards.RSBF_MOE_RECOMPUTE or any(name.startswith("moe_") for name in fields)
     base = _dsv4_config(**_RSBF) if moe else _dense_config(**_RSBF)
     config = _violating(base, **fields)
     with pytest.raises(ValueError) as excinfo:
@@ -792,9 +815,75 @@ def test_rsbf_rule_is_reported_alone(rule, fields):
     assert _rsbf_reported(excinfo) == [rule]
 
 
+# R16: each option alone, at EP 8 (the rule is reported with the offending option).
+_LOCKSTEP_OPTIONS = [
+    ("moe_token_dispatcher_type='allgather'", dict(moe_token_dispatcher_type="allgather")),
+    (
+        "moe_flex_dispatcher_backend='deepep'",
+        dict(moe_token_dispatcher_type="flex", moe_flex_dispatcher_backend="deepep"),
+    ),
+    (
+        "moe_flex_dispatcher_backend='deepepv2'",
+        dict(moe_token_dispatcher_type="flex", moe_flex_dispatcher_backend="deepepv2"),
+    ),
+    (
+        "moe_flex_dispatcher_backend='ncclep'",
+        dict(moe_token_dispatcher_type="flex", moe_flex_dispatcher_backend="ncclep"),
+    ),
+    ("moe_shared_expert_overlap", dict(moe_shared_expert_overlap=True)),
+    (
+        "overlap_dispatch_backward_with_experts_wgrad",
+        dict(overlap_dispatch_backward_with_experts_wgrad=True),
+    ),
+    ("moe_megakernel_backend", dict(moe_megakernel_backend="any")),
+    ("moe_latent_size", dict(moe_latent_size=128)),
+    ("log_moe_overload_factor", dict(log_moe_overload_factor=True)),
+]
+
+
+@pytest.mark.parametrize(
+    "option,fields", _LOCKSTEP_OPTIONS, ids=[option for option, _ in _LOCKSTEP_OPTIONS]
+)
+def test_rsbf_lockstep_moe_option_is_reported_alone(option, fields):
+    """R16: with expert parallelism, each option a lockstep null cannot replay is reported
+    alone (named); without expert parallelism the same config passes."""
+    config = _violating(_dsv4_config(**_RSBF, expert_model_parallel_size=8), **fields)
+    with pytest.raises(ValueError) as excinfo:
+        guards.validate_rsbf_config(config)
+    assert _rsbf_reported(excinfo) == [f"{guards.RSBF_LOCKSTEP_MOE} ({option})"]
+    guards.validate_rsbf_config(_violating(_dsv4_config(**_RSBF), **fields))
+
+
+def test_rsbf_lockstep_moe_options_are_listed_together():
+    config = _violating(
+        _dsv4_config(**_RSBF, expert_model_parallel_size=8),
+        moe_token_dispatcher_type="allgather",
+        log_moe_overload_factor=True,
+    )
+    with pytest.raises(ValueError) as excinfo:
+        guards.validate_rsbf_config(config)
+    assert _rsbf_reported(excinfo) == [
+        f"{guards.RSBF_LOCKSTEP_MOE} (moe_token_dispatcher_type='allgather' / "
+        "log_moe_overload_factor)"
+    ]
+
+
 def test_rsbf_configs_pass_and_rules_collect():
     guards.validate_rsbf_config(_dense_config(**_RSBF))
     guards.validate_rsbf_config(_dsv4_config(**_RSBF))
+    # Lockstep MoE: DSv4 at EP 8 with the all-to-all dispatcher, and with flex + HybridEP under
+    # a static per-rank budget (with the TE op fuser).
+    guards.validate_rsbf_config(_dsv4_config(**_RSBF, expert_model_parallel_size=8))
+    guards.validate_rsbf_config(
+        _violating(
+            _dsv4_config(**_RSBF, expert_model_parallel_size=8),
+            moe_token_dispatcher_type="flex",
+            moe_flex_dispatcher_backend="hybridep",
+            moe_expert_rank_capacity_factor=2.0,
+            use_transformer_engine_op_fuser=True,
+            loop_rsbf_over_budget="warn",
+        )
+    )
     guards.validate_rsbf_config(
         _dense_config(
             **_RSBF,
@@ -803,6 +892,9 @@ def test_rsbf_configs_pass_and_rules_collect():
             loop_min_rounds=2,
             loop_rsbf_waves=2,
             loop_rsbf_fill="sample_order",
+            loop_rsbf_rebalance=False,
+            loop_rsbf_move_transport="all_to_all",
+            loop_rsbf_tail_item_moves=False,
         )
     )
     # Quantile balancing and global aux loss on a dense model: no router, nothing rejected.
@@ -838,6 +930,10 @@ def test_rsbf_config_is_validated_at_construction():
         dict(loop_min_rounds=2),
         dict(loop_rsbf_waves=2),
         dict(loop_rsbf_fill="sample_order"),
+        dict(loop_rsbf_rebalance=False),
+        dict(loop_rsbf_move_transport="all_to_all"),
+        dict(loop_rsbf_tail_item_moves=False),
+        dict(loop_rsbf_over_budget="warn"),
     ],
 )
 def test_rsbf_fields_require_the_rsbf_schedule(fields):

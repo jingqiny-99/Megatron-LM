@@ -22,6 +22,14 @@ state with the recompute). Misuse (a second write, a read or release of a missin
 taken entry, an in-place change of a stored tensor, a wave that ends with live entries) raises
 ``StateStoreError`` with the key.
 
+Multi-EU (one store per EU; keys are wave-global sample ids): an entry that leaves this EU by
+a move is released as ``"sent"`` (``send_state`` / ``send_crit``, after the transfer
+completed), and a copy that arrives by a move is installed with ``put_received_*``. A received
+install is accepted only when the key is absent here and was never released this wave, or was
+released as ``"sent"`` (a checkpoint that went away and comes back by a later move); an entry
+that was consumed (``"taken"``) or evicted (``"freed"``) can never come back. Origin writes
+(``put_*``) stay strictly write-once.
+
 M1 keeps every entry in HBM. The placement policy (``StatePlacement``), the Grace tier and
 ``prefetch`` are interfaces that later milestones fill (M3 / M6a); the store already reports
 the per-wave live-byte peak per tier.
@@ -161,7 +169,8 @@ class LoopStateStore:
         self.act_dtype = act_dtype
         self.device = None if device is None else _normalize_device(device)
         self._entries: dict[StoreKey, _Entry] = {}
-        # Keys released this wave, "freed" or "taken" (error messages; write-once per wave).
+        # Keys released this wave, "freed", "taken" or "sent" (error messages; write-once per
+        # wave, except a "sent" key may be received again).
         self._released: dict[StoreKey, str] = {}
         # Per sample: the first [S, c, nH] put this wave (by a state or the injection) and the
         # key that set it; every later state, injection and crit row count is checked against it.
@@ -302,6 +311,39 @@ class LoopStateStore:
         """Release the injection of ``sample``."""
         self._release(StoreKey("injection", sample, 0), take=False)
 
+    def holds_injection(self, sample: int) -> bool:
+        """Whether this store holds a live injection copy of ``sample``."""
+        return StoreKey("injection", sample, 0) in self._entries
+
+    # -----------------------------------------------------------------------------------
+    # Moves between EUs (multi-EU RSBF)
+    # -----------------------------------------------------------------------------------
+
+    def send_state(self, sample: int, r: int) -> None:
+        """Release ``s_r`` of ``sample`` after it left this EU by a move (kind ``"sent"``).
+        Call after the transfer completed; the bytes are poisoned like a free."""
+        self._check_round(r, minimum=1, what="state")
+        self._release(StoreKey("state", sample, r), take=False, kind="sent")
+
+    def send_crit(self, sample: int, r: int) -> None:
+        """Release ``crit_r`` of ``sample`` after it left this EU by a move."""
+        self._check_round(r, minimum=0, what="crit")
+        self._release(StoreKey("crit", sample, r), take=False, kind="sent")
+
+    def put_received_state(self, sample: int, r: int, state: Tensor) -> None:
+        """Install ``s_r`` of ``sample`` that arrived by a move."""
+        self._check_round(r, minimum=1, what="state")
+        self._put(StoreKey("state", sample, r), state, received=True)
+
+    def put_received_crit(self, sample: int, r: int, crit: Tensor) -> None:
+        """Install ``crit_r`` of ``sample`` that arrived by a move."""
+        self._check_round(r, minimum=0, what="crit")
+        self._put(StoreKey("crit", sample, r), crit, received=True)
+
+    def put_received_injection(self, sample: int, injection: Tensor) -> None:
+        """Install a copy of the injection of ``sample`` that arrived by a move."""
+        self._put(StoreKey("injection", sample, 0), injection, received=True)
+
     # -----------------------------------------------------------------------------------
     # Placement interface
     # -----------------------------------------------------------------------------------
@@ -361,14 +403,16 @@ class LoopStateStore:
         if rows is not None and tensor.shape[1] != rows[0]:
             raise StateStoreError(f"{key}: {tensor.shape[1]} rows, {rows[1]} has {rows[0]}")
 
-    def _put(self, key: StoreKey, tensor: Tensor) -> None:
+    def _put(self, key: StoreKey, tensor: Tensor, *, received: bool = False) -> None:
         if self._wave is None:
             raise StateStoreError(f"{key}: put outside a wave (call begin_wave first)")
         if key in self._entries:
             raise StateStoreError(f"{key}: already stored (an entry is written once)")
-        if key in self._released:
+        released = self._released.get(key)
+        if released is not None and not (received and released == "sent"):
             raise StateStoreError(
-                f"{key}: already {self._released[key]} this wave (an entry is written once)"
+                f"{key}: already {released} this wave (an entry is written once"
+                + ("; only an entry sent away by a move may come back)" if received else ")")
             )
         self._validate(key, tensor)
         stored = tensor.detach()
@@ -414,14 +458,16 @@ class LoopStateStore:
                 "the checkpoint no longer holds the sweep's value"
             )
 
-    def _release(self, key: StoreKey, *, take: bool) -> Optional[Tensor]:
+    def _release(
+        self, key: StoreKey, *, take: bool, kind: Optional[str] = None
+    ) -> Optional[Tensor]:
         entry = self._entries.get(key)
         if entry is None:
-            action = "take" if take else "free"
+            action = "take" if take else ("send" if kind == "sent" else "free")
             raise StateStoreError(f"{key}: cannot {action}, {self._missing(key)}")
         self._check_version(key, entry)
         del self._entries[key]
-        self._released[key] = "taken" if take else "freed"
+        self._released[key] = kind or ("taken" if take else "freed")
         tensor = entry.tensor
         storage = entry.storage
         last = True
@@ -463,6 +509,8 @@ class LoopStateStore:
             return "already freed (use after free or double free)"
         if released == "taken":
             return "already taken (ownership moved to the caller)"
+        if released == "sent":
+            return "sent to another EU (it left this EU by a move)"
         return "never stored"
 
     def _describe_live(self, limit: int = 8) -> str:

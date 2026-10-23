@@ -396,8 +396,17 @@ RSBF_SUM_LOSS = "calculate_per_token_loss=False"
 RSBF_TRUNCATED_BPTT = "truncated BPTT under RSBF"
 RSBF_SAMPLE_DEPTH = "loop_sample_depth under RSBF"
 RSBF_LOOP_RECOMPUTE = "loop_recompute under RSBF"
-RSBF_TP_EP = "tensor / expert parallelism under one-EU RSBF"
-RSBF_STATIC_BUDGET_MOE = "static-budget MoE under RSBF"
+RSBF_TP = "tensor parallelism under RSBF"
+RSBF_ETP = "expert tensor parallelism under RSBF"
+RSBF_STATIC_BUDGET_MOE = "static-budget MoE other than flex + HybridEP under RSBF"
+# Expert parallelism runs lockstep across the EUs (null items replay a sub-round's MoE
+# collectives on EUs without an item of its type); options whose collectives or statistics a
+# null cannot replay are rejected (with EP > 1 only). moe_hybridep_pad_variable_tokens /
+# moe_hybridep_pad_uneven_dispatch_inputs (an EP all-reduce inside every call) stay rejected by
+# HYBRIDEP_PADDING, MoE recompute by OTHER_RECOMPUTE (and RSBF_MOE_RECOMPUTE).
+RSBF_LOCKSTEP_MOE = "MoE options that break lockstep nulls under RSBF"
+RSBF_MOE_RECOMPUTE = "MoE layer recompute under RSBF"
+RSBF_CAPACITY_MOE = "capacity MoE under RSBF"
 RSBF_FREEZE_FOR_MTP = "freeze_base_model_for_mtp under RSBF"
 RSBF_QUANTILE_BALANCING = "quantile-balancing router under RSBF"
 RSBF_DEPTH_PROBS = "loop_depth_probs mismatch"
@@ -424,8 +433,43 @@ def _depth_probs_valid(probs: Optional[Sequence[float]], max_rounds: int) -> boo
     )
 
 
+def _lockstep_moe_options(config: Any) -> List[str]:
+    """The MoE options a lockstep null item cannot replay (checked with expert parallelism)."""
+    dispatcher = getattr(config, "moe_token_dispatcher_type", "allgather")
+    backend = getattr(config, "moe_flex_dispatcher_backend", None)
+    options = {
+        # Every rank all-gathers every rank's tokens: no null form.
+        "moe_token_dispatcher_type='allgather'": dispatcher == "allgather",
+        # Only HybridEP has a null form (the other backends' metadata and budgets are not
+        # defined for an all-excluded routing).
+        f"moe_flex_dispatcher_backend={backend!r}": dispatcher == "flex" and backend != "hybridep",
+        # The dispatcher runs the shared experts inside token_dispatch.
+        "moe_shared_expert_overlap": bool(getattr(config, "moe_shared_expert_overlap", False)),
+        "overlap_dispatch_backward_with_experts_wgrad": bool(
+            getattr(config, "overlap_dispatch_backward_with_experts_wgrad", False)
+        ),
+        "moe_megakernel_backend": getattr(config, "moe_megakernel_backend", None) is not None,
+        # The null path through the latent projections is untested.
+        "moe_latent_size": bool(getattr(config, "moe_latent_size", None)),
+        # Its metric divides by the local token count, 0 on a null.
+        "log_moe_overload_factor": bool(getattr(config, "log_moe_overload_factor", False)),
+    }
+    return [name for name, applies in options.items() if applies]
+
+
+def _lockstep_moe_rule(config: Any, moe: bool) -> dict:
+    """``{"<rule> (<options>)": True}`` when expert parallelism meets lockstep-breaking
+    options, else ``{}``."""
+    if not moe or config.expert_model_parallel_size <= 1:
+        return {}
+    options = _lockstep_moe_options(config)
+    if not options:
+        return {}
+    return {f"{RSBF_LOCKSTEP_MOE} ({' / '.join(options)})": True}
+
+
 def validate_rsbf_config(config: "TransformerConfig") -> None:
-    """Reject configs the one-EU RSBF executor (``loop_schedule='rsbf'``) cannot run.
+    """Reject configs the RSBF executor (``loop_schedule='rsbf'``) cannot run.
 
     Called by ``TransformerConfig.__post_init__`` when ``loop_schedule == 'rsbf'`` and again by
     the RSBF schedule. Collects every violation and raises one ``ValueError``
@@ -446,13 +490,31 @@ def validate_rsbf_config(config: "TransformerConfig") -> None:
         RSBF_SAMPLE_DEPTH: config.loop_sample_depth,
         # RSBF always checkpoints round inputs; a set flag would be silently ignored.
         RSBF_LOOP_RECOMPUTE: config.loop_recompute,
-        # Ranks run different item sequences: no collective inside a step may span more than
-        # one rank (with TP = 1, ETP > 1 builds expert-TP groups across DP ranks).
-        RSBF_TP_EP: config.tensor_model_parallel_size > 1
-        or config.expert_model_parallel_size > 1
-        or (config.expert_tensor_parallel_size or 1) > 1,
-        RSBF_STATIC_BUDGET_MOE: getattr(config, "moe_expert_rank_capacity_factor", None)
-        is not None,
+        # EUs run different items: a collective inside a cell call must be one of the
+        # lockstep MoE calls (expert parallelism, replayed by null items). TP groups would
+        # issue collectives in every attention / MLP call.
+        RSBF_TP: config.tensor_model_parallel_size > 1,
+        # With TP = 1, ETP > 1 builds expert-TP groups across DP ranks (untested with nulls).
+        RSBF_ETP: (config.expert_tensor_parallel_size or 1) > 1,
+        # NCCL EP has no null form (and its static budget has no padding exclusion); only the
+        # flex dispatcher reads the budget (the all-to-all dispatcher ignores it, so a step would
+        # run with a silently unused budget and no over-budget flag).
+        RSBF_STATIC_BUDGET_MOE: getattr(config, "moe_expert_rank_capacity_factor", None) is not None
+        and (
+            getattr(config, "moe_token_dispatcher_type", None) != "flex"
+            or getattr(config, "moe_flex_dispatcher_backend", None) != "hybridep"
+        ),
+        # Options a null item cannot replay (named in the message), with expert parallelism.
+        **_lockstep_moe_rule(config, moe),
+        # The checkpointed MoE layer would replay its dispatch collectives inside a real item's
+        # backward, which no null replays.
+        RSBF_MOE_RECOMPUTE: moe
+        and config.recompute_granularity == "selective"
+        and "moe" in _recompute_modules(config),
+        # Token drop / drop-and-pad: the capacity comes from the local rows (a zero-row null
+        # would send an empty equal-split all-to-all) and drops depend on the co-scheduled
+        # samples. The main plan rejects capacity mode under RSBF.
+        RSBF_CAPACITY_MOE: moe and getattr(config, "moe_expert_capacity_factor", None) is not None,
         RSBF_FREEZE_FOR_MTP: config.freeze_base_model_for_mtp,
         # Its histograms are not replay-gated.
         RSBF_QUANTILE_BALANCING: moe and "quantile_balancing" in balancing,
@@ -477,12 +539,13 @@ def validate_rsbf_config(config: "TransformerConfig") -> None:
 def validate_rsbf_data_parallel(model: Any) -> None:
     """Reject a sharded data-parallel wrapper around a model run by the RSBF executor.
 
-    The executor's DP correctness rests on no collective spanning more than one rank inside a
-    step (ranks run different item counts). Megatron FSDP and torch FSDP2 all-gather
-    parameters and reduce-scatter gradients in per-module hooks, which fire on every cell call
-    and item, so ranks with different sampled depths would issue different numbers of
-    collectives. Megatron ``DistributedDataParallel`` (without ``use_megatron_fsdp``) and a bare
-    module pass. Walks the ``.module`` chain of the wrappers.
+    Inside a step the executor issues collectives only in its plan's fixed order (status
+    exchanges and sample / chain / item moves, identical on every rank), while the ranks run
+    different numbers of cell calls and items (and nulls). Megatron FSDP and torch FSDP2
+    all-gather parameters and reduce-scatter gradients in per-module hooks, which fire on every
+    cell call and item, so their collective count would depend on each rank's items and the
+    ranks would issue mismatched collectives. Megatron ``DistributedDataParallel`` (without
+    ``use_megatron_fsdp``) and a bare module pass. Walks the ``.module`` chain of the wrappers.
     """
     import torch
 

@@ -36,6 +36,7 @@ from megatron.core.packed_seq_params import (
 )
 from megatron.core.rerun_state_machine import get_rerun_state_machine
 from megatron.core.tokenizers.utils.build_tokenizer import build_tokenizer
+from megatron.core.transformer.loop.reporting import loop_metric_report
 from megatron.core.transformer.multi_token_prediction import get_mtp_ranks, mtp_on_this_rank
 from megatron.core.utils import (
     StragglerDetector,
@@ -295,6 +296,7 @@ def loss_func(
     model: Optional[GPTModel] = None,
     loop_losses=None,
     loop_metrics=None,
+    loop_metric_populations=None,
 ):
     """Loss function.
 
@@ -302,6 +304,13 @@ def loss_func(
         loss_mask (torch.Tensor): Used to mask out some portions of the loss
         output_tensor (torch.Tensor): The tensor with the losses
         model (GPTModel, optional): The model (can be wrapped)
+        loop_losses (dict, optional): Auxiliary losses of a loop decoder for this microbatch
+            (MoR router losses), added per token.
+        loop_metrics (dict, optional): Loop decoder metrics for this microbatch, each
+            reported as ``[value summed over its population, population size]``
+            (``megatron/core/transformer/loop/reporting.py``).
+        loop_metric_populations (dict, optional): The loop decoder's population size of each
+            metric not defined over the issued tokens (MoR metrics: valid tokens).
 
     Returns:
         the loss scalar for this micro-batch
@@ -337,8 +346,13 @@ def loss_func(
     for name, auxiliary in (loop_losses or {}).items():
         loss = loss + num_tokens * auxiliary
         report[name] = torch.stack((auxiliary.detach() * num_tokens, num_tokens))
-    for name, metric in (loop_metrics or {}).items():
-        report[name] = torch.stack((metric.detach() * num_tokens, num_tokens))
+    # Loop metrics: [value summed over the metric's population, population size] (the
+    # per-token loss tensor has one element per issued token).
+    report.update(
+        loop_metric_report(
+            loop_metrics, issued_tokens=output_tensor.numel(), populations=loop_metric_populations
+        )
+    )
 
     # Check individual rank losses are not NaN prior to DP all-reduce.
     rerun_state_machine = get_rerun_state_machine()
@@ -433,6 +447,7 @@ def forward_step(data_iterator, model: GPTModel, return_schedule_plan: bool = Fa
         model=model,
         loop_losses=getattr(decoder, "loop_losses", None),
         loop_metrics=getattr(decoder, "loop_metrics", None),
+        loop_metric_populations=getattr(decoder, "loop_metric_populations", None),
     )
 
 

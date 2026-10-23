@@ -172,6 +172,55 @@ class PreludeCell:
                 )
         return PreludeOutputs(injection=injection, crit_state=crit_state)
 
+    @torch.no_grad()
+    def build_context(self, sample: SampleInputs) -> None:
+        """Fill ``sample``'s activation-free metadata (decoder padding mask, hash token IDs,
+        rotary embedding, layer context) without running the prelude: for a sample that
+        arrives on an EU other than its home by a multi-EU move.
+
+        ``embed`` returns a given decoder input untouched, and ``rope_ctx`` and
+        ``_prepare_forward`` read only its shape (the expanded stub is discarded), so a zero
+        stub of the embedding's shape gives the sweep's context: every field is a function of
+        the tokens, position IDs, masks and the config.
+        """
+        program = self.program
+        hybrid, stack = program.hybrid, program.stack
+        if program.check_ports:
+            _check_batch(program, self.PORTS, sample)
+        # Zeros (never read for values): the discarded mHC expansion sees no NaN / Inf.
+        stub = torch.zeros(
+            sample.sequence,
+            sample.rows,
+            program.config.hidden_size,
+            dtype=program.dtype,  # the embedding's (residual-stream) dtype, as in the sweep
+            device=program.device,
+        )
+        _, decoder_padding_mask, hash_input_ids = hybrid.embed(
+            sample.tokens, sample.position_ids, decoder_input=stub, padding_mask=sample.padding_mask
+        )
+        rotary_pos_emb = hybrid.rope_ctx(stub, sample.position_ids)
+        _, ctx = stack._prepare_forward(
+            stub,
+            sample.attention_mask,
+            None,
+            rotary_pos_emb,
+            packed_seq_params=None,
+            padding_mask=decoder_padding_mask,
+            input_ids=hash_input_ids,
+            packed_seq_params_by_layout=None,
+            cp_layout_plan=None,
+        )
+        validate_hybrid_loop_inputs(
+            packed_seq_params=ctx.packed_seq_params,
+            inference_context=ctx.inference_context,
+            attention_mask=ctx.attention_mask,
+            has_dsv4_attention=stack._has_dsv4_attention,
+        )
+        sample.decoder_padding_mask = decoder_padding_mask
+        sample.hash_input_ids = hash_input_ids
+        sample.rotary_pos_emb = rotary_pos_emb
+        sample.ctx = ctx
+
 
 @dataclass
 class RoundOutputs:

@@ -6,6 +6,7 @@
 of the mHC streams over the non-padding tokens, a carried criterion state, a per-round
 auxiliary loss and a differentiable ``init_state``. M1 ships no production online criterion;
 this one exercises the online path, criterion-state checkpointing and its gradients.
+``PaddingDepthCriterion`` is an online criterion with depths prescribed through the batch.
 
 ``retire_late`` / ``retire_early`` build buggy host plans for the executor's exit-enforcement
 tests.
@@ -84,6 +85,27 @@ class ConstantExitCriterion(ExitCriterion):
         """A constant exit bit per row."""
         exit_bits = torch.full((state.shape[1],), self.value, dtype=torch.bool, device=state.device)
         return CriterionStep(exit=exit_bits, crit_state=crit_state)
+
+
+class PaddingDepthCriterion(ExitCriterion):
+    """An online criterion (no ``known_depths``) whose exit round is written into the batch: a
+    row with ``p`` padding tokens exits after round ``p + 1``. ``crit_0`` holds that target and
+    travels with the sample's checkpoints, so tests can prescribe online depths per sample and
+    still have the host learn the exits only from the per-round exit bitmap."""
+
+    state_width = 1
+
+    def init_state(self, injection, valid):
+        """``[c, 1]`` fp32: one plus the row's padding tokens (one without a padding mask)."""
+        rows = injection.shape[1]
+        target = torch.ones(rows, 1, dtype=torch.float32, device=injection.device)
+        if valid is not None:
+            target = target + (~valid).sum(1, keepdim=True).to(torch.float32)
+        return target
+
+    def step(self, state, crit_state, r, valid, depth):
+        """Exit once ``r`` reaches the target; the state is carried unchanged."""
+        return CriterionStep(exit=torch.ge(r, crit_state[:, 0]), crit_state=crit_state)
 
 
 # ---------------------------------------------------------------------------

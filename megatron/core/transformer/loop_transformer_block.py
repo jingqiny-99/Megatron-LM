@@ -136,6 +136,9 @@ class LoopTransformerBlock(TransformerBlock):
                     layer.self_attention.attn_mask_type = AttnMaskType.arbitrary
         self.loop_losses = {}
         self.loop_metrics = {}
+        # Population size of each metric not defined over the issued tokens (MoR: valid
+        # tokens), rebound per forward; see megatron/core/transformer/loop/reporting.py.
+        self.loop_metric_populations = {}
         self._microbatch_id = 0
 
     @staticmethod
@@ -433,6 +436,13 @@ class LoopTransformerBlock(TransformerBlock):
         }
         for index, fraction in enumerate(frequency.detach()):
             self.loop_metrics[f"depth fraction {index + 1}"] = fraction
+        # The MoR metrics are means over the valid tokens (loop/reporting.py).
+        valid_tokens = valid.sum()
+        self.loop_metric_populations = {
+            name: valid_tokens
+            for name in self.loop_metrics
+            if name == "loop depth" or name.startswith("depth fraction ")
+        }
         # Gate gradients reduce over hidden channels and can nearly cancel
         # after the final RMSNorm. Accumulate the weighted residual in FP32,
         # rather than rounding the gate and its reduction to BF16.
@@ -467,6 +477,7 @@ class LoopTransformerBlock(TransformerBlock):
         if attention_bias is not None:
             raise ValueError("Loop decoder does not support external attention bias")
         self.loop_losses = {}
+        self.loop_metric_populations = {}
         hidden_states = self.preprocess_for_layer_schedule(hidden_states)
         self._work = [0.0, 0.0, 0.0]
         kwargs = dict(

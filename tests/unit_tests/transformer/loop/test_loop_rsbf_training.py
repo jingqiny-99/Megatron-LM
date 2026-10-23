@@ -20,7 +20,14 @@
   keys ``train()`` reads (from its source) are the executor's; the validator sees the mean
   per-microbatch loss sum.
 - T5: ``loss_func(..., validate=True)`` is bitwise and call-for-call the function before the
-  ``validate`` keyword; ``validate=False`` runs no check.
+  ``validate`` keyword (with the stage-3 loop-metric rule of ``loop/reporting.py``);
+  ``validate=False`` runs no check.
+- T6: the eager schedule (``forward_step`` + ``loss_func`` per microbatch, per-row depths) and
+  the RSBF schedule report the same reduced value for every loop metric at the same depths, at
+  MBS 1 and 2 (the stage-2 finding: eager logged token layers per microbatch, RSBF per token).
+- T8: ``train()`` configures the schedule's status group (the Gloo DP group, None without data
+  parallelism); ``configure(status_group=...)`` reaches the executor's ``RSBFGroups``.
+- T9: the batch function declares ``report_keys``, the keys its loss function reports.
 """
 
 import ast
@@ -32,6 +39,7 @@ import pytest
 import torch
 import torch.distributed as dist
 
+from megatron.core import parallel_state
 from megatron.core.distributed import DistributedDataParallel
 from megatron.core.distributed.data_parallel_base import _BaseDataParallel
 from megatron.core.pipeline_parallel import schedules
@@ -66,7 +74,10 @@ LOOP_FLOP_KEYS = tuple(
 @pytest.fixture(scope="module", autouse=True)
 def _model_parallel():
     with model_parallel_once():
-        yield
+        try:
+            yield
+        finally:
+            get_loop_rsbf_schedule().reset()  # no stale groups for later modules
 
 
 class _Timer:
@@ -95,7 +106,11 @@ class _SpyRerunStateMachine:
 
 
 class _CPBatch:
-    """What ``pretrain_hybrid.get_batch`` returns (a ``ContextParallelBatch`` at CP = 1)."""
+    """What ``pretrain_hybrid.get_batch`` returns (a ``ContextParallelBatch`` at CP = 1); the
+    eager ``forward_step`` also hands it to the model (SBHD: no THD layouts or plan)."""
+
+    packed_seq_params_by_layout = None
+    thd_plan = None
 
     def __init__(self, batch, packed_seq_params=None):
         self.batch = batch
@@ -189,6 +204,9 @@ def test_batch_function_returns_a_non_validating_microbatch(hybrid):
     assert torch.equal(loss, expected[0]) and torch.equal(num_tokens, expected[1])
     assert report.keys() == expected[2].keys() == {"lm loss"}
     assert len(hybrid.test_machine.calls) == 3  # the validating call checks NaN, Inf, spiky
+    # T9: the declared report keys are the loss function's (a loss record is packed by them).
+    assert microbatch.report_keys == ("lm loss",)
+    assert set(microbatch.report_keys) == report.keys()
 
 
 @pytest.mark.parametrize("what", ["packed", "cu_seqlens", "cached_logits", "modelopt"])
@@ -322,8 +340,12 @@ def test_training_routes_rsbf_configs_to_the_module_schedule():
     assert get_loop_rsbf_forward_backward_func(SimpleNamespace(), _args()) is None
     with pytest.raises(ValueError, match="cuda_graph_impl=full_iteration"):
         get_loop_rsbf_forward_backward_func(rsbf, _args(cuda_graph_impl="full_iteration"))
-    with pytest.raises(ValueError, match="moe_expert_rank_capacity_factor"):
+    # A static per-rank MoE budget runs under RSBF (lockstep nulls; the executor checks
+    # the over-budget flags itself).
+    assert (
         get_loop_rsbf_forward_backward_func(rsbf, _args(moe_expert_rank_capacity_factor=1.0))
+        is get_loop_rsbf_schedule()
+    )
     # Sharded data parallelism: per-module collectives, a different count per DP rank.
     for flag in ("use_megatron_fsdp", "use_torch_fsdp2"):
         with pytest.raises(ValueError, match=flag):
@@ -443,7 +465,17 @@ def test_train_uses_the_rsbf_schedule_and_sets_the_iteration():
     (wrapper,) = lines["FullCudaGraphWrapper"]
     (set_iteration,) = lines["loop_rsbf_schedule.set_iteration"]
     (step,) = lines["train_step"]
+    (configure,) = lines["loop_rsbf_schedule.configure"]
     assert helper < wrapper and set_iteration < step
+    assert helper < configure < step
+    configure_calls = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call) and ast.unparse(node.func) == "loop_rsbf_schedule.configure"
+    ]
+    assert [ast.unparse(keyword.value) for keyword in configure_calls[0].keywords] == [
+        "loop_rsbf_status_group(args)"
+    ]
     set_iteration_calls = [
         node
         for node in ast.walk(tree)
@@ -461,6 +493,68 @@ def test_train_uses_the_rsbf_schedule_and_sets_the_iteration():
     ] == "iteration"
     # evaluate() keeps the standard schedule.
     assert "get_loop_rsbf_forward_backward_func" not in inspect.getsource(training.evaluate)
+    # The RSBF schedule is never wrapped in PagedStashRunner (the executor reduces and checks
+    # the static-budget flags itself): the wrap is guarded by "loop_rsbf_schedule is None".
+    wraps = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.If)
+        and any(
+            isinstance(child, ast.Call) and ast.unparse(child.func) == "PagedStashRunner"
+            for child in ast.walk(node)
+        )
+    ]
+    assert len(wraps) == 1
+    assert "loop_rsbf_schedule is None" in ast.unparse(wraps[0].test)
+    assert wraps[0].lineno > helper
+
+
+def test_status_group_reaches_the_executor(hybrid, monkeypatch):
+    """T8: ``configure(status_group=...)`` reaches the executor as ``RSBFGroups.status`` with
+    the call's ``pg_collection.dp`` as the domain; ``reset`` forgets it; ``train()``'s helper
+    gives no status group without data parallelism."""
+    from megatron.training.training import loop_rsbf_status_group
+
+    model = build_local_loop_model(DENSE, **RSBF)
+    seen = []
+
+    class _StubExecutor:
+        def run_step(self, *args, **kwargs):
+            return []
+
+    def executor_for(self, model, pg_collection, exit_criterion=None, groups=None):
+        seen.append((pg_collection, groups))
+        return _StubExecutor()
+
+    monkeypatch.setattr(LoopRSBFSchedule, "executor_for", executor_for)
+    schedule = LoopRSBFSchedule()
+    status = object()
+    schedule.configure(status_group=status)
+    pg_collection = SimpleNamespace(dp=object())
+    kwargs = dict(
+        forward_step_func=hybrid.forward_step,
+        data_iterator=[iter([])],
+        model=[model],
+        num_microbatches=1,
+        seq_length=SEQ,
+        micro_batch_size=1,
+        pg_collection=pg_collection,
+    )
+    schedule(**kwargs)
+    schedule.reset()
+    schedule(**kwargs)
+    (first_pg, first), (_, second) = seen
+    assert first_pg is pg_collection
+    assert first.domain is pg_collection.dp and first.status is status
+    assert second.domain is pg_collection.dp and second.status is None
+    # The helper returns the Gloo DP group only with data parallelism (DP > 1 under a
+    # multi-rank torchrun) and Gloo process groups enabled.
+    if parallel_state.get_data_parallel_world_size() == 1:
+        expected = None
+    else:
+        expected = parallel_state.get_data_parallel_group_gloo(with_context_parallel=False)
+    assert loop_rsbf_status_group(SimpleNamespace(use_gloo_process_groups=True)) is expected
+    assert loop_rsbf_status_group(SimpleNamespace(use_gloo_process_groups=False)) is None
 
 
 # ---------------------------------------------------------------------------
@@ -601,10 +695,19 @@ def test_reports_reduce_to_the_work_record_totals(hybrid):
 
 
 def _loss_func_before_validate_keyword(
-    module, loss_mask, output_tensor, model=None, loop_losses=None, loop_metrics=None
+    module,
+    loss_mask,
+    output_tensor,
+    model=None,
+    loop_losses=None,
+    loop_metrics=None,
+    loop_metric_populations=None,
 ):
     """``pretrain_hybrid.loss_func`` before the ``validate`` keyword (the default branch:
-    no cached logits, no ModelOpt), with the module's ``get_args`` and rerun state machine."""
+    no cached logits, no ModelOpt), with the module's ``get_args`` and rerun state machine,
+    and with loop metrics reported by the stage-3 rule (written out here, not imported:
+    ``[total, population]``, token-layer counts are totals, every other metric a mean over
+    its population, the issued tokens unless the decoder names another)."""
     args = module.get_args()
     losses = output_tensor.view(-1).float()
     loss_mask = loss_mask.view(-1).float()
@@ -617,7 +720,13 @@ def _loss_func_before_validate_keyword(
         loss = loss + num_tokens * auxiliary
         report[name] = torch.stack((auxiliary.detach() * num_tokens, num_tokens))
     for name, metric in (loop_metrics or {}).items():
-        report[name] = torch.stack((metric.detach() * num_tokens, num_tokens))
+        population = torch.as_tensor(
+            (loop_metric_populations or {}).get(name, output_tensor.numel())
+        ).float()
+        total = metric.detach().float()
+        if name not in ("loop active token layers", "loop backward token layers"):
+            total = total * population
+        report[name] = torch.stack((total, population))
 
     rerun_state_machine = module.get_rerun_state_machine()
     if args.check_for_nan_in_loss_and_grad:
@@ -662,7 +771,7 @@ def _describe(calls):
 
 @pytest.mark.parametrize("nan_check", [True, False])
 @pytest.mark.parametrize("spiky_check", [True, False])
-@pytest.mark.parametrize("loop_extras", [False, True])
+@pytest.mark.parametrize("loop_extras", [False, True, "populations"])
 def test_loss_func_validate_true_is_the_old_function(hybrid, nan_check, spiky_check, loop_extras):
     hybrid.test_args.check_for_nan_in_loss_and_grad = nan_check
     hybrid.test_args.check_for_spiky_loss = spiky_check
@@ -673,8 +782,14 @@ def test_loss_func_validate_true_is_the_old_function(hybrid, nan_check, spiky_ch
     if loop_extras:
         extras = dict(
             loop_losses={"loop router loss": torch.tensor(0.25)},
-            loop_metrics={"loop depth": torch.tensor(2.5)},
+            loop_metrics={
+                "loop depth": torch.tensor(2.5),
+                "loop active token layers": torch.tensor(float(2 * SEQ * 10)),
+                "loop forward flops per token": torch.tensor(3.0e5),
+            },
         )
+    if loop_extras == "populations":  # a MoR decoder: depth over the valid tokens
+        extras["loop_metric_populations"] = {"loop depth": torch.tensor(SEQ + 3)}
     machine = hybrid.test_machine
     new = hybrid.loss_func(loss_mask, output, **extras)
     new_calls = _describe(machine.calls)
@@ -692,3 +807,69 @@ def test_loss_func_validate_true_is_the_old_function(hybrid, nan_check, spiky_ch
     quiet = hybrid.loss_func(loss_mask, output, validate=False, **extras)
     assert machine.calls == []
     assert torch.equal(quiet[0], old[0]) and torch.equal(quiet[1], old[1])
+
+
+# ---------------------------------------------------------------------------
+# T6: eager and RSBF report the same loop metrics
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("mbs", [1, 2])
+def test_eager_and_rsbf_report_the_same_loop_metrics(hybrid, mbs):
+    """Prescribed depths [1, 3, 2, 4]. Eager: ``pretrain_hybrid.forward_step`` per microbatch
+    with the rows' depths (``set_loop_depths``), then its loss closure; RSBF: the schedule over
+    the same microbatches. ``train_step``'s reduction (a copy) gives, for every loop key the
+    eager path reports, the same value: depth and token layers exactly (integers), FLOPs per
+    token to fp32 rounding. ``loop sample moves`` is RSBF-only. The token-layer value is
+    E[d] x core sublayers per token in both."""
+    model = build_local_loop_model(DENSE, **RSBF)
+    stack = model.decoder
+    samples = len(DEPTHS)
+    batches = _rows(samples, mbs)
+    reports = LoopRSBFSchedule()(
+        forward_step_func=hybrid.forward_step,
+        data_iterator=[iter(batches)],
+        model=[model],
+        num_microbatches=samples // mbs,
+        seq_length=SEQ,
+        micro_batch_size=mbs,
+        pg_collection=SimpleNamespace(dp=None),
+        exit_criterion=PrescribedDepthCriterion(dict(enumerate(DEPTHS))),
+    )
+    rsbf = _train_step_reduction(reports)
+
+    hybrid.test_args.loop_architecture = "huginn"  # forward_step reads the decoder's metrics
+    eager_reports = []
+    for index, cp_batch in enumerate(batches):
+        rows = DEPTHS[index * mbs : (index + 1) * mbs]
+        stack.set_loop_depths(torch.tensor(rows, device=device()))
+        output, loss_closure = hybrid.forward_step(iter([cp_batch]), model)
+        eager_reports.append(loss_closure(output)[2])
+    eager = _train_step_reduction(eager_reports)
+
+    loop_keys = {key for key in eager if key.startswith("loop ")}
+    assert loop_keys == {
+        "loop depth",
+        "loop active token layers",
+        "loop backward token layers",
+        *LOOP_FLOP_KEYS,
+    }
+    assert set(rsbf) == set(eager) | {"loop sample moves"}
+    mean_depth = sum(DEPTHS) / samples
+    for key in ("loop depth", "loop active token layers", "loop backward token layers"):
+        assert torch.equal(eager[key], rsbf[key]), (key, eager[key], rsbf[key])
+    assert rsbf["loop depth"].item() == mean_depth
+    assert rsbf["loop active token layers"].item() == mean_depth * stack.loop_roles.core
+    for phase in ("forward", "backward"):
+        key = f"loop {phase} flops per token"
+        if mbs == 1:
+            assert eager[key].item() == pytest.approx(rsbf[key].item(), rel=1e-6), key
+        else:
+            # FLOPs count executed work: the eager oracle runs max(depths) rounds for every row
+            # of a microbatch (exited rows self-carry), RSBF only each sample's own rounds.
+            assert eager[key].item() > rsbf[key].item(), key
+    # Recompute is work each schedule executes: RSBF recomputes every item, the eager stack
+    # only with loop_recompute (off here). Same unit, different work.
+    assert eager["loop recompute flops per token"].item() == 0.0
+    assert rsbf["loop recompute flops per token"].item() > 0.0
+    assert eager["lm loss"].item() == pytest.approx(rsbf["lm loss"].item(), rel=1e-5)

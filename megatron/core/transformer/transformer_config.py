@@ -133,6 +133,29 @@ class TransformerConfig(ModelParallelConfig):
     after its exit; 'sample_order': every chain after the last forward round, in sample order
     (the eager reference's accumulation order)."""
 
+    loop_rsbf_rebalance: bool = True
+    """RSBF with data parallelism (one EU per DP rank, the DP group is the domain): min-move
+    rebalancing of the active samples between forward rounds (only the surplus above
+    ceil(active / EUs) moves, preferring an EU that already holds the sample's injection).
+    False keeps every sample on the EU that loaded it. Must be the same on every rank."""
+
+    loop_rsbf_move_transport: Literal["p2p", "all_to_all"] = "p2p"
+    """RSBF with data parallelism: how sample, chain and item moves travel between EUs.
+    'p2p': batch_isend_irecv on the non-empty pairs of each move phase; 'all_to_all': one
+    all_to_all_single per move phase over the whole domain."""
+
+    loop_rsbf_tail_item_moves: bool = True
+    """RSBF with data parallelism: once fewer than 2 x EUs backward items remain in a slot's
+    backward phase, move ready CORE / CODA items together with their checkpoint to idle EUs
+    (chain-parallel tail). False runs every item where its checkpoint lives."""
+
+    loop_rsbf_over_budget: Literal["raise", "warn"] = "raise"
+    """RSBF with a static per-rank MoE budget (moe_expert_rank_capacity_factor, HybridEP): what
+    happens when a dispatch overflowed the budget (tokens dropped) on any rank of the domain
+    during a step; the flags are reduced over the domain first, so every rank decides alike.
+    'raise': every rank raises at the end of the step; 'warn': the domain's first rank logs the
+    offending ranks and training continues."""
+
     loop_exit_criterion: Literal["fixed", "sampled"] = "fixed"
     """RSBF: per-sample exit. 'fixed': every sample runs loop_iterations rounds. 'sampled':
     each sample's depth is drawn from loop_depth_probs with a counter-based generator keyed by
@@ -2260,6 +2283,10 @@ class TransformerConfig(ModelParallelConfig):
                     ("loop_min_rounds", self.loop_min_rounds != 1),
                     ("loop_rsbf_waves", self.loop_rsbf_waves != 1),
                     ("loop_rsbf_fill", self.loop_rsbf_fill != "drain"),
+                    ("loop_rsbf_rebalance", not self.loop_rsbf_rebalance),
+                    ("loop_rsbf_move_transport", self.loop_rsbf_move_transport != "p2p"),
+                    ("loop_rsbf_tail_item_moves", not self.loop_rsbf_tail_item_moves),
+                    ("loop_rsbf_over_budget", self.loop_rsbf_over_budget != "raise"),
                 )
                 if is_set
             ]

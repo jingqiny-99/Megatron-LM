@@ -84,7 +84,10 @@ gpu = pytest.mark.skipif(not CUDA, reason="TE / MoE / DSv4 layers and sync-debug
 @pytest.fixture(scope="module", autouse=True)
 def _model_parallel():
     with model_parallel_once():
-        yield
+        try:
+            yield
+        finally:
+            get_loop_rsbf_schedule().reset()  # no stale groups for later modules
 
 
 @pytest.fixture
@@ -656,13 +659,16 @@ def test_normalizer_records_and_loss_scales(request, hybrid, monkeypatch, determ
         "loop depth",
         "loop active token layers",
         "loop backward token layers",
+        "loop sample moves",
     } == keys
     records = executor.stats.loss_records
     assert [record.key.global_index for record in records] == list(range(len(DEPTHS)))
     assert [record.depth for record in records] == list(DEPTHS)
     for report, record, depth in zip(reports, records, DEPTHS):
         assert torch.equal(report["lm loss"][0], record.loss)
-        assert report["loop depth"].tolist() == [float(depth), 1.0]
+        # Per issued token (loop/reporting.py): [depth x tokens, tokens].
+        assert report["loop depth"].tolist() == [float(depth * SEQ), float(SEQ)]
+        assert report["loop sample moves"].tolist() == [0.0, float(depth)]  # one EU: no moves
     _assert_grads_equal(scaled, {name: 2 * grad for name, grad in unscaled.items()})
 
 
@@ -881,7 +887,9 @@ def test_schedule_entry_runs_sampled_depths_per_iteration(request, hybrid):
         expected = SampledDepthCriterion([0.25] * 4, seed=3).known_depths(keys)
         assert len(set(expected)) > 1
         assert [executor.stats.depths[key] for key in keys] == expected
-        assert [report["loop depth"][0].item() for report in reports] == expected
+        assert [
+            report["loop depth"][0].item() / report["loop depth"][1].item() for report in reports
+        ] == expected
     assert executors[0] is executors[1]
 
 
@@ -914,6 +922,8 @@ def test_schedule_rejects_what_it_cannot_run(request, hybrid):
     with pytest.raises(ValueError, match="must divide"):
         executor = _executor(model, DEPTHS, waves=2)
         executor.run_step(_next_batch, iterator, 3, model=model)
+    with pytest.raises(ValueError, match="at least one microbatch"):
+        _executor(model, DEPTHS).run_step(_next_batch, iterator, 0, model=model)
     standard = build_local_loop_model(DENSE, loop_iterations=R_MAX)
     with pytest.raises(ValueError, match="Loop RSBF does not support: calculate_per_token_loss"):
         _executor(standard, DEPTHS)

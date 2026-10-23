@@ -37,6 +37,7 @@ from megatron.core.parallel_state import (
 )
 from megatron.core.rerun_state_machine import get_rerun_state_machine
 from megatron.core.tokenizers.utils.build_tokenizer import build_tokenizer
+from megatron.core.transformer.loop.reporting import loop_metric_report
 from megatron.core.transformer.loop.rsbf_executor import (
     RSBF_BATCH_FUNC_ATTR,
     RSBF_LOSS_VALIDATOR_ATTR,
@@ -330,6 +331,7 @@ def loss_func(
     loop_losses=None,
     loop_metrics=None,
     validate: bool = True,
+    loop_metric_populations=None,
 ):
     """Loss function.
 
@@ -340,10 +342,14 @@ def loss_func(
         loop_losses (dict, optional): Auxiliary losses of a loop decoder for this microbatch
             (MoR router losses), added per token.
         loop_metrics (dict, optional): Loop decoder metrics for this microbatch (depth,
-            token layers, FLOPs per token), reported token-weighted.
+            token layers, FLOPs per token), each reported as ``[value summed over its
+            population, population size]`` (``megatron/core/transformer/loop/reporting.py``),
+            so the logged value is the per-token mean in the eager and RSBF schedules alike.
         validate (bool): Run the rerun-state-machine checks (NaN / Inf / spiky loss,
             ``validate_loss``) on this loss. The loop RSBF schedule passes False and validates
             the step once instead (no host sync per sample; see ``validate_loss``).
+        loop_metric_populations (dict, optional): The loop decoder's population size of each
+            metric not defined over the issued tokens (MoR metrics: valid tokens).
 
     Returns:
         the loss scalar for this micro-batch
@@ -377,8 +383,13 @@ def loss_func(
     for name, auxiliary in (loop_losses or {}).items():
         loss = loss + num_tokens * auxiliary
         report[name] = torch.stack((auxiliary.detach() * num_tokens, num_tokens))
-    for name, metric in (loop_metrics or {}).items():
-        report[name] = torch.stack((metric.detach() * num_tokens, num_tokens))
+    # Loop metrics: [value summed over the metric's population, population size] (the
+    # per-token loss tensor has one element per issued token).
+    report.update(
+        loop_metric_report(
+            loop_metrics, issued_tokens=output_tensor.numel(), populations=loop_metric_populations
+        )
+    )
 
     if validate:
         validate_loss(loss)
@@ -444,6 +455,7 @@ def forward_step(data_iterator, model: HybridModel):
         model=model,
         loop_losses=getattr(decoder, "loop_losses", None),
         loop_metrics=getattr(decoder, "loop_metrics", None),
+        loop_metric_populations=getattr(decoder, "loop_metric_populations", None),
     )
 
 
@@ -487,6 +499,9 @@ def loop_rsbf_batch(data_iterator, model: HybridModel) -> LoopMicrobatch:
             padding_mask=batch.get("padding_mask"),
             # No loop_losses / loop_metrics: the schedule reports per-sample records.
             loss_func=partial(loss_func, model=model, validate=False),
+            # The keys loss_func(validate=False) reports without cached logits / ModelOpt
+            # (both rejected above): a sample's loss record is packed by them across EUs.
+            report_keys=("lm loss",),
         )
     timers('batch-generator').stop()
     return microbatch
