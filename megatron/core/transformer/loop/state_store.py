@@ -13,7 +13,17 @@ Entry                                  Written by                  Freed by
 ``crit_{i,0}``                         PRELUDE sweep               CORE(i, 1) item
 ``s_{i,r}``, ``crit_{i,r}`` (r < d_i)  CORE sweep of round r       CORE(i, r + 1) item
 ``s_{i,d}``, ``crit_{i,d}``            CORE sweep of round d_i     CODA item
+``x_{i,r,l}`` (block input)            CORE sweep of round r       CORE(i, r), after the
+                                                                   backward of block ``l``
+``trace_{i,r,l}`` (check only)         CORE sweep of round r       CORE(i, r), after its check
 =====================================  ==========================  ===========================
+
+Block inputs (kind ``"block"``) are the block-checkpoint item's stash: the input of core
+sublayer ``l`` (core-relative, ``1 <= l < L``) of round ``r``, captured by the sweep. Trace
+entries (kind ``"trace"``, ``check_recompute`` only) are the sweep's output of every core
+sublayer ``0 <= l < L``, compared with the item's recompute. Both have the round state's shape
+and dtype; a trace entry and a block entry may share one storage (the output of sublayer
+``l - 1`` is the input of sublayer ``l``), which is counted once.
 
 ``LoopStateStore`` holds them for one wave (one RSBF pass) with explicit frees: every entry is
 written once, read any number of times and released exactly once, either freed or taken
@@ -30,19 +40,21 @@ released as ``"sent"`` (a checkpoint that went away and comes back by a later mo
 that was consumed (``"taken"``) or evicted (``"freed"``) can never come back. Origin writes
 (``put_*``) stay strictly write-once.
 
-M1 keeps every entry in HBM. The placement policy (``StatePlacement``), the Grace tier and
+Every entry is in HBM. The placement policy (``StatePlacement``), the Grace tier and
 ``prefetch`` are interfaces that later milestones fill (M3 / M6a); the store already reports
-the per-wave live-byte peak per tier.
+the per-wave live-byte peak per tier and per kind.
 """
 
 import enum
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Literal, NamedTuple, Optional, Protocol
 
 import torch
 from torch import Tensor
 
-EntryKind = Literal["state", "crit", "injection"]
+EntryKind = Literal["state", "crit", "injection", "block", "trace"]
+# Kinds keyed by a core sublayer as well as a (sample, round), shaped like the round state.
+SUBLAYER_KINDS = ("block", "trace")
 
 
 class StateTier(enum.Enum):
@@ -56,29 +68,37 @@ class StateTier(enum.Enum):
 class StatePlacement(Protocol):
     """Chooses the tier of each entry when it is written."""
 
-    def tier(self, sample: int, r: int, kind: EntryKind) -> StateTier:
-        """The tier of entry ``kind`` of ``sample`` at round ``r`` (0 for the injection)."""
+    def tier(self, sample: int, r: int, kind: EntryKind, sublayer: int = -1) -> StateTier:
+        """The tier of entry ``kind`` of ``sample`` at round ``r`` (0 for the injection);
+        ``sublayer`` is passed (as a keyword) for the per-sublayer kinds ``"block"`` and
+        ``"trace"`` only, so a policy without it serves every other kind."""
 
 
 class HBMOnlyPlacement:
     """Every entry in HBM (M1)."""
 
-    def tier(self, sample: int, r: int, kind: EntryKind) -> StateTier:
+    def tier(self, sample: int, r: int, kind: EntryKind, sublayer: int = -1) -> StateTier:
         """Always ``StateTier.HBM``."""
-        del sample, r, kind
+        del sample, r, kind, sublayer
         return StateTier.HBM
 
 
 class StoreKey(NamedTuple):
-    """One entry: ``kind`` of wave-local ``sample`` at round ``r`` (the injection uses 0)."""
+    """One entry: ``kind`` of wave-local ``sample`` at round ``r`` (the injection uses 0);
+    ``sublayer`` is the core-relative sublayer of a ``"block"`` / ``"trace"`` entry (-1
+    otherwise)."""
 
     kind: EntryKind
     sample: int
     r: int
+    sublayer: int = -1
 
     def __str__(self) -> str:
         if self.kind == "injection":
             return f"e[sample {self.sample}]"
+        if self.kind in SUBLAYER_KINDS:
+            symbol = "x" if self.kind == "block" else "trace"
+            return f"{symbol}[sample {self.sample}, round {self.r}, sublayer {self.sublayer}]"
         symbol = "s" if self.kind == "state" else "crit"
         return f"{symbol}[sample {self.sample}, round {self.r}]"
 
@@ -86,13 +106,17 @@ class StoreKey(NamedTuple):
 @dataclass(frozen=True)
 class StoreStats:
     """Live entries and bytes now, and the live-byte high-water mark of the current (or, from
-    ``end_wave``, the finished) wave. Bytes count each underlying storage once."""
+    ``end_wave``, the finished) wave. Bytes count each underlying storage once; per kind, a
+    storage's bytes count for the kind of its earliest-put live entry (re-attributed when that
+    entry is released while another still holds the storage)."""
 
     live_entries: int
     live_bytes: int
     peak_bytes: int
     peak_bytes_by_tier: dict
     wave: Optional[int] = None
+    live_bytes_by_kind: dict = field(default_factory=dict)
+    peak_bytes_by_kind: dict = field(default_factory=dict)
 
 
 class StateStoreError(RuntimeError):
@@ -108,6 +132,16 @@ class _Entry:
     storage: Optional[tuple]
     # The tensor's version counter at put (None for an inference tensor, which has none).
     version: Optional[int]
+
+
+@dataclass
+class _Storage:
+    """One live storage: the live entries on it (put order), its bytes, its tier and the kind
+    its bytes are attributed to (that of ``keys[0]``)."""
+
+    keys: list
+    nbytes: int
+    tier: StateTier
 
 
 def _normalize_device(device) -> torch.device:
@@ -154,6 +188,9 @@ class LoopStateStore:
             None accepts any floating dtype. Criterion states are always fp32.
         device: when given, every entry must be on it. An unindexed ``"cuda"`` means the
             current CUDA device at construction.
+        core_sublayers: ``L``, the core sublayers of the loop; when given, block-input
+            sublayers must be in ``1 .. L-1`` and trace sublayers in ``0 .. L-1`` (otherwise
+            only the lower bounds are checked).
     """
 
     def __init__(
@@ -163,11 +200,13 @@ class LoopStateStore:
         poison_on_free: bool = False,
         act_dtype: Optional[torch.dtype] = None,
         device: Optional[torch.device] = None,
+        core_sublayers: Optional[int] = None,
     ):
         self.placement = placement if placement is not None else HBMOnlyPlacement()
         self.poison_on_free = poison_on_free
         self.act_dtype = act_dtype
         self.device = None if device is None else _normalize_device(device)
+        self.core_sublayers = core_sublayers
         self._entries: dict[StoreKey, _Entry] = {}
         # Keys released this wave, "freed", "taken" or "sent" (error messages; write-once per
         # wave, except a "sent" key may be received again).
@@ -177,14 +216,17 @@ class LoopStateStore:
         self._shapes: dict[int, tuple[torch.Size, StoreKey]] = {}
         # Per sample: the first crit row count c put this wave, and its key.
         self._crit_rows: dict[int, tuple[int, StoreKey]] = {}
-        # Live storages: id -> [references from live entries, bytes, tier].
-        self._storages: dict[tuple, list] = {}
+        # Live storages: id -> the live entries on it, its bytes, tier and attributed kind.
+        self._storages: dict[tuple, _Storage] = {}
         # Storages taken by a caller this wave: never poisoned through another entry.
         self._taken_storages: set[tuple] = set()
         self._wave: Optional[int] = None
         self._live_bytes = {tier: 0 for tier in StateTier}
         self._peak_bytes = {tier: 0 for tier in StateTier}
         self._peak_total = 0
+        # Live bytes per entry kind (each storage counted for one kind) and their peaks.
+        self._live_kind_bytes: dict[str, int] = {}
+        self._peak_kind_bytes: dict[str, int] = {}
 
     # -----------------------------------------------------------------------------------
     # Waves
@@ -208,6 +250,7 @@ class LoopStateStore:
         self._taken_storages.clear()
         self._peak_bytes = {tier: 0 for tier in StateTier}
         self._peak_total = 0
+        self._peak_kind_bytes = dict(self._live_kind_bytes)
 
     def end_wave(self) -> StoreStats:
         """Close the open wave; every entry must have been released. Returns the wave's stats
@@ -237,6 +280,7 @@ class LoopStateStore:
         self._taken_storages.clear()
         self._wave = None
         self._live_bytes = {tier: 0 for tier in StateTier}
+        self._live_kind_bytes = {}
 
     def stats(self) -> StoreStats:
         """The current live entries and bytes and the open wave's peaks."""
@@ -246,6 +290,8 @@ class LoopStateStore:
             peak_bytes=self._peak_total,
             peak_bytes_by_tier=dict(self._peak_bytes),
             wave=self._wave,
+            live_bytes_by_kind={k: v for k, v in self._live_kind_bytes.items() if v},
+            peak_bytes_by_kind=dict(self._peak_kind_bytes),
         )
 
     # -----------------------------------------------------------------------------------
@@ -316,6 +362,37 @@ class LoopStateStore:
         return StoreKey("injection", sample, 0) in self._entries
 
     # -----------------------------------------------------------------------------------
+    # Block inputs x_{r,l} and sweep traces (per core sublayer)
+    # -----------------------------------------------------------------------------------
+
+    def put_block_input(
+        self, sample: int, r: int, sublayer: int, x: Tensor, *, kind: EntryKind = "block"
+    ) -> None:
+        """Store the sweep's input of core sublayer ``sublayer`` of round ``r`` (``kind``
+        ``"block"``, the block-checkpoint stash) or its output (``kind`` ``"trace"``,
+        ``check_recompute``), ``[S, c, nH]``."""
+        self._put(self._sublayer_key(kind, sample, r, sublayer), x)
+
+    def get_block_input(
+        self, sample: int, r: int, sublayer: int, *, kind: EntryKind = "block"
+    ) -> Tensor:
+        """The stored entry of ``sublayer`` of round ``r``."""
+        return self._get(self._sublayer_key(kind, sample, r, sublayer))
+
+    def free_block_input(
+        self, sample: int, r: int, sublayer: int, *, kind: EntryKind = "block"
+    ) -> None:
+        """Release the entry of ``sublayer`` of round ``r`` (after its block's backward)."""
+        self._release(self._sublayer_key(kind, sample, r, sublayer), take=False)
+
+    def take_block_input(
+        self, sample: int, r: int, sublayer: int, *, kind: EntryKind = "block"
+    ) -> Tensor:
+        """Remove the entry of ``sublayer`` of round ``r`` and hand it to the caller (never
+        poisoned)."""
+        return self._release(self._sublayer_key(kind, sample, r, sublayer), take=True)
+
+    # -----------------------------------------------------------------------------------
     # Moves between EUs (multi-EU RSBF)
     # -----------------------------------------------------------------------------------
 
@@ -344,16 +421,33 @@ class LoopStateStore:
         """Install a copy of the injection of ``sample`` that arrived by a move."""
         self._put(StoreKey("injection", sample, 0), injection, received=True)
 
+    def send_block_input(
+        self, sample: int, r: int, sublayer: int, *, kind: EntryKind = "block"
+    ) -> None:
+        """Release a block-input (or trace) entry after it left this EU with a moved CORE
+        item."""
+        self._release(self._sublayer_key(kind, sample, r, sublayer), take=False, kind="sent")
+
+    def put_received_block_input(
+        self, sample: int, r: int, sublayer: int, x: Tensor, *, kind: EntryKind = "block"
+    ) -> None:
+        """Install a block-input (or trace) entry that arrived with a moved CORE item."""
+        self._put(self._sublayer_key(kind, sample, r, sublayer), x, received=True)
+
     # -----------------------------------------------------------------------------------
     # Placement interface
     # -----------------------------------------------------------------------------------
 
-    def prefetch(self, sample: int, r: int, kind: EntryKind = "state") -> None:
-        """Bring entry ``kind`` of ``sample`` at round ``r`` to HBM before its consumer runs
-        (``r`` is ignored for the injection). A no-op in M1 (every entry is in HBM); checks that
-        the entry is live (``s_0`` needs nothing)."""
+    def prefetch(self, sample: int, r: int, kind: EntryKind = "state", sublayer: int = -1) -> None:
+        """Bring entry ``kind`` of ``sample`` at round ``r`` (and ``sublayer`` for a block /
+        trace entry) to HBM before its consumer runs (``r`` is ignored for the injection). A
+        no-op while every entry is in HBM; checks that the entry is live (``s_0`` needs
+        nothing)."""
         if kind == "injection":
             self._get(StoreKey("injection", sample, 0))
+            return
+        if kind in SUBLAYER_KINDS:
+            self._get(self._sublayer_key(kind, sample, r, sublayer))
             return
         if kind not in ("state", "crit"):
             raise StateStoreError(f"prefetch: unknown entry kind {kind!r}")
@@ -370,6 +464,21 @@ class LoopStateStore:
     def _check_round(r: int, *, minimum: int, what: str) -> None:
         if r < minimum:
             raise StateStoreError(f"{what} round must be >= {minimum}, got {r}")
+
+    def _sublayer_key(self, kind: str, sample: int, r: int, sublayer: int) -> StoreKey:
+        """The key of a block-input (``1 <= sublayer < L``) or trace (``0 <= sublayer < L``)
+        entry of round ``r >= 1``."""
+        if kind not in SUBLAYER_KINDS:
+            raise StateStoreError(f"not a per-sublayer entry kind: {kind!r}")
+        self._check_round(r, minimum=1, what=kind)
+        low = 1 if kind == "block" else 0
+        high = self.core_sublayers
+        if sublayer < low or (high is not None and sublayer >= high):
+            bound = "L" if high is None else str(high)
+            raise StateStoreError(
+                f"{kind} sublayer must be in {low} .. {bound} - 1 (core-relative), got {sublayer}"
+            )
+        return StoreKey(kind, sample, r, sublayer)
 
     def _validate(self, key: StoreKey, tensor: Tensor) -> None:
         if not isinstance(tensor, Tensor):
@@ -418,7 +527,10 @@ class LoopStateStore:
         stored = tensor.detach()
         if stored.requires_grad:  # pragma: no cover - detach() never requires grad
             raise StateStoreError(f"{key}: the stored tensor requires grad")
-        tier = self.placement.tier(key.sample, key.r, key.kind)
+        if key.kind in SUBLAYER_KINDS:
+            tier = self.placement.tier(key.sample, key.r, key.kind, sublayer=key.sublayer)
+        else:
+            tier = self.placement.tier(key.sample, key.r, key.kind)
         if tier is not StateTier.HBM:
             raise NotImplementedError(f"{key}: tier {tier} is an interface only (M1 is HBM only)")
         storage = self._storage_id(stored)
@@ -433,12 +545,13 @@ class LoopStateStore:
             ref = self._storages.get(storage)
             if ref is None:
                 nbytes = stored.untyped_storage().nbytes()
-                self._storages[storage] = [1, nbytes, tier]
+                self._storages[storage] = _Storage(keys=[key], nbytes=nbytes, tier=tier)
                 self._live_bytes[tier] += nbytes
                 self._peak_bytes[tier] = max(self._peak_bytes[tier], self._live_bytes[tier])
                 self._peak_total = max(self._peak_total, sum(self._live_bytes.values()))
+                self._attribute(key.kind, nbytes)
             else:
-                ref[0] += 1
+                ref.keys.append(key)
 
     def _get(self, key: StoreKey) -> Tensor:
         entry = self._entries.get(key)
@@ -473,11 +586,17 @@ class LoopStateStore:
         last = True
         if storage is not None:
             ref = self._storages[storage]
-            ref[0] -= 1
-            last = ref[0] == 0
+            owner = ref.keys[0].kind
+            ref.keys.remove(key)
+            last = not ref.keys
             if last:
                 del self._storages[storage]
-                self._live_bytes[ref[2]] -= ref[1]
+                self._live_bytes[ref.tier] -= ref.nbytes
+                self._attribute(owner, -ref.nbytes)
+            elif ref.keys[0].kind != owner:
+                # The earliest-put live entry changed kind: its kind owns the bytes now.
+                self._attribute(owner, -ref.nbytes)
+                self._attribute(ref.keys[0].kind, ref.nbytes)
             if take:
                 self._taken_storages.add(storage)
         if take:
@@ -494,6 +613,12 @@ class LoopStateStore:
             with torch.no_grad():
                 tensor.fill_(float("nan"))
         return None
+
+    def _attribute(self, kind: str, nbytes: int) -> None:
+        """Add ``nbytes`` (negative: remove) to ``kind``'s live bytes and its peak."""
+        live = self._live_kind_bytes.get(kind, 0) + nbytes
+        self._live_kind_bytes[kind] = live
+        self._peak_kind_bytes[kind] = max(self._peak_kind_bytes.get(kind, 0), live)
 
     @staticmethod
     def _storage_id(tensor: Tensor) -> Optional[tuple]:
@@ -514,7 +639,7 @@ class LoopStateStore:
         return "never stored"
 
     def _describe_live(self, limit: int = 8) -> str:
-        keys = sorted(self._entries, key=lambda k: (k.sample, k.r, k.kind))
+        keys = sorted(self._entries, key=lambda k: (k.sample, k.r, k.kind, k.sublayer))
         text = ", ".join(str(key) for key in keys[:limit])
         if len(keys) > limit:
             text += f", ... ({len(keys) - limit} more)"

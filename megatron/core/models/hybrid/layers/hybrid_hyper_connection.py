@@ -750,6 +750,11 @@ class HyperConnectionHybridLayer(GraphableMegatronModule):
             output_with_bias = layer._group_offload_output_with_bias(
                 output_with_bias, attn_norm_manager, forced_released_tensors=[residual]
             )
+            # As TransformerLayer._forward_attention does after its BDA: the manager holds the
+            # norm input, so keeping it would keep this call's graph alive until the layer's next
+            # call (a forward without backward, e.g. a loop sweep, would retain the whole
+            # sublayer's activations).
+            layer.attn_norm_manager = None
             return output_with_bias, None, layer.hidden_dropout, layer.config.bias_dropout_fusion
 
         output_with_bias, residual = layer._forward_mlp_output_with_bias(

@@ -28,8 +28,12 @@ sample_order / all_to_all, one pass and waves), M5 (buggy plans raise on every r
 for an exited sample moved before its extra sweep), M7 (train_step's reduction and
 finalize's token count), M9 (check_recompute, poison_on_free, check_plan), M8 (lockstep MoE
 with a stub 'E' module whose every call is a collective over its EP group: null items replay
-each sub-round type's calls, at EP = W and EP = 2 inside the domain), and the static-budget
-over-budget flags (reduced over the domain: every rank raises, or the first rank warns).
+each sub-round type's calls, at EP = W and EP = 2 inside the domain; also with block-checkpoint
+plans, whose CORE-B items and nulls run per block), the static-budget over-budget flags
+(reduced over the domain: every rank raises, or the first rank warns), and the
+block-checkpoint item forms (stride 1, 2 and 3 on the 4-sublayer core) at W EUs against the
+whole-round item at the same W (bitwise: dense / mHC, no cross-EU MoE) and against one EU, with
+tail item moves that carry the round's block-input stash.
 """
 
 import os
@@ -42,7 +46,7 @@ import torch.distributed as dist
 
 from megatron.core import parallel_state
 from megatron.core.transformer.loop.dispatcher import RSBFGroups
-from megatron.core.transformer.loop.null_items import register_lockstep_module
+from megatron.core.transformer.loop.null_items import core_b_segments, register_lockstep_module
 from megatron.core.transformer.loop.program import LoopProgram, PrescribedDepthCriterion
 from megatron.core.transformer.loop.rsbf_executor import (
     OVER_BUDGET,
@@ -587,6 +591,158 @@ def test_item_moves_back_to_a_former_sample_move_source():
 
 
 # ---------------------------------------------------------------------------
+# Block-checkpoint and nested items across EUs (stage 4)
+# ---------------------------------------------------------------------------
+
+# (loop_rsbf_item_form, stride) per arm; the core of DENSE has 4 sublayers.
+FORMS = {
+    "whole_round": ("whole_round", None),
+    "block1": ("block", 1),
+    "block2": ("block", 2),
+    "block3": ("block", 3),
+    "nested1": ("nested", None),
+    "nested2": ("nested", 2),
+}
+
+
+def _forms_worker(rank, world, spec):
+    cpu_worker_setup()
+    try:
+        return _forms(rank, world, spec)
+    finally:
+        cpu_worker_teardown()
+
+
+def _forms(rank, world, spec):
+    """Every item form of ``spec["forms"]`` at W EUs (the same weights: every model is built
+    from the same seed): per-sample losses and the gradients summed over the ranks bitwise
+    equal to the whole-round arm at the same W; the whole-round arm against the one-EU
+    reference (losses bitwise, gradients within the gate); store hygiene; returns per-form
+    move counts."""
+    domain = parallel_state.get_data_parallel_group()
+    status = parallel_state.get_data_parallel_group_gloo()
+    per_rank = spec["per_rank"]
+    total = per_rank * world
+    rows = _rows(total, padded=spec.get("padded", False))
+    depths = _depths(spec["depths"], total, world, 1)
+    criterion = PrescribedDepthCriterion(depths)
+    mine = _microbatches(rows, mbs=1, world=world, rank=rank)
+    options = dict(spec.get("options", {}))
+    if options.get("check_plan"):
+        options["status"] = status
+    extra = dict(MHC) if "mhc" in spec["model"] else {}
+    results, summary = {}, {}
+    for form in spec["forms"]:
+        item_form, stride = FORMS[form]
+        overrides = (
+            {}
+            if item_form == "whole_round"
+            else dict(loop_rsbf_item_form=item_form, loop_rsbf_block_stride=stride)
+        )
+        model = build_local_loop_model(DENSE, **RSBF, **extra, **overrides)
+        if form == "whole_round":
+            ref_reports, ref_executor, ref_grads = _step(
+                model, _microbatches(rows, mbs=1, world=1, rank=0), criterion, mbs=1
+            )
+            reference = _losses(ref_executor, ref_reports)
+            abs_sum = _abs_sample_grads(model, rows, depths)
+        reports, executor, grads = _step(model, mine, criterion, mbs=1, domain=domain, **options)
+        stats = executor.stats
+        assert executor.program.item_form == item_form, form
+        assert stats.host_syncs == 1 and all(p.live_entries == 0 for p in stats.store_peaks)
+        assert stats.stash_copies == 0, form
+        if item_form == "block":
+            blocks = len(executor.program.uniform_core_plan.blocks)
+            assert stats.stash_moves == (blocks - 1) * sum(
+                1 for kind, _, _ in _item_moves(executor) if kind == "core"
+            ), form
+        # A nested item's layer stash is item-local: a moved CORE item carries no stash and
+        # rebuilds where it runs (one rebuild per CORE item of this EU).
+        core_items = sum(1 for kind, _, _ in stats.item_order if kind == "core")
+        assert stats.rebuilds == (core_items if item_form == "nested" else 0), form
+        if item_form == "nested":
+            assert stats.stash_moves == 0, form
+        results[form] = (_losses(executor, reports), _sum_over_ranks(grads))
+        summary[form] = dict(moves=dict(stats.moves), stash_moves=stats.stash_moves)
+    base_losses, base_grads = results["whole_round"]
+    for key, loss in base_losses.items():
+        assert torch.equal(loss, reference[key]), ("whole_round", key)
+    _assert_grads_close(base_grads, ref_grads, abs_sum)
+    for form, (losses, grads) in results.items():
+        assert losses.keys() == base_losses.keys(), form
+        for key in losses:
+            assert torch.equal(losses[key], base_losses[key]), (form, key)
+        assert grads.keys() == base_grads.keys(), form
+        for name, grad in grads.items():
+            assert torch.equal(grad, base_grads[name]), (form, name)
+    return summary
+
+
+def _item_moves(executor):
+    """(item kind, sample, round) of every item move of the executor's last wave plan."""
+    from megatron.core.transformer.loop.rsbf_plan import MovePhase
+
+    return [
+        (t.item, t.sample, t.round)
+        for step in executor._planner.steps  # pylint: disable=protected-access
+        if isinstance(step, MovePhase)
+        for t in step.transfers
+        if t.kind == "item"
+    ]
+
+
+@pytest.mark.parametrize("world", [2, 4])
+def test_block_items_match_the_whole_round_at_w_eus(world):
+    """M8 / M8b at W = 2 and 4 on the dense model (skewed depths: sample moves, and at W = 4
+    tail item moves): block items of stride 1 (pair-splitting), 2 and 3 (non-dividing) and
+    nested items of stride 1 and 2 give the whole-round item's per-sample losses and gradients
+    bitwise, the whole round the one-EU reference's; every moved CORE item carries its round's
+    block inputs (``stash_moves``; none for the nested item, whose layer stash is rebuilt
+    where the item runs), with check_recompute (traces travel too), poison_on_free,
+    check_plan and the port checks on."""
+    results = run_spawned(
+        _forms_worker,
+        world,
+        dict(
+            model="dense",
+            depths="skew",
+            per_rank=4,
+            forms=list(FORMS),
+            options=dict(check_recompute=True, poison_on_free=True, check_plan=True),
+        ),
+        timeout=TIMEOUT,
+    )
+    for result in results[1:]:
+        assert result == results[0]
+    summary = results[0]
+    assert summary["whole_round"]["moves"]["sample"] > 0
+    assert all(summary[form]["moves"] == summary["whole_round"]["moves"] for form in summary)
+    if world >= 4:
+        assert summary["whole_round"]["moves"]["item"] > 0
+        assert summary["block1"]["stash_moves"] > 0 and summary["block2"]["stash_moves"] > 0
+    assert summary["nested1"]["stash_moves"] == summary["nested2"]["stash_moves"] == 0
+
+
+def test_block_items_with_mhc_and_padding_at_four_eus():
+    """The 4-stream mHC model with padded rows (mixed depths), block strides 1 and 2 and the
+    nested item, plain (no debug checks) at W = 4: bitwise the whole-round arm."""
+    _needs_dynamo_off("mhc")
+    results = run_spawned(
+        _forms_worker,
+        4,
+        dict(
+            model="mhc",
+            depths="mixed",
+            per_rank=2,
+            padded=True,
+            forms=["whole_round", "block1", "block2", "nested1"],
+        ),
+        timeout=TIMEOUT,
+    )
+    assert all(result == results[0] for result in results)
+
+
+# ---------------------------------------------------------------------------
 # M3: waves across EUs
 # ---------------------------------------------------------------------------
 
@@ -867,13 +1023,20 @@ _TYPES = ("prelude_f", "core_f", "core_b", "coda", "prelude_b")
 _BACKWARD = ("core_b", "coda", "prelude_b")
 
 
-def _stub_model():
+# Prelude '*E' (2), core '*E*E' (4: two lockstep modules), coda '*E' (2), MTP '*E': the stub
+# model of the block-checkpoint lockstep cases (blocks of stride 2 hold one core E each).
+STUB_BLOCKS = "*E*E*E*E/*E"
+
+
+def _stub_model(pattern=STUB, **overrides):
     """The stub model and its ``RecordingLockstepMLP`` modules (construction order: prelude E,
-    core E, coda E, MTP E)."""
+    core E(s), coda E, MTP E)."""
     RecordingLockstepMLP.instances = []
-    model = build_local_loop_model(STUB, moe_layer=stub_moe_layer_spec(), **RSBF, **STUB_MOE)
+    model = build_local_loop_model(
+        pattern, moe_layer=stub_moe_layer_spec(), **RSBF, **STUB_MOE, **overrides
+    )
     stubs = list(RecordingLockstepMLP.instances)
-    assert [stub.index for stub in stubs] == [0, 1, 2, 3]
+    assert [stub.index for stub in stubs] == list(range(pattern.count("E")))
     return model, stubs
 
 
@@ -921,11 +1084,21 @@ class _SubRoundMarker:
         LoopRSBFExecutor._execute = self._original
 
 
-def _expected_calls(plan):
+def _expected_calls(plan, program):
     """Per sub-round type, the stub calls of a real item (= of a null): the type's modules
-    forward, then for the backward types in reverse."""
+    forward, then for the backward types in reverse; CORE-B per segment of the program's
+    backward plan (one segment for the whole round)."""
     expected = {}
     for kind_type, entries in plan.by_type.items():
+        if kind_type is SubRoundType.CORE_B:
+            calls = []
+            segments = core_b_segments(plan, program.uniform_core_plan, program.roles.core_start)
+            for segment in segments:
+                calls += [(entry.module.index, "fwd") for entry in segment.entries]
+                if segment.backward:
+                    calls += [(entry.module.index, "bwd") for entry in reversed(segment.entries)]
+            expected[kind_type.value] = calls
+            continue
         calls = [(entry.module.index, "fwd") for entry in entries]
         if kind_type.value in _BACKWARD:
             calls += [(entry.module.index, "bwd") for entry in reversed(entries)]
@@ -940,7 +1113,8 @@ def _lockstep_worker(rank, world, spec):
         domain = parallel_state.get_data_parallel_group()
         status = parallel_state.get_data_parallel_group_gloo()
         own, ep = _stub_groups(world, rank, spec["layout"])
-        model, stubs = _stub_model()
+        pattern = spec.get("pattern", STUB)
+        model, stubs = _stub_model(pattern, **spec.get("overrides", {}))
         out = {}
         for depth_kind in spec["depths"]:
             per_rank = spec["per_rank"]
@@ -975,18 +1149,21 @@ def _lockstep_worker(rank, world, spec):
             finally:
                 marker.close()
             plan = executor.lockstep
-            # Discovery: prelude E, core E, coda E + the MTP depth's E.
-            assert {t.value: [e.module.index for e in plan.by_type[t]] for t in plan.by_type} == {
-                "prelude_f": [0],
-                "prelude_b": [0],
-                "core_f": [1],
-                "core_b": [1],
-                "coda": [2, 3],
-            }
-            assert [entry.name for entry in plan.by_type[SubRoundType.CODA]] == [
-                "decoder.layers.7.mlp",
-                "mtp.layers.0.mtp_model_layer.layers.1.mlp",
-            ]
+            if pattern == STUB:
+                # Discovery: prelude E, core E, coda E + the MTP depth's E.
+                assert {
+                    t.value: [e.module.index for e in plan.by_type[t]] for t in plan.by_type
+                } == {
+                    "prelude_f": [0],
+                    "prelude_b": [0],
+                    "core_f": [1],
+                    "core_b": [1],
+                    "coda": [2, 3],
+                }
+                assert [entry.name for entry in plan.by_type[SubRoundType.CODA]] == [
+                    "decoder.layers.7.mlp",
+                    "mtp.layers.0.mtp_model_layer.layers.1.mlp",
+                ]
             for key, loss in _losses(executor, reports).items():
                 assert torch.equal(loss, reference[key]), (depth_kind, key)
             _assert_grads_close(_sum_over_ranks(grads), ref_grads, abs_sum)
@@ -995,7 +1172,7 @@ def _lockstep_worker(rank, world, spec):
             assert stats.host_syncs == 1 and all(p.live_entries == 0 for p in stats.store_peaks)
             out[depth_kind] = dict(
                 logs=[entry for entry in StubLog.entries if entry[0] is not None],
-                expected=_expected_calls(plan),
+                expected=_expected_calls(plan, executor.program),
                 null_moe_calls=stats.null_moe_calls,
                 nulls=dict(stats.nulls),
                 moves=dict(stats.moves),
@@ -1064,6 +1241,72 @@ def test_lockstep_nulls_replay_the_moe_calls_of_their_type(world, layout):
     assert sum(result["sparse"]["null_moe_calls"] for result in results) > 0
     for depth_kind in ("skew", "sparse"):
         assert all(r[depth_kind]["nulls"] == results[0][depth_kind]["nulls"] for r in results)
+
+
+@pytest.mark.parametrize("world", [2, 4])
+@pytest.mark.parametrize("stride", [1, 2, 4])
+def test_lockstep_nulls_follow_block_checkpoint_items(world, stride):
+    """M8 with block-checkpoint CORE items on the stub model with two core E modules
+    ('*E*E' core): a real CORE item runs its blocks in reverse (each block's E forward, then
+    its backward), so every CORE-B null runs the same per-block segments; in every sub-round
+    every rank makes exactly those calls, the tags agree over the EP group, check_lockstep
+    and check_plan pass, and the losses / gradients match one EU."""
+    results = run_spawned(
+        _lockstep_worker,
+        world,
+        dict(
+            layout="world",
+            depths=["skew"],
+            per_rank=2,
+            pattern=STUB_BLOCKS,
+            overrides=dict(loop_rsbf_item_form="block", loop_rsbf_block_stride=stride),
+        ),
+        timeout=TIMEOUT,
+    )
+    mixed = _check_lockstep_logs(results, world, "world")
+    assert "core_b" in mixed, mixed
+    core_b = results[0]["skew"]["expected"]["core_b"]
+    # Two core E modules (stub indices 1 and 2, core sublayers 1 and 3): one per block for
+    # strides 1 and 2 (the later block first); stride 4 is the whole round.
+    if stride == 4:
+        assert core_b == [(1, "fwd"), (2, "fwd"), (2, "bwd"), (1, "bwd")]
+    else:
+        assert core_b == [(2, "fwd"), (2, "bwd"), (1, "fwd"), (1, "bwd")]
+
+
+@pytest.mark.parametrize("world", [2, 4])
+@pytest.mark.parametrize("stride", [1, 2, 3])
+def test_lockstep_nulls_follow_nested_items(world, stride):
+    """M8 with nested CORE items on the stub model with two core E modules ('*E*E' core): a
+    real CORE item first rebuilds the core up to its last block's start forward-only (the
+    first core E), then runs its blocks in reverse (each block's E forward, then its
+    backward), so every CORE-B null runs the same segments; in every sub-round every rank
+    makes exactly those calls, the tags agree over the EP group, check_lockstep, check_plan and
+    check_recompute pass, and the losses / gradients match one EU."""
+    results = run_spawned(
+        _lockstep_worker,
+        world,
+        dict(
+            layout="world",
+            depths=["skew"],
+            per_rank=2,
+            pattern=STUB_BLOCKS,
+            overrides=dict(loop_rsbf_item_form="nested", loop_rsbf_block_stride=stride),
+            options=dict(check_recompute=True),
+        ),
+        timeout=TIMEOUT,
+    )
+    mixed = _check_lockstep_logs(results, world, "world")
+    assert "core_b" in mixed, mixed
+    # Core E modules at stub indices 1 and 2 (core sublayers 1 and 3). Every stride's rebuild
+    # ([0, 3), [0, 2), [0, 3)) runs the first; the block holding sublayer 3 comes first.
+    assert results[0]["skew"]["expected"]["core_b"] == [
+        (1, "fwd"),
+        (2, "fwd"),
+        (2, "bwd"),
+        (1, "fwd"),
+        (1, "bwd"),
+    ]
 
 
 def _over_budget_worker(rank, world, mode):

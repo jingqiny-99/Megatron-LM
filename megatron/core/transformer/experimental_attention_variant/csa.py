@@ -60,6 +60,10 @@ from megatron.core.transformer.experimental_attention_variant.dsa import (
 from megatron.core.transformer.experimental_attention_variant.dsa_kernels import (
     use_fused_dsa_kernels,
 )
+from megatron.core.transformer.experimental_attention_variant.dsa_masking import (
+    indexer_loss_padding_mask_in_scope,
+    indexer_loss_query_valid_rows,
+)
 from megatron.core.transformer.experimental_attention_variant.dsv4_layer_config import (
     get_compact_indexer_workspace_registry,
 )
@@ -2587,8 +2591,12 @@ class CompressedSparseAttention(MegatronModule):
         offset: int,
         window_idxs: torch.Tensor,
         packed_seq_params: Optional[PackedSeqParams],
+        query_valid_rows: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         """PyTorch fallback path (no fused kernels).
+
+        ``query_valid_rows`` (``[b, sq]`` bool, None = every row) excludes the other query
+        rows from the indexer loss and its gradient (``indexer_loss_padding_mask``).
 
         Returns ``(output, indexer_loss)``.
         """
@@ -2634,7 +2642,7 @@ class CompressedSparseAttention(MegatronModule):
                         None,
                         None,
                         None,
-                        None,
+                        query_valid_rows,
                         self.config.calculate_per_token_loss,
                         True,
                         non_compressed_lse,
@@ -2946,8 +2954,20 @@ class CompressedSparseAttention(MegatronModule):
                 offset,
                 window_idxs,
                 packed_seq_params,
+                # The padded rows of an enclosing loop stack (None outside one).
+                query_valid_rows=indexer_loss_query_valid_rows(b, sq, query.device),
             )
         elif has_indexer_compressed and self.training and torch.is_grad_enabled():
+            if (self.config.dsa_indexer_loss_coeff or 0.0) > 0 and (
+                indexer_loss_padding_mask_in_scope() is not None
+            ):
+                # A host check on the scope (no device read): the fused SBHD kernel has no
+                # row mask, so padded rows would train the indexer.
+                raise NotImplementedError(
+                    "indexer-loss row mask on the fused SBHD CSA path (a padding mask is in "
+                    "scope, e.g. a loop stack with padded or exited rows); use "
+                    "dsa_kernel_backend='none' or no padding"
+                )
             output, indexer_loss = self._forward_fused_indexer_training(
                 query,
                 x,

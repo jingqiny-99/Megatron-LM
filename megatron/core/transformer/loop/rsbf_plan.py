@@ -27,6 +27,12 @@ Samples are wave-global ids ``g = 0 .. G-1`` (the global batch position minus th
    moves). Chain records travel lazily, one hop, from the predecessor's EU to the EU that runs
    the successor.
 
+Block-checkpoint items (``core_stash``): the sweep of round ``r`` stores the round's block
+inputs on ``EU_r(g)``, the EU that runs CORE(g, r), so a sample move (which carries the round
+input of the *next* round) never carries them; a moved CORE item carries its round's block
+inputs (slots ``block_input:<l>``) and, under ``check_recompute``, the sweep's per-sublayer
+outputs (``trace:<l>``, ``core_trace``) with it.
+
 ``known_depth_plan`` plans a whole wave from known depths (no per-round exchange). ``digest()``
 covers the inputs, the exits and every emitted step, so ranks can compare plans in tests.
 
@@ -50,8 +56,11 @@ __all__ = [
     "SUBROUND_TYPE_OF",
     "Transfer",
     "WavePlanner",
+    "block_slot",
     "chain_slots",
     "known_depth_plan",
+    "parse_sublayer_slot",
+    "trace_slot",
 ]
 
 
@@ -89,6 +98,34 @@ GRAD_INJECTION = "grad_injection"
 GRAD_CRIT = "grad_crit"
 LOSS_RECORD = "loss_record"
 EXPECTED_STATE = "expected_state"
+# CORE item moves of a block-checkpoint plan: one slot per stashed block input
+# (``block_input:<l>``) and, under check_recompute, per sweep trace entry (``trace:<l>``); their
+# ``frees`` entries are ``("block:<l>", r)`` / ``("trace:<l>", r)``.
+BLOCK_INPUT = "block_input"
+TRACE = "trace"
+# The ``frees`` kinds of those entries (the state store's entry kinds).
+BLOCK_ENTRY = "block"
+TRACE_ENTRY = "trace"
+
+
+def block_slot(sublayer: int) -> str:
+    """The payload slot of the block input of core sublayer ``sublayer``."""
+    return f"{BLOCK_INPUT}:{sublayer}"
+
+
+def trace_slot(sublayer: int) -> str:
+    """The payload slot of the sweep's output of core sublayer ``sublayer``."""
+    return f"{TRACE}:{sublayer}"
+
+
+def parse_sublayer_slot(name: str) -> tuple:
+    """``(base, sublayer)`` of a per-sublayer slot (``"block_input:3"`` -> ``("block_input",
+    3)``) or of a ``frees`` kind (``"block:3"`` -> ``("block", 3)``); ``(name, -1)`` for any
+    other name."""
+    base, sep, index = name.partition(":")
+    if not sep:
+        return name, -1
+    return base, int(index)
 
 
 @dataclass(frozen=True)
@@ -213,7 +250,9 @@ def _encode(step: Step) -> str:
     if isinstance(step, MovePhase):
         parts = []
         for t in step.transfers:
-            frees = "/".join(f"{kind}{r}" for kind, r in t.frees)
+            # "@" separates a per-sublayer kind ("block:2") from its round, so that
+            # ("block:2", 13) and ("block:21", 3) differ; the stage-3 kinds keep "kind{r}".
+            frees = "/".join(f"{kind}@{r}" if ":" in kind else f"{kind}{r}" for kind, r in t.frees)
             parts.append(
                 f"{t.kind}:{t.sample}:{t.src}:{t.dst}:{t.round}:{t.item}:"
                 f"{'/'.join(t.slots)}:{frees}"
@@ -243,6 +282,11 @@ class WavePlanner:
         batch_slots: the batch fields the wave's microbatches have (a subset of
             ``BATCH_SLOTS``, in that order), sent on a sample's first arrival on an EU.
         report_keys: the number of report keys of the loss record (digest only).
+        core_stash: the core-relative sublayers whose input the sweep stashes for the CORE
+            item (``CoreBackwardPlan.stashed_block_inputs``; the same for every round); a
+            moved CORE item carries them.
+        core_trace: ``L`` when the sweep stores its per-sublayer outputs for
+            ``check_recompute`` (a moved CORE item carries them), else 0.
     """
 
     def __init__(
@@ -258,6 +302,8 @@ class WavePlanner:
         check_recompute: bool,
         batch_slots: tuple,
         report_keys: int,
+        core_stash: tuple = (),
+        core_trace: int = 0,
     ):
         if num_eus < 1:
             raise ValueError(f"num_eus must be >= 1, got {num_eus}")
@@ -272,6 +318,11 @@ class WavePlanner:
         unknown = [slot for slot in batch_slots if slot not in BATCH_SLOTS]
         if unknown:
             raise ValueError(f"unknown batch slots {unknown}")
+        core_stash = tuple(int(l) for l in core_stash)
+        if any(l < 1 for l in core_stash) or list(core_stash) != sorted(set(core_stash)):
+            raise ValueError(f"core_stash must be ascending sublayers >= 1, got {core_stash}")
+        if core_trace < 0:
+            raise ValueError(f"core_trace must be >= 0, got {core_trace}")
         self.num_eus = num_eus
         self.home = tuple(int(h) for h in home)
         self.max_rounds = max_rounds
@@ -283,6 +334,8 @@ class WavePlanner:
         # Declared order, whatever order the caller passed them in.
         self.batch_slots = tuple(slot for slot in BATCH_SLOTS if slot in batch_slots)
         self.report_keys = report_keys
+        self.core_stash = core_stash
+        self.core_trace = int(core_trace)
         num = len(self.home)
         self._loc = list(self.home)  # EU holding the sample's latest round state
         self._eu_round: list = [[None] for _ in range(num)]  # [g][r] = EU_r(g), r >= 1
@@ -304,6 +357,12 @@ class WavePlanner:
             f"rebalance={int(rebalance)}|items={int(tail_item_moves)}|"
             f"crit={int(criterion_differentiable)}|check={int(check_recompute)}|"
             f"batch={'/'.join(self.batch_slots)}|reports={report_keys}"
+            # Only non-default stash layouts enter the digest (stage-3 digests unchanged).
+            + (
+                f"|stash={','.join(map(str, core_stash))}|trace={self.core_trace}"
+                if core_stash or self.core_trace
+                else ""
+            )
         )
 
     # -----------------------------------------------------------------------------------
@@ -641,6 +700,13 @@ class WavePlanner:
             slots.append(EXIT_FLAGS)
             frees = ((("state", r - 1),) if r > 1 else ()) + (("crit", r - 1),)
         slots += self._arrive(g, dst)
+        if item.kind == "core":
+            # The round's block-input stash (and check_recompute trace) lives with its CORE
+            # item: it moves with it and is released on the source.
+            slots += [block_slot(l) for l in self.core_stash]
+            slots += [trace_slot(l) for l in range(self.core_trace)]
+            frees += tuple((f"{BLOCK_ENTRY}:{l}", r) for l in self.core_stash)
+            frees += tuple((f"{TRACE_ENTRY}:{l}", r) for l in range(self.core_trace))
         self.stats.item_moves += 1
         return Transfer(
             kind="item",

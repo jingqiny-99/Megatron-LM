@@ -5409,6 +5409,7 @@ def training_log(
             num_hash_layers=num_hash_layers,
             pg_collection=pg_collection,
             total_loss_dict=total_loss_dict,
+            loop_rounds=loop_metric_rounds(args),
         )
 
     # Log MTP metrics.
@@ -5502,6 +5503,7 @@ def training_log(
             configured_cp_size=args.context_parallel_size,
             pp_group=pp_group,
             dp_group=dp_group,
+            loop_rounds=loop_metric_rounds(args),
         )
 
     # Dump memory snapshot and print metrics to stdout.
@@ -6215,6 +6217,19 @@ def checkpoint_and_decide_exit(
         return True
 
     return False
+
+
+def loop_metric_rounds(args) -> Optional[int]:
+    """The round count of a Huginn hybrid loop (``loop_iterations``), whose MoE and
+    indexer-loss trackers also log per-round bins (filled by the loop stack and the RSBF sweep
+    inside ``forward_statistics_round``); None for every other model, including a MoR hybrid
+    loop (its stack does not bin rounds, so its round keys would all read zero). The condition
+    depends on the config only, so every rank issues the same metric collectives."""
+    from megatron.core.transformer.loop.guards import is_hybrid_loop_config
+
+    if is_hybrid_loop_config(args) and args.loop_architecture == "huginn":
+        return args.loop_iterations
+    return None
 
 
 def get_loop_rsbf_forward_backward_func(config, args):

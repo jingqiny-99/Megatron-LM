@@ -12,8 +12,8 @@ module holds what the cells and the executor share:
   crosses a cell boundary;
 * the per-sample inputs (``SampleKey``, ``SampleInputs``) and the phase of a cell call
   (``LoopPhase``: sweep, recompute with grad, rebuild);
-* the backward plan of one core round (``CoreBlock``, ``CoreBackwardPlan``): M1 builds only the
-  whole-round block, later block / nested items plug in as new plans;
+* the backward plan of one core round (``CoreBlock``, ``CoreBackwardPlan``): the whole-round,
+  block-checkpoint (stride ``s``) and nested item forms, chosen by config (``build_core_plan``);
 * the exit-criterion contract (``ExitCriterion``) and the built-in criteria;
 * ``LoopProgram``: the cells, the criterion, the device scalars (phase, round, the after-exit
   violation counter) and the per-(sample, round) backward plan.
@@ -22,6 +22,7 @@ module holds what the cells and the executor share:
 """
 
 import abc
+import dataclasses
 import enum
 import weakref
 from dataclasses import dataclass
@@ -30,6 +31,11 @@ from typing import TYPE_CHECKING, Callable, Literal, Mapping, Optional, Sequence
 import torch
 from torch import Tensor
 
+from megatron.core.transformer.loop.guards import (
+    LoopRoles,
+    is_block_boundary,
+    rsbf_item_form_violations,
+)
 from megatron.core.utils import get_attr_wrapped_model
 
 if TYPE_CHECKING:
@@ -127,6 +133,11 @@ MOVE_PORTS: tuple[Port, ...] = (
     # (exited, exit_round) of the sample, int32: a copy of the executor's device flags.
     Port("exit_flags", "in", ("*",), "int32", False, "executor"),
     *_BATCH_IN,
+    # A moved CORE item's block-input stash (slots ``block_input:<l>``) and, under
+    # check_recompute, the sweep's per-sublayer outputs (``trace:<l>``); the port is the slot
+    # name without the ``:<l>`` suffix.
+    Port("block_input", "in", ("S", "c", "nH"), "act", False, "state_store", optional=True),
+    Port("trace", "in", ("S", "c", "nH"), "act", False, "state_store", optional=True),
 )
 
 
@@ -217,8 +228,8 @@ class LoopPhase(enum.IntEnum):
     SWEEP = 0
     # Grad-mode replay of a round inside a backward item; graph kept; statistics gated.
     RECOMPUTE = 1
-    # Nested item (M8): sweep mode filling the layer-input stash; statistics gated. Declared
-    # only.
+    # Nested item (M8): sweep mode inside the backward item, filling the item's layer-input
+    # stash; statistics gated.
     REBUILD = 2
 
 
@@ -249,12 +260,25 @@ class CoreBlock:
             raise ValueError("only a block from sublayer 0 on the round input runs the prologue")
 
 
+ItemForm = Literal["whole_round", "block", "nested"]
+
+
 @dataclass(frozen=True)
 class CoreBackwardPlan:
     """How the backward item of one (sample, round) replays the round.
 
     The sweep of that round reads ``stashed_block_inputs()`` (what to stash) and the item
     runs ``blocks`` in reverse, both from ``LoopProgram.core_plan``, so they cannot disagree.
+
+    Three forms (``form``), built by the constructors below:
+
+    * whole round (``whole_round``): one block over the core from the round input ``s_{r-1}``;
+    * block-checkpoint with stride ``s`` (``strided``): blocks of ``s`` core sublayers (the
+      last may be shorter); the sweep stashes the input of every later block, and the item
+      recomputes and back-propagates the blocks in reverse, each from its stashed input;
+    * nested (``nested``, ``rebuild``): the item first rebuilds ``[0, rebuild_end)`` without
+      keeping a graph, filling an item-local stash with the inputs of every later block, then
+      runs the blocks in reverse as the block item does.
     """
 
     blocks: tuple[CoreBlock, ...]
@@ -276,20 +300,64 @@ class CoreBackwardPlan:
                 or after.input_source == "round_input"
             ):
                 raise ValueError(f"blocks {before} and {after} do not chain")
+        # The sweep stashes block inputs of a plan without rebuild; the item's rebuild fills
+        # the layer stash of a plan with one. A plan never mixes the two.
+        expected = "layer_stash" if self.rebuild else "block_stash"
+        sources = sorted({block.input_source for block in self.blocks[1:]} - {expected})
+        if sources:
+            raise ValueError(
+                "mixed block input sources: every block after the first of a "
+                f"{'rebuild' if self.rebuild else 'non-rebuild'} plan reads {expected!r}, "
+                f"got {sources}"
+            )
+        if self.rebuild and len(self.blocks) < 2:
+            raise ValueError("a rebuild plan needs at least two blocks")
 
     @property
     def core_sublayers(self) -> int:
         """The core sublayers the plan covers: ``[0, blocks[-1].end)``."""
         return self.blocks[-1].end
 
+    @property
+    def form(self) -> ItemForm:
+        """``"nested"`` with a rebuild, else ``"whole_round"`` for one block, else
+        ``"block"``."""
+        if self.rebuild:
+            return "nested"
+        return "whole_round" if len(self.blocks) == 1 else "block"
+
+    @property
+    def stride(self) -> int:
+        """The block length in core sublayers: the first block's (the last may be shorter)."""
+        return self.blocks[0].end
+
     def stashed_block_inputs(self) -> tuple[int, ...]:
-        """Core-relative sublayers whose input the sweep must stash (M8b); none for M1."""
+        """Core-relative sublayers whose input the sweep must stash (the block form's block
+        starts after 0); none for the whole-round and nested forms."""
         return tuple(block.start for block in self.blocks if block.input_source == "block_stash")
+
+    def rebuilt_layer_inputs(self) -> tuple[int, ...]:
+        """Core-relative sublayers whose input the nested item's rebuild stores (its block
+        starts after 0); none without a rebuild."""
+        return tuple(block.start for block in self.blocks if block.input_source == "layer_stash")
+
+    @property
+    def rebuild_end(self) -> int:
+        """The rebuild runs the prologue and core sublayers ``[0, rebuild_end)``: up to the
+        last block's start, the last input it must store (the last block's output feeds
+        nothing the item needs). 0 without a rebuild."""
+        return self.blocks[-1].start if self.rebuild else 0
+
+    def forward_units(self) -> float:
+        """Core forward passes per sample-round, in units of one round's forward: the sweep
+        (1), the item's recompute (1) and its backward (2), plus the nested rebuild's
+        ``rebuild_end / L``."""
+        return 4.0 + self.rebuild_end / self.core_sublayers
 
     @staticmethod
     def whole_round(core_sublayers: int) -> "CoreBackwardPlan":
         """One block over the whole core from the round input: the block item with stride
-        ``s = L_core``, the only plan M1 builds."""
+        ``s = L_core``."""
         return CoreBackwardPlan(
             blocks=(
                 CoreBlock(
@@ -301,6 +369,83 @@ class CoreBackwardPlan:
                 ),
             )
         )
+
+    @staticmethod
+    def strided(core_sublayers: int, stride: int) -> "CoreBackwardPlan":
+        """The block-checkpoint plan: blocks ``[j s, min((j + 1) s, L))`` for ``j = 0 ..
+        ceil(L / s) - 1``; block 0 from the round input with the prologue, later blocks from
+        the sweep's block-input stash, the last with the epilogue. ``1 <= stride <= L``;
+        ``strided(L, L) == whole_round(L)``."""
+        if not 1 <= stride <= core_sublayers:
+            raise ValueError(
+                f"a block stride must be in 1..{core_sublayers} core sublayers, got {stride}"
+            )
+        blocks = []
+        for start in range(0, core_sublayers, stride):
+            end = min(start + stride, core_sublayers)
+            blocks.append(
+                CoreBlock(
+                    start=start,
+                    end=end,
+                    input_source="round_input" if start == 0 else "block_stash",
+                    with_prologue=start == 0,
+                    with_epilogue=end == core_sublayers,
+                )
+            )
+        return CoreBackwardPlan(blocks=tuple(blocks))
+
+    @staticmethod
+    def nested(core_sublayers: int, stride: int = 1) -> "CoreBackwardPlan":
+        """The nested plan: ``strided(L, stride)`` with every later block read from the
+        rebuild's layer stash. ``1 <= stride < L`` (a nested plan has at least two blocks);
+        ``stride = 1`` is per sublayer, ``stride = 2`` per attention + MLP layer."""
+        if not 1 <= stride < core_sublayers:
+            raise ValueError(
+                f"a nested stride must be in 1..{core_sublayers - 1} core sublayers (at least "
+                f"two blocks), got {stride}"
+            )
+        strided = CoreBackwardPlan.strided(core_sublayers, stride)
+        blocks = (strided.blocks[0],) + tuple(
+            dataclasses.replace(block, input_source="layer_stash") for block in strided.blocks[1:]
+        )
+        return CoreBackwardPlan(blocks=blocks, rebuild=True)
+
+
+def build_core_plan(config, roles: LoopRoles) -> CoreBackwardPlan:
+    """The backward plan a config asks for on a core of ``roles.core`` sublayers:
+    ``loop_rsbf_item_form`` ``whole_round`` / ``block`` (stride ``loop_rsbf_block_stride``)
+    / ``nested`` (stride default 1). The fields are read with their ``TransformerConfig``
+    defaults when a duck-typed config does not define them. Raises ``ValueError`` naming the
+    broken item-form rules (``guards.rsbf_item_form_violations``) against the built core."""
+    form = getattr(config, "loop_rsbf_item_form", "whole_round")
+    stride = getattr(config, "loop_rsbf_block_stride", None)
+    violations = rsbf_item_form_violations(form, stride, roles.core)
+    if violations:
+        raise ValueError(
+            f"LoopProgram does not support: {', '.join(violations)} (loop_rsbf_item_form="
+            f"{form!r}, loop_rsbf_block_stride={stride}, {roles.core} core sublayers)"
+        )
+    if form == "block":
+        return CoreBackwardPlan.strided(roles.core, stride)
+    if form == "nested":
+        return CoreBackwardPlan.nested(roles.core, 1 if stride is None else stride)
+    return CoreBackwardPlan.whole_round(roles.core)
+
+
+def block_boundaries_split_pairs(
+    plan: CoreBackwardPlan, layer_symbols: Sequence[str], roles: LoopRoles
+) -> tuple[int, ...]:
+    """Core-relative block starts of ``plan`` that are not on a block boundary of the pattern
+    (``guards.is_block_boundary``), i.e. that separate an attention sublayer from its MLP /
+    MoE sublayer. Harmless in eager execution (every sublayer call is a function of the
+    residual state and the per-forward context only); reported, since a per-pair graph
+    needs pair-aligned block starts."""
+    symbols = list(layer_symbols)
+    return tuple(
+        block.start
+        for block in plan.blocks[1:]
+        if not is_block_boundary(symbols, roles.core_start + block.start)
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -508,6 +653,38 @@ def _eager_only_options(config) -> list[str]:
     return options
 
 
+def _coda_dsv4_attentions(hybrid, stack) -> list:
+    """The ``DSv4HybridAttention`` calls a D42 request reaches, in run order: the attentions of
+    the coda sublayers, then those of each MTP depth's layer (a repeated MTP layer once per
+    depth)."""
+    # Lazy: the attention module imports the CSA kernels.
+    from megatron.core.transformer.experimental_attention_variant import (
+        deepseek_v4_hybrid_attention,
+    )
+
+    attention = deepseek_v4_hybrid_attention.DSv4HybridAttention
+    parts = list(stack.layers[stack.loop_roles.core_end :])
+    mtp = getattr(hybrid, "mtp", None)
+    depths = (getattr(stack.config, "mtp_num_layers", None) or 0) if mtp is not None else 0
+    for depth in range(depths):
+        parts.append(mtp.layers[0 if getattr(mtp, "mtp_use_repeated_layer", False) else depth])
+    return [module for part in parts for module in part.modules() if isinstance(module, attention)]
+
+
+def _coda_recompute_request(config, hybrid, stack) -> frozenset:
+    """D42: ``{"mla_up_proj"}`` when the config asks for the coda up-projection recompute; a
+    ``ValueError`` when no DSv4 attention in the coda sublayers or the MTP layers could honour
+    it."""
+    if not getattr(config, "loop_rsbf_coda_recompute_mla_up_proj", False):
+        return frozenset()
+    if not _coda_dsv4_attentions(hybrid, stack):
+        raise ValueError(
+            "LoopProgram does not support: loop_rsbf_coda_recompute_mla_up_proj without a DSv4 "
+            "attention in the coda sublayers or the MTP layers (nothing to recompute)"
+        )
+    return frozenset({"mla_up_proj"})
+
+
 class LoopProgram:
     """The loop model as cells over one ``HybridModel`` with a Huginn ``LoopHybridStack``.
 
@@ -590,6 +767,9 @@ class LoopProgram:
             for r in range(1, self.max_rounds + 1)
         }
         self.after_exit_violations = torch.zeros((), dtype=torch.int32, device=self.device)
+        # The CORE item form: uniform over (sample, round) until a planner chooses per round.
+        self._core_plan = build_core_plan(config, self.roles)
+        self._coda_recompute_modules = _coda_recompute_request(config, hybrid, stack)
         self.prelude = PreludeCell(self)
         self.core = CoreRound(self)
         self.coda = CodaHeadCell(self)
@@ -633,13 +813,53 @@ class LoopProgram:
 
     def core_plan(self, sample: SampleInputs, r: int) -> CoreBackwardPlan:
         """The backward plan of ``sample``'s round ``r``: read by the sweep (what to stash) and
-        by the CORE item (what to replay). M1: the whole round as one block."""
-        plan = CoreBackwardPlan.whole_round(self.roles.core)
+        by the CORE item (what to replay). The config's plan (``uniform_core_plan``) for every
+        (sample, round)."""
+        plan = self._core_plan
         if plan.core_sublayers != self.roles.core:
             raise ValueError(
                 f"the core plan covers {plan.core_sublayers} of {self.roles.core} core sublayers"
             )
         return plan
+
+    @property
+    def uniform_core_plan(self) -> CoreBackwardPlan:
+        """The config's backward plan, the object ``core_plan`` returns for every (sample,
+        round): CORE-B lockstep nulls follow it, so the executor checks that the plan it read
+        is this one."""
+        return self._core_plan
+
+    @property
+    def item_form(self) -> ItemForm:
+        """The CORE item form of the config's plan."""
+        return self._core_plan.form
+
+    @property
+    def coda_recompute_modules(self) -> frozenset:
+        """Modules the CODA item asks to recompute in its backward (D42: ``{"mla_up_proj"}``
+        with ``loop_rsbf_coda_recompute_mla_up_proj``, else empty)."""
+        return self._coda_recompute_modules
+
+    def coda_recompute_attentions(self) -> list:
+        """The attention calls the CODA item's ``coda_recompute_modules`` request reaches (the
+        DSv4 attentions of the coda sublayers and of each MTP depth, in run order); empty
+        without a request."""
+        if not self._coda_recompute_modules:
+            return []
+        return _coda_dsv4_attentions(self.hybrid, self.stack)
+
+    def core_parameter_overlap(self) -> list[str]:
+        """Names of parameters used by more than one core sublayer (none for the patterns the
+        loop builds). The block and nested items rely on this: each core parameter then gets
+        one gradient addition per item in every form."""
+        stack, roles = self.stack, self.roles
+        owners: dict = {}
+        names: dict = {}
+        for index in range(roles.core_start, roles.core_end):
+            for name, param in stack.layers[index].named_parameters(prefix=f"layers.{index}"):
+                owners.setdefault(id(param), set()).add(index)
+                names.setdefault(id(param), name)
+        return sorted(names[key] for key, layers in owners.items() if len(layers) > 1)
 
     def check(self, port: Port, value: Optional[Tensor], *, rows: int, sequence: int) -> None:
         """Validate ``value`` against ``port`` for a call with ``rows`` rows of ``sequence``

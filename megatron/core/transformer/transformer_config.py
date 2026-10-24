@@ -156,6 +156,29 @@ class TransformerConfig(ModelParallelConfig):
     'raise': every rank raises at the end of the step; 'warn': the domain's first rank logs the
     offending ranks and training continues."""
 
+    loop_rsbf_item_form: Literal["whole_round", "block", "nested"] = "whole_round"
+    """RSBF: the form of the per-round backward (CORE) item. 'whole_round': recompute the whole
+    round from its checkpointed input, then back-propagate it. 'block': the block-checkpoint
+    item; the forward sweep also stores the input of every loop_rsbf_block_stride-th core
+    sublayer, and the item recomputes and back-propagates one block of that many sublayers at a
+    time, last block first. 'nested': the item first rebuilds the round without keeping a graph,
+    storing the block inputs, then recomputes and back-propagates one block at a time (blocks of
+    loop_rsbf_block_stride core sublayers, default 1). All forms give the same gradients; they
+    trade recompute work against live activation memory."""
+
+    loop_rsbf_block_stride: Optional[int] = None
+    """RSBF: the block length of the 'block' and 'nested' item forms, in core sublayers (symbols
+    of the core part of the hybrid pattern, so one attention + MLP layer is 2). Required for
+    'block' (1 <= stride <= the core sublayers; equal to them is the whole round; it need not
+    divide them, the last block is then shorter); optional for 'nested' (1 <= stride < the core
+    sublayers, default 1); must be unset for 'whole_round'."""
+
+    loop_rsbf_coda_recompute_mla_up_proj: bool = False
+    """RSBF: recompute the up projection and RoPE (the q / kv up-projection activations) of the
+    DSv4 attentions of the coda sublayers and the MTP layers in the coda item's backward instead
+    of keeping them (selective recompute of the coda item only). Needs
+    experimental_attention_variant='dsv4_hybrid'; gradients are unchanged."""
+
     loop_exit_criterion: Literal["fixed", "sampled"] = "fixed"
     """RSBF: per-sample exit. 'fixed': every sample runs loop_iterations rounds. 'sampled':
     each sample's depth is drawn from loop_depth_probs with a counter-based generator keyed by
@@ -2287,6 +2310,12 @@ class TransformerConfig(ModelParallelConfig):
                     ("loop_rsbf_move_transport", self.loop_rsbf_move_transport != "p2p"),
                     ("loop_rsbf_tail_item_moves", not self.loop_rsbf_tail_item_moves),
                     ("loop_rsbf_over_budget", self.loop_rsbf_over_budget != "raise"),
+                    ("loop_rsbf_item_form", self.loop_rsbf_item_form != "whole_round"),
+                    ("loop_rsbf_block_stride", self.loop_rsbf_block_stride is not None),
+                    (
+                        "loop_rsbf_coda_recompute_mla_up_proj",
+                        self.loop_rsbf_coda_recompute_mla_up_proj,
+                    ),
                 )
                 if is_set
             ]

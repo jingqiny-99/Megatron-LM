@@ -2,6 +2,9 @@
 
 """Masking helpers for DeepSeek sparse attention."""
 
+from collections.abc import Iterator
+from contextlib import contextmanager
+from contextvars import ContextVar
 from typing import Optional, Tuple
 
 import torch
@@ -22,6 +25,9 @@ __all__ = [
     "gather_sparse_topk_validity_and_bias",
     "generate_varlen_mask_params",
     "generate_varlen_mask_params_for_positions",
+    "indexer_loss_padding_mask",
+    "indexer_loss_padding_mask_in_scope",
+    "indexer_loss_query_valid_rows",
     "masked_softmax",
     "masked_softmax_inplace",
     "masked_log_softmax",
@@ -598,3 +604,43 @@ def build_fused_indexer_varlen_bounds(
         return starts.to(dtype=torch.int32), ends.to(dtype=torch.int32)
 
     return None
+
+
+# The ``[b, sq]`` padding mask (True = padding) of the layer calls in scope, for the SBHD
+# indexer loss (``indexer_loss_padding_mask``).
+_INDEXER_LOSS_PADDING_MASK: ContextVar[Optional[torch.Tensor]] = ContextVar(
+    "indexer_loss_padding_mask", default=None
+)
+
+
+@contextmanager
+def indexer_loss_padding_mask(mask: Optional[torch.Tensor]) -> Iterator[None]:
+    """Exclude the padded query rows of ``mask`` (``[b, sq]`` bool, True = padding) from the
+    SBHD indexer loss of the layer calls inside the scope (their KL terms and gradients).
+
+    A loop stack enters it with its layer context's padding mask (row-tail padding and the
+    rows of exited samples); ``None`` (also the default outside any scope) masks nothing and
+    hides an enclosing mask. The previous mask is restored on exit, also when the body raises.
+    THD layouts carry their real-token rows in the packed metadata instead.
+    """
+    token = _INDEXER_LOSS_PADDING_MASK.set(mask)
+    try:
+        yield
+    finally:
+        _INDEXER_LOSS_PADDING_MASK.reset(token)
+
+
+def indexer_loss_padding_mask_in_scope() -> Optional[torch.Tensor]:
+    """The padding mask of the enclosing ``indexer_loss_padding_mask`` scope, or None."""
+    return _INDEXER_LOSS_PADDING_MASK.get()
+
+
+def indexer_loss_query_valid_rows(b: int, sq: int, device: torch.device) -> Optional[torch.Tensor]:
+    """The ``[b, sq]`` bool real-row mask (``query_valid_rows``) of the enclosing
+    ``indexer_loss_padding_mask`` scope, or None without a mask in scope."""
+    mask = _INDEXER_LOSS_PADDING_MASK.get()
+    if mask is None:
+        return None
+    if mask.dtype != torch.bool:
+        raise ValueError(f"the indexer-loss padding mask must be bool, got {mask.dtype}")
+    return normalize_query_valid_rows(~mask, b=b, sq=sq, device=device)

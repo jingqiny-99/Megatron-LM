@@ -23,6 +23,7 @@ from megatron.core.transformer.attention import Attention, QKVLayout
 from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.experimental_attention_variant.csa import _build_csa_submodule
 from megatron.core.transformer.experimental_attention_variant.csa_utils import cp_utils
+from megatron.core.transformer.selective_recompute import selective_recompute_requested
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.torch_norm import LayerNormBuilder
 from megatron.core.transformer.transformer_config import MLATransformerConfig
@@ -361,8 +362,10 @@ class DSv4HybridAttention(Attention):
             # note that batch is a dummy dimension in the packed case
             core_attn_out = core_attn_out.reshape(core_attn_out.size(0), 1, -1)
 
-        if self.recompute_up_proj:
-            assert self.qkv_up_checkpoint is not None
+        assert not self.recompute_up_proj or self.qkv_up_checkpoint is not None
+        # Set exactly when the up projection was checkpointed: by the config switch or by a
+        # scoped request (``selective_recompute``).
+        if self.qkv_up_checkpoint is not None:
             self.qkv_up_checkpoint.discard_output_and_register_recompute(core_attn_out)
             self.qkv_up_checkpoint = None
 
@@ -784,7 +787,7 @@ class DSv4HybridSelfAttention(DSv4HybridAttention):
                 return query, key, value
             return query, key, value, boundary_kv
 
-        if self.recompute_up_proj:
+        if self.recompute_up_proj or selective_recompute_requested("mla_up_proj"):
             quantization = self.config.fp8 or self.config.fp4
             self.qkv_up_checkpoint = tensor_parallel.CheckpointWithoutOutput(fp8=quantization)
             if boundary_kv_compressed is None:
@@ -808,6 +811,8 @@ class DSv4HybridSelfAttention(DSv4HybridAttention):
                     boundary_kv_compressed,
                 )
         else:
+            # No checkpoint for forward() to discard (none left from an earlier call).
+            self.qkv_up_checkpoint = None
             if boundary_kv_compressed is None:
                 query, key, value = qkv_up_proj_and_rope_apply(
                     q_compressed, kv_compressed, k_pos_emb, rotary_pos_emb, self.pg_collection.cp

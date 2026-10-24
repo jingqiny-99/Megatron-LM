@@ -620,3 +620,154 @@ def test_origin_write_after_send_raises(dev):
     ):
         store.put_state(0, 1, _state(dev))
     store.end_wave()
+
+
+# ---------------------------------------------------------------------------
+# Block inputs and sweep traces (stage 4)
+# ---------------------------------------------------------------------------
+
+
+def test_block_inputs_round_trip_and_free_rules(dev):
+    """Block inputs ``x[g, r, l]`` and trace entries: put / get / free / take, write-once per
+    wave, keys per (sample, round, sublayer, kind), and the wave ends empty."""
+    store = _store(dev, core_sublayers=4)
+    x1, x2, t0 = _state(dev, 1.0), _state(dev, 2.0), _state(dev, 3.0)
+    store.put_block_input(0, 2, 1, x1)
+    store.put_block_input(0, 2, 2, x2)
+    store.put_block_input(0, 2, 0, t0, kind="trace")
+    assert torch.equal(store.get_block_input(0, 2, 1), x1)
+    assert torch.equal(store.get_block_input(0, 2, 0, kind="trace"), t0)
+    with pytest.raises(StateStoreError, match=r"x\[sample 0, round 2, sublayer 3\]: never"):
+        store.get_block_input(0, 2, 3)
+    with pytest.raises(StateStoreError, match=r"x\[sample 1, round 2, sublayer 1\]: never"):
+        store.get_block_input(1, 2, 1)
+    with pytest.raises(StateStoreError, match=r"already stored"):
+        store.put_block_input(0, 2, 1, x1)
+    assert store.stats().live_entries == 3
+    store.free_block_input(0, 2, 1)
+    with pytest.raises(StateStoreError, match=r"cannot free, already freed"):
+        store.free_block_input(0, 2, 1)
+    with pytest.raises(StateStoreError, match=r"already freed this wave"):
+        store.put_block_input(0, 2, 1, x1)
+    assert store.take_block_input(0, 2, 2) is not None
+    with pytest.raises(StateStoreError, match=r"already taken"):
+        store.get_block_input(0, 2, 2)
+    with pytest.raises(StateStoreError, match=r"trace\[sample 0, round 2, sublayer 0\]"):
+        store.end_wave()
+    store.take_block_input(0, 2, 0, kind="trace")
+    assert store.end_wave().live_entries == 0
+
+
+def test_block_input_ranges_and_checks(dev):
+    """Rounds >= 1; block sublayers in 1 .. L-1 and trace sublayers in 0 .. L-1 (only the
+    lower bound without ``core_sublayers``); the round state's shape and dtype; in-place
+    changes after the put raise."""
+    store = _store(dev, core_sublayers=4, act_dtype=torch.float32)
+    with pytest.raises(StateStoreError, match=r"block round must be >= 1"):
+        store.put_block_input(0, 0, 1, _state(dev))
+    with pytest.raises(StateStoreError, match=r"block sublayer must be in 1 \.\. 4 - 1"):
+        store.put_block_input(0, 1, 0, _state(dev))
+    with pytest.raises(StateStoreError, match=r"block sublayer must be in 1 \.\. 4 - 1"):
+        store.put_block_input(0, 1, 4, _state(dev))
+    with pytest.raises(StateStoreError, match=r"trace sublayer must be in 0 \.\. 4 - 1"):
+        store.put_block_input(0, 1, 4, _state(dev), kind="trace")
+    with pytest.raises(StateStoreError, match=r"not a per-sublayer entry kind"):
+        store.put_block_input(0, 1, 1, _state(dev), kind="state")
+    with pytest.raises(StateStoreError, match=r"dtype torch.bfloat16"):
+        store.put_block_input(0, 1, 1, _state(dev, dtype=torch.bfloat16))
+    store.put_state(0, 1, _state(dev))
+    with pytest.raises(StateStoreError, match=r"shape \(8, 2, 16\) is not \(8, 1, 16\)"):
+        store.put_block_input(0, 1, 1, _state(dev, rows=2))
+    x = _state(dev, 5.0)
+    store.put_block_input(0, 1, 1, x)
+    x.add_(1.0)
+    with pytest.raises(StateStoreError, match=r"x\[sample 0, round 1, sublayer 1\]: modified"):
+        store.get_block_input(0, 1, 1)
+    store.reset()
+    unbounded = _store(dev)
+    unbounded.put_block_input(0, 1, 99, _state(dev))
+    unbounded.prefetch(0, 1, kind="block", sublayer=99)
+    with pytest.raises(StateStoreError, match=r"x\[sample 0, round 1, sublayer 98\]: never"):
+        unbounded.prefetch(0, 1, kind="block", sublayer=98)
+    unbounded.reset()
+
+
+def test_block_inputs_move_between_stores(dev):
+    """``send_block_input`` releases an entry as sent (poisoned like a free); the destination
+    installs it with ``put_received_block_input``; an entry consumed here cannot come back,
+    one sent away can."""
+    src, dst = _store(dev, poison_on_free=True), _store(dev)
+    x = _state(dev, 4.0)
+    alias = x.view(-1)
+    src.put_block_input(3, 2, 1, x)
+    copy = src.get_block_input(3, 2, 1).clone()
+    src.send_block_input(3, 2, 1)
+    assert torch.isnan(alias).all()
+    with pytest.raises(StateStoreError, match=r"sent to another EU"):
+        src.get_block_input(3, 2, 1)
+    dst.put_received_block_input(3, 2, 1, copy)
+    assert torch.equal(dst.get_block_input(3, 2, 1), copy)
+    src.put_received_block_input(3, 2, 1, copy.clone())  # it comes back
+    src.free_block_input(3, 2, 1)
+    with pytest.raises(StateStoreError, match=r"already freed this wave"):
+        src.put_received_block_input(3, 2, 1, copy.clone())
+    dst.take_block_input(3, 2, 1)
+    with pytest.raises(StateStoreError, match=r"already taken this wave"):
+        dst.put_received_block_input(3, 2, 1, copy.clone())
+    src.end_wave()
+    dst.end_wave()
+
+
+class _SublayerPlacement:
+    """Records the keyword the store passes for per-sublayer kinds."""
+
+    def __init__(self):
+        self.calls = []
+
+    def tier(self, sample, r, kind, sublayer=-1):
+        self.calls.append((kind, sample, r, sublayer))
+        return StateTier.HBM
+
+
+def test_placement_sees_the_sublayer_of_block_entries(dev):
+    placement = _SublayerPlacement()
+    store = _store(dev, placement=placement)
+    store.put_state(1, 2, _state(dev))
+    store.put_block_input(1, 2, 3, _state(dev))
+    store.put_block_input(1, 2, 0, _state(dev), kind="trace")
+    assert placement.calls == [("state", 1, 2, -1), ("block", 1, 2, 3), ("trace", 1, 2, 0)]
+    assert HBMOnlyPlacement().tier(0, 1, "block", sublayer=2) is StateTier.HBM
+    store.reset()
+
+
+def test_bytes_per_kind_count_a_shared_storage_once(dev):
+    """A trace entry that aliases a block input (the output of sublayer l - 1 is the input of
+    sublayer l) shares its bytes: counted once, for the kind of the earliest-put live entry,
+    and re-attributed to the other kind when that entry is released first."""
+    store = _store(dev)
+    unit = _nbytes(_state(dev))
+    shared, other = _state(dev, 1.0), _state(dev, 2.0)
+    store.put_state(0, 1, _state(dev))
+    store.put_block_input(0, 1, 1, shared)
+    store.put_block_input(0, 1, 0, shared, kind="trace")  # the same storage
+    store.put_block_input(0, 1, 1, other, kind="trace")
+    stats = store.stats()
+    assert stats.live_bytes == 3 * unit and stats.live_entries == 4
+    assert stats.live_bytes_by_kind == {"state": unit, "block": unit, "trace": unit}
+    store.free_block_input(0, 1, 1)  # the trace entry keeps the storage
+    stats = store.stats()
+    assert stats.live_bytes == 3 * unit
+    assert stats.live_bytes_by_kind == {"state": unit, "trace": 2 * unit}
+    store.take_block_input(0, 1, 0, kind="trace")
+    store.take_block_input(0, 1, 1, kind="trace")
+    store.free_state(0, 1)
+    final = store.end_wave()
+    assert final.live_bytes_by_kind == {}
+    assert final.peak_bytes_by_kind == {"state": unit, "block": unit, "trace": 2 * unit}
+    assert final.peak_bytes == 3 * unit
+
+
+def test_store_key_text_of_block_entries():
+    assert str(StoreKey("block", 4, 2, 3)) == "x[sample 4, round 2, sublayer 3]"
+    assert str(StoreKey("trace", 4, 2, 0)) == "trace[sample 4, round 2, sublayer 0]"
+    assert StoreKey("state", 4, 2) == ("state", 4, 2, -1)

@@ -19,11 +19,13 @@ data-parallel group is one execution unit (EU); the group is the step's domain o
    idle EUs, ``loop_rsbf_tail_item_moves``). An item runs where its checkpoint lives: CODA and
    CORE(g, r) on the EU that swept the round (or its item-move destination), PRELUDE at home.
 3. **Forward.** Every sweep runs with grad enabled (the training kernel path) and drops its
-   graph; the round inputs ``s_r`` and ``crit_r`` are checkpointed in this EU's
-   ``LoopStateStore``. A sample move carries ``s_{r-1}``, ``crit_{r-1}``, the injection ``e``
-   when the destination holds no copy, the device exit flags and, on the sample's first arrival
-   on an EU, its batch rows (the arriving EU rebuilds the activation-free context with
-   ``PreludeCell.build_context``).
+   graph at every core sublayer boundary (``CoreRound.forward_detached``: at most one
+   sublayer's saved activations live); the round inputs ``s_r`` and ``crit_r`` are
+   checkpointed in this EU's ``LoopStateStore``, and so are the block inputs the round's CORE
+   item reads (block-checkpoint form). A sample move carries ``s_{r-1}``, ``crit_{r-1}``, the
+   injection ``e`` when the destination holds no copy, the device exit flags and, on the
+   sample's first arrival on an EU, its batch rows (the arriving EU rebuilds the
+   activation-free context with ``PreludeCell.build_context``).
 4. **Exits.** Known depths (``fixed``, ``sampled``, prescribed) are host data for every sample of
    the domain's wave: the whole wave is planned without a per-round sync. An online criterion's
    exit bits are copied to the host once per round after the slot's backward work has been
@@ -75,9 +77,43 @@ MoE aux and DSA indexer losses: the router runs once per sample (batch 1) with t
 of a one-microbatch step, so their gradient equals the standard schedule's at MBS 1 at any
 MBS (batch invariance); at MBS ``b`` the standard schedule averages them over the ``b`` rows of
 a microbatch, a ``1 / b`` smaller coefficient. Their logged values are weighted ``1 / b``
-(``forward_statistics_weight``) to match the standard schedule's logs at the same MBS. Graphs
-and block / nested items are later steps; the item interface (``BackwardItem.plan``,
-``CoreBackwardPlan``) is where block and nested items plug in.
+(``forward_statistics_weight``) to match the standard schedule's logs at the same MBS.
+
+CORE item forms (``loop_rsbf_item_form``): the sweep and the CORE item of a round read the same
+``LoopProgram.core_plan``, which is the config's plan for every (sample, round)
+(``LoopProgram.uniform_core_plan``; CORE-B lockstep nulls follow it,
+``null_items.core_b_segments``). The CORE item runs the plan's blocks in reverse: each block is
+recomputed with grad from a fresh leaf on its input (block 0: ``s_{r-1}``; later blocks: the
+input the sweep stashed, ``LoopStateStore.put_block_input``) and back-propagated at once with
+the gradient the next block handed to its input (the last block: ``dL/ds_r``, ``dL/dcrit_r``
+and the criterion's ``aux_loss``), so only one block's activations are alive. The whole round is
+the one-block plan (stage 3, op for op). Stash entries alias the sweep's activations (no copy;
+a view or a non-owning layout is cloned, ``ExecutorStats.stash_copies``); they stay on the EU
+that swept the round, which is where its CORE item runs, travel with the item when a tail item
+move carries it (``ExecutorStats.stash_moves``) and are freed right after their block's
+backward. The nested item stashes nothing in the sweep: it first rebuilds the round's prefix
+``[0, rebuild_end)`` in sweep mode inside the item (phase ``REBUILD``: grad enabled, the graph
+dropped at every sublayer, statistics gated like a recompute), keeping the inputs of its later
+blocks in an item-local layer stash, then runs the blocks in reverse from that stash as the
+block item does; each layer-stash entry is dropped right after its block's backward. Graphs are
+a later step.
+
+Coda up-projection recompute (D42, ``loop_rsbf_coda_recompute_mla_up_proj``): the CODA item's
+coda sublayers and head run inside ``request_selective_recompute({"mla_up_proj"})``
+(``CodaHeadCell``), so the DSv4 attentions of the coda and the MTP layers checkpoint their
+query / key-value up projections and RoPE and the item's backward replays them (the
+``loop recompute flops per token`` report adds them); the core rounds are unaffected.
+
+Statistics of loop rounds: each sweep runs inside ``forward_statistics_round(r, R_max)``, so the
+MoE aux / z-loss and indexer-loss trackers also bin what the round records per (round, layer).
+
+The sweep's one-sublayer bound assumes no module keeps a graph-attached tensor past its call:
+the allgather MoE dispatcher keeps ``local_probs`` until its next call (one sublayer's graph
+stays alive past the detach); the alltoall dispatcher clears it. Values are unaffected.
+``measure_memory`` (debug, CUDA) records each cell call's allocator peak and retained bytes
+above its entry baseline (``ExecutorStats.memory``), the quantities of the arena rule (one
+sublayer live in a sweep, one block in a block item, one block plus the layer stash in a
+nested item).
 """
 
 import contextlib
@@ -85,9 +121,10 @@ import enum
 import functools
 import hashlib
 import logging
+import math
 import weakref
 from dataclasses import dataclass, field
-from typing import Any, Callable, Iterator, Literal, Optional, Sequence
+from typing import Any, Callable, Iterator, Literal, Optional, Sequence, Union
 
 import torch
 import torch.distributed as dist
@@ -97,7 +134,11 @@ from megatron.core.pipeline_parallel.schedules import (
     _build_default_pg_collection,
     set_auxiliary_loss_scales,
 )
-from megatron.core.transformer.forward_replay import forward_statistics_weight
+from megatron.core.transformer.forward_replay import (
+    forward_statistics_round,
+    forward_statistics_weight,
+)
+from megatron.core.transformer.loop import flops
 from megatron.core.transformer.loop.dispatcher import LoopSampleDispatcher, RSBFGroups
 from megatron.core.transformer.loop.guards import validate_rsbf_config, validate_rsbf_data_parallel
 from megatron.core.transformer.loop.null_items import LockstepPlan, build_lockstep_plan, run_null
@@ -110,11 +151,14 @@ from megatron.core.transformer.loop.program import (
     LoopProgram,
     SampleInputs,
     SampleKey,
+    block_boundaries_split_pairs,
     find_port,
     global_sample_index,
 )
 from megatron.core.transformer.loop.rsbf_plan import (
     BATCH_SLOTS,
+    BLOCK_ENTRY,
+    BLOCK_INPUT,
     CRIT_STATE,
     EXIT_FLAGS,
     EXPECTED_STATE,
@@ -124,14 +168,19 @@ from megatron.core.transformer.loop.rsbf_plan import (
     INJECTION,
     LOSS_RECORD,
     ROUND_INPUT,
+    TRACE,
+    TRACE_ENTRY,
     FreeInjection,
     MovePhase,
     SubRound,
     SubRoundType,
     Transfer,
     WavePlanner,
+    block_slot,
+    parse_sublayer_slot,
+    trace_slot,
 )
-from megatron.core.transformer.loop.state_store import LoopStateStore
+from megatron.core.transformer.loop.state_store import LoopStateStore, StoreKey
 from megatron.core.transformer.loop_transformer_block import recompute_context
 from megatron.core.utils import get_attr_wrapped_model, get_model_config
 
@@ -141,6 +190,7 @@ __all__ = [
     "ExecutorStats",
     "ItemKind",
     "LoopMicrobatch",
+    "MemoryRecord",
     "LoopRSBFExecutor",
     "LoopRSBFSchedule",
     "RSBF_BATCH_FUNC_ATTR",
@@ -168,6 +218,12 @@ PLAN_MISMATCH = "host exit plan != device exits"
 REPORT_SCHEMA = "loss function report keys differ from the microbatch's report_keys"
 OVER_BUDGET = "static MoE budget exceeded"
 UNSUPPORTED = "Loop RSBF does not support: "
+# The plan of a (sample, round) is not the program's uniform plan.
+NON_UNIFORM_PLAN = "a CORE plan other than the program's uniform plan"
+# verify_stash: a stash entry no longer holds the value the sweep captured.
+STASH_MODIFIED = "stash entry modified after capture"
+# check_recompute: a replayed value differs from the sweep's.
+RECOMPUTE_DIFFERS = "check_recompute: the replayed {what} differs from the sweep"
 
 # Columns of the end-of-step flag table (one row per EU, reduced MAX over the domain).
 _FLAG_AFTER_EXIT, _FLAG_PLAN_MISMATCH, _FLAG_OVER_BUDGET, _FLAG_REPORT_SCHEMA = range(4)
@@ -283,6 +339,20 @@ class WorkRecord:
     backward: float
 
 
+@dataclass(frozen=True)
+class MemoryRecord:
+    """``measure_memory``: the allocator bytes of one cell call of this EU, relative to the
+    bytes allocated when it started (``base``): its peak (``torch.cuda.max_memory_allocated``)
+    and what it left allocated (``retained``; negative when it freed more than it kept)."""
+
+    kind: str  # the plan item kind: prelude_sweep, core_sweep, coda, core, prelude
+    sample: int  # wave-global id g
+    round: int
+    base: int
+    peak: int
+    retained: int
+
+
 @dataclass
 class ExecutorStats:
     """Host-side record of one step (tests and logging). Plan-derived fields (moves,
@@ -308,6 +378,21 @@ class ExecutorStats:
     flagged_ranks: dict = field(default_factory=dict)  # flag name -> EUs that raised it
     null_moe_calls: int = 0  # MoE calls made by this EU's null items
     over_budget_layers: list = field(default_factory=list)  # this EU's overflowed MoE modules
+    # Block-input stash entries carried by moved CORE items (plan-derived: every EU).
+    stash_moves: int = 0
+    # Stash entries the sweep had to copy (a view or a non-owning layout; expected 0).
+    stash_copies: int = 0
+    # Core-relative block starts of the CORE plan that split an attention + MLP / MoE pair.
+    split_pairs: tuple = ()
+    # check_recompute="report": max |replayed - sweep| per check name over the step.
+    recompute_diffs: dict = field(default_factory=dict)
+    # verify_stash: the debug syncs of its comparisons (not in debug_syncs).
+    stash_verify_syncs: int = 0
+    # Nested items: rebuilds run by this EU, and the most layer-stash entries one item held.
+    rebuilds: int = 0
+    layer_stash_peak: int = 0
+    # measure_memory: one MemoryRecord per cell call of this EU, in execution order.
+    memory: list = field(default_factory=list)
 
 
 @contextlib.contextmanager
@@ -409,15 +494,31 @@ class LoopRSBFExecutor:
             ``config.loop_rsbf_tail_item_moves``).
         over_budget: ``"raise"`` or ``"warn"`` when a static MoE budget overflowed anywhere in
             the domain during a step (default ``config.loop_rsbf_over_budget``).
-        check_recompute: assert every replayed round state and injection equals the sweep's
-            (bitwise; test-only, one host sync per comparison) and that the RNG states are
-            unchanged across a wave.
+        check_recompute: ``True`` / ``"raise"``: assert every replayed round state and
+            injection, the output of every recomputed core sublayer and every input a nested
+            item's rebuild stores equals the sweep's (bitwise; test-only), and that the RNG
+            states are unchanged across a wave. The state and injection checks cost one host
+            sync each; the per-sublayer (and rebuild) checks of a CORE item are read in one
+            host sync per item. ``"report"`` runs the same
+            comparisons and records ``max |replayed - sweep|`` per check in
+            ``ExecutorStats.recompute_diffs`` instead of raising (bitwise equality needs
+            row-invariant expert GEMMs at EP > 1). False / None: off.
         poison_on_free: fill freed checkpoints with NaN (tests).
         check_plan: compare the plan digests of every EU at each wave's start (inputs) and end
             (every step) over the status group (debug; raises on every rank on a mismatch).
         check_lockstep: assert that every real item calls exactly the lockstep MoE modules of
             its sub-round type, in order, and that every real call has its module's null
             signature (debug; raises on the rank that ran the item).
+        verify_stash: keep a clone of every stash entry at capture and compare it with the
+            entry when the item reads it (catches writes the version counter cannot see, e.g.
+            kernels writing through raw pointers; debug, one sync per entry, counted in
+            ``ExecutorStats.stash_verify_syncs``).
+        sweep_detach: ``"sublayer"`` (default) drops the graph of the sweep-mode forwards (the
+            sweep and the nested rebuild) at every core sublayer; ``"block"`` only at the
+            inputs they store (debug, for bisecting).
+        measure_memory: record every cell call's allocator peak and retained bytes above its
+            entry baseline in ``ExecutorStats.memory`` (debug, CUDA only: a device
+            synchronize and a peak reset around every call).
     """
 
     def __init__(
@@ -432,15 +533,20 @@ class LoopRSBFExecutor:
         move_transport: Optional[str] = None,
         tail_item_moves: Optional[bool] = None,
         over_budget: Optional[str] = None,
-        check_recompute: bool = False,
+        check_recompute: Union[bool, str, None] = False,
         poison_on_free: bool = False,
         check_plan: bool = False,
         check_lockstep: bool = False,
+        verify_stash: bool = False,
+        sweep_detach: str = "sublayer",
+        measure_memory: bool = False,
     ):
         if pg_collection is None:
             raise ValueError("LoopRSBFExecutor needs a process group collection")
         config = program.config
         validate_rsbf_config(config)
+        if measure_memory and program.device.type != "cuda":
+            raise ValueError("measure_memory reads the CUDA caching allocator")
         self.program = program
         self.config = config
         self.pg_collection = pg_collection
@@ -463,13 +569,32 @@ class LoopRSBFExecutor:
         self.over_budget = config.loop_rsbf_over_budget if over_budget is None else over_budget
         if self.over_budget not in ("raise", "warn"):
             raise ValueError(f"unknown over_budget mode {self.over_budget!r}")
-        self.check_recompute = check_recompute
+        if check_recompute is True:
+            check_recompute = "raise"
+        if check_recompute not in (False, None, "raise", "report"):
+            raise ValueError(f"unknown check_recompute mode {check_recompute!r}")
+        if sweep_detach not in ("sublayer", "block"):
+            raise ValueError(f"unknown sweep_detach {sweep_detach!r}")
+        # The comparison mode ("raise" / "report") and whether any check runs.
+        self.recompute_mode = check_recompute or None
+        self.check_recompute = self.recompute_mode is not None
         self.check_plan = check_plan
         self.check_lockstep = check_lockstep
+        self.verify_stash = verify_stash
+        self.sweep_detach = sweep_detach
+        self.measure_memory = measure_memory
         self.device = program.device
         self.store = LoopStateStore(
-            poison_on_free=poison_on_free, act_dtype=program.dtype, device=program.device
+            poison_on_free=poison_on_free,
+            act_dtype=program.dtype,
+            device=program.device,
+            core_sublayers=program.roles.core,
         )
+        self._split_pairs = block_boundaries_split_pairs(
+            program.uniform_core_plan, program.stack.layer_type_list, program.roles
+        )
+        # verify_stash: (kind, sample, round, sublayer) -> the clone taken at capture.
+        self._stash_clones: dict = {}
         self.stats = ExecutorStats()
         self.dispatcher: Optional[LoopSampleDispatcher] = None
         self._dispatcher_key = None
@@ -558,7 +683,7 @@ class LoopRSBFExecutor:
             )
         if self.store.wave is not None:  # a previous step raised mid-wave
             self.store.reset()
-        self.stats = ExecutorStats()
+        self.stats = ExecutorStats(split_pairs=self._split_pairs)
         program.reset_counters()
         device = self.device
         dispatcher = self._setup_domain()
@@ -820,6 +945,8 @@ class LoopRSBFExecutor:
             check_recompute=self.check_recompute,
             batch_slots=tuple(self._schema),
             report_keys=len(self._report_keys),
+            core_stash=program.uniform_core_plan.stashed_block_inputs(),
+            core_trace=program.roles.core if self.check_recompute else 0,
         )
         self._planner = planner
         context = "|".join(
@@ -835,6 +962,7 @@ class LoopRSBFExecutor:
             self._check_digest(planner, context, "plan inputs")
 
         store.begin_wave(wave)
+        self._stash_clones = {}
         rng = self._rng_state() if self.check_recompute else None
         home_samples_g = sorted(samples)
         self._samples = samples  # gains the samples that arrive on this EU
@@ -962,6 +1090,7 @@ class LoopRSBFExecutor:
                     continue
                 if self.check_lockstep:
                     self.lockstep.begin_item()
+                measured = self._memory_begin() if self.measure_memory else None
                 if item.kind == "prelude_sweep":
                     self._prelude_sweep(item.sample)
                 elif item.kind == "core_sweep":
@@ -972,9 +1101,14 @@ class LoopRSBFExecutor:
                     self._core_item(item.sample, item.round)
                 else:
                     self._prelude_item(item.sample)
+                if measured is not None:
+                    self._memory_end(measured, item.kind, item.sample, item.round)
                 if self.check_lockstep:
                     self.lockstep.end_item(
-                        step.type, f"{item.kind}(sample {item.sample}, round {item.round})"
+                        step.type,
+                        f"{item.kind}(sample {item.sample}, round {item.round})",
+                        core_plan=self.program.uniform_core_plan,
+                        core_start=self.program.roles.core_start,
                     )
             elif isinstance(step, MovePhase):
                 self._run_move_phase(step)
@@ -983,6 +1117,26 @@ class LoopRSBFExecutor:
                     self.store.free_injection(step.sample)
             else:  # pragma: no cover - the planner emits nothing else
                 raise TypeError(f"unknown plan step {step!r}")
+
+    def _memory_begin(self) -> int:
+        """``measure_memory``: synchronize, reset the allocator peak; the baseline bytes."""
+        torch.cuda.synchronize(self.device)
+        torch.cuda.reset_peak_memory_stats(self.device)
+        return torch.cuda.memory_allocated(self.device)
+
+    def _memory_end(self, base: int, kind: str, g: int, r: int) -> None:
+        """``measure_memory``: the call's peak and retained bytes above ``base``."""
+        torch.cuda.synchronize(self.device)
+        self.stats.memory.append(
+            MemoryRecord(
+                kind=kind,
+                sample=g,
+                round=r,
+                base=base,
+                peak=torch.cuda.max_memory_allocated(self.device) - base,
+                retained=torch.cuda.memory_allocated(self.device) - base,
+            )
+        )
 
     def _run_null(self, kind_type: SubRoundType) -> None:
         """An EU without an item in a lockstep sub-round: the type's MoE calls on an empty
@@ -1014,6 +1168,9 @@ class LoopRSBFExecutor:
             inner_context=ctx.quant_context_factory,
             sequence=self._sequence,
             device=self.device,
+            # CORE-B nulls follow the items' (uniform) backward plan.
+            core_plan=self.program.uniform_core_plan,
+            core_start=self.program.roles.core_start,
         )
 
     def _run_move_phase(self, phase: MovePhase) -> None:
@@ -1024,6 +1181,9 @@ class LoopRSBFExecutor:
             self.stats.moves[t.kind] += 1
             if t.kind == "sample":
                 self._moves_of[t.sample] += 1
+            self.stats.stash_moves += sum(
+                parse_sublayer_slot(kind)[0] == BLOCK_ENTRY for kind, _ in t.frees
+            )
         received = self.dispatcher.exchange(phase, send=self._payload, recv=self._receive_buffers)
         for t in phase.transfers:
             if t.src == eu:
@@ -1043,6 +1203,8 @@ class LoopRSBFExecutor:
         """``(shape, dtype)`` of a payload slot at c = 1 (the port table)."""
         program = self.program
         if slot in (ROUND_INPUT, INJECTION, GRAD_STATE, GRAD_INJECTION, EXPECTED_STATE):
+            return (self._sequence, 1, program.hidden_width), program.dtype
+        if parse_sublayer_slot(slot)[0] in (BLOCK_INPUT, TRACE):
             return (self._sequence, 1, program.hidden_width), program.dtype
         if slot in (CRIT_STATE, GRAD_CRIT):
             return (1, program.criterion.state_width), torch.float32
@@ -1085,6 +1247,11 @@ class LoopRSBFExecutor:
                 tensors.append(
                     torch.cat((self._exited_dev[g : g + 1], self._exit_round_dev[g : g + 1]))
                 )
+            elif parse_sublayer_slot(slot)[0] in (BLOCK_INPUT, TRACE):
+                # Contiguous and owning its storage (``_stash_tensor``): sent as is.
+                base, sublayer = parse_sublayer_slot(slot)
+                kind = BLOCK_ENTRY if base == BLOCK_INPUT else TRACE_ENTRY
+                tensors.append(store.get_block_input(g, t.round, sublayer, kind=kind))
             else:
                 tensors.append(getattr(self._samples[g], slot))
         return tensors
@@ -1103,10 +1270,16 @@ class LoopRSBFExecutor:
             del self._chain[g]
             return
         for kind, r in t.frees:
+            base, sublayer = parse_sublayer_slot(kind)
             if kind == "state":
                 self.store.send_state(g, r)
-            else:
+            elif kind == "crit":
                 self.store.send_crit(g, r)
+            elif base in (BLOCK_ENTRY, TRACE_ENTRY):
+                self.store.send_block_input(g, r, sublayer, kind=base)
+                self._stash_clones.pop((base, g, r, sublayer), None)
+            else:  # pragma: no cover - the planner frees nothing else
+                raise AssertionError(f"transfer {t} releases an unknown entry {kind!r}")
 
     def _install(self, t: Transfer, tensors: list) -> None:
         """What arrived on this EU with ``t``."""
@@ -1115,8 +1288,12 @@ class LoopRSBFExecutor:
         if self.program.check_ports:
             ports = CHAIN_PORTS if t.kind == "chain" else MOVE_PORTS
             for slot, value in slots.items():
+                # A per-sublayer slot ("block_input:<l>") is checked against its base port.
                 self.program.check(
-                    find_port(ports, slot, "in"), value, rows=1, sequence=self._sequence
+                    find_port(ports, parse_sublayer_slot(slot)[0], "in"),
+                    value,
+                    rows=1,
+                    sequence=self._sequence,
                 )
         if t.kind == "chain":
             if g in self._chain:  # pragma: no cover - one record per chain
@@ -1133,10 +1310,17 @@ class LoopRSBFExecutor:
         if "tokens" in slots:
             self._arrive(g, slots)
         for kind, r in t.frees:
+            base, sublayer = parse_sublayer_slot(kind)
             if kind == "state":
                 store.put_received_state(g, r, slots[ROUND_INPUT])
-            else:
+            elif kind == "crit":
                 store.put_received_crit(g, r, slots[CRIT_STATE])
+            elif base in (BLOCK_ENTRY, TRACE_ENTRY):
+                slot = block_slot(sublayer) if base == BLOCK_ENTRY else trace_slot(sublayer)
+                store.put_received_block_input(g, r, sublayer, slots[slot], kind=base)
+                self._keep_stash_clone(base, g, r, sublayer, slots[slot])
+            else:  # pragma: no cover - the planner frees nothing else
+                raise AssertionError(f"transfer {t} installs an unknown entry {kind!r}")
         if INJECTION in slots:
             store.put_received_injection(g, slots[INJECTION])
         # Exit flags only grow (0 -> exited, 0 -> the exit round), so the newest knowledge is
@@ -1225,25 +1409,49 @@ class LoopRSBFExecutor:
         if self._host_exit_round[g]:
             raise RuntimeError(f"{SWEEP_AFTER_EXIT}: the host plan swept retired sample {g}")
         sample = self._samples[g]
-        # What the sweep would stash for the round's backward item (nothing for M1's
-        # whole-round plan); the item consults the same plan.
-        plan = program.core_plan(sample, r)
-        if plan.stashed_block_inputs() or plan.rebuild:
-            raise NotImplementedError("block / nested CORE items arrive with M8b / M8")
+        # What the sweep stashes for the round's backward item (nothing for the whole round and
+        # the nested item); the item consults the same plan.
+        plan = self._checked_core_plan(sample, r)
         sl = slice(g, g + 1)
-        with torch.enable_grad():
-            out = program.core(
+        stash = plan.stashed_block_inputs()
+        # The counting forward of round r: statistics also binned per (round, layer).
+        with torch.enable_grad(), forward_statistics_round(r, program.max_rounds):
+            fwd = program.core.forward_detached(
                 store.get_state(g, r - 1),
                 store.get_injection(g),
                 sample,
                 r=r,
                 phase=LoopPhase.SWEEP,
+                capture=stash,
                 crit_state=store.get_crit(g, r - 1),
                 exited=self._exited_dev[sl],
                 depth=None if self._depth_dev is None else self._depth_dev[sl],
+                trace=self.check_recompute,
+                detach_every_sublayer=self.sweep_detach == "sublayer",
             )
+        out = fwd.outputs
         store.put_state(g, r, out.state)
         store.put_crit(g, r, out.crit_state)
+        # Block inputs (and check_recompute traces): aliases of the sweep's activations, one
+        # stored tensor per captured tensor (trace l - 1 is the block input l).
+        stored = {}
+
+        def stashed(tensor):
+            if fwd.modified_after_capture(tensor):
+                # A later sublayer wrote into its (detached) input in place.
+                raise RuntimeError(
+                    f"{STASH_MODIFIED}: sample {g}, round {r}: a core sublayer modified a "
+                    "captured activation in place during the sweep"
+                )
+            if id(tensor) not in stored:
+                stored[id(tensor)] = self._stash_tensor(tensor)
+            return stored[id(tensor)]
+
+        for sublayer in stash:
+            self._stash_put(BLOCK_ENTRY, g, r, sublayer, stashed(fwd.captured[sublayer]))
+        for sublayer, tensor in enumerate(fwd.trace):
+            self._stash_put(TRACE_ENTRY, g, r, sublayer, stashed(tensor))
+        del stored, fwd
         self._work("core_sweep", g, r)
         bit = out.exit.to(torch.int32)
         del out
@@ -1295,76 +1503,236 @@ class LoopRSBFExecutor:
             loss_record=record,
         )
 
+    def _checked_core_plan(self, sample: SampleInputs, r: int) -> CoreBackwardPlan:
+        """``program.core_plan(sample, r)`` (read once by the sweep and once by the item of
+        every (sample, round)), which must be the program's uniform plan: the CORE-B lockstep
+        nulls of every EU follow that plan."""
+        plan = self.program.core_plan(sample, r)
+        if plan is not self.program.uniform_core_plan:
+            raise RuntimeError(
+                f"{NON_UNIFORM_PLAN} for sample {sample.key.global_index}, round {r} (CORE-B "
+                "sub-rounds would need to be typed by plan)"
+            )
+        return plan
+
     def _core_item(self, g: int, r: int) -> None:
-        """Replay round ``r`` from its checkpoints with grad (the plan's blocks in reverse; one
-        whole-round block in M1), then back-propagate ``dL/ds_r``, ``dL/dcrit_r`` and the
-        criterion's ``aux_loss``."""
+        """Replay round ``r`` from its checkpoints with grad and back-propagate ``dL/ds_r``,
+        ``dL/dcrit_r`` and the criterion's ``aux_loss``: the plan's blocks in reverse, each
+        recomputed from a fresh leaf on its input (``s_{r-1}`` for block 0; for later blocks
+        the sweep's stash, or for a nested item the layer stash its rebuild filled first) and
+        back-propagated at once; the leaf's gradient seeds the previous block. The whole round
+        is one block (stage 3, op for op)."""
         program, store = self.program, self.store
         sample = self._samples[g]
-        item = BackwardItem(ItemKind.CORE, g, r, plan=program.core_plan(sample, r))
+        item = BackwardItem(ItemKind.CORE, g, r, plan=self._checked_core_plan(sample, r))
         record = self._chain.pop(g)
         plan = item.plan
         label = self._log_item(item)
-        if len(plan.blocks) != 1 or plan.rebuild:
-            raise NotImplementedError("block / nested CORE items arrive with M8b / M8")
-        block = plan.blocks[0]
+        check = self.check_recompute
         previous = None
         if r > 1:
-            previous = (
-                store.take_state(g, r - 1) if self.check_recompute else store.get_state(g, r - 1)
-            )
+            previous = store.take_state(g, r - 1) if check else store.get_state(g, r - 1)
         round_input = None if previous is None else previous.detach().requires_grad_()
         injection = store.get_injection(g).detach().requires_grad_()
         differentiable = program.criterion.differentiable
         crit = store.get_crit(g, r - 1).detach().requires_grad_(differentiable)
         sl = slice(g, g + 1)
+        exited = self._exited_dev[sl]
+        depth = None if self._depth_dev is None else self._depth_dev[sl]
+        whole = len(plan.blocks) == 1
+        # check_recompute: (name, device difference) of the per-sublayer comparisons (and the
+        # rebuild's), read in one host sync after the block loop.
+        pending = []
+        # Nested: the item-local layer stash (core-relative sublayer -> its rebuilt input).
+        layer_stash = self._rebuild(g, r, plan, previous, label, pending) if plan.rebuild else {}
+        # dL/d(output of the block being replayed): dL/ds_r for the last block.
+        grad = record.grad_state
         with torch.profiler.record_function(label), torch.enable_grad():
-            with recompute_context(label + "/phase=recompute"):
-                out = program.core(
-                    round_input,
-                    injection,
-                    sample,
-                    r=r,
-                    phase=LoopPhase.RECOMPUTE,
-                    crit_state=crit,
-                    exited=self._exited_dev[sl],
-                    depth=None if self._depth_dev is None else self._depth_dev[sl],
-                    block=block,
+            for block in reversed(plan.blocks):
+                if block.input_source == "round_input":
+                    leaf = round_input
+                elif block.input_source == "layer_stash":
+                    leaf = layer_stash[block.start].detach().requires_grad_()
+                else:
+                    leaf = self._stash_get(BLOCK_ENTRY, g, r, block.start, take=check)
+                    leaf = leaf.detach().requires_grad_()
+                trace = [] if check else None
+                name = label + (
+                    "/phase=recompute" if whole else f"/block={block.start}/phase=recompute"
                 )
-            if self.check_recompute:
-                self._check_equal(out.state, record.expected_state, f"s[{g}, round {r}]")
-            outputs, grads = [], []
-            if record.grad_state is not None:
-                outputs.append(out.state)
-                grads.append(record.grad_state)
-            if out.aux_loss is not None:
-                # The criterion's per-round loss, token-weighted like loop losses (ph: num_tokens
-                # * auxiliary) and scaled like the main loss.
-                outputs.append(out.aux_loss * record.loss_record.num_tokens)
-                grads.append(self._aux_seed.reshape(out.aux_loss.shape))
-            if record.grad_crit is not None:
-                outputs.append(out.crit_state)
-                grads.append(record.grad_crit)
-            torch.autograd.backward(outputs, grads)
-        del out
+                with recompute_context(name):
+                    out = program.core(
+                        leaf,
+                        injection,
+                        sample,
+                        r=r,
+                        phase=LoopPhase.RECOMPUTE,
+                        crit_state=crit,
+                        exited=exited,
+                        depth=depth,
+                        block=block,
+                        trace=trace,
+                    )
+                if check:
+                    for offset, actual in enumerate(trace):
+                        sublayer = block.start + offset
+                        expected = self._stash_get(TRACE_ENTRY, g, r, sublayer, take=True)
+                        what = f"trace[sample {g}, round {r}, sublayer {sublayer}]"
+                        pending.append((what, self._device_difference(actual, expected)))
+                    del trace
+                outputs, grads = [], []
+                if block.with_epilogue:
+                    if check:
+                        self._check_equal(out.state, record.expected_state, f"s[{g}, round {r}]")
+                    if grad is not None:
+                        outputs.append(out.state)
+                        grads.append(grad)
+                    if out.aux_loss is not None:
+                        # The criterion's per-round loss, token-weighted like loop losses (ph:
+                        # num_tokens * auxiliary) and scaled like the main loss.
+                        outputs.append(out.aux_loss * record.loss_record.num_tokens)
+                        grads.append(self._aux_seed.reshape(out.aux_loss.shape))
+                    if record.grad_crit is not None:
+                        outputs.append(out.crit_state)
+                        grads.append(record.grad_crit)
+                else:
+                    # A block output always feeds the next block in a residual stack; zeros
+                    # keep the block's attached auxiliary losses if it ever does not.
+                    outputs.append(out)
+                    grads.append(torch.zeros_like(out) if grad is None else grad)
+                torch.autograd.backward(outputs, grads)
+                del out, outputs, grads
+                # dL/d(block input), complete: the block input feeds this block only.
+                grad = None if leaf is None else leaf.grad
+                if block.input_source == "block_stash" and not check:
+                    store.free_block_input(g, r, block.start)
+                elif block.input_source == "layer_stash":
+                    self._drop_layer_input(layer_stash, block.start)
+                del leaf
+        if layer_stash:  # pragma: no cover - every later block reads its own entry
+            raise AssertionError(f"layer-stash entries {sorted(layer_stash)} were not read")
+        if pending:
+            self._read_checks(pending)
         record.expected_state = None
         grad_injection = (
             injection.grad
             if record.grad_injection is None
             else record.grad_injection + injection.grad
         )
-        if r > 1 and not self.check_recompute:
+        if r > 1 and not check:
             store.free_state(g, r - 1)
         store.free_crit(g, r - 1)
         self._work("core_item", g, r)
         self._chain[g] = ChainRecord(
             sample=g,
-            grad_state=None if round_input is None else round_input.grad,
+            grad_state=grad,
             grad_injection=grad_injection,
             grad_crit=crit.grad if differentiable else None,
-            expected_state=previous if self.check_recompute else None,
+            expected_state=previous if check else None,
             loss_record=record.loss_record,
         )
+
+    def _rebuild(
+        self,
+        g: int,
+        r: int,
+        plan: CoreBackwardPlan,
+        previous: Optional[Tensor],
+        label: str,
+        pending: list,
+    ) -> dict:
+        """Phase 2 of a nested CORE item: the prologue and core sublayers ``[0,
+        plan.rebuild_end)`` of round ``r`` in sweep mode (grad enabled, the training path as
+        in the sweep and the recompute, D35; the graph dropped at every sublayer; statistics
+        gated and tensor observation suspended like a recompute; no epilogue). Returns the
+        item-local layer stash: the inputs of the plan's later blocks. With check_recompute
+        each stored input is queued against the sweep's output of the sublayer before it (the
+        trace entry, read here and taken by the block that recomputes that sublayer)."""
+        program, store = self.program, self.store
+        with torch.enable_grad(), recompute_context(label + "/phase=rebuild"):
+            fwd = program.core.forward_detached(
+                previous,
+                store.get_injection(g),
+                self._samples[g],
+                r=r,
+                phase=LoopPhase.REBUILD,
+                capture=plan.rebuilt_layer_inputs(),
+                end=plan.rebuild_end,
+                detach_every_sublayer=self.sweep_detach == "sublayer",
+            )
+        layer_stash = {}
+        for sublayer, tensor in fwd.captured.items():
+            if fwd.modified_after_capture(tensor):
+                raise RuntimeError(
+                    f"{STASH_MODIFIED}: sample {g}, round {r}: a core sublayer modified a "
+                    "captured activation in place during the rebuild"
+                )
+            layer_stash[sublayer] = tensor
+            if self.check_recompute:
+                expected = store.get_block_input(g, r, sublayer - 1, kind=TRACE_ENTRY)
+                what = f"rebuild[sample {g}, round {r}, input of sublayer {sublayer}]"
+                pending.append((what, self._device_difference(tensor, expected)))
+        del fwd
+        self.stats.rebuilds += 1
+        self.stats.layer_stash_peak = max(self.stats.layer_stash_peak, len(layer_stash))
+        return layer_stash
+
+    def _drop_layer_input(self, layer_stash: dict, sublayer: int) -> None:
+        """Drop a nested item's layer-stash entry after its block's backward; with
+        ``poison_on_free`` fill it with NaN first unless another entry shares its storage."""
+        tensor = layer_stash.pop(sublayer)
+        if not (self.store.poison_on_free and tensor.is_floating_point()):
+            return
+        storage = tensor.untyped_storage().data_ptr()
+        if all(other.untyped_storage().data_ptr() != storage for other in layer_stash.values()):
+            with torch.no_grad():
+                tensor.fill_(float("nan"))
+
+    # -----------------------------------------------------------------------------------
+    # The block-input stash
+    # -----------------------------------------------------------------------------------
+
+    def _stash_tensor(self, tensor: Tensor) -> Tensor:
+        """``tensor`` itself when it is contiguous and owns its whole storage (the store then
+        counts exactly its bytes and the dispatcher can send it without a copy), else a
+        contiguous copy (``ExecutorStats.stash_copies``)."""
+        if (
+            tensor.is_contiguous()
+            and tensor.storage_offset() == 0
+            and tensor.untyped_storage().nbytes() == tensor.numel() * tensor.element_size()
+        ):
+            return tensor
+        self.stats.stash_copies += 1
+        return tensor.clone(memory_format=torch.contiguous_format)
+
+    def _stash_put(self, kind: str, g: int, r: int, sublayer: int, tensor: Tensor) -> None:
+        """Store a block input (``kind`` ``"block"``) or a sweep trace entry (``"trace"``)."""
+        self.store.put_block_input(g, r, sublayer, tensor, kind=kind)
+        self._keep_stash_clone(kind, g, r, sublayer, tensor)
+
+    def _keep_stash_clone(self, kind: str, g: int, r: int, sublayer: int, tensor: Tensor):
+        if self.verify_stash:
+            self._stash_clones[(kind, g, r, sublayer)] = tensor.detach().clone()
+
+    def _stash_get(self, kind: str, g: int, r: int, sublayer: int, *, take: bool) -> Tensor:
+        """Read (``take``: remove) a stash entry; with ``verify_stash`` compare it with its
+        capture-time clone first."""
+        store = self.store
+        if take:
+            tensor = store.take_block_input(g, r, sublayer, kind=kind)
+        else:
+            tensor = store.get_block_input(g, r, sublayer, kind=kind)
+        clone = self._stash_clones.pop((kind, g, r, sublayer), None)
+        if clone is not None:
+            self.stats.stash_verify_syncs += 1
+            with _sync_allowed(self.device):
+                equal = torch.equal(clone, tensor)
+            if not equal:
+                raise RuntimeError(
+                    f"{STASH_MODIFIED}: {StoreKey(kind, g, r, sublayer)} (a kernel wrote into "
+                    "a stashed activation; the stash must copy it for this configuration)"
+                )
+        return tensor
 
     def _prelude_item(self, g: int) -> None:
         """Replay the prelude with grad and back-propagate ``dL/de`` (and ``dL/dcrit_0`` into
@@ -1397,7 +1765,10 @@ class LoopRSBFExecutor:
 
     def _cell_flops(self, sequence: int) -> dict:
         """Forward FLOPs of one call of each cell on one SBHD row of ``sequence`` tokens (the
-        per-symbol table), and the coda's backward (2 x layers + the head's own factors)."""
+        per-symbol table), the coda's backward (2 x layers + the head's own factors), a nested
+        CORE item's rebuild (the adapter + core sublayers ``[0, rebuild_end)``; 0 for the
+        other forms) and the CODA item's recompute (D42: the up projections of the attentions
+        its request reaches; 0 without one)."""
         cached = self._flops.get(sequence)
         if cached is not None:
             return cached
@@ -1415,16 +1786,38 @@ class LoopRSBFExecutor:
         coda = stack.range_forward_flops(
             roles.core_end, len(stack.layers), tokens, squared, sequence
         )
+        plan = self.program.uniform_core_plan
+        core_rebuild = 0.0
+        if plan.rebuild:
+            core_rebuild = stack.range_forward_flops(
+                roles.core_start,
+                roles.core_start + plan.rebuild_end,
+                tokens,
+                squared,
+                sequence,
+                extra=stack.round_extra_forward_flops(tokens),
+            )
         coda_backward = 2 * coda
         for work, factor in stack.head_work_terms(tokens, squared, sequence):
             coda = coda + work
             coda_backward = coda_backward + factor * work
+        coda_recompute = 0.0
+        for attention in self.program.coda_recompute_attentions():
+            coda_recompute = coda_recompute + flops.dsv4_up_proj_forward_flops(
+                attention.config, tokens
+            )
         table = {
             "prelude": float(prelude),
             "core": float(core),
             "coda": float(coda),
             "coda_backward": float(coda_backward),
+            "core_rebuild": float(core_rebuild),
+            "coda_recompute": float(coda_recompute),
         }
+        # A CORE item's recompute: the round once, plus the nested rebuild.
+        table["core_item_recompute"] = (
+            table["core"] + table["core_rebuild"] if plan.rebuild else table["core"]
+        )
         self._flops[sequence] = table
         return table
 
@@ -1438,10 +1831,10 @@ class LoopRSBFExecutor:
             forward += table["core"]
         forward += table["coda"]
         backward = table["coda_backward"]
-        recompute = 0.0
+        recompute = table["coda_recompute"]  # 0.0 without a coda recompute request
         for _ in range(depth):
             backward += 2 * table["core"]
-            recompute += table["core"]
+            recompute += table["core_item_recompute"]
         backward += 2 * table["prelude"]
         recompute += table["prelude"]
         return forward, backward, recompute
@@ -1454,8 +1847,8 @@ class LoopRSBFExecutor:
         forward, recompute, backward = {
             "prelude_sweep": (table["prelude"], 0.0, 0.0),
             "core_sweep": (table["core"], 0.0, 0.0),
-            "coda": (table["coda"], 0.0, table["coda_backward"]),
-            "core_item": (0.0, table["core"], 2 * table["core"]),
+            "coda": (table["coda"], table["coda_recompute"], table["coda_backward"]),
+            "core_item": (0.0, table["core_item_recompute"], 2 * table["core"]),
             "prelude_item": (0.0, table["prelude"], 2 * table["prelude"]),
         }[kind]
         self.stats.work.append(
@@ -1540,13 +1933,45 @@ class LoopRSBFExecutor:
             return read()
 
     def _check_equal(self, actual: Tensor, expected: Optional[Tensor], what: str) -> None:
+        """One check_recompute comparison, read at once (one debug sync)."""
         if expected is None:
+            return
+        if self.recompute_mode == "report":
+            self._read_checks([(what, self._device_difference(actual, expected))])
             return
         self.stats.debug_syncs += 1
         with _sync_allowed(self.device):
             equal = torch.equal(actual, expected)
         if not equal:
-            raise RuntimeError(f"check_recompute: the replayed {what} differs from the sweep")
+            raise RuntimeError(RECOMPUTE_DIFFERS.format(what=what))
+
+    def _device_difference(self, actual: Tensor, expected: Tensor) -> Tensor:
+        """A 0-dim fp32 device value, no sync: ``"raise"`` 1.0 where ``actual`` and
+        ``expected`` differ anywhere (else 0.0), ``"report"`` ``max |actual - expected|``; inf
+        for a shape or dtype mismatch."""
+        with torch.no_grad():
+            actual = actual.detach()
+            if actual.shape != expected.shape or actual.dtype != expected.dtype:
+                return torch.full((), float("inf"), dtype=torch.float32, device=actual.device)
+            if self.recompute_mode == "report":
+                return (actual.float() - expected.float()).abs().max()
+            return torch.ne(actual, expected).any().to(torch.float32)
+
+    def _read_checks(self, pending: list) -> None:
+        """Read queued check_recompute differences in one debug sync; ``"raise"`` names the
+        first failing check, ``"report"`` records the maxima per name."""
+        names = [name for name, _ in pending]
+        self.stats.debug_syncs += 1
+        with _sync_allowed(self.device):
+            values = torch.stack([value for _, value in pending]).tolist()
+        for name, value in zip(names, values):
+            if self.recompute_mode == "report":
+                known = self.stats.recompute_diffs.get(name)
+                self.stats.recompute_diffs[name] = (
+                    value if known is None or math.isnan(value) else max(known, value)
+                )
+            elif value != 0.0:  # a NaN is a difference too
+                raise RuntimeError(RECOMPUTE_DIFFERS.format(what=name))
 
     def _rng_state(self):
         cuda = torch.cuda.get_rng_state(self.device) if self.device.type == "cuda" else None

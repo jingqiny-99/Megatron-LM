@@ -18,17 +18,23 @@ Each cell runs the model's own code, in the order of the eager forward
 For one row, prelude + ``d`` core rounds + coda is the eager forward at depth ``d`` op for op,
 so per-sample losses equal the eager reference bitwise where the same kernels run. The cells
 neither detach nor set the grad mode: the executor does (sweep: grad enabled, inputs detached,
-graph dropped; items: fresh leaves, graph kept).
+graph dropped; items: fresh leaves, graph kept). The one exception is
+``CoreRound.forward_detached``, whose contract is sweep mode: it drops the graph at every
+sublayer boundary (same ops, same order as the attached round), so at most one sublayer's
+saved activations are alive, and it captures sublayer inputs for the block-checkpoint stash.
 """
 
 import dataclasses
 from dataclasses import dataclass
-from typing import Optional, Union
+from typing import Optional, Sequence, Union
 
 import torch
 from torch import Tensor
 
 from megatron.core.models.hybrid.hybrid_block import HybridStackLayerContext
+from megatron.core.transformer.experimental_attention_variant.dsa_masking import (
+    indexer_loss_padding_mask,
+)
 from megatron.core.transformer.loop.guards import validate_hybrid_loop_inputs
 from megatron.core.transformer.loop.program import (
     CODA_PORTS,
@@ -42,6 +48,7 @@ from megatron.core.transformer.loop.program import (
     SampleInputs,
     find_port,
 )
+from megatron.core.transformer.selective_recompute import request_selective_recompute
 
 __all__ = [
     "CodaHeadCell",
@@ -49,6 +56,7 @@ __all__ = [
     "CoreBackwardPlan",
     "CoreBlock",
     "CoreRound",
+    "DetachedForward",
     "PreludeCell",
     "PreludeOutputs",
     "RoundOutputs",
@@ -232,6 +240,24 @@ class RoundOutputs:
     aux_loss: Optional[Tensor]  # [] fp32, differentiable criteria only
 
 
+@dataclass
+class DetachedForward:
+    """The result of ``CoreRound.forward_detached`` (sweep mode, graph dropped)."""
+
+    outputs: Optional[RoundOutputs]  # the epilogue's outputs; None when the call ends early
+    captured: dict  # core-relative sublayer l -> its input x_l (detached), l in ``capture``
+    trace: tuple  # ``trace=True``: the output of every sublayer run (detached), in order
+    # id(tensor) -> its in-place version counter when it was produced, for every captured and
+    # traced tensor: a later sublayer of the same forward writing into it in place (allowed by
+    # autograd on a detached input) shows as a newer version (``modified_after_capture``).
+    versions: dict = dataclasses.field(default_factory=dict)
+
+    def modified_after_capture(self, tensor: Tensor) -> bool:
+        """Whether ``tensor`` (captured or traced by this forward) was modified in place after
+        it was produced."""
+        return tensor._version != self.versions[id(tensor)]  # pylint: disable=protected-access
+
+
 class CoreRound:
     """One Huginn core round over the layer runner.
 
@@ -263,11 +289,14 @@ class CoreRound:
         ctx: HybridStackLayerContext,
         alive: Optional[Tensor],
         label: str,
+        trace: Optional[list] = None,
     ) -> Tensor:
         """Core-relative sublayers ``[start, end)`` (stack sublayers ``P + start .. P + end``).
 
         Without ``alive`` this is the eager round's layer pass. With it, each sublayer's
-        output is kept only on the alive rows, and the dead rows are marked as padding.
+        output is kept only on the alive rows, and the dead rows are marked as padding. With
+        a ``trace`` list, each sublayer runs in its own ``_run_range`` call (the same ops in
+        the same order) and its output is appended (attached to the graph).
         """
         roles = self.program.roles
         if not 0 <= start <= end <= roles.core:
@@ -275,7 +304,12 @@ class CoreRound:
         stack = self.program.stack
         first, last = roles.core_start + start, roles.core_start + end
         if alive is None:
-            return stack._run_range(x, first, last, ctx, label)
+            if trace is None:
+                return stack._run_range(x, first, last, ctx, label)
+            for index in range(first, last):
+                x = stack._run_range(x, index, index + 1, ctx, label)
+                trace.append(x)
+            return x
         rows = x.shape[1]
         dead = (~alive)[:, None]
         ctx = dataclasses.replace(
@@ -287,6 +321,8 @@ class CoreRound:
         keep = alive.reshape(1, rows, 1)
         for index in range(first, last):
             x = torch.where(keep, stack._run_range(x, index, index + 1, ctx, label), x)
+            if trace is not None:
+                trace.append(x)
         return x
 
     def epilogue(
@@ -346,6 +382,7 @@ class CoreRound:
         depth: Optional[Tensor] = None,
         alive: Optional[Tensor] = None,
         block: Optional[CoreBlock] = None,
+        trace: Optional[list] = None,
     ) -> Union[RoundOutputs, Tensor]:
         """Run round ``r`` (or one block of it) for ``sample``.
 
@@ -354,12 +391,15 @@ class CoreRound:
                 the prologue.
             injection: ``e``, the prelude output.
             r: the round, 1..R_max; passed to the criterion as a device scalar.
-            phase: ``SWEEP`` or ``RECOMPUTE`` (``REBUILD`` arrives with nested items, M8).
+            phase: ``SWEEP`` or ``RECOMPUTE`` (a ``REBUILD`` runs through
+                ``forward_detached``).
             crit_state: ``crit_{r-1}`` ``[c, k]`` fp32.
             exited: ``[c]`` int32 device flags of rows the executor saw exit.
             depth: ``[c]`` int32 depths for known-depth criteria.
             alive: ``[c]`` bool, None when every row is alive (always in M1).
             block: a block of ``program.core_plan``; None runs the whole round.
+            trace: a list that receives the output of every sublayer of the block (attached;
+                ``check_recompute``), see ``layers``.
 
         Returns:
             ``RoundOutputs`` when the call runs the epilogue, else the block output.
@@ -367,7 +407,7 @@ class CoreRound:
         program = self.program
         phase = LoopPhase(phase)
         if phase == LoopPhase.REBUILD:
-            raise NotImplementedError("the rebuild phase arrives with nested items (M8)")
+            raise NotImplementedError("a rebuild runs through forward_detached (sweep mode)")
         r_tensor = program.round_tensor(r)
         phase_tensor = program.phase_tensor(phase)
         if block is None:
@@ -387,7 +427,7 @@ class CoreRound:
         label = f"{_label(sample)}/loop={r}/phase={phase.name.lower()}"
         with torch.profiler.record_function(label), ctx.outer_quant_context:
             x = self.prologue(round_input, injection) if block.with_prologue else round_input
-            x = self.layers(x, block.start, block.end, ctx, alive, label)
+            x = self.layers(x, block.start, block.end, ctx, alive, label, trace)
             if not block.with_epilogue:
                 return x
             outputs = self.epilogue(
@@ -411,16 +451,141 @@ class CoreRound:
                 )
         return outputs
 
-    def _check_inputs(self, sample, round_input, injection, crit_state, exited, depth, alive):
+    def forward_detached(
+        self,
+        round_input: Optional[Tensor],
+        injection: Tensor,
+        sample: SampleInputs,
+        *,
+        r: int,
+        phase: LoopPhase,
+        capture: Sequence[int] = (),
+        end: Optional[int] = None,
+        crit_state: Optional[Tensor] = None,
+        exited: Optional[Tensor] = None,
+        depth: Optional[Tensor] = None,
+        trace: bool = False,
+        detach_every_sublayer: bool = True,
+    ) -> DetachedForward:
+        """Sweep mode (phase ``SWEEP`` or ``REBUILD``): the training-path forward of round
+        ``r`` with the autograd graph dropped at every sublayer boundary, so at most one
+        sublayer's saved activations are alive at a time.
+
+        The values are bitwise those of ``__call__`` (the same sublayer calls in the same
+        order; only ``requires_grad`` of the sublayer inputs differs). The caller holds
+        ``torch.enable_grad()`` (the training kernel path, D35).
+
+        Args:
+            round_input: ``s_{r-1}`` (None at r = 1).
+            injection: ``e``.
+            r: the round, 1..R_max.
+            phase: ``SWEEP`` (the CORE-F sweep) or ``REBUILD`` (the nested item's rebuild).
+            capture: core-relative sublayers ``l`` in ``[1, end]`` whose input ``x_l`` (the
+                output of sublayer ``l - 1``) is returned in ``captured``.
+            end: run core sublayers ``[0, end)`` only, without the epilogue (a rebuild); None
+                runs the whole core and the epilogue (needs ``crit_state`` and ``exited``).
+            crit_state, exited, depth: the epilogue's inputs (as ``__call__``).
+            trace: also return the output of every sublayer run (``check_recompute``).
+            detach_every_sublayer: False drops the graph only at the captured sublayers (and
+                at the end): a debug setting for bisecting a per-sublayer detach.
+
+        Returns:
+            ``DetachedForward``: the epilogue's outputs (None with ``end``), the captured
+            inputs and the trace; every tensor detached.
+        """
         program = self.program
-        for name, value in (
-            ("round_input", round_input),
-            ("injection", injection),
-            ("crit_state", crit_state),
-            ("exited", exited),
-            ("depth", depth),
-            ("alive", alive),
-        ):
+        phase = LoopPhase(phase)
+        if phase not in (LoopPhase.SWEEP, LoopPhase.REBUILD):
+            raise ValueError(f"forward_detached runs sweep mode (SWEEP / REBUILD), got {phase!r}")
+        core = program.roles.core
+        stop = core if end is None else end
+        if not 0 <= stop <= core:
+            raise ValueError(f"end {end} outside [0, {core}]")
+        capture = tuple(sorted(set(capture)))
+        if any(not 1 <= l <= stop for l in capture):
+            raise ValueError(f"captured sublayers {capture} outside [1, {stop}]")
+        if end is None and (crit_state is None or exited is None):
+            raise ValueError("a whole-round forward_detached needs crit_state and exited")
+        ctx = _context(sample)
+        if program.check_ports:
+            if end is None:
+                self._check_inputs(sample, round_input, injection, crit_state, exited, depth, None)
+            else:
+                self._check_inputs(sample, round_input, injection, rebuild=True)
+        stack, first = program.stack, program.roles.core_start
+        label = f"{_label(sample)}/loop={r}/phase={phase.name.lower()}"
+        captured, traced, outputs, versions = {}, [], None, {}
+        with torch.profiler.record_function(label), ctx.outer_quant_context:
+            x = self.prologue(round_input, injection)
+            if detach_every_sublayer:
+                x = x.detach()
+            for l in range(stop):
+                x = stack._run_range(x, first + l, first + l + 1, ctx, label)
+                keep = l + 1 in capture
+                if detach_every_sublayer or keep:
+                    x = x.detach()
+                if trace:
+                    # The captured tensor itself when it is one (a stash shares it).
+                    traced.append(x if x.grad_fn is None else x.detach())
+                    versions[id(traced[-1])] = traced[-1]._version  # pylint: disable=W0212
+                if keep:
+                    captured[l + 1] = x
+                    versions[id(x)] = x._version  # pylint: disable=protected-access
+            if end is None:
+                outputs = self.epilogue(
+                    x,
+                    round_input,
+                    crit_state=crit_state,
+                    r=program.round_tensor(r),
+                    phase=program.phase_tensor(phase),
+                    alive=None,
+                    exited=exited,
+                    depth=depth,
+                    valid=sample.valid(),
+                )
+        if outputs is not None:
+            outputs = RoundOutputs(
+                state=outputs.state.detach(),
+                exit=outputs.exit,
+                crit_state=outputs.crit_state.detach(),
+                aux_loss=None if outputs.aux_loss is None else outputs.aux_loss.detach(),
+            )
+            if program.check_ports:
+                for name in ("state", "exit", "crit_state", "aux_loss"):
+                    program.check(
+                        find_port(self.PORTS, name, "out"),
+                        getattr(outputs, name),
+                        rows=sample.rows,
+                        sequence=sample.sequence,
+                    )
+        return DetachedForward(
+            outputs=outputs, captured=captured, trace=tuple(traced), versions=versions
+        )
+
+    def _check_inputs(
+        self,
+        sample,
+        round_input,
+        injection,
+        crit_state=None,
+        exited=None,
+        depth=None,
+        alive=None,
+        *,
+        rebuild: bool = False,
+    ):
+        """Validate the input ports; a rebuild (``rebuild=True``) passes only ``round_input``
+        and ``injection`` (it runs no epilogue)."""
+        program = self.program
+        values = [("round_input", round_input), ("injection", injection)]
+        if not rebuild:
+            values += [
+                ("crit_state", crit_state),
+                ("exited", exited),
+                ("depth", depth),
+                ("alive", alive),
+            ]
+        for name, value in values:
             program.check(
                 find_port(self.PORTS, name, "in"), value, rows=sample.rows, sequence=sample.sequence
             )
@@ -447,7 +612,11 @@ class CodaHeadCell:
         """Run the coda and the head on ``s_d`` and apply ``sample.loss_func``.
 
         ``cp_batch`` is None: at CP = 1 ``head_loss`` hands it only to the MTP layout
-        conversion, which needs none.
+        conversion, which needs none. The coda sublayers and the head run inside
+        ``request_selective_recompute(program.coda_recompute_modules)`` (D42: the coda and MTP
+        attentions checkpoint their up projections, which the item's backward replays); the
+        head also inside ``indexer_loss_padding_mask`` of the sample's padding mask, as the
+        stack's layers (padded rows do not train the MTP indexers).
         """
         program = self.program
         hybrid, stack = program.hybrid, program.stack
@@ -461,7 +630,10 @@ class CodaHeadCell:
                 sequence=sample.sequence,
             )
         label = f"{_label(sample)}/coda"
-        with torch.profiler.record_function(label):
+        with (
+            torch.profiler.record_function(label),
+            request_selective_recompute(program.coda_recompute_modules),
+        ):
             with ctx.outer_quant_context:
                 hidden_states = stack._run_range(
                     state, program.roles.core_end, len(stack.layers), ctx, label
@@ -471,18 +643,19 @@ class CodaHeadCell:
                 hidden_states, mhc_multistream = decoder_output
             else:
                 hidden_states, mhc_multistream = decoder_output, None
-            output = hybrid.head_loss(
-                hidden_states,
-                mhc_multistream,
-                input_ids=sample.tokens,
-                position_ids=sample.position_ids,
-                attention_mask=sample.attention_mask,
-                labels=sample.labels,
-                loss_mask=sample.loss_mask,
-                padding_mask=sample.padding_mask,
-                cp_batch=None,
-                rotary_pos_emb=sample.rotary_pos_emb,
-            )
+            with indexer_loss_padding_mask(sample.padding_mask):
+                output = hybrid.head_loss(
+                    hidden_states,
+                    mhc_multistream,
+                    input_ids=sample.tokens,
+                    position_ids=sample.position_ids,
+                    attention_mask=sample.attention_mask,
+                    labels=sample.labels,
+                    loss_mask=sample.loss_mask,
+                    padding_mask=sample.padding_mask,
+                    cp_batch=None,
+                    rotary_pos_emb=sample.rotary_pos_emb,
+                )
             loss, num_tokens, report = sample.loss_func(sample.loss_mask, output)
         if program.check_ports:
             for name, value in (("loss", loss), ("num_tokens", num_tokens)):

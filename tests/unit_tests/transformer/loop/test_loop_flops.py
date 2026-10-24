@@ -173,6 +173,23 @@ def test_dsv4_rows_with_a_real_config():
     assert flops.sublayer_forward_flops("C", config, T, Q, S) > 0
 
 
+def test_dsv4_up_proj_row_is_part_of_the_attention_row():
+    """D42's coda recompute FLOPs: the query up projection and the key-value projection of one
+    DSv4 attention, the weight terms the attention row counts for them (its ``q_term`` without
+    the down projection and the norm, its ``kv_term`` without the norm)."""
+    c = SimpleNamespace(**_DSV4)
+    up = flops.dsv4_up_proj_forward_flops(c, T)
+    weights = c.q_lora_rank * c.num_attention_heads * c.v_head_dim + c.hidden_size * c.v_head_dim
+    assert up == 2 * T * weights
+    token_linear, _ = flops.dsv4_hybrid_self_attention_coefficients(
+        **_DSV4, seq_length=S, n_layers_r0=1, n_layers_r4=0, n_layers_r128=0
+    )
+    q_term = c.q_lora_rank * (c.hidden_size + c.num_attention_heads * c.v_head_dim + 1)
+    kv_term = c.hidden_size * c.v_head_dim + c.v_head_dim
+    assert weights == q_term + kv_term - c.q_lora_rank * (c.hidden_size + 1) - c.v_head_dim
+    assert up < 2 * token_linear * T
+
+
 def test_rows_reject_unknown_symbols_and_ratios():
     with pytest.raises(ValueError, match="no row for sublayer 'M'"):
         flops.sublayer_forward_flops("M", _config(), T, Q, S)

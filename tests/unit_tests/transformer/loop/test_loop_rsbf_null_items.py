@@ -3,8 +3,10 @@
 """Lockstep MoE across the EUs of an RSBF domain (``loop/null_items.py``).
 
 CPU cases (no process group beyond the module's one-rank world): the null runner (call order,
-leaves, rows per form, backward only for the backward types, quantization contexts), the
-plan's real-call checks (signatures, the per-item call log), the static-budget flags, the
+leaves, rows per form, backward only for the backward types, quantization contexts), the CORE-B
+call segments of block-checkpoint and nested backward plans (``core_b_segments``, the null and
+the call check following them), the plan's real-call checks (signatures with the detached-input
+hint, the per-item call log), the static-budget flags, the
 adapter registry, discovery on a stub 'E' model (``build_lockstep_plan``), the ``MoELayer``
 adapter's null forms and config signatures (dispatcher stubs), and the executor's refusal of a
 null without a layer context (unequal home counts). The spawned multi-EU stub cases are M8 in
@@ -44,6 +46,19 @@ module):
   loss rule, gradients by the normwise rule; each arm self-deterministic).
 * G6: the move gate on the G2 workload (sampled R4-uniform depths, 8 per EU, 8 steps): the
   step-aggregate moves <= 5% of the active sample-rounds; bulk / tail maxima printed.
+* G7 (M8b): block-checkpoint CORE items (strides 1 and 2) on a DSv4-like model with three core
+  MoE sublayers (``'WECEHECEHE/WE'``, core ``'CEHECE'``) at EP = W, skewed depths so that tail
+  item moves carry block-input stashes at W >= 4: no hang, ``check_lockstep`` on every call of
+  the sweep (per-sublayer detached inputs) and the per-block recomputes, the MoE collectives
+  identical on every rank, per-sample losses and expert-bias counts bitwise equal to the
+  whole-round arm (the sweep and the CODA items are form-independent), gradients by the bf16
+  normwise rule (a block's input is the sweep's value, co-scheduled with other EUs' sweeps;
+  expert GEMMs are not row-invariant across co-scheduling), ``check_recompute="report"``
+  differences printed, ``verify_stash`` on. Its nested arm (M8, same strides): no stash moves,
+  one rebuild per CORE item, ``check_lockstep`` on the rebuild's forward-only MoE calls too,
+  losses, expert-bias counts and gradients bitwise equal to the whole-round arm (every EU of a
+  CORE-B sub-round runs the same plan, so the rebuild and the block recomputes co-schedule
+  the whole-round recompute's token values in every MoE call).
 """
 
 import contextlib
@@ -58,18 +73,22 @@ import torch.distributed as dist
 
 from megatron.core.transformer.loop import null_items
 from megatron.core.transformer.loop.null_items import (
+    DETACHED_MOE_INPUT,
     FORM_EMPTY,
     FORM_NOMINAL,
     LOCKSTEP,
+    CallSegment,
     LockstepAdapter,
     LockstepEntry,
     LockstepPlan,
     LockstepSignature,
     build_lockstep_plan,
+    core_b_segments,
     register_lockstep_module,
     run_null,
 )
 from megatron.core.transformer.loop.program import (
+    CoreBackwardPlan,
     LoopProgram,
     PrescribedDepthCriterion,
     SampledDepthCriterion,
@@ -177,11 +196,13 @@ class _RecorderAdapter(LockstepAdapter):
         module.flag.fill_(False)
 
 
-def _plan(names, form=FORM_EMPTY, log=None, wrap=None):
-    """A hand-made plan: the same modules for every sub-round type."""
+def _plan(names, form=FORM_EMPTY, log=None, wrap=None, stack_indices=None):
+    """A hand-made plan: the same modules for every sub-round type (``stack_indices``: the
+    hosting sublayers' stack indices, default -1)."""
     log = [] if log is None else log
     adapter = _RecorderAdapter(form)
     modules = [_Recorder(name, log) for name in names]
+    stack_indices = stack_indices or [-1] * len(modules)
     entries = tuple(
         LockstepEntry(
             module=module,
@@ -191,6 +212,7 @@ def _plan(names, form=FORM_EMPTY, log=None, wrap=None):
             form=form,
             name=module.name,
             wrap=wrap if index == len(modules) - 1 else None,
+            stack_index=stack_indices[index],
         )
         for index, module in enumerate(modules)
     )
@@ -288,6 +310,129 @@ def test_run_null_nominal_rows_and_empty_types():
         )
         == 0
     )
+
+
+# ---------------------------------------------------------------------------------------------
+# CPU: CORE-B segments of block-checkpoint and nested items
+# ---------------------------------------------------------------------------------------------
+
+# Core MoE modules at stack sublayers 3, 5 and 7 of a core starting at 2 (core-relative 1, 3,
+# 5; L = 6), e.g. the 'E' sublayers of '*E*E*E'.
+_CORE_START, _CORE = 2, 6
+
+
+def _core_names(segments):
+    return [([e.module.name for e in seg.entries], seg.backward) for seg in segments]
+
+
+@cpu_only
+@pytest.mark.parametrize(
+    "plan, expected",
+    [
+        (None, [(["m3", "m5", "m7"], True)]),
+        (CoreBackwardPlan.whole_round(_CORE), [(["m3", "m5", "m7"], True)]),
+        # Blocks in reverse, each its MoE calls with its backward.
+        (CoreBackwardPlan.strided(_CORE, 2), [(["m7"], True), (["m5"], True), (["m3"], True)]),
+        (CoreBackwardPlan.strided(_CORE, 3), [(["m5", "m7"], True), (["m3"], True)]),
+        # Attention-only blocks have no MoE call (no empty segment).
+        (CoreBackwardPlan.strided(_CORE, 1), [(["m7"], True), (["m5"], True), (["m3"], True)]),
+        (CoreBackwardPlan.strided(_CORE, 4), [(["m7"], True), (["m3", "m5"], True)]),
+        # Nested: the rebuild's forward-only segment first ([0, rebuild_end) = [0, 4)).
+        (
+            CoreBackwardPlan.nested(_CORE, 2),
+            [(["m3", "m5"], False), (["m7"], True), (["m5"], True), (["m3"], True)],
+        ),
+    ],
+    ids=["none", "whole", "block2", "block3", "block1", "block4", "nested2"],
+)
+def test_core_b_segments_follow_the_backward_plan(plan, expected):
+    lockstep, _, _ = _plan(["m3", "m5", "m7"], stack_indices=[3, 5, 7])
+    segments = core_b_segments(lockstep, plan, _CORE_START)
+    assert all(isinstance(segment, CallSegment) for segment in segments)
+    assert _core_names(segments) == expected
+    empty = LockstepPlan(by_type={t: () for t in SubRoundType})
+    assert core_b_segments(empty, plan, _CORE_START) == ()
+
+
+@cpu_only
+def test_run_null_and_the_call_check_follow_the_core_plan():
+    """A CORE-B null of a block / nested plan runs each segment from a fresh zero leaf,
+    back-propagating the block segments (not the rebuild's); other types ignore the plan; the
+    real-call check of a CORE-B item expects the segments' forward calls."""
+    contexts = _Contexts()
+    lockstep, modules, log = _plan(["m3", "m5", "m7"], stack_indices=[3, 5, 7])
+    kwargs = dict(
+        outer_context=contextlib.nullcontext(),
+        inner_context=contexts.inner,
+        sequence=16,
+        device=torch.device("cpu"),
+        core_start=_CORE_START,
+    )
+    block = CoreBackwardPlan.strided(_CORE, 3)
+    assert run_null(lockstep, SubRoundType.CORE_B, core_plan=block, **kwargs) == 3
+    leaf = (0, 1, 8)
+    assert log == [
+        ("fwd", "m5", leaf, torch.float64),
+        ("fwd", "m7", leaf, torch.float64),
+        ("bwd", "m7"),
+        ("bwd", "m5"),
+        ("fwd", "m3", leaf, torch.float64),
+        ("bwd", "m3"),
+    ]
+    log.clear()
+    nested = CoreBackwardPlan.nested(_CORE, 2)
+    assert run_null(lockstep, SubRoundType.CORE_B, core_plan=nested, **kwargs) == 5
+    assert [entry[:2] for entry in log] == [
+        ("fwd", "m3"),
+        ("fwd", "m5"),
+        ("fwd", "m7"),
+        ("bwd", "m7"),
+        ("fwd", "m5"),
+        ("bwd", "m5"),
+        ("fwd", "m3"),
+        ("bwd", "m3"),
+    ]
+    log.clear()
+    assert run_null(lockstep, SubRoundType.CORE_F, core_plan=block, **kwargs) == 3
+    assert [entry[:2] for entry in log] == [("fwd", "m3"), ("fwd", "m5"), ("fwd", "m7")]
+    # The real-call check of a CORE-B item with the block plan.
+    m3, m5, m7 = modules
+    x = torch.zeros(2, 1, 8, dtype=torch.float64, requires_grad=True)
+    with lockstep.observing(record_calls=True):
+        lockstep.begin_item()
+        for module in (m5, m7, m3):
+            module(x)
+        lockstep.end_item(
+            SubRoundType.CORE_B, "core(0, 1)", core_plan=block, core_start=_CORE_START
+        )
+        lockstep.begin_item()
+        for module in (m3, m5, m7):  # the whole round's order
+            module(x)
+        with pytest.raises(RuntimeError, match="called the MoE modules"):
+            lockstep.end_item(
+                SubRoundType.CORE_B, "core(0, 2)", core_plan=block, core_start=_CORE_START
+            )
+        lockstep.begin_item()
+        for module in (m3, m5, m7):  # CORE-F ignores the plan
+            module(x)
+        lockstep.end_item(
+            SubRoundType.CORE_F, "core_sweep(0, 2)", core_plan=block, core_start=_CORE_START
+        )
+
+
+@cpu_only
+def test_a_detached_moe_input_names_the_cause():
+    """A real call whose MoE input does not require grad (an 'E' sublayer without a
+    parameterized pre-op under the detached sweep) fails the signature check with a hint."""
+    lockstep, (m3, _, _), _ = _plan(["m3", "m5", "m7"])
+    x = torch.zeros(2, 1, 8, dtype=torch.float64)
+    with lockstep.observing(), pytest.raises(RuntimeError) as excinfo:
+        m3(x)
+    assert DETACHED_MOE_INPUT in str(excinfo.value)
+    lockstep, (m3, _, _), _ = _plan(["m3", "m5", "m7"])
+    with lockstep.observing(), pytest.raises(RuntimeError) as excinfo:
+        m3(x.float().requires_grad_())  # another dtype: no hint
+    assert DETACHED_MOE_INPUT not in str(excinfo.value)
 
 
 # ---------------------------------------------------------------------------------------------
@@ -737,7 +882,7 @@ def _dsv4_fields(**overrides):
     return fields
 
 
-def _dsv4_model(pg_collection=None, **overrides):
+def _dsv4_model(pg_collection=None, *, pattern="WECEHE/WE", **overrides):
     from megatron.core.models.hybrid.hybrid_model import HybridModel
     from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
     from megatron.core.transformer.loop.hybrid_specs import loop_hybrid_dsv4_stack_spec
@@ -753,7 +898,7 @@ def _dsv4_model(pg_collection=None, **overrides):
         hybrid_stack_spec=loop_hybrid_dsv4_stack_spec(config),
         vocab_size=VOCAB,
         max_sequence_length=1024,
-        hybrid_layer_pattern="WECEHE/WE",
+        hybrid_layer_pattern=pattern,
         position_embedding_type="rope",
         pg_collection=pg_collection,
     ).cuda()
@@ -1176,6 +1321,120 @@ def test_dsv4_lockstep_w_eus_match_one_eu(deterministic, router_dtype):
     assert dense.keys() == ref_dense.keys()
     _assert_normwise(dense, ref_dense, "dense")
     _assert_normwise(experts, {name: ref_experts[name] for name in experts}, "experts")
+
+
+# G7: prelude 'WE', core 'CEHECE' (three MoE sublayers), coda 'HE', MTP 'WE'.
+BLOCK_PATTERN = "WECEHECEHE/WE"
+BLOCK_RATIOS = [0, 0, 4, 0, 128, 0, 4, 0, 128, 0, 0, 0]
+
+
+def _skewed_depths(total, world):
+    """EU 0's home samples run R_max = 4 rounds, the others 1 or 2: sample moves, and at
+    W >= 4 tail item moves of CORE items (with their round's block-input stash)."""
+    return {g: 4 if g % world == 0 else 1 + (g // world) % 2 for g in range(total)}
+
+
+@gpu_ep
+@pytest.mark.parametrize("stride", [1, 2])
+def test_dsv4_lockstep_block_items_match_the_whole_round(deterministic, stride):
+    """G7 (see the module docstring)."""
+    del deterministic
+    from megatron.core.process_groups_config import ProcessGroupCollection
+
+    world = dist.get_world_size()
+    total = PER_RANK * world
+    batch = _global_batch(total)
+    criterion = PrescribedDepthCriterion(_skewed_depths(total, world))
+    pg_collection = ProcessGroupCollection.use_mpu_process_groups()
+    fields = dict(pattern=BLOCK_PATTERN, num_layers=10, csa_compress_ratios=BLOCK_RATIOS)
+    arms = {}
+    with _hadamard_fallback():
+        for name, form in (
+            ("whole", {}),
+            ("block", dict(loop_rsbf_item_form="block", loop_rsbf_block_stride=stride)),
+            ("nested", dict(loop_rsbf_item_form="nested", loop_rsbf_block_stride=stride)),
+        ):
+            model = _dsv4_model(**fields, **form)
+            assert model.decoder.loop_roles.core == 6
+            _sync_dense(model)
+            _reset_expert_bias_counts(model)
+            ep = _ep_ranks(model)
+            checks = {}
+            if name != "whole":
+                checks = dict(check_recompute="report", verify_stash=True, poison_on_free=True)
+            with CollectiveOpLogger(groups=[ep]) as log:
+                losses, grads, executor = _run(
+                    model, _local(batch), criterion, pg_collection, check_lockstep=True, **checks
+                )
+            ops = [op for op in log.ops if op[0] in ("all_to_all_single", "all_gather_into_tensor")]
+            arms[name] = (
+                losses,
+                _dense_summed(model, grads),
+                executor,
+                ops,
+                _expert_bias_counts(model),
+            )
+            del model
+    losses, grads, executor, ops, counts = arms["block"]
+    whole_losses, whole_grads, whole_executor, _, whole_counts = arms["whole"]
+    stats = executor.stats
+    assert executor.program.item_form == "block"
+    assert stats.flagged_ranks["over_budget"] == []
+    assert stats.moves == whole_executor.stats.moves and stats.moves["sample"] > 0
+    _check_nested_arm(arms["nested"], arms["whole"], world, stride)
+    if world >= 4:
+        assert stats.moves["item"] > 0 and stats.stash_moves > 0, (stats.moves, stats.stash_moves)
+    assert stats.nulls["core_b"] > 0
+    # The MoE collectives: the same sequence on every rank, forward and backward.
+    every_ops = [None] * world
+    dist.all_gather_object(every_ops, ops)
+    assert all(other == every_ops[0] for other in every_ops), "MoE collective order differs"
+    # Losses and expert-bias counts come from the sweep and the CODA items: form-independent.
+    assert losses.keys() == whole_losses.keys()
+    for key, loss in losses.items():
+        assert torch.equal(loss, whole_losses[key]), key
+    assert counts.keys() == whole_counts.keys() and counts
+    for name, count in counts.items():
+        assert torch.equal(count, whole_counts[name]), name
+    assert grads.keys() == whole_grads.keys()
+    _assert_normwise(grads, whole_grads, f"block stride {stride} vs whole round")
+    assert stats.stash_copies == 0  # sublayer outputs own their storage: aliased, not copied
+    worst = max(stats.recompute_diffs.values(), default=0.0)
+    print(f"stride {stride}: max |recompute - sweep| {worst:.3e} over {len(stats.recompute_diffs)}")
+
+
+def _check_nested_arm(nested, whole, world, stride):
+    """G7's nested arm against the whole round at EP = W: the same moves and nulls, the same
+    MoE collective sequence on every rank (rebuild segments included), losses and expert-bias
+    counts bitwise (sweep and CODA items), and gradients bitwise: every CORE-B sub-round runs
+    the same plan on every EU, so the rebuild and each block recompute co-schedule the same
+    token values in every MoE call as the whole round's recompute (expert GEMMs see the same
+    rows)."""
+    losses, grads, executor, ops, counts = nested
+    whole_losses, whole_grads, whole_executor, _, whole_counts = whole
+    stats = executor.stats
+    assert executor.program.item_form == "nested"
+    assert stats.flagged_ranks["over_budget"] == []
+    assert stats.moves == whole_executor.stats.moves and stats.nulls == whole_executor.stats.nulls
+    assert stats.stash_moves == 0 and stats.stash_copies == 0
+    core_items = sum(1 for kind, _, _ in stats.item_order if kind == "core")
+    assert stats.rebuilds == core_items
+    # nested(6, 1): 6 blocks, 5 rebuilt inputs; nested(6, 2): 3 blocks, 2.
+    assert core_items == 0 or stats.layer_stash_peak == {1: 5, 2: 2}[stride]
+    every_ops = [None] * world
+    dist.all_gather_object(every_ops, ops)
+    assert all(other == every_ops[0] for other in every_ops), "MoE collective order differs"
+    assert losses.keys() == whole_losses.keys()
+    for key, loss in losses.items():
+        assert torch.equal(loss, whole_losses[key]), key
+    assert counts.keys() == whole_counts.keys() and counts
+    for name, count in counts.items():
+        assert torch.equal(count, whole_counts[name]), name
+    assert grads.keys() == whole_grads.keys()
+    for name, grad in grads.items():
+        assert torch.equal(grad, whole_grads[name]), ("nested", stride, name)
+    worst = max(stats.recompute_diffs.values(), default=0.0)
+    print(f"nested {stride}: max |replay - sweep| {worst:.3e} over {len(stats.recompute_diffs)}")
 
 
 @gpu_ep

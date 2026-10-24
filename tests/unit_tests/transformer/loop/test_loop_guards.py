@@ -24,9 +24,11 @@ from megatron.core.transformer.loop import guards
 from megatron.core.transformer.loop.guards import (
     LoopRoles,
     has_dsv4_attention,
+    is_block_boundary,
     is_hybrid_loop_config,
     reject_pipe_in_loop_pattern,
     resolve_hybrid_loop_roles,
+    rsbf_item_form_violations,
     validate_hybrid_loop_config,
     validate_hybrid_loop_inputs,
     validate_hybrid_loop_pattern,
@@ -798,6 +800,27 @@ _RSBF_RULES = [
         ),
     ),
     (guards.RSBF_AUTOCAST, dict(enable_autocast=True)),
+    # Item forms on the dense core of 4 sublayers (R19 - R21).
+    (guards.RSBF_ITEM_FORM, dict(loop_rsbf_item_form="bogus")),
+    (guards.RSBF_BLOCK_STRIDE_MISMATCH, dict(loop_rsbf_item_form="block")),
+    (guards.RSBF_BLOCK_STRIDE_MISMATCH, dict(loop_rsbf_block_stride=2)),
+    (
+        guards.RSBF_BLOCK_STRIDE_MISMATCH,
+        dict(loop_rsbf_item_form="block", loop_rsbf_block_stride=0),
+    ),
+    (
+        guards.RSBF_BLOCK_STRIDE_MISMATCH,
+        dict(loop_rsbf_item_form="nested", loop_rsbf_block_stride=-1),
+    ),
+    (
+        guards.RSBF_BLOCK_STRIDE_BEYOND_CORE,
+        dict(loop_rsbf_item_form="block", loop_rsbf_block_stride=5),
+    ),
+    (
+        guards.RSBF_BLOCK_STRIDE_BEYOND_CORE,
+        dict(loop_rsbf_item_form="nested", loop_rsbf_block_stride=4),
+    ),
+    (guards.RSBF_CODA_RECOMPUTE_WITHOUT_DSV4, dict(loop_rsbf_coda_recompute_mla_up_proj=True)),
 ]
 
 
@@ -907,6 +930,77 @@ def test_rsbf_configs_pass_and_rules_collect():
     assert _rsbf_reported(excinfo) == [guards.RSBF_SUM_LOSS, guards.RSBF_LOOP_RECOMPUTE]
 
 
+def test_rsbf_item_forms_pass():
+    """Block strides 1 .. L (dividing or not; L is the whole round), nested strides 1 .. L - 1
+    or none, on the dense core (L = 4) and the DSV4-TINY core (L = 8, D42 with dsv4_hybrid);
+    built through ``__post_init__``."""
+    for stride in range(1, 5):
+        _dense_config(**_RSBF, loop_rsbf_item_form="block", loop_rsbf_block_stride=stride)
+    for stride in (None, 1, 2, 3):
+        _dense_config(**_RSBF, loop_rsbf_item_form="nested", loop_rsbf_block_stride=stride)
+    _dense_config(**_RSBF, loop_rsbf_item_form="whole_round")
+    _dsv4_config(**_RSBF, loop_rsbf_item_form="block", loop_rsbf_block_stride=2)
+    _dsv4_config(**_RSBF, loop_rsbf_item_form="block", loop_rsbf_block_stride=8)
+    _dsv4_config(**_RSBF, loop_rsbf_item_form="nested", loop_rsbf_block_stride=7)
+    _dsv4_config(
+        **_RSBF,
+        loop_rsbf_item_form="nested",
+        loop_rsbf_block_stride=2,
+        loop_rsbf_coda_recompute_mla_up_proj=True,
+    )
+    with pytest.raises(ValueError) as excinfo:
+        _dsv4_config(**_RSBF, loop_rsbf_item_form="block", loop_rsbf_block_stride=9)
+    assert _rsbf_reported(excinfo) == [guards.RSBF_BLOCK_STRIDE_BEYOND_CORE]
+
+
+@pytest.mark.parametrize(
+    "form, stride, core, expected",
+    [
+        ("whole_round", None, 8, []),
+        ("whole_round", None, None, []),
+        ("whole_round", 8, 8, [guards.RSBF_BLOCK_STRIDE_MISMATCH]),
+        ("block", None, 8, [guards.RSBF_BLOCK_STRIDE_MISMATCH]),
+        ("block", 0, None, [guards.RSBF_BLOCK_STRIDE_MISMATCH]),
+        ("block", 1, 8, []),
+        ("block", 3, 8, []),
+        ("block", 8, 8, []),
+        ("block", 9, 8, [guards.RSBF_BLOCK_STRIDE_BEYOND_CORE]),
+        ("block", 9, None, []),  # core unknown at config time: checked by LoopProgram
+        ("nested", None, 8, []),
+        ("nested", 7, 8, []),
+        ("nested", 8, 8, [guards.RSBF_BLOCK_STRIDE_BEYOND_CORE]),
+        ("nested", None, 1, [guards.RSBF_BLOCK_STRIDE_BEYOND_CORE]),
+        ("nested", 0, 8, [guards.RSBF_BLOCK_STRIDE_MISMATCH]),
+        ("layer", 2, 8, [guards.RSBF_ITEM_FORM]),
+    ],
+)
+def test_rsbf_item_form_rules(form, stride, core, expected):
+    assert rsbf_item_form_violations(form, stride, core) == expected
+
+
+def test_rsbf_item_form_range_rule_needs_the_layer_count():
+    """Without num_layers the config cannot know the core; the program checks it later."""
+    config = _violating(
+        _dense_config(**_RSBF), num_layers=0, loop_rsbf_item_form="block", loop_rsbf_block_stride=99
+    )
+    guards.validate_rsbf_config(config)
+
+
+def test_block_boundaries_of_a_pattern():
+    """A cut is on a block boundary when an MLP / MoE sublayer ends before it and a mixer starts
+    after it; the pattern's ends always are."""
+    symbols = list("*-*-EH")
+    assert [is_block_boundary(symbols, cut) for cut in range(len(symbols) + 1)] == [
+        True,  # start
+        False,  # '*' | '-'
+        True,  # '-' | '*'
+        False,  # '*' | '-'
+        False,  # '-' | 'E': no mixer after the cut
+        True,  # 'E' | 'H'
+        True,  # end
+    ]
+
+
 def test_rsbf_config_is_validated_at_construction():
     with pytest.raises(ValueError) as excinfo:
         _dense_config(loop_schedule="rsbf")
@@ -934,6 +1028,9 @@ def test_rsbf_config_is_validated_at_construction():
         dict(loop_rsbf_move_transport="all_to_all"),
         dict(loop_rsbf_tail_item_moves=False),
         dict(loop_rsbf_over_budget="warn"),
+        dict(loop_rsbf_item_form="nested"),
+        dict(loop_rsbf_item_form="block", loop_rsbf_block_stride=2),
+        dict(loop_rsbf_coda_recompute_mla_up_proj=True),
     ],
 )
 def test_rsbf_fields_require_the_rsbf_schedule(fields):

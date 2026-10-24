@@ -11,7 +11,11 @@ from megatron.core.process_groups_config import (
     MultiModuleProcessGroupCollection,
     ProcessGroupCollection,
 )
-from megatron.core.transformer.forward_replay import in_forward_replay, statistics_weight
+from megatron.core.transformer.forward_replay import (
+    in_forward_replay,
+    statistics_round,
+    statistics_weight,
+)
 from megatron.core.utils import get_pg_size
 
 
@@ -116,12 +120,34 @@ class DSAIndexerLossLoggingHelper:
         needed = max(num_layers, layer_number)
         DSAIndexerLossLoggingHelper.ensure_tracker_size(needed)
         weight = statistics_weight()
-        if weight == 1.0:
-            tracker["values"][layer_number - 1] += loss.detach()
-        else:
-            tracker["values"][layer_number - 1] += loss.detach() * weight
+        addend = loss.detach() if weight == 1.0 else loss.detach() * weight
+        tracker["values"][layer_number - 1] += addend
+        loop_round = statistics_round()
+        if loop_round is not None:
+            # Loop rounds (``forward_statistics_round``): also binned per (round, layer).
+            r, rounds = loop_round
+            DSAIndexerLossLoggingHelper.round_bins(rounds)[r - 1, layer_number - 1] += addend
         tracker["reduce_group"] = reduce_group
         tracker["avg_group"] = avg_group
+
+    @staticmethod
+    def round_bins(rounds: int) -> torch.Tensor:
+        """``tracker["round_values"]``, at least ``[rounds, len(values)]`` (zeros added): the
+        losses recorded inside ``forward_statistics_round``, binned per (round, layer)."""
+        tracker = DSAIndexerLossLoggingHelper.tracker
+        values = tracker["values"]
+        bins = tracker.get("round_values")
+        if bins is None or bins.shape[0] < rounds or bins.shape[1] < values.shape[0]:
+            grown = torch.zeros(
+                max(rounds, 0 if bins is None else bins.shape[0]),
+                values.shape[0],
+                device=values.device,
+                dtype=values.dtype,
+            )
+            if bins is not None:
+                grown[: bins.shape[0], : bins.shape[1]] = bins
+            tracker["round_values"] = bins = grown
+        return bins
 
     @staticmethod
     def clean_loss_in_tracker(preserve_groups: bool = False):
@@ -131,6 +157,8 @@ class DSAIndexerLossLoggingHelper:
         avg_group = tracker.get("avg_group") if preserve_groups else None
         if "values" in tracker:
             tracker["values"].zero_()
+        if tracker.get("round_values") is not None:
+            tracker["round_values"].zero_()
         tracker["reduce_group"] = reduce_group
         tracker["avg_group"] = avg_group
 
@@ -142,6 +170,7 @@ class DSAIndexerLossLoggingHelper:
         pp_group: Optional[torch.distributed.ProcessGroup] = None,
         dp_group: Optional[torch.distributed.ProcessGroup] = None,
         pg_collection: Optional[ProcessGroupCollection] = None,
+        loop_rounds: Optional[int] = None,
     ):
         """Collect and reduce the indexer losses across ranks.
 
@@ -164,6 +193,9 @@ class DSAIndexerLossLoggingHelper:
             dp_group: Data-parallel group that owns the language model. Used by static CP
                 logging and to validate the Dynamic-CP parent domain; defaults to the legacy
                 global process-group registry when omitted.
+            loop_rounds: The loop's round count: the per-(round, layer) bins (zeros where
+                nothing was recorded) are reduced with the same collectives as the values.
+                Must be the same on every rank.
         """
         if pg_collection is not None:
             pp_group = pg_collection.pp if pp_group is None else pp_group
@@ -228,29 +260,34 @@ class DSAIndexerLossLoggingHelper:
             values = tracker.get("values")
             if values is None or values.shape[0] != size:
                 raise RuntimeError("DSA metric tracker storage does not match its fixed capacity.")
-        values = tracker["values"]
+        reduced = [tracker["values"]]
+        if loop_rounds is not None:
+            reduced.append(DSAIndexerLossLoggingHelper.round_bins(loop_rounds))
 
-        if dynamic_cp_parent_group is not None:
-            torch.distributed.all_reduce(values, group=pp_group)
-            values.mul_(configured_cp_size)
-            torch.distributed.all_reduce(
-                values, group=dynamic_cp_parent_group, op=torch.distributed.ReduceOp.AVG
-            )
-        else:
-            # Apply static-CP normalization on the PP stage that owns each indexer before
-            # broadcasting its layer slots across PP. Empty PP stages have no local group
-            # metadata and can safely skip CP because their values are still zero here.
-            if tracker.get('reduce_group') is not None:
-                torch.distributed.all_reduce(values, group=tracker.get('reduce_group'))
-            if tracker.get('avg_group') is not None:
+        if dp_group is None and dynamic_cp_parent_group is None:
+            # Legacy fallback; explicit process-group collections are preferred.
+            dp_group = parallel_state.get_data_parallel_group(with_context_parallel=False)
+        for values in reduced:
+            if dynamic_cp_parent_group is not None:
+                torch.distributed.all_reduce(values, group=pp_group)
+                values.mul_(configured_cp_size)
                 torch.distributed.all_reduce(
-                    values, group=tracker['avg_group'], op=torch.distributed.ReduceOp.AVG
+                    values, group=dynamic_cp_parent_group, op=torch.distributed.ReduceOp.AVG
                 )
-            torch.distributed.all_reduce(values, group=pp_group)
-            if dp_group is None:
-                # Legacy fallback; explicit process-group collections are preferred.
-                dp_group = parallel_state.get_data_parallel_group(with_context_parallel=False)
-            torch.distributed.all_reduce(values, group=dp_group, op=torch.distributed.ReduceOp.AVG)
+            else:
+                # Apply static-CP normalization on the PP stage that owns each indexer before
+                # broadcasting its layer slots across PP. Empty PP stages have no local group
+                # metadata and can safely skip CP because their values are still zero here.
+                if tracker.get('reduce_group') is not None:
+                    torch.distributed.all_reduce(values, group=tracker.get('reduce_group'))
+                if tracker.get('avg_group') is not None:
+                    torch.distributed.all_reduce(
+                        values, group=tracker['avg_group'], op=torch.distributed.ReduceOp.AVG
+                    )
+                torch.distributed.all_reduce(values, group=pp_group)
+                torch.distributed.all_reduce(
+                    values, group=dp_group, op=torch.distributed.ReduceOp.AVG
+                )
 
     @staticmethod
     def track_indexer_metrics(
@@ -268,6 +305,7 @@ class DSAIndexerLossLoggingHelper:
         pp_group: Optional[torch.distributed.ProcessGroup] = None,
         dp_group: Optional[torch.distributed.ProcessGroup] = None,
         pg_collection: Optional[ProcessGroupCollection] = None,
+        loop_rounds: Optional[int] = None,
     ):
         """Track the sparse attention indexer metrics for logging.
 
@@ -289,6 +327,9 @@ class DSAIndexerLossLoggingHelper:
                 raw local token sums.
             pp_group: Pipeline-parallel group that owns the language model.
             dp_group: Data-parallel group that owns the language model.
+            loop_rounds: The loop's round count (``R_max``) for a depth-recurrent model: also
+                log ``"indexer loss round {r}"`` (round ``r``'s bins, normalized like
+                ``"indexer loss"``) to the writers. Must be the same on every rank.
         """
         if pg_collection is not None:
             pp_group = pg_collection.pp if pp_group is None else pp_group
@@ -300,6 +341,8 @@ class DSAIndexerLossLoggingHelper:
             configured_cp_size=configured_cp_size,
             pp_group=pp_group,
             dp_group=dp_group,
+            # Only pass the loop keyword when set: keeps the pre-loop call shape.
+            **({} if loop_rounds is None else {"loop_rounds": loop_rounds}),
         )
         tracker = DSAIndexerLossLoggingHelper.tracker
         if "values" not in tracker:
@@ -325,6 +368,17 @@ class DSAIndexerLossLoggingHelper:
 
         if wandb_writer is not None:
             wandb_writer.log({"indexer loss": avg_indexer_loss}, iteration)
+
+        if loop_rounds is not None:
+            # Writers only: total_loss_dict keeps its keys.
+            bins = tracker["round_values"][:loop_rounds] * loss_scale
+            for r in range(loop_rounds):
+                key = f"indexer loss round {r + 1}"
+                value = bins[r].sum() / max(num_indexer_layers, 1)
+                if writer is not None:
+                    writer.add_scalar(key, value, iteration)
+                if wandb_writer is not None:
+                    wandb_writer.log({key: value}, iteration)
 
         DSAIndexerLossLoggingHelper.clean_loss_in_tracker(preserve_groups=preserve_groups)
 

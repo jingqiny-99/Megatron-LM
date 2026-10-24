@@ -154,6 +154,15 @@ def has_dsv4_attention(layer_symbols: Sequence[str]) -> bool:
     return any(symbol in _DSV4_ATTENTION_SYMBOLS for symbol in layer_symbols)
 
 
+def is_block_boundary(layer_symbols: Sequence[str], cut: int) -> bool:
+    """True if a cut before sublayer ``cut`` separates whole attention + MLP blocks: the
+    sublayer before it ends a block (MLP / MoE) and the one after it starts one (a sequence
+    mixer). The ends of the pattern (``cut`` 0 or ``len(layer_symbols)``) are boundaries."""
+    if not 0 < cut < len(layer_symbols):
+        return True
+    return layer_symbols[cut - 1] in _BLOCK_END and layer_symbols[cut] in _BLOCK_START
+
+
 def _recompute_modules(config: Any) -> Sequence[str]:
     modules = getattr(config, "recompute_modules", None)
     return _DEFAULT_RECOMPUTE_MODULES if modules is None else modules
@@ -290,9 +299,7 @@ def resolve_hybrid_loop_roles(
         # A cut must separate whole attention + MLP blocks: the sublayer before it ends a
         # block, the one after it starts one.
         for cut in (roles.core_start, roles.core_end):
-            if 0 < cut < num_sublayers and not (
-                symbols[cut - 1] in _BLOCK_END and symbols[cut] in _BLOCK_START
-            ):
+            if not is_block_boundary(symbols, cut):
                 violations.append(CUT_NOT_ON_BLOCK)
                 break
         # Hash layers route by token id; in the prelude each runs once per sample, while a
@@ -415,6 +422,16 @@ RSBF_WAVES = "loop_rsbf_waves < 1"
 RSBF_GLOBAL_AUX_LOSS = "global aux loss under RSBF"
 RSBF_AUTOCAST = "autocast under RSBF"
 RSBF_SHARDED_DP = "sharded data parallelism (Megatron FSDP / torch FSDP2) under RSBF"
+# Backward item forms (``loop_rsbf_item_form``; ``program.build_core_plan``).
+RSBF_ITEM_FORM = "unknown loop_rsbf_item_form"
+RSBF_BLOCK_STRIDE_MISMATCH = "loop_rsbf_block_stride mismatch"
+RSBF_BLOCK_STRIDE_BEYOND_CORE = "loop_rsbf_block_stride beyond the core"
+RSBF_CODA_RECOMPUTE_WITHOUT_DSV4 = "coda mla_up_proj recompute without DSv4 attention"
+
+# The CORE item forms: the whole round as one block (stage 3), the block-checkpoint item with
+# stride ``loop_rsbf_block_stride`` (block inputs stashed by the sweep) and the nested item
+# (rebuild, then per-block recompute + backward).
+RSBF_ITEM_FORMS = ("whole_round", "block", "nested")
 
 
 def _load_balancing_types(config: Any) -> Sequence[str]:
@@ -431,6 +448,49 @@ def _depth_probs_valid(probs: Optional[Sequence[float]], max_rounds: int) -> boo
         and all(p >= 0 for p in probs)
         and abs(sum(probs) - 1.0) <= 1e-6
     )
+
+
+def rsbf_item_form_violations(
+    form: str, stride: Optional[int], core_sublayers: Optional[int]
+) -> List[str]:
+    """The item-form rules (``loop_rsbf_item_form`` / ``loop_rsbf_block_stride``) broken by
+    ``form`` and ``stride`` on a core of ``core_sublayers`` sublayers (None: unknown, the
+    range rule is skipped).
+
+    ``stride`` counts core sublayers. ``block`` needs ``1 <= stride <= core_sublayers``
+    (``stride == core_sublayers`` is the whole round; the last block may be shorter);
+    ``nested`` takes an optional stride (its granularity, default 1) with
+    ``1 <= stride < core_sublayers`` (a nested item has at least two blocks); ``whole_round``
+    takes none.
+    """
+    if form not in RSBF_ITEM_FORMS:
+        return [RSBF_ITEM_FORM]
+    if (
+        (form == "block" and stride is None)
+        or (form == "whole_round" and stride is not None)
+        or (stride is not None and stride < 1)
+    ):
+        return [RSBF_BLOCK_STRIDE_MISMATCH]
+    if core_sublayers is None or form == "whole_round":
+        return []
+    if form == "block":
+        beyond = stride > core_sublayers
+    else:
+        beyond = (1 if stride is None else stride) >= core_sublayers
+    return [RSBF_BLOCK_STRIDE_BEYOND_CORE] if beyond else []
+
+
+def _config_core_sublayers(config: Any) -> Optional[int]:
+    """``L_core = num_layers - prelude - coda`` at config time (``num_layers`` counts the
+    sublayers of the main hybrid pattern; the pattern itself is a model argument), or None
+    when the role fields or ``num_layers`` are unset. ``LoopProgram`` re-checks the item form
+    against the built pattern."""
+    prelude = getattr(config, "loop_prelude_sublayers", None)
+    coda = getattr(config, "loop_coda_sublayers", None)
+    num_layers = getattr(config, "num_layers", 0) or 0
+    if prelude is None or coda is None or num_layers <= 0:
+        return None
+    return num_layers - prelude - coda
 
 
 def _lockstep_moe_options(config: Any) -> List[str]:
@@ -479,6 +539,11 @@ def validate_rsbf_config(config: "TransformerConfig") -> None:
     moe = getattr(config, "num_moe_experts", None) is not None
     balancing = _load_balancing_types(config)
     sampled = config.loop_exit_criterion == "sampled"
+    item_form_rules = rsbf_item_form_violations(
+        getattr(config, "loop_rsbf_item_form", "whole_round"),
+        getattr(config, "loop_rsbf_block_stride", None),
+        _config_core_sublayers(config),
+    )
     unsupported = {
         # The executor drives LoopHybridStack cells: a hybrid Huginn loop with role fields.
         RSBF_WITHOUT_HYBRID_ROLES: not is_hybrid_loop_config(config),
@@ -530,6 +595,14 @@ def validate_rsbf_config(config: "TransformerConfig") -> None:
         RSBF_GLOBAL_AUX_LOSS: moe and "global_aux_loss" in balancing,
         # forward_step's autocast region; the cells do not replicate it.
         RSBF_AUTOCAST: config.enable_autocast,
+        # The CORE item form and its stride (no silently ignored stride, none outside the
+        # core).
+        **{rule: True for rule in item_form_rules},
+        # D42: the scoped up-projection recompute exists only in DSv4HybridAttention.
+        RSBF_CODA_RECOMPUTE_WITHOUT_DSV4: bool(
+            getattr(config, "loop_rsbf_coda_recompute_mla_up_proj", False)
+        )
+        and getattr(config, "experimental_attention_variant", None) != "dsv4_hybrid",
     }
     violations = [name for name, value in unsupported.items() if value]
     if violations:

@@ -30,6 +30,7 @@ from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.forward_replay import in_forward_replay, statistics_weight
 from megatron.core.transformer.loop import rsbf_executor
 from megatron.core.transformer.loop.program import (
+    CoreBackwardPlan,
     LoopPhase,
     LoopProgram,
     PrescribedDepthCriterion,
@@ -39,6 +40,7 @@ from megatron.core.transformer.loop.program import (
     global_sample_index,
 )
 from megatron.core.transformer.loop.rsbf_executor import (
+    NON_UNIFORM_PLAN,
     PLAN_MISMATCH,
     RSBF_BATCH_FUNC_ATTR,
     SWEEP_AFTER_EXIT,
@@ -50,6 +52,7 @@ from megatron.core.transformer.loop.rsbf_executor import (
 )
 from megatron.core.transformer.moe.moe_logging import MoEMetricsTracker, set_moe_metrics_tracker
 from megatron.core.transformer.multi_token_prediction import MTPLossAutoScaler
+from megatron.core.transformer.selective_recompute import selective_recompute_requested
 from tests.unit_tests.transformer.loop import hybrid_loop_utils
 from tests.unit_tests.transformer.loop.hybrid_loop_utils import (
     CUDA,
@@ -553,10 +556,20 @@ def test_buggy_host_plans_are_caught(request, hybrid, monkeypatch):
     assert executor.program.after_exit_violations.item() == 0
 
 
-def test_core_plan_is_consulted_by_sweep_and_item(request, hybrid, monkeypatch):
+@pytest.mark.parametrize(
+    "form",
+    [
+        {},
+        dict(loop_rsbf_item_form="block", loop_rsbf_block_stride=2),
+        dict(loop_rsbf_item_form="nested"),
+    ],
+    ids=["whole_round", "block2", "nested"],
+)
+def test_core_plan_is_consulted_by_sweep_and_item(request, hybrid, monkeypatch, form):
     """C9: the sweep and the CORE item of every (sample, round) read the same
-    ``program.core_plan`` (what to stash / what to replay), once each."""
-    model = _model("dense", request)
+    ``program.core_plan`` (what to stash / what to replay), once each, in every item form
+    (the nested item's rebuild reads the item's plan)."""
+    model = _model("dense", request, **form)
     executor = _executor(model, DEPTHS)
     calls = []
     real = executor.program.core_plan
@@ -573,6 +586,98 @@ def test_core_plan_is_consulted_by_sweep_and_item(request, hybrid, monkeypatch):
     )
     expected = sorted((i, r) for i, depth in enumerate(DEPTHS) for r in range(1, depth + 1))
     assert sorted(calls) == sorted(expected * 2)
+
+
+def _step(executor, model, hybrid):
+    return executor.run_step(
+        _next_batch,
+        iter(_microbatches(model, hybrid, _batches(len(DEPTHS)))),
+        len(DEPTHS),
+        model=model,
+    )
+
+
+def test_core_plans_must_be_the_uniform_plan(request, hybrid, monkeypatch):
+    """CORE-B lockstep nulls follow the program's uniform plan, so a plan read for a (sample,
+    round) must be that object (an equal copy is not)."""
+    model = _model("dense", request)
+    executor = _executor(model, DEPTHS)
+    program = executor.program
+    assert program.item_form == "whole_round"
+    monkeypatch.setattr(
+        program, "core_plan", lambda sample, r: CoreBackwardPlan.whole_round(program.roles.core)
+    )
+    with pytest.raises(RuntimeError, match=NON_UNIFORM_PLAN):
+        _step(executor, model, hybrid)
+
+
+def test_a_block_plan_of_stride_l_is_the_whole_round(request, hybrid, deterministic_algorithms):
+    """``loop_rsbf_item_form='block'`` with the core's length as stride is the whole round
+    (the same plan) and runs bitwise as the default form."""
+    whole = _model("dense", request, loop_rsbf_item_form="block", loop_rsbf_block_stride=4)
+    reference = _model("dense", request)
+    batches = _batches(len(DEPTHS))
+    reports, executor, grads = _rsbf(whole, hybrid, batches, DEPTHS)
+    assert executor.program.item_form == "whole_round"
+    expected_reports, _, expected_grads = _rsbf(reference, hybrid, batches, DEPTHS)
+    _assert_losses_equal(_lm_losses(reports), _lm_losses(expected_reports))
+    _assert_grads_equal(grads, expected_grads)
+
+
+def test_the_coda_item_scopes_its_recompute_request(request, hybrid, deterministic_algorithms):
+    """D42: the CODA item runs the coda sublayers and the head (MTP included) inside
+    ``request_selective_recompute(program.coda_recompute_modules)``; prelude, sweeps and CORE /
+    PRELUDE items never see the request. A dense coda has no DSv4 attention (the config
+    cannot set the flag; the program's request is set directly here), so nothing is
+    checkpointed: the step equals the step without the request bitwise, with no recompute
+    FLOPs added."""
+    model = _model("mtp", request)
+    batches = _batches(len(DEPTHS))
+    expected_reports, expected_executor, expected_grads = _rsbf(model, hybrid, batches, DEPTHS)
+    executor = _executor(model, DEPTHS)
+    executor.program._coda_recompute_modules = frozenset({"mla_up_proj"})
+    assert executor.program.coda_recompute_attentions() == []
+    roles = model.decoder.loop_roles
+    calls = []
+
+    def spy(index):
+        return lambda module, args: calls.append(
+            (index, selective_recompute_requested("mla_up_proj"))
+        )
+
+    handles = [
+        layer.register_forward_pre_hook(spy(index))
+        for index, layer in enumerate(model.decoder.layers)
+    ]
+    handles.append(model.mtp.register_forward_pre_hook(spy("mtp")))
+    model.zero_grad(set_to_none=True)
+    try:
+        reports = executor.run_step(
+            _next_batch, iter(_microbatches(model, hybrid, batches)), len(batches), model=model
+        )
+    finally:
+        for handle in handles:
+            handle.remove()
+    assert not selective_recompute_requested("mla_up_proj")
+    for index, requested in calls:
+        coda = index == "mtp" or index >= roles.core_end
+        assert requested == coda, (index, requested)
+    assert sum(index == "mtp" for index, _ in calls) == len(DEPTHS)
+    _assert_losses_equal(_lm_losses(reports), _lm_losses(expected_reports))
+    _assert_grads_equal(_grads(model), expected_grads)
+    assert executor.stats.work == expected_executor.stats.work
+
+
+def test_measure_memory_needs_cuda(request):
+    """``measure_memory`` reads the CUDA caching allocator (the arena GPU test,
+    ``test_loop_rsbf_item_memory.py``)."""
+    model = _model("dense", request)
+    if CUDA:
+        executor = _executor(model, DEPTHS, measure_memory=True)
+        assert executor.measure_memory
+    else:
+        with pytest.raises(ValueError, match="measure_memory"):
+            _executor(model, DEPTHS, measure_memory=True)
 
 
 # ---------------------------------------------------------------------------
@@ -677,14 +782,29 @@ def test_normalizer_records_and_loss_scales(request, hybrid, monkeypatch, determ
 # ---------------------------------------------------------------------------
 
 
+# The CORE item forms of the 4-sublayer dense core: (loop_rsbf_item_form, stride).
+FORMS = {
+    "whole_round": ("whole_round", None),
+    "block1": ("block", 1),
+    "block3": ("block", 3),
+    "nested1": ("nested", None),
+    "nested3": ("nested", 3),
+}
+
+
+@pytest.mark.parametrize("form", list(FORMS))
 @pytest.mark.parametrize("name", ["dense_padded", "mhc_mtp"])
 def test_poisoned_store_and_recompute_checks_change_nothing(
-    request, hybrid, name, deterministic_algorithms
+    request, hybrid, name, form, deterministic_algorithms
 ):
-    """NaN-poisoned frees and check_recompute (every replayed round state and injection equals
-    the sweep's bitwise; the RNG states are unchanged across each wave) give bitwise the plain
-    run's losses and gradients; every wave ends with an empty store."""
-    model = _model(name, request)
+    """NaN-poisoned frees and check_recompute (every replayed round state and injection, and
+    the output of every recomputed core sublayer, equals the sweep's bitwise; the RNG states
+    are unchanged across each wave; every input a nested item's rebuild stores equals the
+    sweep's) give bitwise the plain run's losses and gradients; every wave ends with an empty
+    store. Debug syncs: one per CORE item for its state check, one per CORE item for its
+    per-sublayer (and rebuild) checks, one per PRELUDE item, in every form."""
+    item_form, stride = FORMS[form]
+    model = _model(name, request, loop_rsbf_item_form=item_form, loop_rsbf_block_stride=stride)
     batches = _batches(len(DEPTHS), padded=name.endswith("padded"))
     plain_reports, plain, plain_grads = _rsbf(model, hybrid, batches, DEPTHS, waves=2)
     reports, checked, grads = _rsbf(
@@ -692,10 +812,53 @@ def test_poisoned_store_and_recompute_checks_change_nothing(
     )
     _assert_losses_equal(_lm_losses(reports), _lm_losses(plain_reports))
     _assert_grads_equal(grads, plain_grads)
-    assert checked.stats.debug_syncs == sum(DEPTHS) - len(DEPTHS) + 2 * len(DEPTHS)
+    assert checked.stats.debug_syncs == 2 * sum(DEPTHS) - len(DEPTHS) + 2 * len(DEPTHS)
     for stats in checked.stats.store_peaks + plain.stats.store_peaks:
         assert stats.live_entries == 0 and stats.live_bytes == 0 and stats.peak_bytes > 0
     assert checked.store.wave is None
+
+
+def test_recompute_checks_report_instead_of_raising(request, hybrid, monkeypatch):
+    """``check_recompute="report"`` records ``max |replayed - sweep|`` per check (all zero
+    here) without raising; a perturbed recompute of the first core sublayer is reported for
+    that sublayer only (stride 1: every later block starts from the sweep's stash), while
+    ``"raise"`` names it."""
+    model = _model("dense", request, loop_rsbf_item_form="block", loop_rsbf_block_stride=1)
+    core = model.decoder.loop_roles.core
+    batches = _batches(len(DEPTHS))
+    _, executor, _ = _rsbf(model, hybrid, batches, DEPTHS, check_recompute="report")
+    diffs = executor.stats.recompute_diffs
+    traces = [name for name in diffs if name.startswith("trace[")]
+    assert len(traces) == core * sum(DEPTHS)
+    assert len(diffs) == len(traces) + sum(DEPTHS) + len(DEPTHS)  # + states + injections
+    assert all(value == 0.0 for value in diffs.values())
+    # Perturb the first core sublayer in recomputes only (statistics replay gate on).
+    from megatron.core.transformer.forward_replay import in_forward_replay
+
+    def perturb(module, args, output):
+        del module, args
+        if not in_forward_replay():
+            return None
+        if isinstance(output, tuple):
+            return (output[0] + 1.0,) + tuple(output[1:])
+        return output + 1.0
+
+    first_layer = model.decoder.layers[model.decoder.loop_roles.core_start]
+    handle = first_layer.register_forward_hook(perturb)
+    try:
+        _, executor, _ = _rsbf(model, hybrid, batches, DEPTHS, check_recompute="report")
+        diffs = executor.stats.recompute_diffs
+        assert diffs["trace[sample 0, round 1, sublayer 0]"] > 0.5
+        assert all(
+            value == 0.0 for name, value in diffs.items() if not name.endswith("sublayer 0]")
+        )
+        first = r"replayed trace\[sample \d+, round \d+, sublayer 0\]"
+        with pytest.raises(RuntimeError, match=first):
+            _rsbf(model, hybrid, batches, DEPTHS, check_recompute=True)
+    finally:
+        handle.remove()
+    with pytest.raises(ValueError, match="unknown check_recompute"):
+        _executor(model, DEPTHS, check_recompute="warn")
 
 
 # ---------------------------------------------------------------------------

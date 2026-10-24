@@ -189,6 +189,19 @@ def dsv4_attention_forward_flops(
     return 2 * (token_linear * tokens + core * squared_lengths)
 
 
+def dsv4_up_proj_forward_flops(config: Any, tokens):
+    """The up projections inside one DSv4 attention's ``qkv_up_proj_and_rope_apply`` (the part
+    a ``mla_up_proj`` selective recompute replays, D42): the query up projection
+    (``q_lora_rank -> heads * v_head_dim``) and the single-head key-value projection
+    (``hidden -> v_head_dim``). The same weight terms as ``q_term`` / ``kv_term`` of
+    ``dsv4_hybrid_self_attention_coefficients``; norms and RoPE are excluded."""
+    weights = (
+        config.q_lora_rank * config.num_attention_heads * config.v_head_dim
+        + config.hidden_size * config.v_head_dim
+    )
+    return 2 * tokens * weights
+
+
 def sublayer_forward_flops(
     symbol: str,
     config: Any,

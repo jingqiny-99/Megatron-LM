@@ -710,25 +710,36 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
             hidden_states = decoder_output
             mhc_multistream = None
 
-        return self.head_loss(
-            hidden_states,
-            mhc_multistream,
-            input_ids=input_ids,
-            position_ids=position_ids,
-            attention_mask=attention_mask,
-            labels=labels,
-            loss_mask=loss_mask,
-            mtp_input_mask=mtp_input_mask,
-            mtp_decoder_input=mtp_decoder_input,
-            packed_seq_params=packed_seq_params,
-            padding_mask=padding_mask,
-            cp_batch=cp_batch,
-            inference_context=inference_context,
-            inference_params=inference_params,
-            rotary_pos_emb=rotary_pos_emb,
-            runtime_gather_output=runtime_gather_output,
-            compute_mtp_loss=compute_mtp_loss,
-        )
+        head_context = nullcontext()
+        # getattr: upstream unit tests drive forward() with stub configs that predate the loop.
+        if getattr(self.config, "loop_architecture", "none") != "none":
+            from megatron.core.transformer.experimental_attention_variant.dsa_masking import (
+                indexer_loss_padding_mask,
+            )
+
+            # As the loop stack's layers: padded rows do not train the MTP layers' indexers
+            # (the RSBF CODA item enters the same scope around head_loss).
+            head_context = indexer_loss_padding_mask(padding_mask)
+        with head_context:
+            return self.head_loss(
+                hidden_states,
+                mhc_multistream,
+                input_ids=input_ids,
+                position_ids=position_ids,
+                attention_mask=attention_mask,
+                labels=labels,
+                loss_mask=loss_mask,
+                mtp_input_mask=mtp_input_mask,
+                mtp_decoder_input=mtp_decoder_input,
+                packed_seq_params=packed_seq_params,
+                padding_mask=padding_mask,
+                cp_batch=cp_batch,
+                inference_context=inference_context,
+                inference_params=inference_params,
+                rotary_pos_emb=rotary_pos_emb,
+                runtime_gather_output=runtime_gather_output,
+                compute_mtp_loss=compute_mtp_loss,
+            )
 
     def embed(
         self,

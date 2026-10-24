@@ -355,6 +355,30 @@ class TestHybridStackMHC:
             layer.hyper_connection.mapping_proj.weight.grad is not None for layer in stack.layers
         )
 
+    def test_raw_attention_branch_releases_the_norm_manager(self):
+        """The raw attention branch drops the inner layer's attention-norm offload manager
+        after use (as ``TransformerLayer._forward_attention`` does): it holds the norm input,
+        so keeping it would keep the forward's graph alive until the layer's next call, which
+        a forward without backward (e.g. a loop's sweep) turns into retained activations."""
+        config = _get_config(num_layers=2)
+        stack = HybridStack(
+            config=config,
+            submodules=hybrid_stack_spec.submodules,
+            post_layer_norm=False,
+            layer_type_list=[Symbols.ATTENTION, Symbols.MLP],
+            pp_layer_offset=0,
+            pg_collection=_get_pg_collection(),
+        ).cuda()
+        hidden_states = torch.randn(8, 2, config.hidden_size, device="cuda", requires_grad=True)
+
+        output = stack(hidden_states, attention_mask=None)
+
+        attention = stack.layers[0].inner_layer
+        assert attention.attn_norm_manager is None
+        assert stack.layers[1].inner_layer.mlp_norm_manager is None
+        output.float().sum().backward()
+        assert hidden_states.grad is not None
+
     def test_real_moe_raw_branch_forward_backward(self):
         config = _get_config(
             num_layers=1,

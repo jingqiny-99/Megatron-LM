@@ -27,11 +27,18 @@ real tokens:
 from the model; modules whose collective groups span one rank are not lockstep (dense models and
 EP = 1 get empty tuples, and their nulls do nothing). ``register_lockstep_module`` lets tests
 drive a stub module class through the same machinery.
+
+CORE-B items follow the round's backward plan (``CoreBackwardPlan``): a block-checkpoint item
+runs its blocks in reverse, each block's MoE calls forward and then that block's backward, and
+a nested item first rebuilds a prefix of the core forward-only. ``core_b_segments`` splits the
+CORE-B calls into those segments; the nulls (``run_null(core_plan=...)``) and the call check
+(``LockstepPlan.end_item(core_plan=...)``) follow them, so every EU of a CORE-B sub-round issues
+the same sequence. For the whole-round plan this is the single segment of stage 3.
 """
 
 import contextlib
 from dataclasses import dataclass, field
-from typing import Any, Callable, ContextManager, Optional, Sequence
+from typing import TYPE_CHECKING, Any, Callable, ContextManager, Optional, Sequence
 
 import torch
 import torch.distributed as dist
@@ -39,15 +46,20 @@ from torch import Tensor, nn
 
 from megatron.core.transformer.loop.rsbf_plan import SubRoundType
 
+if TYPE_CHECKING:
+    from megatron.core.transformer.loop.program import CoreBackwardPlan
+
 __all__ = [
     "FORM_EMPTY",
     "FORM_NOMINAL",
+    "CallSegment",
     "LockstepAdapter",
     "LockstepEntry",
     "LockstepPlan",
     "LockstepSignature",
     "MoELockstepAdapter",
     "build_lockstep_plan",
+    "core_b_segments",
     "register_lockstep_module",
     "run_null",
 ]
@@ -58,6 +70,12 @@ FORM_NOMINAL = "nominal"  # S x c rows, every route excluded (HybridEP)
 
 UNSUPPORTED = "Loop RSBF does not support: "
 LOCKSTEP = "lockstep"  # message prefix of the lockstep checks
+# Hint of a signature mismatch whose real MoE input does not require grad.
+DETACHED_MOE_INPUT = (
+    "MoE input does not require grad: an E sublayer without a parameterized pre-op under the "
+    "detached sweep (every sublayer input of the sweep and the rebuild is detached, so an 'E' "
+    "sublayer must feed its MoE through a norm or mHC h_pre with weights)"
+)
 
 # Sub-round types whose items run a backward (nulls of these types back-propagate too).
 _BACKWARD_TYPES = frozenset((SubRoundType.CORE_B, SubRoundType.CODA, SubRoundType.PRELUDE_B))
@@ -303,8 +321,10 @@ def _spans_ranks(groups: Sequence) -> bool:
 class LockstepEntry:
     """One MoE call of a sub-round type: the module, the hosting sublayer's config and
     ``layer_number - 1`` (the arguments of its inner quantization context), the null form,
-    a name for messages, and ``wrap``, the extra quantization context a real call of an MTP
-    depth runs in (``MultiTokenPredictionLayer.get_inner_quantization_context``)."""
+    a name for messages, ``wrap``, the extra quantization context a real call of an MTP
+    depth runs in (``MultiTokenPredictionLayer.get_inner_quantization_context``), and
+    ``stack_index``, the hosting sublayer's index in its stack (the decoder's, or the MTP
+    depth's inner stack), independent of the pipeline layer offset."""
 
     module: nn.Module
     adapter: LockstepAdapter
@@ -313,6 +333,43 @@ class LockstepEntry:
     form: str
     name: str
     wrap: Optional[Callable[[], ContextManager]] = None
+    stack_index: int = -1
+
+
+@dataclass(frozen=True)
+class CallSegment:
+    """A run of lockstep MoE calls of one item: ``entries`` forward in order, then (when
+    ``backward``) their backward in reverse."""
+
+    entries: tuple
+    backward: bool
+
+
+def core_b_segments(
+    plan: "LockstepPlan", core_plan: Optional["CoreBackwardPlan"], core_start: int
+) -> tuple:
+    """The CORE-B MoE call segments of a CORE item that follows ``core_plan``: for a nested
+    plan, first the forward-only rebuild of core sublayers ``[0, rebuild_end)``; then, for
+    each block in reverse, the block's MoE calls with its backward. Entries are selected by
+    ``stack_index - core_start``; empty segments are dropped. ``core_plan`` None (or a whole
+    round) gives the stage-3 single segment."""
+    entries = plan.by_type[SubRoundType.CORE_B]
+    if core_plan is None:
+        return (CallSegment(tuple(entries), True),) if entries else ()
+
+    def within(lo, hi):
+        return tuple(e for e in entries if lo <= e.stack_index - core_start < hi)
+
+    ranges = []
+    if core_plan.rebuild:
+        ranges.append((0, core_plan.rebuild_end, False))
+    ranges += [(block.start, block.end, True) for block in reversed(core_plan.blocks)]
+    segments = []
+    for lo, hi, backward in ranges:
+        selected = within(lo, hi)
+        if selected:
+            segments.append(CallSegment(selected, backward))
+    return tuple(segments)
 
 
 @dataclass
@@ -405,11 +462,14 @@ class LockstepPlan:
         if signature.observed and not self._check_every:
             return
         if observed.key() != signature.key():
+            hint = ""
+            if signature.hidden_requires_grad and not observed.hidden_requires_grad:
+                hint = f" ({DETACHED_MOE_INPUT})"
             raise RuntimeError(
                 f"{LOCKSTEP}: a real call of {self._names[id(module)]} has the "
                 f"signature {observed.key()} but its null items use {signature.key()} (hidden "
                 "dtype, hidden requires_grad, probs dtype, probs requires_grad, routing dtype); "
-                "the nulls would issue mismatched expert-parallel collectives"
+                f"the nulls would issue mismatched expert-parallel collectives{hint}"
             )
         signature.observed = True
 
@@ -417,10 +477,25 @@ class LockstepPlan:
         """Start logging the real MoE calls of one item (``check_lockstep``)."""
         self._calls = []
 
-    def end_item(self, kind_type: SubRoundType, label: str) -> None:
-        """Compare the logged real calls with the plan's calls of ``kind_type``."""
+    def end_item(
+        self,
+        kind_type: SubRoundType,
+        label: str,
+        *,
+        core_plan: Optional["CoreBackwardPlan"] = None,
+        core_start: int = 0,
+    ) -> None:
+        """Compare the logged real calls with the plan's calls of ``kind_type`` (CORE-B with
+        ``core_plan``: the forward calls of its segments, ``core_b_segments``)."""
         calls, self._calls = self._calls or [], None
-        expected = [entry.module for entry in self.by_type[kind_type]]
+        if kind_type is SubRoundType.CORE_B and core_plan is not None:
+            expected = [
+                entry.module
+                for segment in core_b_segments(self, core_plan, core_start)
+                for entry in segment.entries
+            ]
+        else:
+            expected = [entry.module for entry in self.by_type[kind_type]]
         if len(calls) != len(expected) or any(a is not b for a, b in zip(calls, expected)):
 
             def names(modules):
@@ -471,6 +546,7 @@ def _scan(stack, start: int, end: int, prefix: str, wrap, budget: list, seen: se
                 form=adapter.form(module),
                 name=full_name,
                 wrap=wrap,
+                stack_index=index,
             )
         )
     return entries
@@ -546,33 +622,43 @@ def run_null(
     inner_context: Callable[[Any, int], ContextManager],
     sequence: int,
     device: torch.device,
+    core_plan: Optional["CoreBackwardPlan"] = None,
+    core_start: int = 0,
 ) -> int:
     """Run the null item of ``kind_type``: every lockstep MoE call of the type on an empty
     input (rows per the entry's form, ``sequence`` x 1 for "nominal"), chained, then for the
-    backward types a backward of zeros through the chain. ``outer_context`` and
+    backward types a backward of zeros through the chain. CORE-B with ``core_plan`` runs the
+    plan's segments (``core_b_segments``) in order, each chained from a fresh zero leaf and
+    back-propagated when the segment is. ``outer_context`` and
     ``inner_context(layer_config, layer_number)`` are the stack's quantization contexts (as
     the cells and ``HybridStack._run_layer`` enter them). Returns the number of MoE calls."""
-    entries = plan.by_type[kind_type]
-    if not entries:
-        return 0
-    output = None
-    with torch.enable_grad(), outer_context:
-        for entry in entries:
-            signature = plan.signature[entry.module]
-            if output is None:
-                rows = 0 if entry.form == FORM_EMPTY else sequence
-                hidden = torch.zeros(
-                    (rows, 1, entry.layer_config.hidden_size),
-                    dtype=signature.hidden_dtype,
-                    device=device,
-                    requires_grad=signature.hidden_requires_grad,
-                )
-            else:
-                # Chained: the backward visits the modules in reverse, as a real item's does.
-                hidden = output.to(signature.hidden_dtype)
-            wrap = entry.wrap() if entry.wrap is not None else contextlib.nullcontext()
-            with wrap, inner_context(entry.layer_config, entry.layer_number):
-                output = entry.adapter.null_forward(entry, hidden, signature)
-        if kind_type in _BACKWARD_TYPES and output.requires_grad:
-            torch.autograd.backward(output, torch.zeros_like(output))
-    return len(entries)
+    if kind_type is SubRoundType.CORE_B and core_plan is not None:
+        segments = core_b_segments(plan, core_plan, core_start)
+    else:
+        entries = plan.by_type[kind_type]
+        segments = (CallSegment(tuple(entries), kind_type in _BACKWARD_TYPES),) if entries else ()
+    calls = 0
+    for segment in segments:
+        output = None
+        with torch.enable_grad(), outer_context:
+            for entry in segment.entries:
+                signature = plan.signature[entry.module]
+                if output is None:
+                    rows = 0 if entry.form == FORM_EMPTY else sequence
+                    hidden = torch.zeros(
+                        (rows, 1, entry.layer_config.hidden_size),
+                        dtype=signature.hidden_dtype,
+                        device=device,
+                        requires_grad=signature.hidden_requires_grad,
+                    )
+                else:
+                    # Chained: the backward visits the modules in reverse, as a real item's
+                    # does.
+                    hidden = output.to(signature.hidden_dtype)
+                wrap = entry.wrap() if entry.wrap is not None else contextlib.nullcontext()
+                with wrap, inner_context(entry.layer_config, entry.layer_number):
+                    output = entry.adapter.null_forward(entry, hidden, signature)
+            if segment.backward and output.requires_grad:
+                torch.autograd.backward(output, torch.zeros_like(output))
+        calls += len(segment.entries)
+    return calls

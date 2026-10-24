@@ -29,6 +29,11 @@ reduce-scatter is checked by gathering the reduced shards back.
   exchange per forward round, one host sync per round plus one).
 * D6: a buggy host plan (the same on every rank) is raised by every rank naming the EU that
   ran the bad sweep; the next step runs (no poisoned communicator).
+* D7 (M8b / M8): block-checkpoint and nested CORE items (strides 2 and 1) at W EUs with local
+  layers, the TE spec (fp32, fused wgrad into ``main_grad``) and the TE spec in bf16:
+  per-sample losses and ``main_grad`` after finalize bitwise equal to the whole-round item's
+  (each parameter gets the same addends in the same order), with check_recompute and
+  verify_stash.
 * D3 drives the path ``train()`` uses: the module schedule (``get_loop_rsbf_schedule()``)
   with ``pg_collection=None`` (the default collection), a ``forward_step_func`` carrying the
   batch-function and loss-validator hooks, the executor cache over two steps and finalize
@@ -169,10 +174,11 @@ def _loss_func(loss_mask, output):
     )
 
 
-def _build_model(te):
-    """The dense loop model: local layers, or the TE spec with fused wgrad accumulation."""
+def _build_model(te, **overrides):
+    """The dense loop model: local layers, or the TE spec with fused wgrad accumulation;
+    ``overrides`` are config fields (e.g. the CORE item form)."""
     if not te:
-        return build_local_loop_model(DENSE, **RSBF)
+        return build_local_loop_model(DENSE, **RSBF, **overrides)
     from megatron.core.transformer.loop.hybrid_specs import loop_hybrid_stack_spec
 
     config = hybrid_loop_config(
@@ -182,6 +188,7 @@ def _build_model(te):
         gradient_accumulation_fusion=True,
         attention_backend=AttnBackend.unfused,
         **RSBF,
+        **overrides,
     )
     torch.manual_seed(1234)
     model_parallel_cuda_manual_seed(1234)
@@ -195,8 +202,8 @@ def _build_model(te):
     ).cuda()
 
 
-def _ddp_model(pg_collection=None, *, distributed_optimizer=False, te=False):
-    model = _build_model(te)
+def _ddp_model(pg_collection=None, *, distributed_optimizer=False, te=False, **overrides):
+    model = _build_model(te, **overrides)
     ddp_config = DistributedDataParallelConfig(
         overlap_grad_reduce=False,
         use_distributed_optimizer=distributed_optimizer,
@@ -495,6 +502,58 @@ def test_train_path_schedule_at_dp(single_rank_groups, full_precision_gemms, te)
         schedule.set_iteration(0)
     assert executors[0] is executors[1]  # cached; the default collection is refreshed per call
     assert executors[1].pg_collection.dp is not None
+
+
+_TE_PARAM = pytest.mark.skipif(
+    not _te_fused_wgrad_available(), reason="needs TE and the fused wgrad accumulation kernel"
+)
+
+
+@pytest.mark.parametrize(
+    "te, dtype",
+    [
+        (False, torch.float32),
+        pytest.param(True, torch.float32, marks=_TE_PARAM),
+        pytest.param(True, torch.bfloat16, marks=_TE_PARAM),
+    ],
+    ids=["local", "te_fused_wgrad", "te_bf16"],
+)
+def test_block_items_match_the_whole_round_at_w_eus(full_precision_gemms, te, dtype):
+    """D7: block items of stride 2 (one attention + MLP pair per block) and 1 (every sublayer
+    its own block) and nested items of the same strides at W EUs (rebalancing on: samples
+    move) give the whole-round item's per-sample losses and finalized ``main_grad``
+    bitwise."""
+    del full_precision_gemms
+    batch = _global_batch(dist.get_world_size())
+    local = _local_slice(batch)
+    pg_collection = ProcessGroupCollection.use_mpu_process_groups()
+    precision = {} if dtype == torch.float32 else dict(params_dtype=dtype, bf16=True)
+    results = {}
+    arms = (None, ("block", 2), ("block", 1), ("nested", 2), ("nested", 1))
+    for arm in arms:
+        form = (
+            {} if arm is None else dict(loop_rsbf_item_form=arm[0], loop_rsbf_block_stride=arm[1])
+        )
+        ddp = _ddp_model(te=te, **precision, **form)
+        checks = {} if arm is None else dict(check_recompute=True, verify_stash=True)
+        reports, executor = _rsbf_step(ddp, local, pg_collection, batch, **checks)
+        stats = executor.stats
+        assert stats.host_syncs == 1 and stats.moves["sample"] > 0
+        assert all(peak.live_entries == 0 for peak in stats.store_peaks)
+        if arm is not None and arm[0] == "nested":
+            assert stats.stash_moves == 0 and stats.rebuilds == sum(
+                1 for kind, _, _ in stats.item_order if kind == "core"
+            )
+        results[arm] = (_losses(reports, executor), _main_grads(ddp), stats.stash_copies)
+    base_losses, base_grads, _ = results[None]
+    for arm in arms[1:]:
+        losses, grads, copies = results[arm]
+        _assert_losses_equal(losses, base_losses)
+        assert grads.keys() == base_grads.keys()
+        for name, grad in grads.items():
+            assert torch.equal(grad, base_grads[name]), (arm, name)
+        # Sublayer outputs own their storage: the stash aliases them (no copy).
+        assert copies == 0, (arm, copies)
 
 
 def test_waves_match_one_pass():

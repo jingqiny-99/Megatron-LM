@@ -30,6 +30,10 @@ from megatron.core.models.hybrid.hybrid_block import HybridStack, HybridStackLay
 from megatron.core.models.hybrid.layers.utils import Symbols
 from megatron.core.tensor_observation import observe_layer_residuals
 from megatron.core.transformer.enums import AttnMaskType
+from megatron.core.transformer.experimental_attention_variant.dsa_masking import (
+    indexer_loss_padding_mask,
+)
+from megatron.core.transformer.forward_replay import forward_statistics_round
 from megatron.core.transformer.loop import flops
 from megatron.core.transformer.loop.guards import (
     LoopRoles,
@@ -224,12 +228,12 @@ class LoopHybridStack(HybridStack):
                 before the round-count all-reduce, which its TP x EP peers then wait on.
 
         This is the eager oracle of row exit, not the executor's: exited rows still run every
-        later round and are discarded by the self-carry. Only the MoE router sees them as
-        padding (``padding_mask``); with the alltoall dispatcher they are still dispatched to
-        experts, and auxiliary losses that ``padding_mask`` does not reach (e.g. the DSA
-        indexer loss of DSv4 core layers) are still computed and back-propagated for them in
-        every extra round. While every row of the TP x EP group is alive the round runs exactly
-        as uniform depth (no padding mask is added), so equal row depths equal uniform depth
+        later round and are discarded by the self-carry. The MoE router and the SBHD indexer
+        loss of DSv4 attentions see them as padding (``padding_mask``, through
+        ``_run_range``'s ``indexer_loss_padding_mask``; the fused SBHD indexer kernel has no
+        row mask and refuses it); with the alltoall dispatcher they are still dispatched to
+        experts. While every row of the TP x EP group is alive the round runs exactly as
+        uniform depth (no padding mask is added), so equal row depths equal uniform depth
         bitwise.
         """
         self._loop_depths = depths
@@ -296,24 +300,32 @@ class LoopHybridStack(HybridStack):
         An empty input (a compact-MoR round no local token reached) skips every non-MoE
         sublayer and runs only the MoE MLP, so the EP dispatch / combine and its backward keep
         the collective order across ranks (the GPT loop's rule).
+
+        The context's padding mask (row-tail padding, and the rows of exited samples in a
+        per-row-depth round) also masks the SBHD indexer loss of DSv4 attentions
+        (``indexer_loss_padding_mask``): padded and frozen rows do not train the indexer. The
+        scope is entered here, inside every replay of the range, so activation recomputes
+        see it too.
         """
-        for index in range(start, end):
-            layer = self.layers[index]
-            with torch.profiler.record_function(f"{label}/layer={index}"):
-                if x.shape[0] == 0:
-                    residual_accumulator = x
-                    if getattr(layer, "is_moe_layer", False):
-                        update, _ = layer.mlp(x)
-                        x = x + update
-                    observe_layer_residuals(layer, residual_accumulator, x)
-                else:
-                    # Observes the layer residuals itself, once per call.
-                    x = self._run_layer(index, x, ctx)
-                    # A grouped CUDA-graph replay covering the next sublayer would make this
-                    # loop skip it silently; eager only (graphs are guarded off).
-                    assert (
-                        ctx.grouped_tail_to_skip is None
-                    ), f"sublayer {index} replayed a grouped CUDA graph inside the hybrid loop"
+        with indexer_loss_padding_mask(ctx.padding_mask):
+            for index in range(start, end):
+                layer = self.layers[index]
+                with torch.profiler.record_function(f"{label}/layer={index}"):
+                    if x.shape[0] == 0:
+                        residual_accumulator = x
+                        if getattr(layer, "is_moe_layer", False):
+                            update, _ = layer.mlp(x)
+                            x = x + update
+                        observe_layer_residuals(layer, residual_accumulator, x)
+                    else:
+                        # Observes the layer residuals itself, once per call.
+                        x = self._run_layer(index, x, ctx)
+                        # A grouped CUDA-graph replay covering the next sublayer would make
+                        # this loop skip it silently; eager only (graphs are guarded off).
+                        assert ctx.grouped_tail_to_skip is None, (
+                            f"sublayer {index} replayed a grouped CUDA graph inside the hybrid "
+                            "loop"
+                        )
         return x
 
     def _layer_forward_flops(self, index, tokens, squared_lengths, sequence, arbitrary_mask):
@@ -506,7 +518,12 @@ class LoopHybridStack(HybridStack):
                     return self.loop_norm(output)
 
             context = torch.no_grad() if step < first_grad else nullcontext()
-            with context:
+            # Statistics recorded in this round's forward are also binned as round step + 1
+            # (an activation replay records nothing, forward_replay). The bins cover rounds
+            # 1..loop_iterations (loop_sample_depth may draw deeper rounds: not binned).
+            rounds = self.config.loop_iterations
+            binned = forward_statistics_round(step + 1, rounds) if step < rounds else nullcontext()
+            with context, binned:
                 if self.config.loop_recompute and torch.is_grad_enabled():
                     updated = checkpoint(
                         recurrence,

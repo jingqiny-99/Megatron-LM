@@ -6,9 +6,11 @@ and no process group, so every case runs anywhere (CPU, CI under torchrun).
 P1 determinism and digests, P2 min-move rebalancing, P3 no moves at round 1 / without
 rebalancing, P4 mirrored chain records and one-hop chain transfers, P5 placement, P6 typed
 sub-rounds and the W = 1 stage-2 item order, P7 the move gate on synthetic workloads, P8
-checkpoint lifetimes against a fake store, P9 online exits == the whole-step known-depth plan.
+checkpoint lifetimes against a fake store, P9 online exits == the whole-step known-depth plan,
+P10 the block-input stash (and check_recompute trace) slots of moved CORE items.
 """
 
+import hashlib
 import random
 
 import pytest
@@ -27,8 +29,12 @@ from megatron.core.transformer.loop.rsbf_plan import (
     SubRoundType,
     Transfer,
     WavePlanner,
+    _encode,
+    block_slot,
     chain_slots,
     known_depth_plan,
+    parse_sublayer_slot,
+    trace_slot,
 )
 
 BATCH = ("tokens", "position_ids", "labels", "loss_mask")
@@ -147,9 +153,14 @@ class _FakeEU:
         self.released[key] = how
 
 
-def _replay(steps, num_eus, home, *, check_recompute=False):
-    """Execute a plan against fake per-EU stores; returns the EUs (asserts on any misuse)."""
+def _replay(steps, num_eus, home, *, check_recompute=False, core_stash=(), core_trace=0):
+    """Execute a plan against fake per-EU stores; returns the EUs (asserts on any misuse).
+    ``core_stash`` / ``core_trace``: the per-sublayer entries each CORE sweep puts and its CORE
+    item consumes (``("block:<l>", g, r)`` / ``("trace:<l>", g, r)``)."""
     eus = [_FakeEU() for _ in range(num_eus)]
+    sublayer_entries = [f"block:{l}" for l in core_stash] + [
+        f"trace:{l}" for l in range(core_trace)
+    ]
     for g, h in enumerate(home):
         eus[h].batch.add(g)
     chain_at = {}
@@ -172,6 +183,8 @@ def _replay(steps, num_eus, home, *, check_recompute=False):
                     eu.require(("crit", g, r - 1))
                     eu.put(("state", g, r))
                     eu.put(("crit", g, r))
+                    for kind in sublayer_entries:
+                        eu.put((kind, g, r))
                 elif item.kind == "coda":
                     assert g not in chain_at
                     eu.release(("state", g, r), consume)
@@ -183,6 +196,10 @@ def _replay(steps, num_eus, home, *, check_recompute=False):
                     if r > 1:
                         eu.release(("state", g, r - 1), consume)
                     eu.release(("crit", g, r - 1), "freed")
+                    # The round's own stash: on this EU (swept here, or carried by the item).
+                    for kind in sublayer_entries:
+                        how = "taken" if kind.startswith("trace") else consume
+                        eu.release((kind, g, r), how)
                 else:
                     assert item.kind == "prelude" and e == home[g]
                     assert chain_at.pop(g) == e
@@ -192,6 +209,11 @@ def _replay(steps, num_eus, home, *, check_recompute=False):
             for t in step.transfers:
                 src, dst = eus[t.src], eus[t.dst]
                 assert 0 <= t.src < num_eus and 0 <= t.dst < num_eus and t.src != t.dst
+                if not (t.kind == "item" and t.item == "core"):
+                    # Only a moved CORE item carries a round's stash (a sample move carries
+                    # the next round's input, never a stash).
+                    assert not any(":" in kind for kind, _ in t.frees), t
+                    assert not any(":" in slot for slot in t.slots), t
                 if t.kind == "chain":
                     assert chain_at[t.sample] == t.src
                 for kind, r in t.frees:
@@ -696,6 +718,93 @@ def test_fake_store_catches_a_bad_plan():
     assert frees
     with pytest.raises(AssertionError):
         _replay(steps[: frees[0]] + steps[frees[0] + 1 :], 2, home)
+
+
+# ---------------------------------------------------------------------------------------
+# P10: the block-input stash moves with CORE items
+# ---------------------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("check_recompute", [False, True])
+def test_stash_slots_travel_with_core_item_moves(check_recompute):
+    """Random depth sets at W = 2 / 4 / 8 with ``core_stash = (2, 4, 6)`` (and ``core_trace =
+    8`` under check_recompute): every moved CORE item carries exactly its round's stash slots
+    (after the stage-3 slots) and frees them; nothing else carries a per-sublayer slot; the
+    fake stores (stash put by the sweep on EU_r(g), consumed by CORE(g, r)) end empty per EU;
+    the steps are those of the plan without a stash except for the extra slots."""
+    rng = random.Random(10)
+    stash, trace = (2, 4, 6), (8 if check_recompute else 0)
+    extra_slots = tuple(block_slot(l) for l in stash) + tuple(trace_slot(l) for l in range(trace))
+    extra_frees = [f"block:{l}" for l in stash] + [f"trace:{l}" for l in range(trace)]
+    moved = 0
+    for _ in range(150):
+        num_eus = rng.choice([2, 4, 8])
+        home = _home(num_eus, rng.randint(2, 6))
+        depths = _random_depths(rng, len(home))
+        fill = rng.choice(["drain", "sample_order"])
+        options = dict(fill=fill, check_recompute=check_recompute)
+        planner = _planner(num_eus, home, core_stash=stash, core_trace=trace, **options)
+        steps = known_depth_plan(planner, depths)
+        _replay(
+            steps,
+            num_eus,
+            home,
+            check_recompute=check_recompute,
+            core_stash=stash,
+            core_trace=trace,
+        )
+        plain_steps = known_depth_plan(_planner(num_eus, home, **options), depths)
+        assert len(plain_steps) == len(steps)
+        for step, plain in zip(steps, plain_steps):
+            if not isinstance(step, MovePhase):
+                assert step == plain
+                continue
+            assert len(step.transfers) == len(plain.transfers)
+            for t, u in zip(step.transfers, plain.transfers):
+                if t.kind == "item" and t.item == "core":
+                    moved += 1
+                    assert t.slots == u.slots + extra_slots, t
+                    assert t.frees == u.frees + tuple((kind, t.round) for kind in extra_frees)
+                else:
+                    assert t == u
+    assert moved > 0
+
+
+def test_stash_layout_enters_the_digest_and_defaults_keep_stage3():
+    """The stash layout is part of the digest; the defaults keep the stage-3 header and step
+    encodings (``kind{r}``); per-sublayer frees encode as ``kind@r`` so that ``("block:2",
+    13)`` and ``("block:21", 3)`` differ."""
+    home = _home(2, 2)
+    header = (
+        "W=2|home=0,1,0,1|R=4|fill=drain|rebalance=1|items=1|crit=0|check=0|"
+        "batch=tokens/position_ids/labels/loss_mask|reports=1"
+    )
+    expected = hashlib.sha256(header.encode() + b"\n").digest()
+    assert _planner(2, home).digest() == expected
+    assert _planner(2, home, core_stash=(), core_trace=0).digest() == expected
+    assert _planner(2, home, core_stash=(2,)).digest() != expected
+    assert _planner(2, home, core_trace=4).digest() != expected
+    assert (
+        _planner(2, home, core_stash=(2,)).digest() != _planner(2, home, core_stash=(3,)).digest()
+    )
+
+    def move(frees):
+        return MovePhase(
+            (Transfer(kind="item", sample=0, src=0, dst=1, round=1, slots=(), frees=frees),)
+        )
+
+    assert _encode(move((("state", 13), ("crit", 3)))) == "M|item:0:0:1:1:::state13/crit3"
+    assert _encode(move((("block:2", 13),))) != _encode(move((("block:21", 3),)))
+    assert _encode(move((("block:2", 13),))).endswith(":block:2@13")
+    assert parse_sublayer_slot(block_slot(3)) == ("block_input", 3)
+    assert parse_sublayer_slot(trace_slot(0)) == ("trace", 0)
+    assert parse_sublayer_slot("block:21") == ("block", 21)
+    assert parse_sublayer_slot(ROUND_INPUT) == (ROUND_INPUT, -1)
+    for bad in ((0,), (2, 1), (2, 2)):
+        with pytest.raises(ValueError, match="core_stash"):
+            _planner(2, home, core_stash=bad)
+    with pytest.raises(ValueError, match="core_trace"):
+        _planner(2, home, core_trace=-1)
 
 
 # ---------------------------------------------------------------------------------------

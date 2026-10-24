@@ -28,7 +28,11 @@ import torch
 
 from megatron.core import parallel_state
 from megatron.core.process_groups_config import ProcessGroupCollection
-from megatron.core.transformer.forward_replay import in_forward_replay, statistics_weight
+from megatron.core.transformer.forward_replay import (
+    in_forward_replay,
+    statistics_round,
+    statistics_weight,
+)
 
 
 @dataclass
@@ -39,6 +43,9 @@ class MetricEntry:
     reduce_group: Optional[torch.distributed.ProcessGroup] = None
     avg_group: Optional[torch.distributed.ProcessGroup] = None
     needs_dp_avg: bool = True
+    # ``[rounds, num_layers]``: the records made inside ``forward_statistics_round`` (loop
+    # rounds), binned by round; created on the first such record (or by ``report``).
+    round_values: Optional[torch.Tensor] = None
 
 
 # ---------------------------------------------------------------------------
@@ -496,10 +503,12 @@ class MoEMetricsTracker:
 
         entry = self._metrics[name]
         weight = statistics_weight()
-        if weight == 1.0:
-            entry.values[layer_number - 1] += value.detach()
-        else:
-            entry.values[layer_number - 1] += value.detach() * weight
+        addend = value.detach() if weight == 1.0 else value.detach() * weight
+        entry.values[layer_number - 1] += addend
+        loop_round = statistics_round()
+        if loop_round is not None:
+            r, rounds = loop_round
+            self._round_bins(entry, rounds)[r - 1, layer_number - 1] += addend
         entry.reduce_group = reduce_group
         entry.avg_group = avg_group
         entry.needs_dp_avg = needs_dp_avg
@@ -521,6 +530,7 @@ class MoEMetricsTracker:
         percentiles: Optional[Dict[str, List[float]]] = None,
         pg_collection: Optional[ProcessGroupCollection] = None,
         num_hash_layers: int = 0,
+        loop_rounds: Optional[int] = None,
     ) -> str:
         """Sync metrics across ranks, aggregate, log, and clear.
 
@@ -552,6 +562,13 @@ class MoEMetricsTracker:
             pg_collection: Custom process-group collection for reduction.
             num_hash_layers: Main-stack MoE layers using hash routing. These do not
                 contribute load-balancing losses; MTP layers remain learned routers.
+            loop_rounds: The loop's round count (``R_max``) for a depth-recurrent model: every
+                reported metric also gets its per-(round, layer) bins (``round_values``; zeros
+                where nothing was recorded), reduced like ``values`` and logged to the
+                writers as ``"{name} round {r}"`` (normalized like ``"{name}"``) and, with
+                ``per_layer_logging``, ``"moe/{name}/round_{r}/layer_{i}"``. Must be the same
+                on every rank (it adds collectives). ``values`` and every other key are
+                unchanged.
 
         Returns:
             Formatted log string for console output.
@@ -577,12 +594,31 @@ class MoEMetricsTracker:
             init_size = num_layers + (mtp_num_layers or 0)
             for name in metric_names:
                 self.ensure_initialized(name, init_size)
+        if loop_rounds is not None:
+            # Before any reduction: every rank reduces the same bins.
+            for name in metric_names:
+                if name in self._metrics:
+                    self._round_bins(self._metrics[name], loop_rounds)
 
-        self._sync_metrics(metric_names, pg_collection)
+        if loop_rounds is None:
+            # Keep the pre-loop call shape (tests patch _sync_metrics positionally).
+            self._sync_metrics(metric_names, pg_collection)
+        else:
+            self._sync_metrics(metric_names, pg_collection, rounds=True)
 
         scalars = self._aggregate(
             loss_scale, num_moe_layers, metric_names, percentiles, num_hash_layers
         )
+        if loop_rounds is not None:
+            round_scalars = self._aggregate_rounds(
+                loss_scale, num_moe_layers, metric_names, num_hash_layers, loop_rounds
+            )
+            # Writers only: the console string and total_loss_dict keep their keys.
+            self._log_scalars(round_scalars, iteration, writer, wandb_writer)
+            if per_layer_logging:
+                self._log_round_layers(
+                    loss_scale, metric_names, iteration, writer, wandb_writer, loop_rounds
+                )
 
         # Megatron integration: accumulate loss metrics into total_loss_dict
         console_scalars = dict(scalars)
@@ -609,6 +645,8 @@ class MoEMetricsTracker:
         """Zero out all metric values (entries are kept for reuse)."""
         for entry in self._metrics.values():
             entry.values.zero_()
+            if entry.round_values is not None:
+                entry.round_values.zero_()
 
     def ensure_initialized(
         self, name: str, num_layers: int, device: Optional[Union[str, torch.device, int]] = None
@@ -640,12 +678,29 @@ class MoEMetricsTracker:
             return [track_names]
         return track_names
 
+    @staticmethod
+    def _round_bins(entry: MetricEntry, rounds: int) -> torch.Tensor:
+        """``entry.round_values`` with at least ``rounds`` rows (zeros added)."""
+        bins = entry.round_values
+        if bins is None or bins.shape[0] < rounds:
+            grown = torch.zeros(
+                rounds, entry.values.shape[0], device=entry.values.device, dtype=entry.values.dtype
+            )
+            if bins is not None:
+                grown[: bins.shape[0]] = bins
+            entry.round_values = bins = grown
+        return bins
+
     def _sync_metrics(
-        self, metric_names: List[str], pg_collection: Optional[ProcessGroupCollection] = None
+        self,
+        metric_names: List[str],
+        pg_collection: Optional[ProcessGroupCollection] = None,
+        rounds: bool = False,
     ) -> None:
         """All-reduce metrics across distributed ranks.
 
-        Reduction order: PP collect → reduce_group sum → avg_group avg → DP avg.
+        Reduction order: PP collect → reduce_group sum → avg_group avg → DP avg. With
+        ``rounds`` the per-round bins follow the same reductions.
         """
         if pg_collection is None:
             pp_group = parallel_state.get_pipeline_model_parallel_group()
@@ -666,20 +721,24 @@ class MoEMetricsTracker:
                 continue
 
             entry = self._metrics[name]
-            v = entry.values
+            tensors = [entry.values]
+            if rounds:
+                tensors.append(entry.round_values)
+            for v in tensors:
+                torch.distributed.all_reduce(v, group=pp_group)
 
-            torch.distributed.all_reduce(v, group=pp_group)
+                if entry.reduce_group is not None:
+                    torch.distributed.all_reduce(v, group=entry.reduce_group)
 
-            if entry.reduce_group is not None:
-                torch.distributed.all_reduce(v, group=entry.reduce_group)
+                if entry.avg_group is not None:
+                    torch.distributed.all_reduce(
+                        v, group=entry.avg_group, op=torch.distributed.ReduceOp.AVG
+                    )
 
-            if entry.avg_group is not None:
-                torch.distributed.all_reduce(
-                    v, group=entry.avg_group, op=torch.distributed.ReduceOp.AVG
-                )
-
-            if entry.needs_dp_avg:
-                torch.distributed.all_reduce(v, group=dp_group, op=torch.distributed.ReduceOp.AVG)
+                if entry.needs_dp_avg:
+                    torch.distributed.all_reduce(
+                        v, group=dp_group, op=torch.distributed.ReduceOp.AVG
+                    )
 
     @staticmethod
     def _count_moe_layers(
@@ -742,6 +801,50 @@ class MoEMetricsTracker:
             result[name] = values.sum() / num_contributors
 
         return result
+
+    def _aggregate_rounds(
+        self,
+        loss_scale: float,
+        num_moe_layers: int,
+        metric_names: List[str],
+        num_hash_layers: int,
+        loop_rounds: int,
+    ) -> Dict[str, torch.Tensor]:
+        """``"{name} round {r}"``: round ``r``'s bins summed over layers, normalized as
+        ``_aggregate`` normalizes ``"{name}"``."""
+        result: Dict[str, torch.Tensor] = {}
+        for name in metric_names:
+            if name not in self._metrics:
+                continue
+            num_contributors = num_moe_layers
+            if name in _LOAD_BALANCING_LOSSES:
+                num_contributors -= num_hash_layers
+            bins = self._metrics[name].round_values[:loop_rounds].float() * loss_scale
+            for r in range(loop_rounds):
+                result[f"{name} round {r + 1}"] = bins[r].sum() / num_contributors
+        return result
+
+    def _log_round_layers(
+        self,
+        loss_scale: float,
+        metric_names: List[str],
+        iteration: int,
+        writer,
+        wandb_writer,
+        loop_rounds: int,
+    ) -> None:
+        """Write the per-(round, layer) values to TensorBoard and/or W&B."""
+        for name in metric_names:
+            if name not in self._metrics:
+                continue
+            bins = self._metrics[name].round_values[:loop_rounds].float() * loss_scale
+            for r, row in enumerate(bins.tolist()):
+                for i, val in enumerate(row):
+                    key = f"moe/{name}/round_{r + 1}/layer_{i}"
+                    if writer is not None:
+                        writer.add_scalar(key, val, iteration)
+                    if wandb_writer is not None:
+                        wandb_writer.log({key: val}, iteration)
 
     def _log_scalars(
         self, scalars: Dict[str, Union[float, torch.Tensor]], iteration: int, writer, wandb_writer

@@ -11,18 +11,23 @@ in RECOMPUTE, PRELUDE), the parameter gradients at max-relative 1e-5. Dense, MTP
 DSv4 cell oracle is CUDA-only. Further cases: port checks, the per-row self-carry (``alive``,
 sweep and recompute), the exit-criterion contract (an online criterion's chain included), the
 after-exit counter, the counter-based sampled depths, ``head_loss`` with the CP = 1 batch, the
-purity of ``_prepare_forward``, the backward plans and the options the program rejects.
+purity of ``_prepare_forward``, the backward plans (the whole-round, block-checkpoint and nested
+item forms, chosen by config) and the options the program rejects.
 """
 
 import contextlib
 import dataclasses
+import math
+from functools import partial
 from types import SimpleNamespace
 
 import pytest
 import torch
 
 from megatron.core.context_parallel.utils import get_batches_on_this_cp_rank
+from megatron.core.transformer.loop import guards
 from megatron.core.transformer.loop.cells import RoundOutputs
+from megatron.core.transformer.loop.guards import LoopRoles
 from megatron.core.transformer.loop.program import (
     CORE_PORTS,
     PRELUDE_PORTS,
@@ -35,6 +40,8 @@ from megatron.core.transformer.loop.program import (
     SampledDepthCriterion,
     SampleInputs,
     SampleKey,
+    block_boundaries_split_pairs,
+    build_core_plan,
     build_exit_criterion,
     counter_seed,
     find_port,
@@ -65,6 +72,7 @@ cpu_rope = hybrid_loop_utils.cpu_rope
 
 DENSE = "*-*-*-*-"  # prelude '*-', core '*-*-', coda '*-'
 MHC = dict(enable_mhc_connections=True, mhc_num_residual_streams=4, mhc_sinkhorn_iterations=5)
+RSBF = dict(loop_schedule="rsbf", calculate_per_token_loss=True)
 R_MAX = 3
 DEPTHS = (1, 3, 2)
 
@@ -904,7 +912,7 @@ def test_after_exit_counter_counts_sweeps_only(request):
     assert program.after_exit_violations.dtype == torch.int32
     program.reset_counters()
     assert program.after_exit_violations.item() == 0
-    with pytest.raises(NotImplementedError, match="M8"):
+    with pytest.raises(NotImplementedError, match="a rebuild runs through forward_detached"):
         program.core(
             None,
             prelude.injection,
@@ -914,6 +922,20 @@ def test_after_exit_counter_counts_sweeps_only(request):
             crit_state=prelude.crit_state,
             exited=_exited(1),
         )
+    # A forward_detached sweep counts like the sweep; a rebuild has no epilogue to count.
+    program.reset_counters()
+    for phase, end, count in ((LoopPhase.SWEEP, None, 1), (LoopPhase.REBUILD, 2, 1)):
+        program.core.forward_detached(
+            None,
+            prelude.injection,
+            sample,
+            r=1,
+            phase=phase,
+            end=end,
+            crit_state=prelude.crit_state,
+            exited=_exited(1, 1),
+        )
+        assert program.after_exit_violations.item() == count
 
 
 # ---------------------------------------------------------------------------
@@ -1190,6 +1212,304 @@ def test_core_plan_is_the_whole_round_and_blocks_compose(request):
         program.core.layers(prelude.injection, 0, program.roles.core + 1, sample.ctx, None, "x")
 
 
+@pytest.mark.parametrize("core", [1, 4, 7, 8])
+def test_strided_plans_cover_the_core_in_blocks_of_the_stride(core):
+    """``strided(L, s)`` for every stride, dividing or not: blocks ``[j s, min((j + 1) s, L))``,
+    block 0 from the round input with the prologue, later blocks from the sweep's stash, the
+    last with the epilogue; ``ceil(L / s) - 1`` stashed inputs; ``s = L`` is the whole round."""
+    for stride in range(1, core + 1):
+        plan = CoreBackwardPlan.strided(core, stride)
+        starts = list(range(0, core, stride))
+        assert [(block.start, block.end) for block in plan.blocks] == [
+            (start, min(start + stride, core)) for start in starts
+        ]
+        assert [block.input_source for block in plan.blocks] == ["round_input"] + [
+            "block_stash"
+        ] * (len(starts) - 1)
+        assert [block.with_prologue for block in plan.blocks] == [True] + [False] * (
+            len(starts) - 1
+        )
+        assert [block.with_epilogue for block in plan.blocks] == [False] * (len(starts) - 1) + [
+            True
+        ]
+        assert plan.stashed_block_inputs() == tuple(starts[1:])
+        assert len(plan.stashed_block_inputs()) == math.ceil(core / stride) - 1
+        assert plan.rebuilt_layer_inputs() == () and not plan.rebuild and plan.rebuild_end == 0
+        assert plan.core_sublayers == core and plan.stride == stride
+        assert plan.form == ("whole_round" if stride == core else "block")
+        assert plan.forward_units() == 4.0
+    assert CoreBackwardPlan.strided(core, core) == CoreBackwardPlan.whole_round(core)
+    assert CoreBackwardPlan.whole_round(core).form == "whole_round"
+    for stride in (0, -1, core + 1):
+        with pytest.raises(ValueError, match=f"a block stride must be in 1..{core}"):
+            CoreBackwardPlan.strided(core, stride)
+
+
+@pytest.mark.parametrize(
+    "core, stride, rebuilt, rebuild_end",
+    [
+        (8, 1, (1, 2, 3, 4, 5, 6, 7), 7),
+        (8, 2, (2, 4, 6), 6),
+        (8, 3, (3, 6), 6),  # non-dividing: a short last block [6, 8)
+        (8, 7, (7,), 7),
+        (2, 1, (1,), 1),
+    ],
+)
+def test_nested_plans_rebuild_up_to_the_last_block(core, stride, rebuilt, rebuild_end):
+    """``nested(L, s)``: the strided blocks with every later block read from the rebuild's
+    layer stash; the rebuild runs ``[0, (n_b - 1) s)`` and costs ``rebuild_end / L`` forward
+    units on top of the 4 of every form."""
+    plan = CoreBackwardPlan.nested(core, stride)
+    strided = CoreBackwardPlan.strided(core, stride)
+    assert plan.rebuild and plan.form == "nested" and plan.stride == stride
+    assert [(b.start, b.end) for b in plan.blocks] == [(b.start, b.end) for b in strided.blocks]
+    assert plan.blocks[0] == strided.blocks[0]
+    assert all(block.input_source == "layer_stash" for block in plan.blocks[1:])
+    assert plan.stashed_block_inputs() == ()
+    assert plan.rebuilt_layer_inputs() == rebuilt
+    assert plan.rebuild_end == rebuild_end == plan.blocks[-1].start
+    assert plan.forward_units() == 4.0 + rebuild_end / core
+    if stride == 1:
+        assert CoreBackwardPlan.nested(core) == plan
+
+
+def test_nested_and_strided_reject_bad_strides():
+    with pytest.raises(ValueError, match="a nested stride must be in 1..7"):
+        CoreBackwardPlan.nested(8, 8)
+    with pytest.raises(ValueError, match="at least two blocks"):
+        CoreBackwardPlan.nested(8, 0)
+    with pytest.raises(ValueError, match="a nested stride must be in 1..0"):
+        CoreBackwardPlan.nested(1)
+
+
+def test_plans_do_not_mix_input_sources():
+    """The new checks run after the chain checks (their messages unchanged, see
+    test_core_plan_is_the_whole_round_and_blocks_compose) with messages of their own."""
+    first = CoreBlock(0, 2, "round_input", with_prologue=True, with_epilogue=False)
+    with pytest.raises(ValueError, match="mixed block input sources: .* non-rebuild plan"):
+        CoreBackwardPlan(blocks=(first, CoreBlock(2, 4, "layer_stash", False, True)))
+    with pytest.raises(ValueError, match="mixed block input sources: .* rebuild plan"):
+        CoreBackwardPlan(blocks=(first, CoreBlock(2, 4, "block_stash", False, True)), rebuild=True)
+    with pytest.raises(ValueError, match="mixed block input sources"):
+        CoreBackwardPlan(
+            blocks=(
+                first,
+                CoreBlock(2, 3, "block_stash", False, False),
+                CoreBlock(3, 4, "layer_stash", False, True),
+            )
+        )
+    with pytest.raises(ValueError, match="a rebuild plan needs at least two blocks"):
+        CoreBackwardPlan(blocks=CoreBackwardPlan.whole_round(4).blocks, rebuild=True)
+    # The chain checks still come first.
+    with pytest.raises(ValueError, match="do not chain"):
+        CoreBackwardPlan(blocks=(first, CoreBlock(3, 4, "layer_stash", False, True)), rebuild=True)
+
+
+def _form_config(form=None, stride=None):
+    """A duck-typed config with only the item-form fields that are not None."""
+    fields = {}
+    if form is not None:
+        fields["loop_rsbf_item_form"] = form
+    if stride is not None:
+        fields["loop_rsbf_block_stride"] = stride
+    return SimpleNamespace(**fields)
+
+
+def test_build_core_plan_follows_the_config():
+    roles = LoopRoles(prelude=2, core=8, coda=4)
+    assert build_core_plan(_form_config(), roles) == CoreBackwardPlan.whole_round(8)
+    assert build_core_plan(_form_config("whole_round"), roles) == CoreBackwardPlan.whole_round(8)
+    assert build_core_plan(_form_config("block", 2), roles) == CoreBackwardPlan.strided(8, 2)
+    assert build_core_plan(_form_config("block", 3), roles) == CoreBackwardPlan.strided(8, 3)
+    assert build_core_plan(_form_config("block", 8), roles) == CoreBackwardPlan.whole_round(8)
+    assert build_core_plan(_form_config("nested"), roles) == CoreBackwardPlan.nested(8, 1)
+    assert build_core_plan(_form_config("nested", 2), roles) == CoreBackwardPlan.nested(8, 2)
+    rejected = [
+        (_form_config("block"), guards.RSBF_BLOCK_STRIDE_MISMATCH),
+        (_form_config("whole_round", 2), guards.RSBF_BLOCK_STRIDE_MISMATCH),
+        (_form_config("block", 0), guards.RSBF_BLOCK_STRIDE_MISMATCH),
+        (_form_config("nested", -1), guards.RSBF_BLOCK_STRIDE_MISMATCH),
+        (_form_config("block", 9), guards.RSBF_BLOCK_STRIDE_BEYOND_CORE),
+        (_form_config("nested", 8), guards.RSBF_BLOCK_STRIDE_BEYOND_CORE),
+        (_form_config("bogus"), guards.RSBF_ITEM_FORM),
+    ]
+    for config, rule in rejected:
+        with pytest.raises(ValueError, match=f"LoopProgram does not support: {rule} "):
+            build_core_plan(config, roles)
+    with pytest.raises(ValueError, match=guards.RSBF_BLOCK_STRIDE_BEYOND_CORE):
+        build_core_plan(_form_config("nested"), LoopRoles(prelude=2, core=1, coda=2))
+
+
+@pytest.mark.parametrize(
+    "form, stride, expected",
+    [
+        ("whole_round", None, CoreBackwardPlan.whole_round(4)),
+        ("block", 1, CoreBackwardPlan.strided(4, 1)),
+        ("block", 3, CoreBackwardPlan.strided(4, 3)),
+        ("nested", None, CoreBackwardPlan.nested(4, 1)),
+        ("nested", 2, CoreBackwardPlan.nested(4, 2)),
+    ],
+)
+def test_core_plan_is_the_config_plan_for_every_round(request, form, stride, expected):
+    """``core_plan`` returns the config's plan object (``uniform_core_plan``) for every
+    (sample, round); ``item_form`` names its form."""
+    model = _model(
+        "dense", request, **RSBF, loop_rsbf_item_form=form, loop_rsbf_block_stride=stride
+    )
+    program = _program(model)
+    assert program.uniform_core_plan == expected and program.item_form == expected.form
+    batch = _batch(2)
+    for row in range(2):
+        sample = _sample(batch, row)
+        for r in range(1, R_MAX + 1):
+            assert program.core_plan(sample, r) is program.uniform_core_plan
+    assert program.coda_recompute_modules == frozenset()
+
+
+def test_program_checks_the_item_form_against_the_built_core(request):
+    """The config-time rules see ``num_layers - prelude - coda``; the program re-checks the
+    stride against the built pattern's core."""
+    model = _model("dense", request, **RSBF, loop_rsbf_item_form="block", loop_rsbf_block_stride=4)
+    assert _program(model).uniform_core_plan == CoreBackwardPlan.whole_round(4)
+    model.config.loop_rsbf_block_stride = 5  # past __post_init__
+    with pytest.raises(ValueError, match=guards.RSBF_BLOCK_STRIDE_BEYOND_CORE):
+        _program(model)
+    model.config.loop_rsbf_item_form, model.config.loop_rsbf_block_stride = "nested", 4
+    with pytest.raises(ValueError, match=guards.RSBF_BLOCK_STRIDE_BEYOND_CORE):
+        _program(model)
+    model.config.loop_rsbf_block_stride = None
+    assert _program(model).uniform_core_plan == CoreBackwardPlan.nested(4)
+
+
+def test_coda_recompute_needs_a_dsv4_attention_in_the_coda(request):
+    """D42: the flag on a model without a DSv4 attention in the coda or MTP layers has nothing
+    to recompute (the config rule R21 needs dsv4_hybrid; set past __post_init__ here)."""
+    model = _model("mtp", request)
+    model.config.loop_rsbf_coda_recompute_mla_up_proj = True
+    with pytest.raises(ValueError, match="nothing to recompute"):
+        _program(model)
+
+
+@pytest.mark.parametrize("name", ["dense", "mhc", "mtp"])
+def test_core_parameters_belong_to_one_sublayer(request, name):
+    model = _model(name, request)
+    program = _program(model)
+    assert program.core_parameter_overlap() == []
+    # A parameter shared by two core sublayers (the two core MLP sublayers) is named.
+    layers = model.decoder.layers
+    first, second = program.roles.core_start + 1, program.roles.core_start + 3
+    name, param = next(iter(layers[first].named_parameters()))
+    path, _, attribute = name.rpartition(".")
+    setattr(layers[second].get_submodule(path), attribute, param)
+    assert program.core_parameter_overlap() == [f"layers.{first}.{name}"]
+
+
+@pytest.mark.parametrize("name", ["dense", "dense_padded", "mtp", "mhc", "mhc_mtp"])
+def test_forward_detached_is_the_round_with_the_graph_dropped(request, name):
+    """Sweep mode: ``forward_detached`` gives the attached round's state, exit and criterion
+    state bitwise, with every output detached; its trace equals the attached per-sublayer
+    outputs (``__call__(trace=...)``, which equals the plain call); ``captured[l]`` is the
+    trace entry ``l - 1`` (one tensor); a rebuild (``end``) runs a prefix without the
+    epilogue; dropping the graph only at captured sublayers gives the same values."""
+    model = _model(name, request)
+    program = _program(model, check_ports=True)
+    core = program.roles.core
+    sample = _sample(_batch(2, padded=name.endswith("padded")), 1)
+    prelude = program.prelude(sample, phase=LoopPhase.SWEEP)
+    injection = prelude.injection.detach()
+    kwargs = dict(
+        crit_state=prelude.crit_state.detach(),
+        exited=_exited(1),
+        depth=torch.tensor([2], dtype=torch.int32, device=device()),
+    )
+    first = program.core(None, injection, sample, r=1, phase=LoopPhase.SWEEP, **kwargs)
+    previous = first.state.detach()
+    plain = program.core(previous, injection, sample, r=2, phase=LoopPhase.SWEEP, **kwargs)
+    attached = []
+    traced = program.core(
+        previous, injection, sample, r=2, phase=LoopPhase.SWEEP, trace=attached, **kwargs
+    )
+    capture = range(1, core + 1)
+    fwd = program.core.forward_detached(
+        previous,
+        injection,
+        sample,
+        r=2,
+        phase=LoopPhase.SWEEP,
+        capture=capture,
+        trace=True,
+        **kwargs,
+    )
+    for out in (traced, fwd.outputs):
+        assert torch.equal(out.state, plain.state) and torch.equal(out.exit, plain.exit)
+        assert torch.equal(out.crit_state, plain.crit_state)
+    assert not fwd.outputs.state.requires_grad and not fwd.outputs.crit_state.requires_grad
+    assert len(attached) == len(fwd.trace) == core
+    assert attached[-1].requires_grad
+    for l in range(core):
+        assert torch.equal(fwd.trace[l], attached[l]), l
+        assert not fwd.trace[l].requires_grad and fwd.trace[l].grad_fn is None
+        assert fwd.captured[l + 1] is fwd.trace[l]
+        assert not fwd.modified_after_capture(fwd.trace[l])
+    fwd.trace[0].mul_(1.0)  # an in-place write after the capture (version bump)
+    assert fwd.modified_after_capture(fwd.captured[1])
+    coarse = program.core.forward_detached(
+        previous,
+        injection,
+        sample,
+        r=2,
+        phase=LoopPhase.SWEEP,
+        capture=(2,),
+        trace=True,
+        detach_every_sublayer=False,
+        **kwargs,
+    )
+    assert torch.equal(coarse.outputs.state, plain.state)
+    assert all(torch.equal(a, b) for a, b in zip(coarse.trace, fwd.trace))
+    assert list(coarse.captured) == [2] and torch.equal(coarse.captured[2], fwd.trace[1])
+    # A rebuild of the first sublayers: no epilogue, no criterion ports.
+    rebuild = program.core.forward_detached(
+        previous, injection, sample, r=2, phase=LoopPhase.REBUILD, capture=(1, 2), end=2
+    )
+    assert rebuild.outputs is None and rebuild.trace == ()
+    assert torch.equal(rebuild.captured[1], fwd.trace[0])
+    assert torch.equal(rebuild.captured[2], fwd.trace[1])
+
+
+def test_forward_detached_rejects_bad_arguments(request):
+    model = _model("dense", request)
+    program = _program(model)
+    sample = _sample(_batch(1), 0)
+    prelude = program.prelude(sample, phase=LoopPhase.SWEEP)
+    kwargs = dict(crit_state=prelude.crit_state, exited=_exited(1))
+    detached = partial(program.core.forward_detached, None, prelude.injection, sample, r=1)
+    with pytest.raises(ValueError, match="sweep mode"):
+        detached(phase=LoopPhase.RECOMPUTE, **kwargs)
+    with pytest.raises(ValueError, match="outside"):
+        detached(phase=LoopPhase.SWEEP, capture=(0,), **kwargs)
+    with pytest.raises(ValueError, match="outside"):
+        detached(phase=LoopPhase.REBUILD, capture=(3,), end=2)
+    with pytest.raises(ValueError, match="end 5 outside"):
+        detached(phase=LoopPhase.REBUILD, end=program.roles.core + 1)
+    with pytest.raises(ValueError, match="needs crit_state and exited"):
+        detached(phase=LoopPhase.SWEEP)
+
+
+def test_block_boundaries_that_split_an_attention_and_its_mlp():
+    dense = list(DENSE)  # prelude '*-', core '*-*-', coda '*-'
+    roles = LoopRoles(prelude=2, core=4, coda=2)
+    assert block_boundaries_split_pairs(CoreBackwardPlan.strided(4, 1), dense, roles) == (1, 3)
+    assert block_boundaries_split_pairs(CoreBackwardPlan.strided(4, 2), dense, roles) == ()
+    assert block_boundaries_split_pairs(CoreBackwardPlan.strided(4, 3), dense, roles) == (3,)
+    assert block_boundaries_split_pairs(CoreBackwardPlan.nested(4, 1), dense, roles) == (1, 3)
+    assert block_boundaries_split_pairs(CoreBackwardPlan.whole_round(4), dense, roles) == ()
+    dsv4 = list("HEHECEHECEHECE")  # prelude 'HE', core 'HECEHECE', coda 'HECE'
+    roles = LoopRoles(prelude=2, core=8, coda=4)
+    assert block_boundaries_split_pairs(CoreBackwardPlan.strided(8, 3), dsv4, roles) == (3,)
+    assert block_boundaries_split_pairs(CoreBackwardPlan.strided(8, 2), dsv4, roles) == ()
+    assert block_boundaries_split_pairs(CoreBackwardPlan.nested(8, 1), dsv4, roles) == (1, 3, 5, 7)
+
+
 # ---------------------------------------------------------------------------
 # Program construction
 # ---------------------------------------------------------------------------
@@ -1243,30 +1563,12 @@ def test_program_rejects_eager_only_options(request, field, value, match):
 # ---------------------------------------------------------------------------
 
 
-@gpu
-def test_dsv4_cells_equal_the_eager_forward(deterministic_algorithms):
-    """'WECEHE/WE' (DSv4 W / C / H attention, unfused; MoE with one hash layer in the prelude;
-    mHC 4; MTP 1), bf16, deterministic kernels: per-sample losses of the cell path equal the
-    eager model bitwise; as one graph the gradients do too wherever the eager reference
-    reproduces itself, and elsewhere stay within the reference's own run-to-run spread."""
-    from unittest.mock import patch
-
-    from megatron.core.models.hybrid.hybrid_model import HybridModel
+def _dsv4_loop_config(vocab, **overrides):
+    """The 'WECEHE/WE' DSv4 loop config of the GPU cases (prelude 'WE', core 'CE', coda 'HE')."""
     from megatron.core.transformer.enums import AttnBackend
-    from megatron.core.transformer.loop.hybrid_specs import loop_hybrid_dsv4_stack_spec
     from megatron.core.transformer.transformer_config import MLATransformerConfig
 
-    try:
-        from fast_hadamard_transform import hadamard_transform  # noqa: F401
-
-        hadamard_patch = contextlib.nullcontext()
-    except ImportError:
-        hadamard_patch = patch(
-            "megatron.core.transformer.experimental_attention_variant.csa.rotate_activation",
-            lambda x: x * (x.size(-1) ** -0.5),
-        )
-    vocab, seq, depths = 128, 256, (2, 1)
-    config = MLATransformerConfig(
+    fields = dict(
         num_layers=6,
         hidden_size=512,
         num_attention_heads=8,
@@ -1314,16 +1616,46 @@ def test_dsv4_cells_equal_the_eager_forward(deterministic_algorithms):
         deterministic_mode=True,
         attention_backend=AttnBackend.unfused,
     )
+    fields.update(overrides)
+    return MLATransformerConfig(**fields)
+
+
+def _dsv4_loop_model(config, vocab):
+    from megatron.core.models.hybrid.hybrid_model import HybridModel
+    from megatron.core.transformer.loop.hybrid_specs import loop_hybrid_dsv4_stack_spec
+
+    torch.manual_seed(1234)
+    return HybridModel(
+        config=config,
+        hybrid_stack_spec=loop_hybrid_dsv4_stack_spec(config),
+        vocab_size=vocab,
+        max_sequence_length=1024,
+        hybrid_layer_pattern="WECEHE/WE",
+        position_embedding_type="rope",
+    ).cuda()
+
+
+@gpu
+def test_dsv4_cells_equal_the_eager_forward(deterministic_algorithms):
+    """'WECEHE/WE' (DSv4 W / C / H attention, unfused; MoE with one hash layer in the prelude;
+    mHC 4; MTP 1), bf16, deterministic kernels: per-sample losses of the cell path equal the
+    eager model bitwise; as one graph the gradients do too wherever the eager reference
+    reproduces itself, and elsewhere stay within the reference's own run-to-run spread."""
+    from unittest.mock import patch
+
+    try:
+        from fast_hadamard_transform import hadamard_transform  # noqa: F401
+
+        hadamard_patch = contextlib.nullcontext()
+    except ImportError:
+        hadamard_patch = patch(
+            "megatron.core.transformer.experimental_attention_variant.csa.rotate_activation",
+            lambda x: x * (x.size(-1) ** -0.5),
+        )
+    vocab, seq, depths = 128, 256, (2, 1)
+    config = _dsv4_loop_config(vocab)
     with hadamard_patch:
-        torch.manual_seed(1234)
-        model = HybridModel(
-            config=config,
-            hybrid_stack_spec=loop_hybrid_dsv4_stack_spec(config),
-            vocab_size=vocab,
-            max_sequence_length=1024,
-            hybrid_layer_pattern="WECEHE/WE",
-            position_embedding_type="rope",
-        ).cuda()
+        model = _dsv4_loop_model(config, vocab)
         program = _program(model, depths, check_ports=True)
         batch = _batch(len(depths), seq=seq, vocab=vocab, dev=torch.device("cuda"))
 
@@ -1367,3 +1699,22 @@ def test_dsv4_cells_equal_the_eager_forward(deterministic_algorithms):
                 noisy.append(name)
         print(f"DSv4 cell oracle: {len(noisy)} non-reproducible eager gradients: {noisy}")
     assert program.after_exit_violations.item() == 0
+
+
+@gpu
+def test_dsv4_coda_recompute_request_and_item_forms():
+    """D42: with a DSv4 attention in the coda ('HE') and the MTP layer ('WE') the program asks
+    the CODA item for the ``mla_up_proj`` recompute; the item form comes from the config."""
+    vocab = 128
+    config = _dsv4_loop_config(
+        vocab, **RSBF, loop_rsbf_coda_recompute_mla_up_proj=True, loop_rsbf_item_form="nested"
+    )
+    # Held here: a LoopProgram references its model weakly.
+    model = _dsv4_loop_model(config, vocab)
+    program = _program(model, (2, 1))
+    assert program.coda_recompute_modules == frozenset({"mla_up_proj"})
+    # The coda 'H' attention and the MTP depth's 'W' attention, in run order.
+    attentions = program.coda_recompute_attentions()
+    assert [module._dsv4_compress_ratio for module in attentions] == [128, 0]
+    assert program.uniform_core_plan == CoreBackwardPlan.nested(program.roles.core)
+    assert program.core_parameter_overlap() == []
