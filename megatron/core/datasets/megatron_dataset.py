@@ -5,7 +5,7 @@ import json
 import warnings
 from abc import ABC, abstractmethod
 from collections import OrderedDict
-from typing import Dict, Iterable, List, Optional, Union
+from typing import Any, Dict, Iterable, List, Optional, Union
 
 import numpy
 import torch
@@ -62,6 +62,7 @@ class MegatronDataset(ABC, torch.utils.data.Dataset):
         self.unique_identifiers["index_split"] = self.index_split.name
         for attr in self._key_config_attributes():
             self.unique_identifiers[attr] = getattr(self.config, attr)
+        self.unique_identifiers.update(self._extra_unique_identifiers())
 
         self.unique_description = json.dumps(
             self.unique_identifiers, indent=4, default=lambda obj: obj.unique_identifiers
@@ -162,6 +163,20 @@ class MegatronDataset(ABC, torch.utils.data.Dataset):
             List[str]: The key config attributes
         """
         return ["random_seed", "sequence_length", "split", "split_matrix", "tokenizer"]
+
+    def _extra_unique_identifiers(self) -> Dict[str, Any]:
+        """Return further identifiers of this dataset's cached resources, appended after the
+        key config attributes (``_key_config_attributes``) in the unique description.
+
+        Unlike the key attributes, these may depend on the config's values (e.g. keys that
+        enter the description only when an option is on, so that every existing description
+        and cache hash stays unchanged otherwise). Called from ``__init__`` once ``config`` is
+        set; the default adds nothing.
+
+        Returns:
+            Dict[str, Any]: The extra identifiers, in order
+        """
+        return {}
 
     @abstractmethod
     def __len__(self) -> int:

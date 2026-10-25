@@ -4284,6 +4284,13 @@ def setup_model_and_optimizer(
     model = _build_model_wrapper(wrap_with_ddp)
     unwrapped_model = unwrap_model(model)
 
+    # RSBF loop planner: plans (and in apply mode sets) the item form, stride, waves, D42 and
+    # Adam to Grace on the built model's config and args, before the optimizer config is read.
+    if getattr(args, "loop_planner", "off") != "off":
+        from megatron.training.loop_rsbf_planning import plan_loop_rsbf
+
+        plan_loop_rsbf(args, model, apply=args.loop_planner == "apply")
+
     # Classify each GTP param's prefetch chain after model build + DDP wrap, before the
     # first forward. Placed here (not in get_model) so it also covers the config-container
     # builder path.
@@ -5329,6 +5336,10 @@ def training_log(
                 "mem-max-allocated-bytes", mem_stats["allocated_bytes.all.peak"], iteration
             )
             writer.add_scalar("mem-allocated-count", mem_stats["allocation.all.current"], iteration)
+        if getattr(args, "_loop_exit_counts", None):
+            from megatron.training.loop_rsbf_planning import log_loop_exit_histogram
+
+            log_loop_exit_histogram(args, iteration, writer, wandb_writer)
         model_config = (
             get_model_config(model[0]) if model else getattr(cfg.model, 'transformer', None)
         )
@@ -5627,6 +5638,11 @@ def training_log(
                     total_loss_dict[key] = torch.tensor([0.0], dtype=torch.float, device='cuda')
         if args.num_experts is not None and moe_log_string:
             log_string += moe_log_string
+        if getattr(args, "_loop_exit_counts_interval", None) is not None:
+            # The log interval's exit-depth histogram (RSBF), reset with the interval.
+            from megatron.training.loop_rsbf_planning import loop_exit_histogram_log_string
+
+            log_string += loop_exit_histogram_log_string(args, reset=should_reset)
         log_string += f' loss scale: {loss_scale:.1f} |'
         if grad_norm is not None:
             log_string += f' grad norm: {grad_norm:.3f} |'
@@ -7105,6 +7121,12 @@ def train(
             args._loop_flops_in_log_interval = (
                 getattr(args, "_loop_flops_in_log_interval", 0.0) + args._loop_flops_in_batch
             )
+        if loop_rsbf_schedule is not None:
+            # The step's realized exit-depth histogram (host data of every rank, no sync):
+            # args attributes for training_log, and the JSONL line of the cost-model reruns.
+            from megatron.training.loop_rsbf_planning import record_loop_exit_histogram
+
+            record_loop_exit_histogram(args, loop_rsbf_schedule, model, iteration)
         num_floating_point_operations_in_batch = num_floating_point_operations(
             args,
             batch_size,

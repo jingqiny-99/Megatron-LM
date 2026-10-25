@@ -51,8 +51,14 @@ host plan on the EU that ran its exit sweep. Both counters (and the report-schem
 reduced over the domain (``all_reduce(MAX)`` of a ``[W, 4]`` table) and read at the single
 end-of-step host sync, which also carries the step's loss sum for the rerun-state-machine
 checks (validated on a host tensor, no further sync, as the mean of the per-microbatch sums so
-the spiky-loss history does not scale with the microbatch count); an online round's after-exit
-flag rides byte ``G`` of the status exchange. Every rank therefore raises together.
+the spiky-loss history does not scale with the microbatch count) and the EU's padded-token
+count; an online round's after-exit flag rides byte ``G`` of the status exchange. Every rank
+therefore raises together.
+
+Exit histogram: ``ExecutorStats.exit_counts`` is the step's realized exit-depth histogram
+(``counts[d - 1]`` samples of the domain exited after round ``d``), a host reduction of the
+plan's depths (identical on every EU, no sync); ``LoopRSBFSchedule.exit_counts`` and
+``.padding`` hand the last step's histogram and the EU's padded / issued tokens to the trainer.
 
 Collectives inside a step (``W > 1``): the move phases on the domain group (the
 data-parallel group; ``batch_isend_irecv`` on the non-empty pairs or one ``all_to_all_single``
@@ -124,7 +130,7 @@ import logging
 import math
 import weakref
 from dataclasses import dataclass, field
-from typing import Any, Callable, Iterator, Literal, Optional, Sequence, Union
+from typing import Any, Callable, Iterable, Iterator, Literal, Optional, Sequence, Union
 
 import torch
 import torch.distributed as dist
@@ -197,6 +203,7 @@ __all__ = [
     "RSBF_LOSS_VALIDATOR_ATTR",
     "SampleLossRecord",
     "WorkRecord",
+    "exit_depth_counts",
     "forward_backward_loop_rsbf",
     "get_loop_rsbf_schedule",
 ]
@@ -393,6 +400,25 @@ class ExecutorStats:
     layer_stash_peak: int = 0
     # measure_memory: one MemoryRecord per cell call of this EU, in execution order.
     memory: list = field(default_factory=list)
+    # The realized exit-depth histogram of the step: ``exit_counts[d - 1]`` samples of the
+    # domain exited after round ``d`` (d = 1..R_max), over every wave (plan-derived, identical
+    # on every EU; sums to the step's samples, ``len(depths)``).
+    exit_counts: list = field(default_factory=list)
+    # This EU's home samples: padded tokens (``padding_mask``; 0 without one) and issued tokens
+    # (the rows' token count) of the step, read with the end-of-step flags.
+    padded_tokens: int = 0
+    issued_tokens: int = 0
+
+
+def exit_depth_counts(depths: Iterable[int], max_rounds: int) -> list:
+    """The exit-depth histogram ``counts[d - 1]`` (d = 1..``max_rounds``) of the realized
+    ``depths`` (host data). A depth outside ``1..max_rounds`` raises (a plan bug)."""
+    counts = [0] * max_rounds
+    for depth in depths:
+        if not 1 <= depth <= max_rounds:
+            raise ValueError(f"exit depth {depth} outside 1..R_max = {max_rounds}")
+        counts[depth - 1] += 1
+    return counts
 
 
 @contextlib.contextmanager
@@ -697,6 +723,7 @@ class LoopRSBFExecutor:
         self._n_tok_local = torch.zeros((), dtype=torch.int32, device=device)
         self._loss_sum_local = torch.zeros((), dtype=torch.float32, device=device)
         self._plan_mismatches = torch.zeros((), dtype=torch.int32, device=device)
+        self._padded_local = torch.zeros((), dtype=torch.int32, device=device)
         self._schema_errors = 0
         per_wave = num_microbatches // self.waves
         reports = []
@@ -729,6 +756,7 @@ class LoopRSBFExecutor:
             self._samples = self._chain = self._records = None
             self._loss_func = None
         self.stats.status_exchanges = dispatcher.stats.status_exchanges - status_before
+        self.stats.exit_counts = exit_depth_counts(self.stats.depths.values(), program.max_rounds)
         step_loss = self._end_of_step(dispatcher)
         if validate_loss is not None:
             # The mean per-microbatch sum: NaN / Inf survive the division, and the spiky-loss
@@ -745,9 +773,9 @@ class LoopRSBFExecutor:
 
     def _end_of_step(self, dispatcher: LoopSampleDispatcher) -> Tensor:
         """The one end-of-step read: every EU's after-exit count, plan mismatches and report
-        schema errors (reduced MAX over the domain, so every rank decides alike) and this EU's
-        loss sum. Raises on every rank when any EU flagged a violation; returns the loss sum
-        (host fp32)."""
+        schema errors (reduced MAX over the domain, so every rank decides alike), this EU's
+        loss sum and its padded-token count (``ExecutorStats.padded_tokens``). Raises on every
+        rank when any EU flagged a violation; returns the loss sum (host fp32)."""
         program, device = self.program, self.device
         num_eus, eu = dispatcher.num_eus, dispatcher.eu
         flags = torch.zeros((num_eus, len(_FLAG_NAMES)), dtype=torch.int32, device=device)
@@ -760,7 +788,11 @@ class LoopRSBFExecutor:
             flags[eu, _FLAG_OVER_BUDGET].copy_(budget_flags.to(device).max())
         if num_eus > 1:
             dist.all_reduce(flags, op=dist.ReduceOp.MAX, group=dispatcher.groups.domain)
-        parts = [flags.reshape(-1), self._loss_sum_local.reshape(1).view(torch.int32)]
+        parts = [
+            flags.reshape(-1),
+            self._loss_sum_local.reshape(1).view(torch.int32),
+            self._padded_local.reshape(1),
+        ]
         if budget_flags is not None:
             # This rank's per-module flags ride the same read (they name the local layers).
             parts.append(budget_flags.to(device))
@@ -769,7 +801,8 @@ class LoopRSBFExecutor:
         width = len(_FLAG_NAMES)
         table = [values[e * width : (e + 1) * width] for e in range(num_eus)]
         loss_bits = values[num_eus * width]
-        local_budget = values[num_eus * width + 1 :]
+        self.stats.padded_tokens = values[num_eus * width + 1]
+        local_budget = values[num_eus * width + 2 :]
         self.stats.over_budget_layers = [
             name for name, flag in zip(budget_names, local_budget) if flag
         ]
@@ -812,8 +845,12 @@ class LoopRSBFExecutor:
         return torch.tensor([loss_bits], dtype=torch.int32).view(torch.float32)[0]
 
     def _split(self, batch, microbatch, iteration, *, micro_batch_size, dp):
-        """The rows of one microbatch as samples (c = 1)."""
+        """The rows of one microbatch as samples (c = 1); counts their issued and padded tokens
+        (the padded count on the device, read at the end of the step)."""
         dp_rank, dp_size = dp
+        self.stats.issued_tokens += batch.tokens.numel()
+        if batch.padding_mask is not None:
+            self._padded_local.add_(batch.padding_mask.sum(dtype=torch.int32))
         samples = []
         for row in range(micro_batch_size):
             rows = slice(row, row + 1)
@@ -2018,6 +2055,33 @@ class LoopRSBFSchedule:
         """The executor cached for ``model``, or None."""
         cached = self._cache.get(get_attr_wrapped_model(model, "head_loss", return_model_obj=True))
         return None if cached is None else cached[1]
+
+    def invalidate(self, model: nn.Module) -> None:
+        """Drop the executor (and program) cached for ``model`` only, so the next step rebuilds
+        them from the model's config (a phase switch); the status group, the iteration and
+        other models' executors are kept (unlike ``reset``)."""
+        self._cache.pop(get_attr_wrapped_model(model, "head_loss", return_model_obj=True), None)
+
+    def _last_stats(self, model: nn.Module) -> Optional[ExecutorStats]:
+        """The statistics of the last step ``model``'s cached executor ran, or None (no
+        executor, or none of its steps reached the end-of-step read)."""
+        executor = self.cached_executor(model)
+        if executor is None or not executor.stats.exit_counts:
+            return None
+        return executor.stats
+
+    def exit_counts(self, model: nn.Module) -> Optional[list]:
+        """The last step's exit-depth histogram of ``model`` (``ExecutorStats.exit_counts``:
+        ``counts[d - 1]`` domain samples exited after round ``d``), or None before its first
+        step."""
+        stats = self._last_stats(model)
+        return None if stats is None else list(stats.exit_counts)
+
+    def padding(self, model: nn.Module) -> Optional[tuple]:
+        """``(padded tokens, issued tokens)`` of this EU's home samples in the last step of
+        ``model`` (padded 0 without a padding mask), or None before its first step."""
+        stats = self._last_stats(model)
+        return None if stats is None else (stats.padded_tokens, stats.issued_tokens)
 
     def executor_for(
         self,

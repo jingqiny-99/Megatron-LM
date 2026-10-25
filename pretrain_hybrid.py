@@ -67,7 +67,11 @@ from megatron.training.argument_utils import (
     pretrain_cfg_container_from_args,
     resolve_tokenizer_vocab_size,
 )
-from megatron.training.arguments import core_transformer_config_from_args, parse_and_validate_args
+from megatron.training.arguments import (
+    check_sbhd_packing_indexer_loss,
+    core_transformer_config_from_args,
+    parse_and_validate_args,
+)
 from megatron.training.datasets.sft_dataset import MockSFTDataset, SFTDataset
 from megatron.training.datasets.varlen_dataset import MockVarlenDataset, VarlenDataset
 from megatron.training.global_vars import (
@@ -112,6 +116,15 @@ BATCH_KEYS = [
     'position_ids',
     'tokens',
 ]
+
+
+def _needs_padding_mask(args) -> bool:
+    """Whether every batch carries a batch-first padding mask on every PP stage: the varlen
+    SBHD validation path and SBHD document packing (row-tail padding)."""
+    return (
+        getattr(args, "use_varlen_dataset", False)
+        and getattr(args, "varlen_sbhd_validation", False)
+    ) or getattr(args, "sbhd_document_packing", False)
 
 
 def get_batch(data_iterator, vp_stage=None):
@@ -175,9 +188,7 @@ def get_batch(data_iterator, vp_stage=None):
     is_sft = args.sft
     has_cu_seqlens = is_sft or args.dataloader_inter_document_masking
     create_attention_mask_in_dataloader = args.create_attention_mask_in_dataloader
-    needs_padding_mask = getattr(args, "use_varlen_dataset", False) and getattr(
-        args, "varlen_sbhd_validation", False
-    )
+    needs_padding_mask = _needs_padding_mask(args)
     mtp_on_this_rank = mtp_on_this_rank_func(
         layout=config.pipeline_model_parallel_layout,
         mtp_num_layers=config.mtp_num_layers,
@@ -518,10 +529,7 @@ def is_dataset_built_on_rank(vp_stage=None, is_packed_sequence=False):
     config = core_transformer_config_from_args(args)
     if mpu.get_tensor_model_parallel_rank() != 0:
         return False
-    elif is_packed_sequence or (
-        getattr(args, 'use_varlen_dataset', False)
-        and getattr(args, 'varlen_sbhd_validation', False)
-    ):
+    elif is_packed_sequence or _needs_padding_mask(args):
         # Every PP stage needs its padding metadata, even without packed THD inputs.
         return True
     return is_first_or_last_pipeline_stage(vp_stage) or mtp_on_this_rank_func(
@@ -576,6 +584,24 @@ def core_gpt_dataset_config_from_args(args: Any) -> GPTDatasetConfig:
         sequence_parallel_size=args.tensor_model_parallel_size * args.sequence_parallel,
         dynamic_context_parallel=args.dynamic_context_parallel,
         inter_document_masking=args.dataloader_inter_document_masking,
+        sbhd_document_packing=getattr(args, "sbhd_document_packing", False),
+        sbhd_packing_open_rows=getattr(args, "sbhd_packing_open_rows", 64),
+    )
+
+
+def _check_sbhd_packing_model_config(args: Any) -> None:
+    """Backstop of the argument-time packing checks on the built model config (its resolved
+    attention variant, loop architecture and DSA kernel backend): with SBHD document packing
+    no indexer loss may see the row-tail padding (a plain DSA indexer loss, a loop-less DSv4
+    one, or one on the fused kernels, which have no row mask)."""
+    if not getattr(args, "sbhd_document_packing", False):
+        return
+    config = core_transformer_config_from_args(args)
+    check_sbhd_packing_indexer_loss(
+        config.experimental_attention_variant,
+        config.dsa_indexer_loss_coeff,
+        config.loop_architecture,
+        config.dsa_kernel_backend,
     )
 
 
@@ -597,6 +623,7 @@ def train_valid_test_datasets_provider(train_val_test_num_samples, vp_stage=None
         is_packed_sequence = not args.varlen_sbhd_validation
     else:
         dataset_type = MockGPTDataset if args.mock_data else GPTDataset
+        _check_sbhd_packing_model_config(args)
 
     config = core_gpt_dataset_config_from_args(args)
 

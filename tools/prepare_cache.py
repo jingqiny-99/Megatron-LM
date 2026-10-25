@@ -154,6 +154,8 @@ def core_gpt_dataset_config_from_args(args: Any) -> GPTDatasetConfig:
         context_parallel_size=args.context_parallel_size,
         data_parallel_size=args.data_parallel_size,
         sequence_parallel_size=args.tensor_model_parallel_size * args.sequence_parallel,
+        sbhd_document_packing=getattr(args, "sbhd_document_packing", False),
+        sbhd_packing_open_rows=getattr(args, "sbhd_packing_open_rows", 64),
     )
 
 

@@ -117,6 +117,36 @@ def test_hybrid_sbhd_validation_broadcasts_padding_mask_on_all_pp_stages():
         Utils.destroy_model_parallel()
 
 
+def test_hybrid_sbhd_document_packing_broadcasts_padding_mask_on_all_pp_stages():
+    """SBHD document packing: packed rows' row-tail padding masks reach every TP rank of every
+    PP stage (the datasets are built on TP rank 0 of every stage)."""
+    if Utils.world_size < 8:
+        pytest.skip("TP2 x PP4 packing needs eight ranks")
+    args = initialize_test_environment(
+        tp_size=2, pp_size=4, cp_size=1, seq_length=32, micro_batch_size=2, global_batch_size=2
+    )
+    args.sbhd_document_packing = True
+    assert pretrain_hybrid.is_dataset_built_on_rank() == (mpu.get_tensor_model_parallel_rank() == 0)
+    contents = torch.tensor([[19], [32]])
+    mask = torch.arange(32).expand(2, 32) >= contents
+    tokens = torch.arange(64).reshape(2, 32)
+    data = {
+        "tokens": tokens,
+        "labels": tokens.clone(),
+        "loss_mask": (torch.arange(32).expand(2, 32) < contents - 1).float(),
+        "position_ids": torch.arange(32).expand(2, 32),
+        "padding_mask": mask,
+    }
+    try:
+        result = pretrain_hybrid.get_batch(iter([data])).get_batch()
+        assert result["padding_mask"].is_cuda and result["padding_mask"].dtype == torch.bool
+        torch.testing.assert_close(result["padding_mask"], mask.cuda())
+        if result["loss_mask"] is not None:
+            assert not result["loss_mask"][result["padding_mask"]].any()
+    finally:
+        Utils.destroy_model_parallel()
+
+
 def test_gpt_dataset_config_preserves_inter_document_masking():
     args = initialize_test_environment(
         tp_size=1,

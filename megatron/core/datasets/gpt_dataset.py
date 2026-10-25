@@ -5,7 +5,7 @@ import os
 import time
 from dataclasses import dataclass, field
 from math import ceil
-from typing import Dict, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import numpy
 import torch
@@ -14,6 +14,12 @@ from megatron.core.datasets.blended_megatron_dataset_config import BlendedMegatr
 from megatron.core.datasets.indexed_dataset import IndexedDataset
 from megatron.core.datasets.megatron_dataset import MegatronDataset
 from megatron.core.datasets.object_storage_utils import ObjectStorageConfig, is_object_storage_path
+from megatron.core.datasets.sbhd_packing import (
+    PackedRows,
+    fast_packer_available,
+    pack_rows_fast,
+    row_capacity,
+)
 from megatron.core.datasets.utils import Split
 from megatron.core.safe_globals import safe_numpy_load
 from megatron.core.tokenizers import MegatronTokenizerBase
@@ -110,6 +116,19 @@ class GPTDatasetConfig(BlendedMegatronDatasetConfig):
     TODO: drop this field once a functional test covers THD-vs-SBHD numerical
     parity in CI."""
 
+    sbhd_document_packing: bool = False
+    """Pack whole documents into each SBHD row of ``sequence_length`` tokens instead of cutting
+    windows over the concatenated document stream (``megatron/core/datasets/sbhd_packing.py``):
+    a document that fits is never split across rows; a document longer than a row is cut into
+    row-length windows as without packing. Rows carry a row-tail ``padding_mask`` (True on
+    padding tokens) and a loss mask that excludes the labels in the padding; attention over a
+    row stays plain causal (no per-document isolation). Rows are counted as samples, so the
+    epochs are counted in rows. Not combinable with ``inter_document_masking``,
+    ``defer_npy_index_mmap``, context parallelism or ``dynamic_context_parallel``."""
+
+    sbhd_packing_open_rows: int = 64
+    """The first-fit window of open rows of the SBHD document packer (1 = next fit)."""
+
     def __post_init__(self) -> None:
         """Do asserts and set fields post init"""
         super().__post_init__()
@@ -125,6 +144,26 @@ class GPTDatasetConfig(BlendedMegatronDatasetConfig):
                 "--varlen-sbhd-validation is incompatible with "
                 "--dynamic-context-parallel (SBHD mode is not packed)."
             )
+
+        if self.sbhd_document_packing:
+            if self.sbhd_packing_open_rows < 1:
+                raise ValueError(
+                    f"sbhd_packing_open_rows must be >= 1, got {self.sbhd_packing_open_rows}"
+                )
+            for name, conflict in (
+                ("inter_document_masking (per-document isolation)", self.inter_document_masking),
+                (
+                    "defer_npy_index_mmap (the packed length needs the packed row index)",
+                    self.defer_npy_index_mmap,
+                ),
+                (
+                    "context_parallel_size > 1 (THD only where cp > 1)",
+                    (self.context_parallel_size or 1) > 1,
+                ),
+                ("dynamic_context_parallel", self.dynamic_context_parallel),
+            ):
+                if conflict:
+                    raise ValueError(f"sbhd_document_packing is incompatible with {name}")
 
         self.token_dtype_code = (
             None
@@ -233,12 +272,37 @@ class GPTDataset(MegatronDataset):
             dtype_code=config.token_dtype_code,
         )
 
+    def _extra_unique_identifiers(self) -> Dict[str, Any]:
+        """The packing keys, only with SBHD document packing (every unpacked description and
+        cache hash is unchanged)."""
+        if not self.config.sbhd_document_packing:
+            return {}
+        return {
+            "sbhd_document_packing": True,
+            "sbhd_packing_open_rows": self.config.sbhd_packing_open_rows,
+        }
+
+    @property
+    def packed_rows(self) -> Optional[PackedRows]:
+        """The packed row index (``sbhd_document_packing``), or None."""
+        return self.sample_index if self.config.sbhd_document_packing else None
+
+    def packed_row_pieces(self, idx: int) -> List[Tuple[int, int, int]]:
+        """The ``(document, offset, length)`` pieces of dataset row ``idx`` (after the
+        shuffle); packing only (tests and debugging)."""
+        if not self.config.sbhd_document_packing:
+            raise ValueError("packed_row_pieces needs sbhd_document_packing")
+        row = self.sample_index.row(int(self.shuffle_index[idx]))
+        return [tuple(int(value) for value in piece) for piece in row]
+
     def __len__(self) -> int:
         """Abstract method implementation
 
         Returns:
             int: The length of the dataset
         """
+        if self.config.sbhd_document_packing:
+            return self.sample_index.num_rows
         if self.config.defer_npy_index_mmap:
             # NOTE(asolergi-nv): We need the number of samples of every GPTDataset to build/hit the BlendedDataset cache # pylint: disable=C0301
             # NOTE(asolergi-nv): Uses logic from megatron/core/datasets/helpers.cpp::build_sample_idx to compute the number of samples # pylint: disable=C0301
@@ -270,6 +334,13 @@ class GPTDataset(MegatronDataset):
 
         Returns:
             Dict[str, torch.Tensor]: The sample information wrapped in a dictionary
+
+        With ``sbhd_document_packing`` the sample is one packed row of ``content`` tokens
+        followed by row-tail padding, and the dictionary also holds ``padding_mask`` (``[S]``
+        bool, True at positions ``>= content``); the loss mask is also 0 from ``content - 1``
+        on (the labels in the padding). The batch-padding sample (``idx`` None) is row 0 with
+        a zero loss mask and row 0's padding mask (its tokens are real-looking and do enter
+        routing statistics and the exit criterion; no Megatron sampler emits None).
         """
         if idx is None:
             # Batch padding sequence so the index does not matter
@@ -300,7 +371,12 @@ class GPTDataset(MegatronDataset):
             )
             if self.masks_and_position_ids_are_cacheable:
                 self.cached_attention_mask = attention_mask
-                self.cached_loss_mask = loss_mask
+                # Packing writes the row's padding into the loss mask below, so the cache
+                # must not alias it (the default path keeps the alias: its only in-place
+                # write is the roll's last-label pad, the same position in every sample).
+                self.cached_loss_mask = (
+                    loss_mask.clone() if self.config.sbhd_document_packing else loss_mask
+                )
                 self.cached_position_ids = position_ids
                 self.masks_and_position_ids_are_cached = True
         else:
@@ -318,6 +394,14 @@ class GPTDataset(MegatronDataset):
         # Batch padding sequence so we mask the loss
         if idx is None:
             loss_mask = torch.zeros_like(loss_mask)
+
+        padding_mask = None
+        if self.config.sbhd_document_packing:
+            # Row-tail padding: token i is padding from the row's content on; label i is
+            # text[i + 1], padding from content - 1 on (in both label conventions).
+            content = int(sum(document_lengths))
+            loss_mask[max(content - 1, 0) :] = 0.0
+            padding_mask = torch.arange(self.config.sequence_length) >= content
 
         if self.config.inter_document_masking:
             # document_lengths come from _query_document_sample_shuffle_indices
@@ -383,6 +467,9 @@ class GPTDataset(MegatronDataset):
                 "position_ids": position_ids,
             }
 
+        if padding_mask is not None:
+            result["padding_mask"] = padding_mask
+
         return result
 
     def _query_document_sample_shuffle_indices(
@@ -411,6 +498,9 @@ class GPTDataset(MegatronDataset):
 
         # Do the shuffle mapping
         idx = self.shuffle_index[idx]
+
+        if self.config.sbhd_document_packing:
+            return self._query_packed_row(int(idx))
 
         # Get the beginning and end documents and offsets
         doc_index_beg, doc_index_beg_offset = self.sample_index[idx]
@@ -472,6 +562,28 @@ class GPTDataset(MegatronDataset):
             document_lengths,
         )
 
+    def _query_packed_row(self, row: int) -> Tuple[numpy.ndarray, numpy.ndarray, list]:
+        """The text of packed row ``row`` (its pieces concatenated, then padded to the row
+        capacity), its document ids and the token count of every piece."""
+        pieces = self.sample_index.row(row)
+        sample_parts = [
+            self.dataset.get(int(document), offset=int(offset), length=int(length))
+            for document, offset, length in pieces
+        ]
+        document_lengths = [len(part) for part in sample_parts]
+        capacity = row_capacity(
+            self.config.sequence_length, self.config.add_extra_token_to_sequence
+        )
+        content = sum(document_lengths)
+        assert 0 < content <= capacity, f"packed row {row} holds {content} tokens"
+        if content < capacity:
+            sample_parts.append([self._pad_token_id] * (capacity - content))
+        return (
+            numpy.concatenate(sample_parts, dtype=numpy.int64),
+            numpy.array(pieces[:, 0], dtype=numpy.int64),
+            document_lengths,
+        )
+
     def _build_document_sample_shuffle_indices(
         self,
     ) -> Tuple[numpy.ndarray, numpy.ndarray, numpy.ndarray]:
@@ -492,7 +604,12 @@ class GPTDataset(MegatronDataset):
         Returns:
             Tuple[numpy.ndarray, numpy.ndarray, numpy.ndarray]: The document index, the sample
             index, and the shuffle index
+
+        With ``sbhd_document_packing`` the sample index is the packed row index
+        (``PackedRows``; ``_build_packed_indices``).
         """
+        if self.config.sbhd_document_packing:
+            return self._build_packed_indices()
         if self.config.defer_npy_index_mmap:
             # NOTE(asolergi-nv): Direct path to lazy memmap the indexes
             base = f"{self.unique_description_hash}-{type(self).__name__}-{self.index_split.name}"
@@ -699,6 +816,139 @@ class GPTDataset(MegatronDataset):
         )
 
         return document_index, sample_index, shuffle_index
+
+    def _build_packed_indices(self) -> Tuple[numpy.ndarray, PackedRows, numpy.ndarray]:
+        """Build (or load) the document index, the packed row index and the shuffle index of
+        SBHD document packing.
+
+        Epochs are counted in rows: each epoch is a fresh document permutation (one
+        ``RandomState(random_seed)`` for the whole build) packed on its own, and epochs are
+        added until their rows reach ``num_samples`` (one epoch when it is None). With more
+        than one epoch, the last epoch is kept out of the global row shuffle when the rows it
+        must contribute are below 80 % of its rows (the threshold of the unpacked path).
+        Cached as ``document_index``, ``packed_row_offsets``, ``packed_pieces`` and
+        ``shuffle_index`` (``.npy``) under the dataset's unique description, which carries the
+        packing keys.
+
+        Returns:
+            Tuple[numpy.ndarray, PackedRows, numpy.ndarray]: The document index (all epochs),
+            the packed rows and the shuffle index
+        """
+        path_to_cache = self.config.path_to_cache
+        if path_to_cache is None and not self.config.mock:
+            path_to_cache = os.path.join(
+                self.dataset.path_prefix, "cache", f"{type(self).__name__}_indices"
+            )
+
+        paths = {}
+        if path_to_cache:
+            base = f"{self.unique_description_hash}-{type(self).__name__}-{self.index_split.name}"
+            for name in (
+                "description.txt",
+                "document_index.npy",
+                "packed_row_offsets.npy",
+                "packed_pieces.npy",
+                "shuffle_index.npy",
+            ):
+                paths[name] = os.path.join(path_to_cache, f"{base}-{name}")
+            cache_hit = self.config.fast_cache_load or all(map(os.path.isfile, paths.values()))
+        else:
+            cache_hit = False
+
+        if not path_to_cache or (
+            not cache_hit
+            and (not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0)
+        ):
+            log_single_rank(
+                logger,
+                logging.INFO,
+                f"Build and save the {type(self).__name__} {self.index_split.name} packed "
+                f"SBHD row indices",
+            )
+            t_beg = time.time()
+            numpy_random_state = numpy.random.RandomState(self.config.random_seed)
+            document_indices, parts = [], []
+            num_rows = 0
+            while True:
+                document_index = _build_document_index(
+                    self.indices, 1, numpy_random_state, separate_final_epoch=False
+                )
+                packed = pack_rows_fast(
+                    document_index,
+                    self.dataset.sequence_lengths,
+                    sequence_length=self.config.sequence_length,
+                    add_extra_token=self.config.add_extra_token_to_sequence,
+                    open_rows=self.config.sbhd_packing_open_rows,
+                )
+                if packed.num_rows == 0:
+                    raise ValueError(
+                        f"{type(self).__name__} {self.index_split.name}: SBHD document "
+                        f"packing found no tokens to pack"
+                    )
+                document_indices.append(document_index)
+                parts.append(packed)
+                num_rows += packed.num_rows
+                if self.num_samples is None or num_rows >= self.num_samples:
+                    break
+
+            num_rows_first = num_rows
+            if len(parts) > 1:
+                rows_before_final = num_rows - parts[-1].num_rows
+                rows_from_final = self.num_samples - rows_before_final
+                # Separate the final epoch if it falls below the threshold (as unpacked).
+                threshold = 0.80
+                if rows_from_final < int(threshold * parts[-1].num_rows):
+                    num_rows_first = rows_before_final
+            packed = PackedRows.concatenate(parts, num_rows_first=num_rows_first)
+            document_index = numpy.concatenate(document_indices)
+            shuffle_index = _build_shuffle_index(num_rows_first, num_rows, numpy_random_state)
+
+            if path_to_cache:
+                os.makedirs(path_to_cache, exist_ok=True)
+                with open(paths["description.txt"], "wt") as writer:
+                    writer.write(self.unique_description)
+                numpy.save(paths["document_index.npy"], document_index, allow_pickle=True)
+                numpy.save(paths["packed_row_offsets.npy"], packed.row_offsets, allow_pickle=True)
+                numpy.save(paths["packed_pieces.npy"], packed.pieces, allow_pickle=True)
+                numpy.save(paths["shuffle_index.npy"], shuffle_index, allow_pickle=True)
+            else:
+                log_single_rank(
+                    logger,
+                    logging.WARNING,
+                    f"Unable to save {type(self).__name__} indexes because path_to_cache is None",
+                )
+
+            capacity = row_capacity(
+                self.config.sequence_length, self.config.add_extra_token_to_sequence
+            )
+            fill = float(packed.pieces[:, 2].sum()) / max(num_rows * capacity, 1)
+            packer = "C++" if fast_packer_available() else "Python"
+            log_single_rank(
+                logger,
+                logging.INFO,
+                f"> packed {num_rows} rows ({num_rows_first} in the global shuffle) from "
+                f"{len(parts)} epoch(s) with the {packer} packer in "
+                f"{time.time() - t_beg:4f} seconds, fill {fill:.4f}",
+            )
+            return document_index, packed, shuffle_index
+
+        log_single_rank(
+            logger,
+            logging.INFO,
+            f"Load the {type(self).__name__} {self.index_split.name} packed SBHD row indices",
+        )
+        loaded = {
+            name: safe_numpy_load(path, allow_pickle=True, mmap_mode="r")
+            for name, path in paths.items()
+            if name.endswith(".npy")
+        }
+        packed = PackedRows(
+            row_offsets=loaded["packed_row_offsets.npy"],
+            pieces=loaded["packed_pieces.npy"],
+            num_rows_first=-1,  # not cached: only the build uses it (for the shuffle)
+        )
+        log_single_rank(logger, logging.INFO, f"> total number of rows: {packed.num_rows}")
+        return loaded["document_index.npy"], packed, loaded["shuffle_index.npy"]
 
     def _get_num_tokens_per_epoch(self) -> int:
         """Calculate the number of tokens in a single epoch

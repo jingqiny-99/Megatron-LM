@@ -517,6 +517,9 @@ def is_dataset_built_on_rank(vp_stage=None):
 
 
 def core_gpt_dataset_config_from_args(args):
+    if getattr(args, "sbhd_document_packing", False):
+        # Not wired here: this entry's batches do not carry the row-tail padding mask.
+        raise ValueError("--sbhd-document-packing is wired for pretrain_hybrid.py only")
     cfg = get_run_config()
     tokenizer = get_tokenizer()
 

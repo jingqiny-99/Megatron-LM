@@ -15,7 +15,7 @@ tests.
 import torch
 from torch import nn
 
-from megatron.core.transformer.loop.program import CriterionStep, ExitCriterion
+from megatron.core.transformer.loop.program import CriterionStep, ExitCriterion, valid_token_mean
 
 
 class HaltingHead(nn.Module):
@@ -31,14 +31,12 @@ class HaltingHead(nn.Module):
 
 def stream_contraction(x, weight, valid):
     """``sum_j w_j . mean_valid(x[:, :, j])`` per row in fp32: ``x`` ``[S, c, n * h]``,
-    ``weight`` ``[n, h]``, ``valid`` ``[c, S]`` bool or None; returns ``[c]``."""
+    ``weight`` ``[n, h]``, ``valid`` ``[c, S]`` bool or None; returns ``[c]``. The mean over
+    the valid tokens is ``valid_token_mean`` (padded positions selected away, contract rule
+    8)."""
     sequence, rows = x.shape[:2]
     streams = x.float().reshape(sequence, rows, *weight.shape)
-    if valid is None:
-        mean = streams.mean(0)
-    else:
-        mask = valid.t().float()[:, :, None, None]
-        mean = (streams * mask).sum(0) / mask.sum(0).clamp_min(1.0)
+    mean = valid_token_mean(streams, valid)
     return (mean * weight.float()).sum((-2, -1))
 
 

@@ -453,6 +453,27 @@ def block_boundaries_split_pairs(
 # ---------------------------------------------------------------------------
 
 
+def valid_token_mean(x: Tensor, valid: Optional[Tensor]) -> Tensor:
+    """Per-row mean over the valid tokens of ``x`` ``[S, c, ...]``, in fp32: ``[c, ...]``.
+
+    ``valid`` is ``[c, S]`` bool (True on non-padding tokens) or None (a plain mean over S).
+    Padded positions are selected away with ``torch.where``, so their values, non-finite ones
+    included, never reach the result (``ExitCriterion`` rule 8); a row without a valid token
+    gives 0.
+    """
+    x = x.float()
+    if valid is None:
+        return x.mean(0)
+    if valid.dtype != torch.bool or valid.shape != (x.shape[1], x.shape[0]):
+        raise ValueError(
+            f"valid must be [c, S] = {[x.shape[1], x.shape[0]]} bool, got "
+            f"{list(valid.shape)} {valid.dtype}"
+        )
+    mask = valid.t().reshape(*valid.t().shape, *([1] * (x.dim() - 2)))
+    count = mask.sum(0).to(torch.float32).clamp_min(1.0)
+    return torch.where(mask, x, torch.zeros((), dtype=x.dtype, device=x.device)).sum(0) / count
+
+
 @dataclass(frozen=True)
 class CriterionStep:
     """One round of an exit criterion, per row of the cell call."""
@@ -475,6 +496,10 @@ class ExitCriterion(abc.ABC):
     6. ``step`` sees the phase only through the core cell.
     7. ``init_state`` may be differentiable (in ``e`` and the criterion's parameters) only when
        ``differentiable``; otherwise it must not require grad.
+    8. Reductions over S use only the ``valid`` tokens of the row (``valid_token_mean``),
+       selecting with ``torch.where`` rather than multiplying by the mask, so padded positions
+       with any value, non-finite ones included, cannot change ``exit``, ``crit_state`` or
+       ``aux_loss``; ``valid`` None means every token is valid.
     """
 
     state_width: int = 0

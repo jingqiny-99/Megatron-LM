@@ -66,6 +66,52 @@ except ImportError:
     HAVE_PACKAGING = False
 
 
+def _default_dsa_kernel_backend(
+    experimental_attention_variant: Optional[str], apply_dsa_kernel_fusion: Optional[bool]
+) -> str:
+    """The DSA kernel backend when none is selected: ``cudnn`` for DSv4 hybrid attention
+    without the deprecated fusion switch, else ``none``."""
+    return (
+        "cudnn"
+        if experimental_attention_variant == "dsv4_hybrid" and apply_dsa_kernel_fusion is None
+        else "none"
+    )
+
+
+def _legacy_dsa_kernel_backend(dsa_kernel_backend: str, apply_dsa_kernel_fusion: bool) -> str:
+    """Fold the deprecated DSv4 ``apply_dsa_kernel_fusion`` switch into the backend (True maps
+    to ``cudnn``, False to ``none``); raises on a conflicting explicit backend."""
+    legacy_backend = "cudnn" if apply_dsa_kernel_fusion else "none"
+    if dsa_kernel_backend not in ("none", legacy_backend):
+        raise ValueError(
+            "Conflicting DSA kernel controls: "
+            f"apply_dsa_kernel_fusion={apply_dsa_kernel_fusion} maps to "
+            f"dsa_kernel_backend={legacy_backend!r}, but "
+            f"dsa_kernel_backend={dsa_kernel_backend!r} was also selected. "
+            "Remove apply_dsa_kernel_fusion and use dsa_kernel_backend only."
+        )
+    return legacy_backend
+
+
+def resolve_dsa_kernel_backend(
+    experimental_attention_variant: Optional[str],
+    dsa_kernel_backend: Optional[str],
+    apply_dsa_kernel_fusion: Optional[bool],
+) -> str:
+    """The ``dsa_kernel_backend`` that ``TransformerConfig.__post_init__`` resolves from the
+    raw (canonical) attention variant, backend and deprecated fusion switch, without building
+    a config (argument-time checks use it): the default when unset, then the fusion switch
+    folded in for DSv4 hybrid attention."""
+    backend = dsa_kernel_backend
+    if backend is None:
+        backend = _default_dsa_kernel_backend(
+            experimental_attention_variant, apply_dsa_kernel_fusion
+        )
+    if apply_dsa_kernel_fusion is not None and experimental_attention_variant == "dsv4_hybrid":
+        backend = _legacy_dsa_kernel_backend(backend, apply_dsa_kernel_fusion)
+    return backend
+
+
 @dataclass
 @experimental_api
 class TransformerConfig(ModelParallelConfig):
@@ -2403,11 +2449,8 @@ class TransformerConfig(ModelParallelConfig):
             )
 
         if self.dsa_kernel_backend is None:
-            self.dsa_kernel_backend = (
-                "cudnn"
-                if self.experimental_attention_variant == "dsv4_hybrid"
-                and self.apply_dsa_kernel_fusion is None
-                else "none"
+            self.dsa_kernel_backend = _default_dsa_kernel_backend(
+                self.experimental_attention_variant, self.apply_dsa_kernel_fusion
             )
 
         if self.use_transformer_engine_op_fuser and self.moe_grouped_gemm:
@@ -2648,15 +2691,9 @@ class TransformerConfig(ModelParallelConfig):
                     "instead.",
                 )
             else:
-                legacy_backend = "cudnn" if self.apply_dsa_kernel_fusion else "none"
-                if self.dsa_kernel_backend not in ("none", legacy_backend):
-                    raise ValueError(
-                        "Conflicting DSA kernel controls: "
-                        f"apply_dsa_kernel_fusion={self.apply_dsa_kernel_fusion} maps to "
-                        f"dsa_kernel_backend={legacy_backend!r}, but "
-                        f"dsa_kernel_backend={self.dsa_kernel_backend!r} was also selected. "
-                        "Remove apply_dsa_kernel_fusion and use dsa_kernel_backend only."
-                    )
+                legacy_backend = _legacy_dsa_kernel_backend(
+                    self.dsa_kernel_backend, self.apply_dsa_kernel_fusion
+                )
                 log_single_rank(
                     logger,
                     logging.WARNING,

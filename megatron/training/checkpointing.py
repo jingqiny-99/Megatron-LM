@@ -2901,6 +2901,12 @@ def load_checkpoint(
         and 'args' in state_dict
     ):
         ckpt_args = state_dict.get('args') or types.SimpleNamespace()
+        if restore_training_state and not args.finetune:
+            # The RSBF loop planner's Adam to Grace must match the saved optimizer state's
+            # layout (checked before the optimizer state dict is built for loading).
+            from megatron.training.loop_rsbf_planning import check_resume_offload
+
+            check_resume_offload(args, ckpt_args)
 
     # GTP padding was sized by the precision recipe of the run that saved the checkpoint, which
     # can differ from this run's (e.g. an MXFP8-trained checkpoint loaded for BF16 inference).
@@ -3301,6 +3307,10 @@ def load_checkpoint(
             check_training_state=restore_training_state,
         )
         if restore_training_state:
+            # Legacy formats read the args only here (before the optimizer state is loaded).
+            from megatron.training.loop_rsbf_planning import check_resume_offload
+
+            check_resume_offload(args, checkpoint_args)
             args.consumed_train_samples = getattr(checkpoint_args, 'consumed_train_samples', 0)
             args.skipped_train_samples = getattr(checkpoint_args, 'skipped_train_samples', 0)
             args.consumed_valid_samples = getattr(checkpoint_args, 'consumed_valid_samples', 0)

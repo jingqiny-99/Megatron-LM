@@ -37,6 +37,10 @@ from megatron.core.tensor_parallel.inference_layers import (
     is_inference_column_parallel_linear,
 )
 from megatron.core.transformer.enums import AttnMaskType, LayerType
+from megatron.core.transformer.experimental_attention_variant.dsa_masking import (
+    indexer_loss_padding_mask,
+    indexer_loss_padding_mask_in_scope,
+)
 from megatron.core.transformer.hyper_connection import learned_output_contract
 from megatron.core.transformer.module import MegatronModule, mark_keep_in_fp32
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
@@ -2757,6 +2761,7 @@ class MultiTokenPredictionLayer(MegatronModule):
         sequence_roll_context: Optional[MTPSequenceRollContext] = None,
         roll_depth: int = 0,
         mtp_input_mask: Optional[Tensor] = None,
+        return_rolled_padding_mask: bool = False,
     ):
         """Roll MTP inputs once and compute the next-depth token embeddings.
 
@@ -2771,6 +2776,9 @@ class MultiTokenPredictionLayer(MegatronModule):
                 in this microbatch.
             roll_depth: Zero-based prediction depth selecting the prefetched
                 successor row for this repeated roll.
+            return_rolled_padding_mask: Also return, as a seventh value, the rolled
+                full-length ``[b, s]`` padding mask before any sequence-parallel scatter
+                (None without a padding mask): the indexer-loss row mask of this depth.
         """
         cp_group = resolve_cp_group(self.cp_group, packed_seq_params)
 
@@ -2827,6 +2835,7 @@ class MultiTokenPredictionLayer(MegatronModule):
 
         if mtp_input_mask is not None:
             mtp_input_mask = rolled_tensors[next_rolled_tensor].bool()
+        rolled_padding_mask = padding_mask
         if padding_mask is not None and self.config.sequence_parallel:
             padding_mask = (
                 scatter_to_sequence_parallel_region(
@@ -2855,6 +2864,16 @@ class MultiTokenPredictionLayer(MegatronModule):
         if not hidden_states.requires_grad:
             hidden_states.requires_grad_(True)
 
+        if return_rolled_padding_mask:
+            return (
+                input_ids,
+                position_ids,
+                padding_mask,
+                mtp_input_mask,
+                decoder_input,
+                hidden_states,
+                rolled_padding_mask,
+            )
         return input_ids, position_ids, padding_mask, mtp_input_mask, decoder_input, hidden_states
 
     def _get_precomputed_embeddings(self, decoder_input: torch.Tensor, hidden_states: torch.Tensor):
@@ -2955,14 +2974,25 @@ class MultiTokenPredictionLayer(MegatronModule):
         sequence_len_offset: Optional[torch.Tensor] = None,
         packed_seq_params_by_layout: Optional[dict[CPLayout, PackedSeqParams | None]] = None,
         cp_layout_plan: Optional[THDCPLayoutPlan] = None,
+        indexer_padding_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """
         Concatenates embeddings with hidden states and then applies transformer layer forward.
+
+        ``indexer_padding_mask`` (``[b, s]`` bool, full length): when given, the transformer
+        layer runs inside ``indexer_loss_padding_mask`` of it (the depth's rolled padding mask,
+        so query rows whose input token is padding do not train its DSA indexer); None leaves
+        any enclosing scope as it is.
         """
         if self.config.sequence_parallel:
             rng_context = tensor_parallel.get_cuda_rng_tracker().fork()
         else:
             rng_context = nullcontext()
+        indexer_context = (
+            nullcontext()
+            if indexer_padding_mask is None
+            else indexer_loss_padding_mask(indexer_padding_mask)
+        )
 
         # Unlike transformer_block.py which needs to support mixed-precision in
         # different layers, currently MTP only uses a global quantization context.
@@ -2985,7 +3015,7 @@ class MultiTokenPredictionLayer(MegatronModule):
             # that when the transformer layer is cudagraphed, the
             # FP8GlobalStateManager.is_first_fp8_module() is True so that the fp8 weight caching
             # can be triggered correctly.
-            with transformer_layer_quantization_context:
+            with transformer_layer_quantization_context, indexer_context:
                 if self.mtp_layer_pattern is not None:
                     hidden_states = self.mtp_model_layer(
                         hidden_states=hidden_states,
@@ -3111,6 +3141,7 @@ class MultiTokenPredictionLayer(MegatronModule):
         sequence_len_offset: Optional[Tensor] = None,
         packed_seq_params_by_layout: Optional[dict[CPLayout, PackedSeqParams | None]] = None,
         cp_layout_plan: Optional[THDCPLayoutPlan] = None,
+        indexer_padding_mask: Optional[Tensor] = None,
     ):
         """Forward a legacy GPT MTP layer with activation recomputation.
 
@@ -3127,6 +3158,9 @@ class MultiTokenPredictionLayer(MegatronModule):
         assert (
             self.mtp_layer_pattern is None
         ), "Hybrid MTP delegates full activation recomputation to its nested HybridStack."
+        layer_kwargs = (
+            {} if indexer_padding_mask is None else {"indexer_padding_mask": indexer_padding_mask}
+        )
 
         def custom_forward(
             hidden_states,
@@ -3158,6 +3192,7 @@ class MultiTokenPredictionLayer(MegatronModule):
                 sequence_len_offset=sequence_len_offset,
                 packed_seq_params_by_layout=packed_seq_params_by_layout,
                 cp_layout_plan=cp_layout_plan,
+                **layer_kwargs,
             )
 
         # Decide the outer quantization context, matching
@@ -3254,6 +3289,7 @@ class MultiTokenPredictionLayer(MegatronModule):
                 sequence_len_offset=sequence_len_offset,
                 packed_seq_params_by_layout=packed_seq_params_by_layout,
                 cp_layout_plan=cp_layout_plan,
+                **layer_kwargs,
             )
         else:
             raise ValueError("Invalid activation recompute method.")
@@ -3312,16 +3348,16 @@ class MultiTokenPredictionLayer(MegatronModule):
             [s, b, h], and optionally the updated context tensor if cross-attention is used.
         """
         assert context is None, "multi token prediction + cross attention is not yet supported."
+        # Inside an indexer-loss row-mask scope (loop models, around the head), this depth's
+        # DSA indexers train on the rows whose rolled input token is real: the depth enters
+        # the scope with its rolled, full-length (pre-SP-scatter) padding mask. Outside any
+        # scope nothing changes.
+        layer_kwargs = {}
         if decoder_input is None:
             assert input_ids is not None and position_ids is not None
-            (
-                input_ids,
-                position_ids,
-                padding_mask,
-                mtp_input_mask,
-                decoder_input,
-                hidden_states,
-            ) = self._get_embeddings(
+            in_scope = indexer_loss_padding_mask_in_scope() is not None
+            embedding_kwargs = {"return_rolled_padding_mask": True} if in_scope else {}
+            embeddings = self._get_embeddings(
                 input_ids=input_ids,
                 position_ids=position_ids,
                 padding_mask=padding_mask,
@@ -3331,7 +3367,13 @@ class MultiTokenPredictionLayer(MegatronModule):
                 mtp_input_mask=mtp_input_mask,
                 sequence_roll_context=sequence_roll_context,
                 roll_depth=roll_depth,
+                **embedding_kwargs,
             )
+            input_ids, position_ids, padding_mask, mtp_input_mask, decoder_input, hidden_states = (
+                embeddings[:6]
+            )
+            if in_scope and embeddings[6] is not None:
+                layer_kwargs["indexer_padding_mask"] = embeddings[6]
         else:
             decoder_input, hidden_states = self._get_precomputed_embeddings(
                 decoder_input=decoder_input, hidden_states=hidden_states
@@ -3363,6 +3405,7 @@ class MultiTokenPredictionLayer(MegatronModule):
                 sequence_len_offset=sequence_len_offset,
                 packed_seq_params_by_layout=packed_seq_params_by_layout,
                 cp_layout_plan=cp_layout_plan,
+                **layer_kwargs,
             )
         else:
             hidden_states = self._proj_and_transformer_layer(
@@ -3382,6 +3425,7 @@ class MultiTokenPredictionLayer(MegatronModule):
                 sequence_len_offset=sequence_len_offset,
                 packed_seq_params_by_layout=packed_seq_params_by_layout,
                 cp_layout_plan=cp_layout_plan,
+                **layer_kwargs,
             )
 
         return hidden_states, input_ids, position_ids, padding_mask, mtp_input_mask

@@ -53,6 +53,7 @@ from megatron.training.argument_utils import (  # noqa: F401 # pylint: disable=u
     _resolve_dsa_kernel_backend_cli_default,
     _wide_residual_config_from_args,
     core_transformer_config_from_args,
+    hybrid_pattern_attention_variant,
 )
 from megatron.training.utils import (
     get_device_arch_version,
@@ -87,6 +88,7 @@ def add_megatron_arguments(parser: argparse.ArgumentParser):
     parser = _add_experimental_attention_variant_args(parser)
     parser = _add_heterogeneous_args(parser)
     parser = _add_logging_args(parser)
+    parser = _add_loop_planner_args(parser)
     parser = _add_straggler_detector_args(parser)
     parser = _add_workload_inspector_server_args(parser)
     parser = _add_inference_args(parser)
@@ -490,6 +492,232 @@ def _validate_loop_rsbf_waves(args):
         )
 
 
+def _validate_loop_exit_histogram(args):
+    """``--loop-exit-histogram-path`` needs the RSBF schedule: the eager schedule records no exit
+    histogram (its depths stay per-microbatch device tensors)."""
+    if getattr(args, 'loop_exit_histogram_path', None) is None:
+        return
+    if getattr(args, 'loop_schedule', 'standard') != 'rsbf':
+        raise ValueError(
+            '--loop-exit-histogram-path needs --loop-schedule rsbf (only the RSBF executor '
+            'records the exit-depth histogram)'
+        )
+
+
+def _validate_loop_planner(args):
+    """``--loop-planner report|apply``: a hybrid Huginn loop on the RSBF schedule; positive
+    sizes; a depth source the run has; and for ``apply``: cp = 1, the four planner-owned RSBF
+    flags left at their defaults, no user ``--optimizer-cpu-offload`` unless pinned with
+    ``--loop-planner-optimizer-offload always``, whose prerequisites must hold."""
+    mode = getattr(args, 'loop_planner', 'off')
+    if mode == 'off':
+        for flag in ('loop_planner_report_path', 'loop_planner_histogram_path'):
+            if getattr(args, flag, None) is not None:
+                raise ValueError(f"--{flag.replace('_', '-')} needs --loop-planner report or apply")
+        return
+    from megatron.core.transformer.loop.guards import is_hybrid_loop_config
+
+    if (
+        getattr(args, 'loop_schedule', 'standard') != 'rsbf'
+        or not is_hybrid_loop_config(args)
+        or getattr(args, 'loop_architecture', 'none') != 'huginn'
+    ):
+        raise ValueError(
+            '--loop-planner needs a hybrid Huginn loop (--loop-architecture huginn with '
+            '--loop-prelude-sublayers / --loop-coda-sublayers) on --loop-schedule rsbf'
+        )
+    for flag in (
+        'loop_planner_hbm_cap_gb',
+        'loop_planner_c2c_gbps',
+        'loop_planner_c2c_margin',
+        'loop_planner_act_bytes_per_token',
+    ):
+        value = getattr(args, flag, None)
+        if value is not None and not value > 0:
+            raise ValueError(f"--{flag.replace('_', '-')} must be > 0, got {value}")
+    for flag in (
+        'loop_planner_grace_gb',
+        'loop_planner_grace_margin_gb',
+        'loop_planner_ep_reserve_gb',
+    ):
+        value = getattr(args, flag, None)
+        if value is not None and value < 0:
+            raise ValueError(f"--{flag.replace('_', '-')} must be >= 0, got {value}")
+    for flag in ('loop_planner_strides', 'loop_planner_waves'):
+        values = getattr(args, flag, None) or [1]
+        if any(value < 1 for value in values):
+            raise ValueError(f"--{flag.replace('_', '-')} must be >= 1, got {values}")
+    if getattr(args, 'loop_planner_small_core_layers', 4) < 0:
+        raise ValueError('--loop-planner-small-core-layers must be >= 0')
+
+    from megatron.training.loop_rsbf_planning import (
+        LOOP_PLANNER_FIXED_DEPTHS,
+        loop_optimizer_offload_blockers,
+        loop_planner_hardware,
+        loop_planner_user_flags,
+    )
+
+    hardware = loop_planner_hardware(args)
+    if not 0 < hardware.hbm_cap_bytes <= hardware.hbm_bytes:
+        raise ValueError(
+            f'--loop-planner-hbm-cap-gb must be in (0, {hardware.hbm_bytes / 1e9:g}] on '
+            f'{hardware.name}'
+        )
+    depths = getattr(args, 'loop_planner_depths', 'config')
+    if depths == 'histogram' and getattr(args, 'loop_planner_histogram_path', None) is None:
+        raise ValueError('--loop-planner-depths histogram needs --loop-planner-histogram-path')
+    if depths != 'histogram' and getattr(args, 'loop_planner_histogram_path', None) is not None:
+        raise ValueError(
+            '--loop-planner-histogram-path is read with --loop-planner-depths histogram'
+        )
+    if depths in LOOP_PLANNER_FIXED_DEPTHS and getattr(args, 'loop_iterations', None) != 4:
+        raise ValueError(
+            f'--loop-planner-depths {depths} is an R_max = 4 setting; --loop-iterations is '
+            f"{getattr(args, 'loop_iterations', None)}"
+        )
+    if mode != 'apply':
+        return
+    if getattr(args, 'context_parallel_size', 1) > 1:
+        raise ValueError(
+            '--loop-planner apply needs --context-parallel-size 1 (a cp > 1 plan is reported '
+            'only; CP / THD is M11): use --loop-planner report'
+        )
+    user = loop_planner_user_flags(args)
+    if user:
+        raise ValueError(
+            '--loop-planner apply sets the RSBF item form, block stride, waves and D42; set by '
+            f"the user: {', '.join(user)}. Drop them, or use --loop-planner report to check them"
+        )
+    offload_mode = getattr(args, 'loop_planner_optimizer_offload', 'auto')
+    if getattr(args, 'optimizer_cpu_offload', False) and offload_mode != 'always':
+        raise ValueError(
+            '--optimizer-cpu-offload is set: under --loop-planner apply the planner decides Adam '
+            'to Grace; pin it with --loop-planner-optimizer-offload always (or drop the flag)'
+        )
+    if offload_mode == 'always':
+        blockers = loop_optimizer_offload_blockers(args, hardware)
+        if blockers:
+            raise ValueError(
+                '--loop-planner-optimizer-offload always needs Adam to Grace to be possible: '
+                + '; '.join(blockers)
+                + ' (set --use-precision-aware-optimizer, AdamW, and a Grace / host tier with '
+                '--loop-planner-grace-gb)'
+            )
+
+
+def _validate_sbhd_document_packing(args):
+    """``--sbhd-document-packing`` (whole documents per SBHD row, row-tail padding): reject the
+    options that would split documents differently, isolate documents, need THD, or let the
+    row-tail padding reach a consumer that cannot exclude it. Reads every argument with
+    ``getattr`` (stub argument namespaces in tests)."""
+    if not getattr(args, 'sbhd_document_packing', False):
+        return
+    open_rows = getattr(args, 'sbhd_packing_open_rows', 64)
+    if open_rows < 1:
+        raise ValueError(f'--sbhd-packing-open-rows must be >= 1, got {open_rows}')
+
+    def reject(option, reason):
+        raise ValueError(f'--sbhd-document-packing is incompatible with {option}: {reason}')
+
+    if getattr(args, 'sft', False):
+        reject('--sft', 'SFT uses its own (THD) packed dataset')
+    if getattr(args, 'use_varlen_dataset', False):
+        reject('--use-varlen-dataset', 'the varlen dataset has its own packing')
+    if getattr(args, 'dataloader_inter_document_masking', False):
+        reject(
+            '--dataloader-inter-document-masking',
+            'packed rows use plain causal attention (no per-document isolation)',
+        )
+    if getattr(args, 'reset_attention_mask', False):
+        reject(
+            '--reset-attention-mask',
+            'per-document attention masks contradict plain causal attention over the row',
+        )
+    if getattr(args, 'context_parallel_size', 1) > 1 or getattr(
+        args, 'dynamic_context_parallel', False
+    ):
+        reject(
+            '--context-parallel-size > 1 / --dynamic-context-parallel',
+            'packed SBHD rows run without context parallelism (THD only where cp > 1)',
+        )
+    if getattr(args, 'sequence_packing_scheduler', None) is not None:
+        reject('--sequence-packing-scheduler', 'it packs THD sequences')
+    if getattr(args, 'dataloader_defer_npy_index_mmap', False):
+        reject(
+            '--dataloader-defer-npy-index-mmap',
+            'the packed dataset length needs the packed row index',
+        )
+    if getattr(args, 'moe_expert_capacity_factor', None) is not None:
+        reject(
+            '--moe-expert-capacity-factor',
+            'padded tokens would take expert capacity (token dropping sees no padding mask)',
+        )
+    balancing = getattr(args, 'moe_router_load_balancing_type', 'aux_loss')
+    balancing = balancing if isinstance(balancing, (list, tuple)) else [balancing]
+    for kind in ('sinkhorn', 'quantile_balancing'):
+        if kind in balancing:
+            reject(
+                f'--moe-router-load-balancing-type {kind}', 'the balancer would count padded tokens'
+            )
+
+    if 'seq_aux_loss' in balancing and getattr(args, 'micro_batch_size', 1) > 1:
+        if getattr(args, 'loop_schedule', 'standard') != 'rsbf':
+            warn_rank_0(
+                '--sbhd-document-packing with seq_aux_loss and --micro-batch-size > 1 outside '
+                'the RSBF executor: rows with unequal row-tail padding share one sequence '
+                'aux-loss normalisation, so the loss is approximate (padding itself is not '
+                'counted).'
+            )
+
+    if (getattr(args, 'dsa_indexer_loss_coeff', None) or 0) > 0:
+        from megatron.core.transformer.transformer_config import resolve_dsa_kernel_backend
+
+        # The variant the model is built with: --hybrid-layer-pattern may imply it.
+        variant = hybrid_pattern_attention_variant(args) or getattr(
+            args, 'experimental_attention_variant', None
+        )
+        check_sbhd_packing_indexer_loss(
+            variant,
+            args.dsa_indexer_loss_coeff,
+            getattr(args, 'loop_architecture', 'none'),
+            resolve_dsa_kernel_backend(
+                variant,
+                getattr(args, 'dsa_kernel_backend', None),
+                getattr(args, 'apply_dsa_kernel_fusion', None),
+            ),
+        )
+
+
+def check_sbhd_packing_indexer_loss(variant, indexer_loss_coeff, loop_architecture, backend):
+    """The DSA indexer-loss rows of ``--sbhd-document-packing``: the row-tail padding must not
+    reach an indexer loss. A plain ``dsa`` indexer loss excludes padding only through THD; a
+    DSv4 indexer loss excludes it only on a loop stack (the stage-4 row mask) and only on the
+    unfused SBHD path (``dsa_kernel_backend`` 'none'). Takes the resolved variant and backend,
+    so the argument validator and the built-config backstop share it."""
+    if not (indexer_loss_coeff or 0) > 0 or variant not in ('dsa', 'dsv4_hybrid'):
+        return
+
+    def reject(option, reason):
+        raise ValueError(f'--sbhd-document-packing is incompatible with {option}: {reason}')
+
+    if variant == 'dsa':
+        reject(
+            f'a DSA indexer loss of experimental_attention_variant={variant!r}',
+            'it excludes padding only through THD packed sequences',
+        )
+    if loop_architecture == 'none':
+        reject(
+            'a DSv4 indexer loss without --loop-architecture',
+            'only loop stacks exclude the padded rows from the SBHD indexer loss',
+        )
+    if backend != 'none':
+        reject(
+            f'a DSv4 indexer loss on the fused SBHD kernels (dsa_kernel_backend '
+            f'resolves to {backend!r})',
+            'the fused SBHD indexer loss has no row mask; use --dsa-kernel-backend none',
+        )
+
+
 def validate_args(args, defaults={}):
     _normalize_dynamic_context_parallel_args(args)
     # Preserve dev's padded hash-table checkpoint shape when its legacy flag is used.
@@ -757,6 +985,8 @@ def validate_args(args, defaults={}):
         f" * gtp_weight_remat_size ({args.gtp_weight_remat_size})"
     )
     _validate_loop_rsbf_waves(args)
+    _validate_loop_exit_histogram(args)
+    _validate_loop_planner(args)
 
     # === Hybrid layer pattern: deprecation handling and validation ===
 
@@ -1964,6 +2194,8 @@ def validate_args(args, defaults={}):
             #   * Otherwise fall back to ``dp_balanced`` (static packing).
             if args.sequence_packing_scheduler is None:
                 args.sequence_packing_scheduler = 'dp_balanced'
+
+    _validate_sbhd_document_packing(args)
 
     # Packed-sequence buffer-size check. Placed after all scheduler auto-select
     # logic (dynamic-cp and --use-varlen-dataset both set the scheduler above)
@@ -3571,6 +3803,149 @@ def _add_logging_args(parser):
     return parser
 
 
+def _add_loop_planner_args(parser):
+    """The loop RSBF planner group: the planner (megatron/training/loop_rsbf_planning.py) and
+    the measured exit-depth histogram export."""
+    group = parser.add_argument_group(title='loop planner')
+    group.add_argument(
+        '--loop-exit-histogram-path',
+        type=str,
+        default=None,
+        help='Loop RSBF runs (--loop-schedule rsbf): append the realized exit-depth histogram '
+        'of every training step to this file, one JSON object per line ("counts" per depth '
+        '1..R_max, "samples", "padding_fraction", the phase geometry), written by the last '
+        'rank. The loop planner (--loop-planner-depths histogram) and the toolkit cost model '
+        '(measured_depth.py) re-run on it.',
+    )
+    group.add_argument(
+        '--loop-planner',
+        type=str,
+        default='off',
+        choices=['off', 'report', 'apply'],
+        help='RSBF planner v1 (hybrid Huginn loops with --loop-schedule rsbf), run at startup '
+        'after the model is built: it evaluates the executor options (item form and block '
+        'stride, waves, D42 coda recompute, Adam to Grace) with a memory and time model and '
+        'logs the decision table. "apply" sets the chosen --loop-rsbf-item-form, '
+        '--loop-rsbf-block-stride, --loop-rsbf-waves and --loop-rsbf-coda-recompute-mla-up-proj '
+        '(which must then be left at their defaults) and, when chosen, --optimizer-cpu-offload; '
+        '"report" only logs the plan and checks the current options.',
+    )
+    group.add_argument(
+        '--loop-planner-hardware',
+        type=str,
+        default='gb200',
+        choices=['gb200', 'h100'],
+        help='Planner hardware preset: gb200 (HBM cap 175 GB, Grace 200 GB, HybridEP reserve '
+        '20 GB, C2C 100 GB/s) or h100 (est.: HBM cap 75 GB, no Grace tier, reserve 8 GB).',
+    )
+    group.add_argument(
+        '--loop-planner-hbm-cap-gb',
+        type=float,
+        default=None,
+        help='HBM the plan may use per GPU, GB (default: the preset, 175 on gb200, 75 on h100).',
+    )
+    group.add_argument(
+        '--loop-planner-grace-gb',
+        type=float,
+        default=None,
+        help='Grace (host) memory per GPU for Adam to Grace and round-state data, GB (default: '
+        'the preset, 200 on gb200, 0 = no Grace tier on h100).',
+    )
+    group.add_argument(
+        '--loop-planner-grace-margin-gb',
+        type=float,
+        default=None,
+        help='Grace planning margin, GB (default 10): a plan using Grace leaves this much free.',
+    )
+    group.add_argument(
+        '--loop-planner-ep-reserve-gb',
+        type=float,
+        default=None,
+        help='HBM reserved for NCCL / HybridEP buffers, GB (default: the preset, 20 / 8).',
+    )
+    group.add_argument(
+        '--loop-planner-c2c-gbps',
+        type=float,
+        default=None,
+        help='Sustained GPU <-> Grace (host) rate, GB/s (default: the preset, 100 / 50).',
+    )
+    group.add_argument(
+        '--loop-planner-c2c-margin',
+        type=float,
+        default=None,
+        help='Headroom factor on the C2C rate a plan may need (default 1.25).',
+    )
+    group.add_argument(
+        '--loop-planner-strides',
+        type=int,
+        nargs='+',
+        default=[1, 2, 3, 4, 6, 9, 18],
+        help='Block-checkpoint strides the planner considers, in core LAYERS (attention + FFN '
+        'pairs; applied as 2 x s core sublayers).',
+    )
+    group.add_argument(
+        '--loop-planner-waves',
+        type=int,
+        nargs='+',
+        default=[1, 2, 4, 8],
+        help='Wave counts the planner considers (kept when they divide the samples and the '
+        'microbatches per EU).',
+    )
+    group.add_argument(
+        '--loop-planner-depths',
+        type=str,
+        default='config',
+        choices=['config', 'histogram', 'r4_geom', 'r4_unif', 'r4_skew'],
+        help='Exit-depth distribution the planner simulates: the exit criterion\'s (config), '
+        'a measured exit histogram (--loop-planner-histogram-path) or an R_max = 4 setting.',
+    )
+    group.add_argument(
+        '--loop-planner-histogram-path',
+        type=str,
+        default=None,
+        help='Exit-histogram file (--loop-exit-histogram-path of an earlier run) for '
+        '--loop-planner-depths histogram.',
+    )
+    group.add_argument(
+        '--loop-planner-act-bytes-per-token',
+        type=float,
+        default=None,
+        help='Saved activation bytes per token of one layer (default: the cost model\'s '
+        'Pro-width estimate scaled to the model\'s dimensions).',
+    )
+    group.add_argument(
+        '--loop-planner-optimizer-offload',
+        type=str,
+        default='auto',
+        choices=['auto', 'never', 'always'],
+        help='Adam to Grace (optimizer CPU offload): auto = a planner option when the hardware '
+        'has a Grace tier and --use-precision-aware-optimizer with AdamW is set; never; always '
+        '= only options with it.',
+    )
+    group.add_argument(
+        '--loop-planner-forms',
+        type=str,
+        default='d28',
+        choices=['d28', 'nested', 'planner'],
+        help='Item forms the applied plan may use: d28 = the whole round on small cores '
+        '(--loop-planner-small-core-layers), the full menu above; nested = the nested item; '
+        'planner = the full menu.',
+    )
+    group.add_argument(
+        '--loop-planner-small-core-layers',
+        type=int,
+        default=4,
+        help='Core layers up to which the d28 form policy applies the whole round.',
+    )
+    group.add_argument(
+        '--loop-planner-report-path',
+        type=str,
+        default=None,
+        help='Write the plan with every evaluated option as JSON to this file (rank 0).',
+    )
+    return parser
+
+
 def _add_regularization_args(parser):
     group = parser.add_argument_group(title='regularization')
 
@@ -4769,6 +5144,22 @@ def _add_data_args(parser):
         help='Return cu_seqlens marking document boundaries '
         'within each sample so that attention is restricted '
         'to individual documents.',
+    )
+    group.add_argument(
+        '--sbhd-document-packing',
+        action='store_true',
+        help='GPT / hybrid dataset path of pretrain_hybrid.py: pack whole documents into each '
+        'SBHD row (a document that fits is never split across rows; a longer one is cut into '
+        'sequence-length windows as without packing). Rows carry a row-tail padding mask that '
+        'the loss, the MoE router statistics and aux losses, the DSA indexer loss and the loop '
+        'exit criterion exclude; attention stays plain causal over the row. Rows count as '
+        'samples. Context parallelism (THD) is not supported.',
+    )
+    group.add_argument(
+        '--sbhd-packing-open-rows',
+        type=int,
+        default=64,
+        help='First-fit window of open rows of --sbhd-document-packing (1 = next fit).',
     )
     group.add_argument(
         '--eod-mask-loss', action='store_true', help='Mask loss for the end of document tokens.'

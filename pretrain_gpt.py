@@ -546,6 +546,9 @@ def train_valid_test_datasets_provider(train_val_test_num_samples, vp_stage=None
         train_val_test_num_samples : A list containing the number of samples in train test and validation.
     """
     args = get_args()
+    if getattr(args, "sbhd_document_packing", False):
+        # This entry's get_batch does not carry the row-tail padding mask to the model.
+        raise ValueError("--sbhd-document-packing is wired for pretrain_hybrid.py only")
 
     config = core_gpt_dataset_config_from_args(args)
 

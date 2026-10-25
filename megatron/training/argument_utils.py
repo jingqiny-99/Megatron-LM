@@ -332,6 +332,32 @@ def _resolve_dsa_kernel_backend_cli_default(args, kw_args):
         kw_args['dsa_kernel_backend'] = 'none'
 
 
+def hybrid_pattern_attention_variant(args) -> Optional[str]:
+    """The ``experimental_attention_variant`` that ``--hybrid-layer-pattern`` implies, or None
+    when the pattern implies none (or is unset): DSv4 C/H/W symbols give ``dsv4_hybrid`` (an
+    explicit different variant raises); without an explicit variant, a DSA symbol gives ``dsa``
+    and a KDA symbol ``kda``. ``core_transformer_config_from_args`` builds the config with it,
+    and argument-time checks use it to see the variant the model will run."""
+    pattern = getattr(args, 'hybrid_layer_pattern', None)
+    if pattern is None:
+        return None
+    from megatron.core.models.hybrid.hybrid_layer_allocation import Symbols
+
+    variant = getattr(args, 'experimental_attention_variant', None)
+    if any(symbol in pattern for symbol in (Symbols.WINDOW, Symbols.CSA, Symbols.HCA)):
+        if variant not in (None, 'dsv4_hybrid'):
+            raise ValueError(
+                "Hybrid C/H/W attention requires experimental_attention_variant='dsv4_hybrid', "
+                f"got {variant!r} for pattern {pattern!r}."
+            )
+        return 'dsv4_hybrid'
+    if variant is None and Symbols.DS_ATTENTION in pattern:
+        return 'dsa'
+    if variant is None and Symbols.KDA in pattern:
+        return 'kda'
+    return None
+
+
 def _mfsdp_v2_disables_pipeline_output_dealloc(args) -> bool:
     """Whether the pipeline-output pseudo-free must stay disabled for ``args``.
 
@@ -530,24 +556,10 @@ def core_transformer_config_from_args(args, config_class=None):
         kw_args['cp_comm_type'] = args.cp_comm_type[0]
     if args.hybrid_layer_pattern is not None:
         kw_args['is_hybrid_model'] = True
-        from megatron.core.models.hybrid.hybrid_layer_allocation import Symbols
-
         pattern = args.hybrid_layer_pattern
-        has_dsv4_attention = any(
-            symbol in pattern for symbol in (Symbols.WINDOW, Symbols.CSA, Symbols.HCA)
-        )
-        variant = getattr(args, 'experimental_attention_variant', None)
-        if has_dsv4_attention:
-            if variant not in (None, 'dsv4_hybrid'):
-                raise ValueError(
-                    "Hybrid C/H/W attention requires experimental_attention_variant='dsv4_hybrid', "
-                    f"got {variant!r} for pattern {pattern!r}."
-                )
-            kw_args['experimental_attention_variant'] = 'dsv4_hybrid'
-        elif variant is None and Symbols.DS_ATTENTION in pattern:
-            kw_args['experimental_attention_variant'] = 'dsa'
-        elif variant is None and Symbols.KDA in pattern:
-            kw_args['experimental_attention_variant'] = 'kda'
+        inferred_variant = hybrid_pattern_attention_variant(args)
+        if inferred_variant is not None:
+            kw_args['experimental_attention_variant'] = inferred_variant
 
         from megatron.training.models.deepseek_v4 import normalize_dsv4_hybrid_csa_compress_ratios
 
