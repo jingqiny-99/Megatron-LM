@@ -36,6 +36,7 @@ from megatron.core.transformer.loop.guards import (
     is_block_boundary,
     rsbf_item_form_violations,
 )
+from megatron.core.transformer.loop.param_store_binding import named_logical_parameters
 from megatron.core.utils import get_attr_wrapped_model
 
 if TYPE_CHECKING:
@@ -873,15 +874,26 @@ class LoopProgram:
             return []
         return _coda_dsv4_attentions(self.hybrid, self.stack)
 
+    @property
+    def param_store(self):
+        """The loop parameter store installed on the model (``loop/param_store.py``), or None."""
+        # Lazy: the store imports this module.
+        from megatron.core.transformer.loop.param_store import find_param_store
+
+        return find_param_store(self.hybrid)
+
     def core_parameter_overlap(self) -> list[str]:
         """Names of parameters used by more than one core sublayer (none for the patterns the
         loop builds). The block and nested items rely on this: each core parameter then gets
-        one gradient addition per item in every form."""
+        one gradient addition per item in every form. A parameter store's hidden compute
+        parameters are included (``named_logical_parameters``)."""
         stack, roles = self.stack, self.roles
         owners: dict = {}
         names: dict = {}
         for index in range(roles.core_start, roles.core_end):
-            for name, param in stack.layers[index].named_parameters(prefix=f"layers.{index}"):
+            for name, param in named_logical_parameters(
+                stack.layers[index], prefix=f"layers.{index}"
+            ):
                 owners.setdefault(id(param), set()).add(index)
                 names.setdefault(id(param), name)
         return sorted(names[key] for key, layers in owners.items() if len(layers) > 1)

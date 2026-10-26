@@ -10,11 +10,13 @@ capacity and its planning margin, C2C), the planner enumerates the executor's op
   without the D42 coda up-projection recompute (``+rc``);
 * waves ``w`` dividing ``n`` and the microbatches per step;
 * the planner moves in order (``-``, ``A`` Adam to Grace, ``AE`` + prelude / coda / MTP dense
-  groups to the Layer window, ``AEM`` + embedding and head Resident with sharded grads); the
-  round-state data (state store and block-input stash) always goes to the free HBM first, then
-  Grace (the partial "states to Grace" spill);
-* the dense layout: ``resident`` (every dense group Resident, what runs today) or
-  ``layer_window`` (the core dense group in the Layer window, M3: the cost model's world);
+  groups to the Layer window, ``AEM`` + embedding and head Resident with sharded grads; with
+  the M3 parameter store also ``E`` and ``EM`` without Adam to Grace, so the dense moves are
+  reachable where Grace is not, e.g. on H100); the round-state data (state store and
+  block-input stash) always goes to the free HBM first, then Grace (the partial "states to
+  Grace" spill);
+* the dense layout: ``resident`` (every dense group Resident) or ``layer_window`` (the core
+  dense group in the Layer window, the parameter store of M3);
 
 evaluates each with a memory model and a time model ported from the toolkit cost model (the
 schedule simulator of ``planner_sched``, the terms of ``planner_costs``), and keeps the fitting
@@ -24,8 +26,12 @@ picks: the **target** (every option, M3 capabilities assumed), the **raw** pick 
 options this run can apply, and the **applied** pick, the raw menu filtered by the form policy
 (D28: the whole round on small cores). ``apply_plan_to_config`` sets the item form, stride,
 waves and D42 on the model config; Adam to Grace is the trainer's
-(``LoopRSBFPlan.optimizer_offload``); the other moves are reported as requested but unavailable
-until M3.
+(``LoopRSBFPlan.optimizer_offload``); the dense layout and the moves E / M are the parameter
+store's modes (``option_store_modes``, ``apply_plan_to_store``) when the run has a store
+(``PlannerCapabilities.layer_window``), else they are reported as requested but unavailable.
+With a store the memory model takes the store's runtime terms
+(``ModelShape.store_terms``: its window slots, scratch pool, shards, transients and the
+replicated rest, per option) instead of the cost model's dense terms.
 
 Exit depths: the config's distribution (``sampled`` / ``fixed``), the plan's R_max = 4 settings
 (``R4_GEOM``, ``R4_UNIF``, ``R4_SKEW``) or the **measured** histogram that training writes per
@@ -48,6 +54,7 @@ from dataclasses import dataclass
 from typing import Any, Dict, List, Literal, Mapping, Optional, Sequence, Tuple
 
 from megatron.core.transformer.loop import planner_costs as costs
+from megatron.core.transformer.loop.param_store import ResidencyMode, StoreModes, store_variant_key
 from megatron.core.transformer.loop.planner_costs import (
     GB,
     ModelShape,
@@ -61,6 +68,8 @@ logger = logging.getLogger(__name__)
 
 __all__ = [
     "EXIT_HISTOGRAM_FORMAT",
+    "MOVE_STEPS",
+    "STORE_MOVE_STEPS",
     "DepthDistribution",
     "LoopRSBFPlan",
     "LoopRSBFPlanner",
@@ -75,10 +84,14 @@ __all__ = [
     "R4_SKEW",
     "R4_UNIF",
     "apply_plan_to_config",
+    "apply_plan_to_store",
     "executor_nested_rebuild_fraction",
     "format_decision_table",
     "log_decision_table",
     "option_item_form",
+    "option_store_key",
+    "option_store_modes",
+    "store_planner_variants",
 ]
 
 # The "format" field of every line of an exit-histogram file (megatron/training/
@@ -375,7 +388,9 @@ class PhaseGeometry:
     the cost model); ``lockstep_eus``: EUs in lockstep (``z``; None: ``EP / cp``, the cost model;
     the trainer passes ``W``: the executor's lockstep unit is the whole domain);
     ``microbatches_per_step``: per EU, waves must divide it (None: ``n``);
-    ``waves_allowed``: False under a batch-size schedule (waves stay 1)."""
+    ``waves_allowed``: False under a batch-size schedule (waves stay 1); ``shard_axis``: the
+    parameter store's shard axis ``z`` (the dense Layer-window gathers, the Resident sync and
+    the replicate group; None: the domain, the cost model's)."""
 
     seq_length: int
     gpus: int
@@ -390,6 +405,7 @@ class PhaseGeometry:
     graphs: Literal["full", "partial", "eager"] = "full"
     ep_overlap: Literal["raw", "two_chunk"] = "two_chunk"
     waves_allowed: bool = True
+    shard_axis: Optional[int] = None
 
     @property
     def eus(self) -> int:
@@ -413,7 +429,10 @@ class PhaseGeometry:
 
     @property
     def dense_axis(self) -> int:
-        """The dense shard axis / Resident sync group: the domain's GPUs (all GPUs: one)."""
+        """The dense shard axis / Resident sync group: the parameter store's ``z`` when set,
+        else the domain's GPUs (all GPUs: one domain)."""
+        if self.shard_axis is not None:
+            return self.shard_axis
         return self.domain_gpus if self.domain_gpus is not None else self.gpus
 
     @property
@@ -455,6 +474,13 @@ class PhaseGeometry:
                 problems.append(f"the EP group must fit a domain of {self.domain_gpus} GPUs")
             elif self.domain_eus < W and (W % self.domain_eus or self.domain_eus % self.lockstep):
                 problems.append(f"{W} EUs do not split into domains of {self.domain_eus}")
+        if self.shard_axis is not None:
+            domain = self.domain_gpus if self.domain_gpus is not None else self.gpus
+            if self.shard_axis < 1 or domain % self.shard_axis:
+                problems.append(
+                    f"the shard axis z = {self.shard_axis} does not divide a domain of "
+                    f"{domain} GPUs"
+                )
         if problems:
             raise PlannerUnsupported("planner v1 cannot model this phase: " + "; ".join(problems))
 
@@ -487,7 +513,7 @@ class PlannerOption:
     regather: bool
     coda_recompute: bool
     waves: int
-    moves: Literal["-", "A", "AE", "AEM"]
+    moves: Literal["-", "A", "E", "EM", "AE", "AEM"]
     layout: Literal["resident", "layer_window"]
 
     @property
@@ -600,6 +626,58 @@ class OptionResult:
         )
 
 
+# The move steps: the cost model's cumulative list, and the steps a run with the parameter store
+# offers (E and EM without Adam to Grace, D-S6-17); "fewest moves first" is their order.
+MOVE_STEPS = ("-", "A", "AE", "AEM")
+STORE_MOVE_STEPS = ("-", "A", "E", "EM", "AE", "AEM")
+
+
+def option_store_modes(option: PlannerOption) -> StoreModes:
+    """The parameter store's modes of ``option``: the ``layer_window`` layout puts the core
+    dense group in the Layer window (``resident``: Resident); move ``E`` puts the prelude, coda
+    and MTP dense groups in the Layer window, kept to their item's backward (one gather per
+    edge unit per item, what the cost model charges); move ``M`` gives the embedding and head
+    sharded gradients; a re-gathered block (``r``) re-gathers the core units for the backward.
+    Adam to Grace (``A``) is not a store mode."""
+    lw, rsg, res = (
+        ResidencyMode.LAYER_WINDOW,
+        ResidencyMode.RESIDENT_SHARDED_GRADS,
+        ResidencyMode.RESIDENT,
+    )
+    edges = lw if "E" in option.moves else res
+    return StoreModes(
+        core=lw if option.layout == "layer_window" else res,
+        prelude=edges,
+        coda=edges,
+        mtp=edges,
+        emb_head=rsg if "M" in option.moves else res,
+        core_regather=bool(option.regather),
+        edge_regather=False,
+    )
+
+
+def option_store_key(option: PlannerOption, core_layers: int) -> str:
+    """The ``store_variant_key`` of ``option`` (its store modes and core item plan)."""
+    form, stride = option_item_form(option, core_layers)
+    return store_variant_key(option_store_modes(option), form, stride)
+
+
+def store_planner_variants(
+    options: Sequence[PlannerOption], core_layers: int
+) -> List[Tuple[StoreModes, str, Optional[int]]]:
+    """The distinct ``(modes, item_form, block_stride)`` of ``options`` (what
+    ``LoopParamStore.planner_terms`` evaluates for ``ModelShape.store_terms``)."""
+    out, seen = [], set()
+    for option in options:
+        form, stride = option_item_form(option, core_layers)
+        modes = option_store_modes(option)
+        key = store_variant_key(modes, form, stride)
+        if key not in seen:
+            seen.add(key)
+            out.append((modes, form, stride))
+    return out
+
+
 class PlannerNoFit(RuntimeError):
     """No applicable option fits; ``table`` holds every evaluated option."""
 
@@ -661,6 +739,10 @@ class LoopRSBFPlan:
             "loop_rsbf_coda_recompute_mla_up_proj": self.coda_recompute,
         }
 
+    def store_modes(self) -> StoreModes:
+        """The parameter store's modes of the applied option (``option_store_modes``)."""
+        return option_store_modes(self.applied.option)
+
     def to_json(self) -> dict:
         """The plan, its inputs and every evaluated option, JSON-ready."""
         return dict(
@@ -676,6 +758,7 @@ class LoopRSBFPlan:
             form_policy=self.form_policy,
             core_layers=self.core_layers,
             config_overrides=self.config_overrides(),
+            store_modes=self.store_modes().describe(),
             optimizer_offload=self.optimizer_offload,
             applied=self.applied.to_json(),
             raw=None if self.raw is None else self.raw.to_json(),
@@ -735,7 +818,9 @@ class LoopRSBFPlanner:
             whole round, added when ``L_core <= max(strides)`` and missing, and always under
             ``form_policy = "d28"`` on a core of at most ``small_core_layers``).
         waves: wave counts (kept when they divide ``n`` and the microbatches).
-        move_steps: the cumulative move steps (the resident layout offers ``-`` / ``A`` only).
+        move_steps: the move steps (``MOVE_STEPS``, the cost model's cumulative list; with the
+            parameter store also ``E`` / ``EM``, ``STORE_MOVE_STEPS``); the resident layout
+            offers ``-`` / ``A`` only.
         layouts: dense layouts to evaluate (None: ``resident`` and ``layer_window``).
         peak_trials: memory peaks over trials, ``max`` (the plan's physical rule) or ``avg``.
         trials: simulation trials (None: 2 if ``W <= 256`` else 1).
@@ -758,7 +843,7 @@ class LoopRSBFPlanner:
         capabilities: PlannerCapabilities = PlannerCapabilities(),
         strides_layers: Sequence[int] = (1, 2, 3, 4, 6, 9, 18),
         waves: Sequence[int] = (1, 2, 4, 8),
-        move_steps: Sequence[str] = ("-", "A", "AE", "AEM"),
+        move_steps: Sequence[str] = MOVE_STEPS,
         layouts: Optional[Sequence[str]] = None,
         peak_trials: Literal["max", "avg"] = "max",
         trials: Optional[int] = None,
@@ -776,7 +861,7 @@ class LoopRSBFPlanner:
         if peak_trials not in ("max", "avg"):
             raise ValueError(f"unknown peak rule {peak_trials!r}")
         for step in move_steps:
-            if step not in ("-", "A", "AE", "AEM"):
+            if step not in STORE_MOVE_STEPS:
                 raise ValueError(f"unknown move step {step!r}")
         layouts = ("resident", "layer_window") if layouts is None else tuple(layouts)
         for layout in layouts:
@@ -961,7 +1046,7 @@ class LoopRSBFPlanner:
         if block:
             mkw.update(block_stride=s, block_window=not regather, coda_rc=rc)
 
-        def place(code, res):
+        def place(code, res, terms):
             comps, adam_grace = costs.memory_components(
                 shape,
                 ph,
@@ -970,6 +1055,7 @@ class LoopRSBFPlanner:
                 adam_on_grace="A" in code,
                 edges_mode="Layer window" if "E" in code else "Resident",
                 emb_mode="Resident + sharded grads" if "M" in code else "Resident",
+                store_terms=terms,
                 **mkw,
             )
             need = (res["peak_sr"] + 1) * per_sr if block else 0.0
@@ -978,6 +1064,9 @@ class LoopRSBFPlanner:
         ideal = flops = None
         results = []
         for code in steps:
+            terms, store_refusal = self._store_terms(
+                PlannerOption(form, s, regather, rc, w, code, layout)
+            )
             cs = 0.0
             it = 0
             while True:
@@ -999,7 +1088,7 @@ class LoopRSBFPlanner:
                     sr_track=srk,
                     **skw,
                 )
-                comps, pl = place(code, res)
+                comps, pl = place(code, res, terms)
                 if pl.share <= cs + 1e-4 or it >= 6:
                     break
                 if it == 0 and not pl.mem_ok and pl.deficit > self.prune_gb * GB:
@@ -1064,9 +1153,25 @@ class LoopRSBFPlanner:
                     c2c_ok,
                     cs,
                     it,
+                    store_refusal=store_refusal,
                 )
             )
         return results
+
+    def _store_terms(self, option: PlannerOption) -> Tuple[Any, Optional[str]]:
+        """``(terms, refusal)``: the parameter store's runtime memory terms of ``option`` from
+        ``shape.store_terms`` (None without a store: the cost model's terms), or None and the
+        reason when the store cannot run the option (its variant is missing or was refused)."""
+        table = self.shape.store_terms
+        if table is None:
+            return None, None
+        key = option_store_key(option, self.shape.core_layers)
+        terms = table.get(key)
+        if terms is None:
+            return None, f"no parameter store terms for {key}"
+        if isinstance(terms, str):
+            return None, terms
+        return terms, None
 
     def _result(
         self,
@@ -1088,6 +1193,8 @@ class LoopRSBFPlanner:
         c2c_ok,
         charged,
         iterations,
+        *,
+        store_refusal: Optional[str] = None,
     ) -> OptionResult:
         hw = self.hardware
         caps = self.capabilities
@@ -1139,6 +1246,8 @@ class LoopRSBFPlanner:
                 refusals.append(f"needs Adam to Grace (excluded: {caps.optimizer_offload_reason})")
             elif name == "coda_recompute":
                 refusals.append("needs D42 (not available)")
+        if store_refusal is not None:
+            refusals.append(store_refusal)
         return OptionResult(
             option=option,
             hbm_bytes=pl.hbm,
@@ -1166,7 +1275,7 @@ class LoopRSBFPlanner:
             policy=pol,
             fits=fits,
             refusals=tuple(refusals),
-            applicable=not missing,
+            applicable=not missing and store_refusal is None,
             missing=tuple(missing),
         )
 
@@ -1279,7 +1388,16 @@ class LoopRSBFPlanner:
                 self.sched_policy,
                 self.rebuild_fraction,
             ],
-            choice=[item_form, stride, o.waves, o.coda_recompute, o.moves, o.layout],
+            choice=[
+                item_form,
+                stride,
+                o.waves,
+                o.coda_recompute,
+                o.moves,
+                o.layout,
+                o.regather,
+                option_store_modes(o).describe(),
+            ],
             mfu=repr(applied.mfu),
         )
         digest = hashlib.sha256(
@@ -1317,6 +1435,13 @@ class LoopRSBFPlanner:
             notes.append("not offered: r variants and moves E / M (layout resident only)")
         elif not self.capabilities.layer_window:
             notes.append("layer_window options: target only (Layer window, M3)")
+        elif any(step in self.move_steps for step in ("E", "EM")):
+            notes.append(
+                "parameter store: moves E / EM offered without Adam to Grace; memory from the "
+                "store's runtime terms"
+                if self.shape.store_terms is not None
+                else "parameter store: moves E / EM offered without Adam to Grace"
+            )
         if self.shape.core_layers < 2:
             notes.append("not offered: nested at L_core < 2")
         if not self.shape.has_coda_dsv4_attention:
@@ -1370,6 +1495,22 @@ def apply_plan_to_config(config: Any, plan: LoopRSBFPlan) -> Dict[str, Any]:
             setattr(config, name, value)
         raise
     return overrides
+
+
+def apply_plan_to_store(store: Any, plan: LoopRSBFPlan, *, core_plan: Any) -> StoreModes:
+    """Set the plan's dense layout and moves E / M as the parameter store's modes
+    (``store.configure_modes(plan.store_modes(), core_plan=...)``; ``core_plan``: the core
+    backward plan of the applied item form, ``build_core_plan`` of the config after
+    ``apply_plan_to_config``). Between steps only (a rerun at a phase start re-applies it).
+    Raises ``PlannerUnsupported`` for a plan computed without the store's capability."""
+    if not plan.capabilities.layer_window:
+        raise PlannerUnsupported(
+            "the plan was computed without the parameter store (capabilities.layer_window "
+            "False); its dense layout is the resident one the store already runs"
+        )
+    modes = plan.store_modes()
+    store.configure_modes(modes, core_plan=core_plan)
+    return modes
 
 
 # ----------------------------------------------------------------------------- reporting
@@ -1470,6 +1611,8 @@ def format_decision_table(plan: LoopRSBFPlan, *, top: int = 12) -> str:
         )
     for item in plan.unavailable:
         lines.append(f"  requested but unavailable: {item}")
+    if caps.layer_window:
+        lines.append(f"  store modes: {plan.store_modes().describe()}")
     lines.append(
         f"  plan: loop_rsbf_item_form={plan.item_form} loop_rsbf_block_stride={plan.block_stride} "
         f"loop_rsbf_waves={plan.waves} coda_recompute={'on' if plan.coda_recompute else 'off'} "

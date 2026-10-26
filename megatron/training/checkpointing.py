@@ -726,6 +726,12 @@ def save_checkpoint(
     start_ckpt = time()
     args = get_args()
 
+    if getattr(args, "loop_param_store_shard_size", 1) > 1:
+        # M3c backstop (argument validation refuses --save with the store first).
+        from megatron.training.loop_param_store_setup import check_loop_param_store_checkpoint
+
+        check_loop_param_store_checkpoint(model, "save_checkpoint")
+
     # Keep the safety invariant even when arguments came through a validation path that does not
     # perform the flat CLI cross-check, or were mutated after startup.
     optimizer_config = getattr(optimizer, "config", None) if optimizer is not None else None
@@ -2830,6 +2836,12 @@ def load_checkpoint(
     args = get_args()
     load_dir = getattr(args, load_arg)
     loading_pretrained_checkpoint = False
+
+    if getattr(args, "loop_param_store_shard_size", 1) > 1:
+        # M3c backstop (argument validation refuses --load with the store first).
+        from megatron.training.loop_param_store_setup import check_loop_param_store_checkpoint
+
+        check_loop_param_store_checkpoint(ddp_model, "load_checkpoint")
 
     # --freeze-all-layers: nothing trains, so load the model in --load weights-only (finetune-style)
     # and auto-resume the data position by feeding this run's own progress tracker -- written to

@@ -41,7 +41,13 @@ the same plan digest.
   set on the model's config (``apply_plan_to_config``: the object the RSBF program and executor
   read when the first step builds them) and mirrored into ``args``; Adam to Grace in the applied
   option sets ``optimizer_cpu_offload`` (``optimizer_offload_fraction`` 1) before the optimizer
-  is built. The other planner moves are reported as requested but unavailable (M3).
+  is built. With the loop parameter store (``--loop-param-store-shard-size`` > 1) the dense
+  layout and the moves E (prelude / coda / MTP dense groups to the Layer window) and M
+  (embedding and head to Resident + sharded grads) are applicable: the plan's store modes are
+  set on the store (``apply_plan_to_store``), the move steps gain ``E`` / ``EM`` without Adam to
+  Grace (H100 has no Grace tier), the dense shard axis is the store's ``z`` and the memory
+  model takes the store's runtime terms per option (``loop_planner_with_store_terms``).
+  Without a store those moves are reported as requested but unavailable.
   ``check_resume_offload`` refuses a resume whose planned optimizer offload differs from the
   checkpoint's (the optimizer state layout differs).
 * ``report``: logs the plan and whether the current config's option fits; changes nothing.
@@ -52,6 +58,7 @@ model's cached executor dropped (``LoopRSBFSchedule.invalidate``) so the next st
 The session lives in this module, not on ``args`` (checkpoints pickle ``args``).
 """
 
+import dataclasses
 import json
 import logging
 import math
@@ -62,11 +69,14 @@ from typing import Any, List, Mapping, Optional, Sequence
 import torch
 
 from megatron.core.num_microbatches_calculator import get_current_running_global_batch_size
+from megatron.core.transformer.loop.param_store import ResidencyMode, find_param_store
 from megatron.core.transformer.loop.planner import (
     EXIT_HISTOGRAM_FORMAT,
+    MOVE_STEPS,
     R4_GEOM,
     R4_SKEW,
     R4_UNIF,
+    STORE_MOVE_STEPS,
     DepthDistribution,
     LoopRSBFPlan,
     LoopRSBFPlanner,
@@ -76,9 +86,11 @@ from megatron.core.transformer.loop.planner import (
     PlannerNoFit,
     PlannerUnsupported,
     apply_plan_to_config,
+    apply_plan_to_store,
     executor_nested_rebuild_fraction,
     format_decision_table,
     option_item_form,
+    store_planner_variants,
 )
 from megatron.core.transformer.loop.planner_costs import GB, ModelShape
 from megatron.core.utils import get_attr_wrapped_model, get_model_config
@@ -98,13 +110,18 @@ __all__ = [
     "loop_exit_histogram_phase",
     "loop_exit_histogram_scalars",
     "loop_optimizer_offload_blockers",
+    "loop_planner_auto_core_mode",
+    "loop_planner_auto_core_options",
     "loop_planner_capabilities",
     "loop_planner_current_option",
     "loop_planner_depths",
     "loop_planner_hardware",
+    "loop_planner_move_steps",
     "loop_planner_phase",
     "loop_planner_shape",
+    "loop_planner_store_option",
     "loop_planner_user_flags",
+    "loop_planner_with_store_terms",
     "make_loop_planner",
     "plan_loop_rsbf",
     "record_loop_exit_histogram",
@@ -376,6 +393,7 @@ def loop_planner_phase(args) -> PhaseGeometry:
         or getattr(args, "decrease_batch_size_if_needed", False)
         or getattr(args, "rampup_batch_size", None) is not None
     )
+    store_z = int(getattr(args, "loop_param_store_shard_size", 1) or 1)
     return PhaseGeometry(
         seq_length=args.seq_length,
         gpus=gpus,
@@ -389,6 +407,7 @@ def loop_planner_phase(args) -> PhaseGeometry:
         graphs="eager",
         ep_overlap="raw",
         waves_allowed=not changing_batch,
+        shard_axis=store_z if store_z > 1 else None,
     )
 
 
@@ -485,9 +504,11 @@ def loop_planner_capabilities(
     hardware: Optional[PlannerHardware] = None,
     shape: Optional[ModelShape] = None,
 ) -> PlannerCapabilities:
-    """What this run can apply: the resident layout only (no Layer window, no Grace tier for
-    round-state data: M3 / M6a); D42 when the model (else ``shape``) has a DSv4 attention in
-    the coda or the MTP layers; Adam to Grace per ``--loop-planner-optimizer-offload``
+    """What this run can apply: the Layer window (core and edge dense groups, moves E / M,
+    re-gathered blocks) when the model holds a loop parameter store (else, without a model,
+    when ``--loop-param-store-shard-size`` > 1), the resident layout only otherwise; no Grace
+    tier for round-state data (M6a); D42 when the model (else ``shape``) has a DSv4 attention
+    in the coda or the MTP layers; Adam to Grace per ``--loop-planner-optimizer-offload``
     (``auto``: when ``loop_optimizer_offload_blockers`` finds nothing, else excluded with those
     reasons; ``never``; ``always``: the menu is restricted to options with it)."""
     hardware = loop_planner_hardware(args) if hardware is None else hardware
@@ -501,10 +522,12 @@ def loop_planner_capabilities(
         offload, reason = not blockers, "; ".join(blockers)
     if module is not None:
         coda = _coda_recompute_available(module)
+        layer_window = find_param_store(module) is not None
     else:
         coda = shape is not None and shape.has_coda_dsv4_attention
+        layer_window = int(getattr(args, "loop_param_store_shard_size", 1) or 1) > 1
     return PlannerCapabilities(
-        layer_window=False,
+        layer_window=layer_window,
         grace_state_tier=False,
         optimizer_offload=offload,
         coda_recompute=coda,
@@ -512,20 +535,74 @@ def loop_planner_capabilities(
     )
 
 
+def loop_planner_move_steps(
+    args, hardware: PlannerHardware, capabilities: PlannerCapabilities
+) -> tuple:
+    """The move steps of the runtime menu. Without a parameter store: the cost model's
+    cumulative ``-, A, AE, AEM`` (``--loop-planner-optimizer-offload always``: the A steps).
+    With a store (``capabilities.layer_window``): ``-, A, E, EM, AE, AEM`` (E and M reachable
+    without Adam to Grace, D-S6-17), minus the A steps when Adam to Grace cannot run here
+    (``loop_optimizer_offload_blockers``), minus ``-`` / ``E`` / ``EM`` under ``always``."""
+    always = getattr(args, "loop_planner_optimizer_offload", "auto") == "always"
+    if not capabilities.layer_window:
+        return tuple(s for s in MOVE_STEPS if "A" in s) if always else MOVE_STEPS
+    steps = list(STORE_MOVE_STEPS)
+    if always:
+        steps = [s for s in steps if "A" in s]
+    elif loop_optimizer_offload_blockers(args, hardware):
+        steps = [s for s in steps if "A" not in s]
+    return tuple(steps)
+
+
+def loop_planner_with_store_terms(
+    shape: ModelShape, planner: LoopRSBFPlanner, phase: PhaseGeometry, module: Any
+) -> ModelShape:
+    """``shape`` with the parameter store's runtime memory terms of every option of
+    ``planner``'s menu (``LoopParamStore.planner_terms``; one host simulation per distinct
+    modes / item form), or ``shape`` unchanged without a store."""
+    store = find_param_store(module)
+    if store is None:
+        return shape
+    variants = store_planner_variants(planner.options(phase), shape.core_layers)
+    return dataclasses.replace(shape, store_terms=store.planner_terms(variants))
+
+
+def loop_planner_store_option(modes: Any) -> Optional[tuple]:
+    """``(layout, moves without A, regather)`` of the planner option whose store modes are
+    ``modes`` (``option_store_modes``' inverse), or None when no option maps to them (a group
+    in a mode the planner does not offer, e.g. edges in Resident + sharded grads)."""
+    lw, rsg, res = (
+        ResidencyMode.LAYER_WINDOW,
+        ResidencyMode.RESIDENT_SHARDED_GRADS,
+        ResidencyMode.RESIDENT,
+    )
+    edges = {modes.prelude, modes.coda, modes.mtp}
+    if len(edges) != 1 or modes.core not in (lw, res) or modes.edge_regather:
+        return None
+    edge = edges.pop()
+    if edge not in (lw, res) or modes.emb_head not in (rsg, res):
+        return None
+    moves = ("E" if edge is lw else "") + ("M" if modes.emb_head is rsg else "")
+    if moves == "M":
+        return None  # M is offered only with E
+    layout = "layer_window" if modes.core is lw else "resident"
+    if layout == "resident" and (moves or modes.core_regather):
+        return None
+    return layout, moves, bool(modes.core_regather)
+
+
 def make_loop_planner(
     args, shape: ModelShape, hardware: PlannerHardware, capabilities: PlannerCapabilities
 ) -> LoopRSBFPlanner:
     """The runtime planner: the CLI's strides / waves / form policy, the executor's schedule
-    policy and nested rebuild; ``--loop-planner-optimizer-offload always`` keeps only the move
-    steps with Adam to Grace."""
-    always = getattr(args, "loop_planner_optimizer_offload", "auto") == "always"
+    policy and nested rebuild, and the move steps (``loop_planner_move_steps``)."""
     return LoopRSBFPlanner(
         shape,
         hardware,
         capabilities=capabilities,
         strides_layers=tuple(getattr(args, "loop_planner_strides", None) or (1, 2, 3, 4, 6, 9, 18)),
         waves=tuple(getattr(args, "loop_planner_waves", None) or (1, 2, 4, 8)),
-        move_steps=("A", "AE", "AEM") if always else ("-", "A", "AE", "AEM"),
+        move_steps=loop_planner_move_steps(args, hardware, capabilities),
         form_policy=getattr(args, "loop_planner_forms", "d28"),
         small_core_layers=getattr(args, "loop_planner_small_core_layers", 4),
         sched_policy="executor",
@@ -534,20 +611,33 @@ def make_loop_planner(
 
 
 def loop_planner_current_option(
-    plan: LoopRSBFPlan, config: Any, *, optimizer_offload: bool
+    plan: LoopRSBFPlan, config: Any, *, optimizer_offload: bool, store_modes: Any = None
 ) -> tuple:
     """``(result, message)``: the decision-table row of the config's current (item form,
-    stride, waves, D42) with this run's optimizer offload in the resident layout (None when the
-    planner's menu has no such option), and a one-line verdict for the log."""
+    stride, waves, D42) with this run's optimizer offload, in the resident layout or, with a
+    parameter store, in the layout / moves / re-gather of its configured ``store_modes``
+    (None when the planner's menu has no such option), and a one-line verdict for the log."""
     form = getattr(config, "loop_rsbf_item_form", "whole_round")
     stride = getattr(config, "loop_rsbf_block_stride", None)
     waves = getattr(config, "loop_rsbf_waves", 1)
     coda = bool(getattr(config, "loop_rsbf_coda_recompute_mla_up_proj", False))
-    moves = "A" if optimizer_offload else "-"
+    layout, dense_moves, regather = "resident", "", False
+    if store_modes is not None:
+        mapped = loop_planner_store_option(store_modes)
+        if mapped is None:
+            return None, (
+                f"loop planner (report): the store modes {store_modes.describe()} are not a "
+                "planner option (edges and the core in Resident or the Layer window, the "
+                "embedding / head Resident or with sharded grads only with the edges windowed)"
+            )
+        layout, dense_moves, regather = mapped
+    moves = ("A" if optimizer_offload else "") + dense_moves or "-"
     label = (
         f"item form {form} stride {stride} waves {waves} D42 {'on' if coda else 'off'} "
         f"moves {moves}"
     )
+    if store_modes is not None:
+        label += f" layout {layout}" + (" re-gathered" if regather else "")
     match = None
     for result in plan.table:
         o = result.option
@@ -556,7 +646,8 @@ def loop_planner_current_option(
             and o.waves == waves
             and o.coda_recompute == coda
             and o.moves == moves
-            and o.layout == "resident"
+            and o.layout == layout
+            and bool(o.regather) == regather
         ):
             match = result
             break
@@ -575,6 +666,90 @@ def loop_planner_current_option(
     else:
         verdict = "does not fit: " + "; ".join(match.refusals or ("refused",))
     return match, f"loop planner (report): the current option ({label}) {verdict}"
+
+
+def loop_planner_auto_core_options(args, model: Any) -> tuple:
+    """``(resident, layer_window, hardware)``: the planner's evaluation (``OptionResult``, None
+    when the menu has no such option) of the run's own item form, stride, waves, D42 and Adam
+    to Grace with the core dense group Resident and in the Layer window (edges and the
+    embedding / head Resident, no re-gather), under ``--loop-planner-hardware`` and its caps,
+    with the parameter store's runtime terms. Raises ``PlannerUnsupported`` / ``ValueError``
+    when the planner cannot model the run."""
+    models = list(model) if isinstance(model, (list, tuple)) else [model]
+    module = models[0]
+    config = get_model_config(module)
+    form = getattr(config, "loop_rsbf_item_form", "whole_round")
+    stride = getattr(config, "loop_rsbf_block_stride", None)
+    waves = getattr(config, "loop_rsbf_waves", 1)
+    coda = bool(getattr(config, "loop_rsbf_coda_recompute_mla_up_proj", False))
+    offload = bool(getattr(args, "optimizer_cpu_offload", False))
+    hardware = loop_planner_hardware(args)
+    shape = loop_planner_shape(args, module)
+    core_layers = shape.core_layers
+    if form == "block":
+        if stride is None or stride % 2:
+            raise PlannerUnsupported(f"block stride {stride} is not whole layers")
+        strides = (stride // 2,)
+    else:
+        strides = (core_layers,)
+    capabilities = loop_planner_capabilities(args, module, hardware=hardware, shape=shape)
+    phase = loop_planner_phase(args)
+    depth = loop_planner_depths(args, config)
+
+    def planner_of(shape_):
+        return LoopRSBFPlanner(
+            shape_,
+            hardware,
+            capabilities=capabilities,
+            strides_layers=strides,
+            waves=(waves,),
+            move_steps=("A",) if offload else ("-",),
+            form_policy="planner",
+            sched_policy="executor",
+            rebuild_fraction=executor_nested_rebuild_fraction(core_layers),
+        )
+
+    planner = planner_of(shape)
+    planner = planner_of(loop_planner_with_store_terms(shape, planner, phase, module))
+    results = planner.evaluate(phase, depth)
+
+    def pick(layout):
+        for result in results:
+            o = result.option
+            if (
+                option_item_form(o, core_layers) == (form, stride)
+                and o.waves == waves
+                and o.coda_recompute == coda
+                and o.layout == layout
+                and not o.regather
+            ):
+                return result
+        return None
+
+    return pick("resident"), pick("layer_window"), hardware
+
+
+def loop_planner_auto_core_mode(args, model: Any) -> tuple:
+    """``(core mode, reason)`` of ``--loop-param-store-modes auto``
+    (``loop_planner_auto_core_options``): core Layer window when the Resident option does not
+    fit, else Resident; Resident with the reason when the planner cannot model the run."""
+    resident, window = ResidencyMode.RESIDENT, ResidencyMode.LAYER_WINDOW
+    try:
+        res, lw, hardware = loop_planner_auto_core_options(args, model)
+    except (PlannerUnsupported, PlannerNoFit, ValueError) as error:
+        return resident, f"core Resident (the planner cannot model this run: {error})"
+    cap = f"HBM cap {hardware.hbm_cap_bytes / GB:.1f} GB on {hardware.name}"
+    if res is None:
+        return resident, f"core Resident (the run's option is not in the planner's menu, {cap})"
+    if res.fits:
+        return resident, f"core Resident fits ({res.hbm_bytes / GB:.2f} GB, {cap})"
+    why = "; ".join(res.refusals) or "does not fit"
+    if lw is not None and lw.fits:
+        return window, (
+            f"core Resident does not fit ({why}); core Layer window fits "
+            f"({lw.hbm_bytes / GB:.2f} GB, {cap})"
+        )
+    return window, f"core Resident does not fit ({why}); core Layer window, smaller ({cap})"
 
 
 def _check_plan_digest(digest: str) -> None:
@@ -655,6 +830,10 @@ class LoopPlannerSession:
         phase = loop_planner_phase(args)
         depth = loop_planner_depths(args, config)
         planner = make_loop_planner(args, shape, hardware, capabilities)
+        if capabilities.layer_window:
+            # The store's runtime memory terms of every option of the menu.
+            shape = loop_planner_with_store_terms(shape, planner, phase, module)
+            planner = make_loop_planner(args, shape, hardware, capabilities)
         try:
             plan = planner.plan(phase, depth)
         except PlannerNoFit as error:
@@ -668,13 +847,23 @@ class LoopPlannerSession:
             self._apply(args, module, config, plan, rerun=rerun)
             self.applied = True
         else:
+            store = find_param_store(module)
             current, message = loop_planner_current_option(
-                plan, config, optimizer_offload=bool(getattr(args, "optimizer_cpu_offload", False))
+                plan,
+                config,
+                optimizer_offload=bool(getattr(args, "optimizer_cpu_offload", False)),
+                store_modes=None if store is None else store.modes,
             )
             if current is not None and current.fits and current.applicable:
                 print_rank_0(message)
             else:
                 warn_rank_0(message)
+            if store is not None:
+                print_rank_0(
+                    "loop planner (report): store modes "
+                    f"{'unset' if store.modes is None else store.modes.describe()}; the plan's "
+                    f"{plan.store_modes().describe()}"
+                )
         self.phase, self.plan = phase, plan
         return plan
 
@@ -715,6 +904,15 @@ class LoopPlannerSession:
         for name, value in overrides.items():
             setattr(args, name, value)
         _validate_loop_rsbf_waves(args)
+        store = find_param_store(module)
+        store_text = ""
+        if store is not None:
+            from megatron.core.transformer.loop.program import build_core_plan
+
+            modes = apply_plan_to_store(
+                store, plan, core_plan=build_core_plan(stack.config, stack.loop_roles)
+            )
+            store_text = f" store_modes={modes.describe()}"
         if plan.optimizer_offload and not offload:
             # Adam to Grace: the hybrid device optimizer with every optimizer state on the host.
             args.optimizer_cpu_offload = True
@@ -726,6 +924,7 @@ class LoopPlannerSession:
             "loop planner: applied "
             + " ".join(f"{name}={value}" for name, value in overrides.items())
             + f" optimizer_cpu_offload={bool(getattr(args, 'optimizer_cpu_offload', False))}"
+            + store_text
         )
 
 

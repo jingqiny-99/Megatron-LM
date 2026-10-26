@@ -120,6 +120,31 @@ stays alive past the detach); the alltoall dispatcher clears it. Values are unaf
 above its entry baseline (``ExecutorStats.memory``), the quantities of the arena rule (one
 sublayer live in a sweep, one block in a block item, one block plus the layer stash in a
 nested item).
+
+The loop parameter store (``loop/param_store.py``, installed on the model before the DDP wrap):
+the dense weights live as canonical shards on the shard axis of the domain and are bound per
+residency mode. The executor then
+
+* takes the domain from the store (``store.groups.domain``: the full data-distribution group of
+  the GTP-remat grid, checked against the collection's ``dp_gtp_remat`` / ``dp``);
+* brackets the waves with ``store.begin_step()`` / ``store.end_step()`` (Resident copies
+  gathered and accumulators zeroed once, the Resident reduce-scatters once, before finalize;
+  ``abort_step`` when a step raises);
+* runs every sub-round inside ``store.subround(type, real=..., lookahead=...)`` (``lookahead``:
+  the type of the next sub-round of the same plan step list, so its first gather is prefetched
+  or the boundary unit carried; none across ``_execute`` calls);
+* splits every backward item per segment (``cells``' ``segments``: one autograd backward per
+  sublayer, adapter, embedding call and head, inside ``store.backward_segment``), so the store
+  can bind each unit's gradient target before its backward and reduce-scatter it right after,
+  in every mode (the split is bitwise with the joint backward);
+* runs a null in every sub-round (dense models included): ``run_null`` walks the sub-round's
+  segment ops with ``store.null_visitor(type)`` around the lockstep MoE calls of each segment,
+  so the store's gathers and reduce-scatters are issued regardless of item validity, in the
+  same order as a real item's on every rank.
+
+The forward visits themselves come from the model (``LoopHybridStack._run_range`` / ``_adapt``,
+``HybridModel.embed`` / ``head_loss``), so sweeps need no change. Without a store every path is
+the stage-5 one op for op.
 """
 
 import contextlib
@@ -146,8 +171,13 @@ from megatron.core.transformer.forward_replay import (
 )
 from megatron.core.transformer.loop import flops
 from megatron.core.transformer.loop.dispatcher import LoopSampleDispatcher, RSBFGroups
-from megatron.core.transformer.loop.guards import validate_rsbf_config, validate_rsbf_data_parallel
+from megatron.core.transformer.loop.guards import (
+    validate_param_store_config,
+    validate_rsbf_config,
+    validate_rsbf_data_parallel,
+)
 from megatron.core.transformer.loop.null_items import LockstepPlan, build_lockstep_plan, run_null
+from megatron.core.transformer.loop.param_store import LoopParamStore, find_param_store
 from megatron.core.transformer.loop.program import (
     CHAIN_PORTS,
     MOVE_PORTS,
@@ -545,7 +575,13 @@ class LoopRSBFExecutor:
         measure_memory: record every cell call's allocator peak and retained bytes above its
             entry baseline in ``ExecutorStats.memory`` (debug, CUDA only: a device
             synchronize and a peak reset around every call).
+        param_store: the model's loop parameter store (default: the one installed on the
+            program's model, ``find_param_store``; None without one). Its modes must be
+            configured (``configure_modes``) for the program's core plan before the first step.
     """
+
+    # The model's loop parameter store (None without one; set by the constructor).
+    param_store: Optional[LoopParamStore] = None
 
     def __init__(
         self,
@@ -566,11 +602,15 @@ class LoopRSBFExecutor:
         verify_stash: bool = False,
         sweep_detach: str = "sublayer",
         measure_memory: bool = False,
+        param_store: Optional[LoopParamStore] = None,
     ):
         if pg_collection is None:
             raise ValueError("LoopRSBFExecutor needs a process group collection")
         config = program.config
         validate_rsbf_config(config)
+        self.param_store = param_store if param_store is not None else program.param_store
+        if self.param_store is not None:
+            validate_param_store_config(config, self.param_store.config)
         if measure_memory and program.device.type != "cuda":
             raise ValueError("measure_memory reads the CUDA caching allocator")
         self.program = program
@@ -643,13 +683,45 @@ class LoopRSBFExecutor:
     # The domain
     # -----------------------------------------------------------------------------------
 
-    def _setup_domain(self) -> LoopSampleDispatcher:
-        """The dispatcher of this step's domain (``pg_collection.dp``), rebuilt when the groups
-        change; one all-rank warm-up exchange per new multi-EU dispatcher."""
+    def _domain_groups(self) -> RSBFGroups:
+        """The step's domain: ``pg_collection.dp``, or with a parameter store the store's
+        domain (the full data-distribution group, which must have the ranks of the
+        collection's ``dp_gtp_remat``, else of its ``dp``; the collection's ``dp`` is the
+        replicate group under the GTP-remat grid)."""
         dp = getattr(self.pg_collection, "dp", None)
-        groups = self.groups if self.groups is not None else RSBFGroups(domain=dp)
-        if groups.domain is not dp:
-            raise ValueError(UNSUPPORTED + "an RSBF domain group other than pg_collection.dp")
+        store = self.param_store
+        if store is None:
+            groups = self.groups if self.groups is not None else RSBFGroups(domain=dp)
+            if groups.domain is not dp:
+                raise ValueError(UNSUPPORTED + "an RSBF domain group other than pg_collection.dp")
+            return groups
+        domain = store.groups.domain
+        ranks = sorted(dist.get_process_group_ranks(domain))
+        full = getattr(self.pg_collection, "dp_gtp_remat", None) or dp
+        given = None if self.groups is None else self.groups.domain
+        for name, group in (
+            ("pg_collection's full data-parallel group", full),
+            ("RSBFGroups", given),
+        ):
+            if group is None or group is domain:
+                continue
+            if sorted(dist.get_process_group_ranks(group)) != ranks:
+                raise ValueError(
+                    UNSUPPORTED + f"the parameter store's domain {ranks} differs from the {name} "
+                    f"{sorted(dist.get_process_group_ranks(group))}"
+                )
+        if full is None and len(ranks) > 1:
+            raise ValueError(
+                UNSUPPORTED + f"a parameter store over a {len(ranks)}-rank domain without a "
+                "data-parallel group in pg_collection"
+            )
+        status = None if self.groups is None else self.groups.status
+        return RSBFGroups(domain=domain, status=status)
+
+    def _setup_domain(self) -> LoopSampleDispatcher:
+        """The dispatcher of this step's domain (``_domain_groups``), rebuilt when the groups
+        change; one all-rank warm-up exchange per new multi-EU dispatcher."""
+        groups = self._domain_groups()
         key = (groups.domain, groups.status, self.move_transport)
         if self.dispatcher is None or self._dispatcher_key != key:
             dispatcher = LoopSampleDispatcher(
@@ -700,6 +772,9 @@ class LoopRSBFExecutor:
         entries)."""
         program, config = self.program, self.config
         validate_rsbf_data_parallel(model)
+        store = self.param_store
+        if store is not None:
+            self._check_store(model)
         if num_microbatches < 1:
             raise ValueError(f"an RSBF step needs at least one microbatch, got {num_microbatches}")
         if num_microbatches % self.waves:
@@ -729,8 +804,12 @@ class LoopRSBFExecutor:
         reports = []
         microbatch = 0
         batch_rows = micro_batch_size
+        stepping = False
         try:
             with lockstep.observing(record_calls=self.check_lockstep):
+                if store is not None:
+                    store.begin_step()
+                    stepping = True
                 for wave in range(self.waves):
                     samples, batches = [], []
                     for _ in range(per_wave):
@@ -751,6 +830,15 @@ class LoopRSBFExecutor:
                         reports += self._run_wave(
                             wave, samples, batches, iteration=iteration, rows=batch_rows
                         )
+                if store is not None:
+                    # Once per step, after the last wave: the Resident reduce-scatters, then
+                    # the side streams joined (before _end_of_step and finalize).
+                    store.end_step()
+                    stepping = False
+        except BaseException:
+            if stepping:
+                store.abort_step()
+            raise
         finally:
             # The samples hold the batch and the loss function (which may hold the model).
             self._samples = self._chain = self._records = None
@@ -770,6 +858,26 @@ class LoopRSBFExecutor:
                 force_all_reduce=force_all_reduce,
             )
         return reports
+
+    def _check_store(self, model: nn.Module) -> None:
+        """Every step (host only): the store's rules with the model's DDP config, and modes
+        configured for the program's core plan (the CORE-B schedule must follow the items'
+        plan; the modes may change between steps)."""
+        store = self.param_store
+        validate_param_store_config(self.config, store.config, getattr(model, "ddp_config", None))
+        if store.modes is None:
+            raise ValueError(
+                "configure the parameter store's modes (LoopParamStore.configure_modes) before "
+                "the first RSBF step"
+            )
+        if store.core_plan != self.program.uniform_core_plan:
+            raise ValueError(
+                f"the parameter store's modes were configured for the core plan "
+                f"{store.core_plan}, the program runs {self.program.uniform_core_plan} "
+                "(configure_modes(..., core_plan=program.uniform_core_plan))"
+            )
+        if self.program.hybrid is not store.hybrid:
+            raise ValueError("the parameter store belongs to another model than the program's")
 
     def _end_of_step(self, dispatcher: LoopSampleDispatcher) -> Tensor:
         """The one end-of-step read: every EU's after-exit count, plan mismatches and report
@@ -1117,36 +1225,33 @@ class LoopRSBFExecutor:
     # Plan steps
     # -----------------------------------------------------------------------------------
 
+    @staticmethod
+    def _next_subround_type(steps: Sequence, index: int) -> Optional[SubRoundType]:
+        """The type of the first ``SubRound`` after ``steps[index]`` (the store's lookahead),
+        or None past the end of this step list."""
+        for step in steps[index + 1 :]:
+            if isinstance(step, SubRound):
+                return step.type
+        return None
+
     def _execute(self, steps: Sequence) -> None:
         eu = self.dispatcher.eu
-        for step in steps:
+        store = self.param_store
+        for index, step in enumerate(steps):
             if isinstance(step, SubRound):
                 item = step.items[eu]
-                if item is None:
-                    self._run_null(step.type)
-                    continue
-                if self.check_lockstep:
-                    self.lockstep.begin_item()
-                measured = self._memory_begin() if self.measure_memory else None
-                if item.kind == "prelude_sweep":
-                    self._prelude_sweep(item.sample)
-                elif item.kind == "core_sweep":
-                    self._core_sweep(item.sample, item.round)
-                elif item.kind == "coda":
-                    self._coda_item(item.sample, item.round)
-                elif item.kind == "core":
-                    self._core_item(item.sample, item.round)
-                else:
-                    self._prelude_item(item.sample)
-                if measured is not None:
-                    self._memory_end(measured, item.kind, item.sample, item.round)
-                if self.check_lockstep:
-                    self.lockstep.end_item(
+                context = contextlib.nullcontext()
+                if store is not None:
+                    context = store.subround(
                         step.type,
-                        f"{item.kind}(sample {item.sample}, round {item.round})",
-                        core_plan=self.program.uniform_core_plan,
-                        core_start=self.program.roles.core_start,
+                        real=item is not None,
+                        lookahead=self._next_subround_type(steps, index),
                     )
+                with context:
+                    if item is None:
+                        self._run_null(step.type)
+                    else:
+                        self._run_item(step, item)
             elif isinstance(step, MovePhase):
                 self._run_move_phase(step)
             elif isinstance(step, FreeInjection):
@@ -1154,6 +1259,31 @@ class LoopRSBFExecutor:
                     self.store.free_injection(step.sample)
             else:  # pragma: no cover - the planner emits nothing else
                 raise TypeError(f"unknown plan step {step!r}")
+
+    def _run_item(self, step: SubRound, item) -> None:
+        """This EU's item of a sub-round (the cell call of its kind)."""
+        if self.check_lockstep:
+            self.lockstep.begin_item()
+        measured = self._memory_begin() if self.measure_memory else None
+        if item.kind == "prelude_sweep":
+            self._prelude_sweep(item.sample)
+        elif item.kind == "core_sweep":
+            self._core_sweep(item.sample, item.round)
+        elif item.kind == "coda":
+            self._coda_item(item.sample, item.round)
+        elif item.kind == "core":
+            self._core_item(item.sample, item.round)
+        else:
+            self._prelude_item(item.sample)
+        if measured is not None:
+            self._memory_end(measured, item.kind, item.sample, item.round)
+        if self.check_lockstep:
+            self.lockstep.end_item(
+                step.type,
+                f"{item.kind}(sample {item.sample}, round {item.round})",
+                core_plan=self.program.uniform_core_plan,
+                core_start=self.program.roles.core_start,
+            )
 
     def _memory_begin(self) -> int:
         """``measure_memory``: synchronize, reset the allocator peak; the baseline bytes."""
@@ -1185,12 +1315,32 @@ class LoopRSBFExecutor:
         assumes it), so every EU sweeps its home samples' preludes in the wave's first
         PRELUDE-F sub-rounds before any null: the planner's PRELUDE-F nulls (unequal home
         counts) are not reachable through the executor, and a null without a layer context
-        means that contract was broken."""
-        if not self.lockstep.by_type[kind_type]:
+        means that contract was broken.
+
+        With a parameter store a null always runs (dense models included): it walks the
+        sub-round's segment ops with the store's null visitor (``run_null(store_visitor=...)``),
+        interleaving the store's gathers / reduce-scatters with the type's MoE calls exactly as
+        a real item does."""
+        store = self.param_store
+        entries = self.lockstep.by_type[kind_type]
+        if not entries and store is None:
             return
         ctx = next(
             (sample.ctx for sample in self._samples.values() if sample.ctx is not None), None
         )
+        if not entries:
+            # The store's events only (no MoE call needs a layer context).
+            visitor = store.null_visitor(kind_type)
+            run_null(
+                self.lockstep,
+                kind_type,
+                outer_context=contextlib.nullcontext(),
+                inner_context=lambda *_: contextlib.nullcontext(),
+                sequence=self._sequence,
+                device=self.device,
+                store_visitor=visitor,
+            )
+            return
         if ctx is None:
             raise ValueError(
                 f"a {kind_type.value} null item on EU {self.dispatcher.eu} before any of its "
@@ -1208,6 +1358,7 @@ class LoopRSBFExecutor:
             # CORE-B nulls follow the items' (uniform) backward plan.
             core_plan=self.program.uniform_core_plan,
             core_start=self.program.roles.core_start,
+            store_visitor=None if store is None else store.null_visitor(kind_type),
         )
 
     def _run_move_phase(self, phase: MovePhase) -> None:
@@ -1515,8 +1666,14 @@ class LoopRSBFExecutor:
         state = store.take_state(g, depth) if self.check_recompute else store.get_state(g, depth)
         leaf = state.detach().requires_grad_()
         with torch.profiler.record_function(label), torch.enable_grad():
-            out = self.program.coda(leaf, sample)
-            torch.autograd.backward(self._grad_scale(out.loss))
+            if self.param_store is None:
+                out = self.program.coda(leaf, sample)
+                torch.autograd.backward(self._grad_scale(out.loss))
+            else:
+                segments = []
+                out = self.program.coda(leaf, sample, segments=segments)
+                # The head segment's output is the loss; the coda sublayers follow in reverse.
+                self._backward_segments(segments, [self._grad_scale(out.loss)], [None])
         report = out.report
         if self.num_eus > 1:
             report = self._checked_report(report)
@@ -1597,6 +1754,7 @@ class LoopRSBFExecutor:
                 name = label + (
                     "/phase=recompute" if whole else f"/block={block.start}/phase=recompute"
                 )
+                segments = None if self.param_store is None else []
                 with recompute_context(name):
                     out = program.core(
                         leaf,
@@ -1609,6 +1767,7 @@ class LoopRSBFExecutor:
                         depth=depth,
                         block=block,
                         trace=trace,
+                        segments=segments,
                     )
                 if check:
                     for offset, actual in enumerate(trace):
@@ -1637,8 +1796,11 @@ class LoopRSBFExecutor:
                     # keep the block's attached auxiliary losses if it ever does not.
                     outputs.append(out)
                     grads.append(torch.zeros_like(out) if grad is None else grad)
-                torch.autograd.backward(outputs, grads)
-                del out, outputs, grads
+                if segments is None:
+                    torch.autograd.backward(outputs, grads)
+                else:
+                    self._backward_segments(segments, outputs, grads)
+                del out, outputs, grads, segments
                 # dL/d(block input), complete: the block input feeds this block only.
                 grad = None if leaf is None else leaf.grad
                 if block.input_source == "block_stash" and not check:
@@ -1668,6 +1830,26 @@ class LoopRSBFExecutor:
             expected_state=previous if check else None,
             loss_record=record.loss_record,
         )
+
+    def _backward_segments(self, segments: list, outputs: list, grads: list) -> None:
+        """Back-propagate an item's segments (``(SegmentKey, leaf, out)`` from the cells) one by
+        one in reverse, each inside the parameter store's ``backward_segment``: the last
+        segment from the item's ``outputs`` / ``grads`` (the epilogue's outputs, the loss), every
+        earlier one from its output with the gradient the next segment left on its leaf (zeros
+        when none arrived: the store's backward op still runs, as a null's does)."""
+        store = self.param_store
+        last = len(segments) - 1
+        grad = None
+        for position in range(last, -1, -1):
+            seg, leaf, out = segments[position]
+            if position == last:
+                seg_outputs, seg_grads = outputs, grads
+            else:
+                seg_outputs = [out]
+                seg_grads = [torch.zeros_like(out) if grad is None else grad]
+            with store.backward_segment(seg):
+                torch.autograd.backward(seg_outputs, seg_grads)
+            grad = None if leaf is None else leaf.grad
 
     def _rebuild(
         self,
@@ -1778,17 +1960,21 @@ class LoopRSBFExecutor:
         sample = self._samples[g]
         record = self._chain.pop(g)
         label = self._log_item(BackwardItem(ItemKind.PRELUDE, g, 0))
+        segments = None if self.param_store is None else []
         with torch.profiler.record_function(label), torch.enable_grad():
             with recompute_context(label + "/phase=recompute"):
-                prelude = self.program.prelude(sample, phase=LoopPhase.RECOMPUTE)
+                prelude = self.program.prelude(sample, phase=LoopPhase.RECOMPUTE, segments=segments)
             if self.check_recompute:
                 self._check_equal(prelude.injection, self.store.get_injection(g), f"e[{g}]")
             outputs, grads = [prelude.injection], [record.grad_injection]
             if record.grad_crit is not None and prelude.crit_state is not None:
                 outputs.append(prelude.crit_state)
                 grads.append(record.grad_crit)
-            torch.autograd.backward(outputs, grads)
-        del prelude
+            if segments is None:
+                torch.autograd.backward(outputs, grads)
+            else:
+                self._backward_segments(segments, outputs, grads)
+        del prelude, segments
         self.store.free_injection(g)
         self._work("prelude_item", g, 0)
         loss = record.loss_record
@@ -2149,7 +2335,11 @@ class LoopRSBFSchedule:
                 f"loop_schedule='rsbf' needs forward_step_func.{RSBF_BATCH_FUNC_ATTR} (the "
                 "microbatch of forward_step without the model call)"
             )
-        groups = RSBFGroups(domain=getattr(pg_collection, "dp", None), status=self._status_group)
+        # With a parameter store the domain is the store's (the full data-distribution group of
+        # the GTP-remat grid; the collection's dp is the replicate group there).
+        store = find_param_store(model)
+        domain = store.groups.domain if store is not None else getattr(pg_collection, "dp", None)
+        groups = RSBFGroups(domain=domain, status=self._status_group)
         executor = self.executor_for(model, pg_collection, exit_criterion, groups)
         if config.timers is not None:
             config.timers('forward-backward', log_level=1).start(

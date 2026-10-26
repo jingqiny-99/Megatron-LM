@@ -1,5 +1,6 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
+import functools
 import logging
 from contextlib import nullcontext
 from typing import Literal, Optional
@@ -60,6 +61,25 @@ def _hybrid_logging_pg_kwargs(pg_collection: ProcessGroupCollection) -> dict:
     if tp_group is None:
         return {}
     return {'tp_group': tp_group, 'dp_cp_group': dp_cp_group}
+
+
+def _loop_store_visit(kind: str):
+    """Run the decorated ``HybridModel`` stage inside the loop parameter store's visit of segment
+    ``kind`` when a store is installed on the model (``_loop_store_hook``, set by
+    ``LoopParamStore.install``); without one the stage runs unchanged."""
+
+    def decorate(method):
+        @functools.wraps(method)
+        def wrapper(self, *args, **kwargs):
+            hook = getattr(self, "_loop_store_hook", None)
+            if hook is None:
+                return method(self, *args, **kwargs)
+            with hook.visit(kind):
+                return method(self, *args, **kwargs)
+
+        return wrapper
+
+    return decorate
 
 
 def _get_hash_moe_layer_threshold(main_pattern: str | None, n_hash_layers: int) -> int:
@@ -776,7 +796,11 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
                     f"padding_mask shape {padding_mask.shape} does not match "
                     f"input_ids shape {input_ids.shape}"
                 )
-            decoder_input = self.embedding(input_ids=input_ids, position_ids=position_ids)
+            # The loop parameter store binds the embedding around its lookup (only here: a
+            # given decoder_input reads no weight).
+            hook = getattr(self, "_loop_store_hook", None)
+            with nullcontext() if hook is None else hook.visit("embed"):
+                decoder_input = self.embedding(input_ids=input_ids, position_ids=position_ids)
 
             # Clear the outputs for padding tokens when using dynamic batching with
             # quantization scales to avoid corrupting amax calculations
@@ -915,6 +939,7 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
 
         return rotary_pos_emb
 
+    @_loop_store_visit("head")
     def head_loss(
         self,
         hidden_states: Tensor,
@@ -950,6 +975,9 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
             inference_params: Deprecated alias of ``inference_context``, forwarded to MTP as
                 given.
             Other arguments are those of ``forward``.
+
+        With a loop parameter store the whole head runs inside the store's head visit (the
+        output layer, the MTP block and its embedding lookup).
 
         Returns:
             The loss when ``labels`` are given on a post-process stage, the ``[b, s, v]``

@@ -297,6 +297,8 @@ def build_local_loop_model(
     coda=2,
     position_embedding_type="none",
     moe_layer=None,
+    share_embeddings_and_output_weights=False,
+    vocab_size=VOCAB,
     **overrides,
 ):
     """A ``HybridModel`` of local layers (``pattern`` may carry an MTP part after '/'), on the
@@ -312,10 +314,11 @@ def build_local_loop_model(
         hybrid_stack_spec=local_model_spec(
             module, hyper_connections=config.enable_mhc_connections, moe_layer=moe_layer
         ),
-        vocab_size=VOCAB,
+        vocab_size=vocab_size,
         max_sequence_length=SEQ,
         hybrid_layer_pattern=pattern,
         position_embedding_type=position_embedding_type,
+        share_embeddings_and_output_weights=share_embeddings_and_output_weights,
     )
     return model.to(device())
 

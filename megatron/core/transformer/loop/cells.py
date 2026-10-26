@@ -22,6 +22,18 @@ graph dropped; items: fresh leaves, graph kept). The one exception is
 ``CoreRound.forward_detached``, whose contract is sweep mode: it drops the graph at every
 sublayer boundary (same ops, same order as the attached round), so at most one sublayer's
 saved activations are alive, and it captures sublayer inputs for the block-checkpoint stash.
+
+Segments (the loop parameter store, ``loop/param_store.py``). With a ``segments`` list the item
+calls (``PreludeCell`` with ``RECOMPUTE``, ``CoreRound`` per block, ``CodaHeadCell``) run every
+sublayer from a fresh leaf (``out_prev.detach().requires_grad_()``; the first leaf is the call's
+input leaf) and append one ``(SegmentKey, leaf, out)`` per segment: the embedding call (with the
+stack expansion; no leaf), the adapter (no leaf: its inputs are the executor's leaves), each
+sublayer, the head (``_finalize_forward``, ``head_loss`` and the loss function on a leaf of the
+last coda sublayer's output). The values are those of the unsegmented call op for op (the same
+``_run_range`` calls on detached copies); the executor back-propagates the segments one by one in
+reverse (one autograd call per segment). The store's segment visits themselves happen in the
+model's code (``LoopHybridStack._run_range`` / ``_adapt``, ``HybridModel.embed`` /
+``head_loss``), so the sweeps and the eager forward visit identically.
 """
 
 import dataclasses
@@ -36,6 +48,7 @@ from megatron.core.transformer.experimental_attention_variant.dsa_masking import
     indexer_loss_padding_mask,
 )
 from megatron.core.transformer.loop.guards import validate_hybrid_loop_inputs
+from megatron.core.transformer.loop.param_store_schedule import SegmentKey
 from megatron.core.transformer.loop.program import (
     CODA_PORTS,
     CORE_PORTS,
@@ -104,20 +117,27 @@ class PreludeCell:
     def __init__(self, program: LoopProgram):
         self.program = program
 
-    def __call__(self, sample: SampleInputs, *, phase: LoopPhase) -> PreludeOutputs:
+    def __call__(
+        self, sample: SampleInputs, *, phase: LoopPhase, segments: Optional[list] = None
+    ) -> PreludeOutputs:
         """Run the prelude for ``sample``.
 
         ``SWEEP`` builds and stores the sample's activation-free metadata (decoder padding
         mask, hash token IDs, rotary embedding, layer context) and ``crit_0``. ``RECOMPUTE``
         (the PRELUDE backward item) re-embeds, re-expands (discarding the new context: the
         sweep's is reused, as an eager checkpoint replay reuses the forward's) and recomputes
-        ``crit_0`` only for a differentiable criterion.
+        ``crit_0`` only for a differentiable criterion. ``segments`` (``RECOMPUTE`` only): a
+        list that receives the embed segment (its output: the expanded decoder input) and one
+        segment per prelude sublayer (each from a fresh leaf); the injection is the last
+        segment's output (see the module docstring).
         """
         program = self.program
         hybrid, stack = program.hybrid, program.stack
         phase = LoopPhase(phase)
         if phase == LoopPhase.REBUILD:
             raise ValueError("the prelude has no rebuild phase")
+        if segments is not None and phase != LoopPhase.RECOMPUTE:
+            raise ValueError("prelude segments split a backward item (phase RECOMPUTE)")
         if program.check_ports:
             _check_batch(program, self.PORTS, sample)
         label = _label(sample)
@@ -154,9 +174,22 @@ class PreludeCell:
                 sample.ctx = ctx
             ctx = _context(sample)
             with ctx.outer_quant_context:
-                injection = stack._run_range(
-                    hidden_states, 0, program.roles.core_start, ctx, label + "/prelude"
-                )
+                if segments is None:
+                    injection = stack._run_range(
+                        hidden_states, 0, program.roles.core_start, ctx, label + "/prelude"
+                    )
+                else:
+                    segments.append((SegmentKey("embed"), None, hidden_states))
+                    injection = _run_segments(
+                        stack,
+                        hidden_states,
+                        0,
+                        program.roles.core_start,
+                        ctx,
+                        label + "/prelude",
+                        segments,
+                        first_leaf=None,
+                    )
             criterion = program.criterion
             crit_state = None
             if phase == LoopPhase.SWEEP or criterion.differentiable:
@@ -258,6 +291,23 @@ class DetachedForward:
         return tensor._version != self.versions[id(tensor)]  # pylint: disable=protected-access
 
 
+def _run_segments(stack, x, first, last, ctx, label, segments, *, first_leaf, trace=None):
+    """Stack sublayers ``[first, last)``, one ``_run_range`` call each from a fresh leaf
+    (``first_leaf`` for the first one when given: the caller's input leaf), appending
+    ``(SegmentKey("sub", index), leaf, out)`` per sublayer (and ``out`` to ``trace``); returns
+    the last output (``x`` for an empty range)."""
+    for index in range(first, last):
+        if index == first and first_leaf is not None:
+            leaf = first_leaf
+        else:
+            leaf = x.detach().requires_grad_()
+        x = stack._run_range(leaf, index, index + 1, ctx, label)
+        segments.append((SegmentKey("sub", index), leaf, x))
+        if trace is not None:
+            trace.append(x)
+    return x
+
+
 class CoreRound:
     """One Huginn core round over the layer runner.
 
@@ -290,19 +340,29 @@ class CoreRound:
         alive: Optional[Tensor],
         label: str,
         trace: Optional[list] = None,
+        segments: Optional[list] = None,
+        first_leaf: Optional[Tensor] = None,
     ) -> Tensor:
         """Core-relative sublayers ``[start, end)`` (stack sublayers ``P + start .. P + end``).
 
         Without ``alive`` this is the eager round's layer pass. With it, each sublayer's
         output is kept only on the alive rows, and the dead rows are marked as padding. With
         a ``trace`` list, each sublayer runs in its own ``_run_range`` call (the same ops in
-        the same order) and its output is appended (attached to the graph).
+        the same order) and its output is appended (attached to the graph). With a
+        ``segments`` list (no ``alive``), each sublayer runs from a fresh leaf (the first from
+        ``first_leaf`` when given) and its segment is appended.
         """
         roles = self.program.roles
         if not 0 <= start <= end <= roles.core:
             raise ValueError(f"core range [{start}, {end}) outside [0, {roles.core})")
         stack = self.program.stack
         first, last = roles.core_start + start, roles.core_start + end
+        if segments is not None:
+            if alive is not None:
+                raise NotImplementedError("row self-carry runs without segments")
+            return _run_segments(
+                stack, x, first, last, ctx, label, segments, first_leaf=first_leaf, trace=trace
+            )
         if alive is None:
             if trace is None:
                 return stack._run_range(x, first, last, ctx, label)
@@ -383,6 +443,7 @@ class CoreRound:
         alive: Optional[Tensor] = None,
         block: Optional[CoreBlock] = None,
         trace: Optional[list] = None,
+        segments: Optional[list] = None,
     ) -> Union[RoundOutputs, Tensor]:
         """Run round ``r`` (or one block of it) for ``sample``.
 
@@ -400,6 +461,10 @@ class CoreRound:
             block: a block of ``program.core_plan``; None runs the whole round.
             trace: a list that receives the output of every sublayer of the block (attached;
                 ``check_recompute``), see ``layers``.
+            segments: a list that receives the block's segments (the adapter when the block
+                runs the prologue, then each sublayer from a fresh leaf; the first sublayer of a
+                block without the prologue runs on ``round_input``, the caller's leaf). The
+                epilogue attaches to the last segment.
 
         Returns:
             ``RoundOutputs`` when the call runs the epilogue, else the block output.
@@ -427,7 +492,23 @@ class CoreRound:
         label = f"{_label(sample)}/loop={r}/phase={phase.name.lower()}"
         with torch.profiler.record_function(label), ctx.outer_quant_context:
             x = self.prologue(round_input, injection) if block.with_prologue else round_input
-            x = self.layers(x, block.start, block.end, ctx, alive, label, trace)
+            first_leaf = None
+            if segments is not None:
+                if block.with_prologue:
+                    segments.append((SegmentKey("adapter"), None, x))
+                else:
+                    first_leaf = round_input
+            x = self.layers(
+                x,
+                block.start,
+                block.end,
+                ctx,
+                alive,
+                label,
+                trace,
+                segments=segments,
+                first_leaf=first_leaf,
+            )
             if not block.with_epilogue:
                 return x
             outputs = self.epilogue(
@@ -608,7 +689,9 @@ class CodaHeadCell:
     def __init__(self, program: LoopProgram):
         self.program = program
 
-    def __call__(self, state: Tensor, sample: SampleInputs) -> CodaOutputs:
+    def __call__(
+        self, state: Tensor, sample: SampleInputs, *, segments: Optional[list] = None
+    ) -> CodaOutputs:
         """Run the coda and the head on ``s_d`` and apply ``sample.loss_func``.
 
         ``cp_batch`` is None: at CP = 1 ``head_loss`` hands it only to the MTP layout
@@ -617,6 +700,10 @@ class CodaHeadCell:
         attentions checkpoint their up projections, which the item's backward replays); the
         head also inside ``indexer_loss_padding_mask`` of the sample's padding mask, as the
         stack's layers (padded rows do not train the MTP indexers).
+
+        ``segments``: a list that receives one segment per coda sublayer (the first on
+        ``state``, the caller's leaf) and the head segment (from a fresh leaf of the last coda
+        output, or ``state`` without coda sublayers; its output is the loss).
         """
         program = self.program
         hybrid, stack = program.hybrid, program.stack
@@ -635,9 +722,24 @@ class CodaHeadCell:
             request_selective_recompute(program.coda_recompute_modules),
         ):
             with ctx.outer_quant_context:
-                hidden_states = stack._run_range(
-                    state, program.roles.core_end, len(stack.layers), ctx, label
-                )
+                if segments is None:
+                    hidden_states = stack._run_range(
+                        state, program.roles.core_end, len(stack.layers), ctx, label
+                    )
+                else:
+                    hidden_states = _run_segments(
+                        stack,
+                        state,
+                        program.roles.core_end,
+                        len(stack.layers),
+                        ctx,
+                        label,
+                        segments,
+                        first_leaf=state,
+                    )
+                    if program.roles.core_end < len(stack.layers):
+                        hidden_states = hidden_states.detach().requires_grad_()
+            head_leaf = hidden_states
             decoder_output = stack._finalize_forward(hidden_states)
             if isinstance(decoder_output, tuple):
                 hidden_states, mhc_multistream = decoder_output
@@ -657,6 +759,8 @@ class CodaHeadCell:
                     rotary_pos_emb=sample.rotary_pos_emb,
                 )
             loss, num_tokens, report = sample.loss_func(sample.loss_mask, output)
+        if segments is not None:
+            segments.append((SegmentKey("head"), head_leaf, loss))
         if program.check_ports:
             for name, value in (("loss", loss), ("num_tokens", num_tokens)):
                 program.check(

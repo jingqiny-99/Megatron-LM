@@ -1037,3 +1037,78 @@ def test_rsbf_fields_require_the_rsbf_schedule(fields):
     with pytest.raises(ValueError, match="require loop_schedule='rsbf'") as excinfo:
         _dense_config(**fields)
     assert set(str(excinfo.value).split(" require")[0].split(", ")) == set(fields)
+
+
+# ---------------------------------------------------------------------------
+# The loop parameter store (validate_param_store_config)
+# ---------------------------------------------------------------------------
+
+_STORE_PREFIX = "Loop parameter store does not support: "
+_STORE_DDP = dict(grad_reduce_in_fp32=True)
+
+# (rule, model config fields, DDP config fields): each on a copy of a passing RSBF config.
+_STORE_RULES = [
+    (guards.STORE_WITHOUT_RSBF, dict(loop_schedule="standard"), {}),
+    (guards.STORE_PIPELINE, dict(pipeline_model_parallel_size=2), {}),
+    (guards.STORE_TP, dict(tensor_model_parallel_size=2), {}),
+    (guards.STORE_CP, dict(context_parallel_size=2), {}),
+    (guards.STORE_SHARED_EXPERT_OVERLAP, dict(moe_shared_expert_overlap=True), {}),
+    (guards.STORE_SUM_LOSS, dict(calculate_per_token_loss=False), {}),
+    (guards.STORE_DELAYED_WGRAD, dict(delay_wgrad_compute=True), {}),
+    (
+        guards.STORE_FP8_PARAMS,
+        dict(fp8="e4m3", fp8_param=True, disable_parameter_transpose_cache=True),
+        {},
+    ),
+    (guards.STORE_FP8_PARAMS, {}, dict(fp8_param_gather=True)),
+    (guards.STORE_TRANSPOSE_CACHE, dict(fp8="e4m3"), {}),
+    (guards.STORE_TRANSPOSE_CACHE, dict(fp4="e2m1"), {}),
+    (guards.STORE_MODULE_GTP, dict(gtp_weight_remat_size=2), {}),
+    (guards.STORE_GRAD_REDUCE_DTYPE, {}, dict(grad_reduce_in_fp32=False)),
+    (guards.STORE_SHARDED_DP, {}, dict(use_megatron_fsdp=True)),
+    (guards.STORE_OPTIMIZER_INSTANCES, {}, dict(num_distributed_optimizer_instances=2)),
+    (guards.STORE_AVERAGE_IN_COLLECTIVE, {}, dict(average_in_collective=True)),
+]
+
+
+def _store_reported(excinfo):
+    message = str(excinfo.value)
+    assert message.startswith(_STORE_PREFIX), message
+    return message[len(_STORE_PREFIX) :].split(", ")
+
+
+@pytest.mark.parametrize(
+    "rule,fields,ddp_fields",
+    _STORE_RULES,
+    ids=[f"{rule}-{'-'.join(list(f) + list(d))}" for rule, f, d in _STORE_RULES],
+)
+def test_param_store_rule_is_reported_alone(rule, fields, ddp_fields):
+    """Each store rule on a copy of a passing RSBF config and DDP config that differs in that
+    rule's fields only (the real config classes: the field names must exist)."""
+    config = _violating(_dense_config(**_RSBF), **fields)
+    ddp_config = _violating(DistributedDataParallelConfig(**_STORE_DDP), **ddp_fields)
+    with pytest.raises(ValueError) as excinfo:
+        guards.validate_param_store_config(config, None, ddp_config)
+    assert _store_reported(excinfo) == [rule]
+
+
+def test_param_store_configs_pass_and_rules_collect():
+    config = _dense_config(**_RSBF)
+    guards.validate_param_store_config(config)
+    guards.validate_param_store_config(config, None, DistributedDataParallelConfig(**_STORE_DDP))
+    guards.validate_param_store_config(_dsv4_config(**_RSBF, expert_model_parallel_size=8))
+    # Quantized with the transpose cache off passes; without a DDP config the DDP rules are
+    # skipped (a bare model).
+    guards.validate_param_store_config(
+        _violating(config, fp8="e4m3", disable_parameter_transpose_cache=True)
+    )
+    guards.validate_param_store_config(config, None, None)
+    violating = _violating(config, loop_schedule="standard", delay_wgrad_compute=True)
+    ddp_config = _violating(DistributedDataParallelConfig(**_STORE_DDP), grad_reduce_in_fp32=False)
+    with pytest.raises(ValueError) as excinfo:
+        guards.validate_param_store_config(violating, None, ddp_config)
+    assert _store_reported(excinfo) == [
+        guards.STORE_WITHOUT_RSBF,
+        guards.STORE_DELAYED_WGRAD,
+        guards.STORE_GRAD_REDUCE_DTYPE,
+    ]

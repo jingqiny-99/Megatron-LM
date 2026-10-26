@@ -609,6 +609,82 @@ def validate_rsbf_config(config: "TransformerConfig") -> None:
         raise ValueError("Loop RSBF does not support: " + ", ".join(violations))
 
 
+# Loop parameter store rule names (``validate_param_store_config``), as they appear in the
+# error message ("Loop parameter store does not support: <name>, <name>").
+STORE_WITHOUT_RSBF = "the loop parameter store without loop_schedule='rsbf'"
+STORE_PIPELINE = "pipeline parallelism with the loop parameter store"
+STORE_TP = "tensor parallelism with the loop parameter store"
+STORE_CP = "context parallelism with the loop parameter store"
+STORE_SHARED_EXPERT_OVERLAP = "moe_shared_expert_overlap with the loop parameter store"
+STORE_SUM_LOSS = "calculate_per_token_loss=False with the loop parameter store"
+STORE_DELAYED_WGRAD = "delay_wgrad_compute with the loop parameter store"
+STORE_FP8_PARAMS = (
+    "FP8 primary weights (fp8_param / fp8_param_gather) with the loop parameter store"
+)
+STORE_TRANSPOSE_CACHE = (
+    "FP8 / FP4 without disable_parameter_transpose_cache with the loop parameter store"
+)
+STORE_GRAD_REDUCE_DTYPE = "grad_reduce_in_fp32=False with the loop parameter store"
+STORE_SHARDED_DP = "Megatron FSDP with the loop parameter store"
+STORE_OPTIMIZER_INSTANCES = "num_distributed_optimizer_instances > 1 with the loop parameter store"
+STORE_AVERAGE_IN_COLLECTIVE = "average_in_collective with the loop parameter store"
+STORE_MODULE_GTP = "module GTP (gtp_weight_remat_size > 1) with the loop parameter store"
+
+
+def validate_param_store_config(
+    config: "TransformerConfig", store_config: Any = None, ddp_config: Any = None
+) -> None:
+    """Reject configs the loop parameter store (``loop/param_store.py``) cannot run.
+
+    ``config``: the model's ``TransformerConfig``; ``store_config``: the store's
+    ``LoopParamStoreConfig`` (its own settings are validated by the store; accepted for the
+    guard's call signature); ``ddp_config``: the DDP wrap's ``DistributedDataParallelConfig``
+    (None: the DDP rules are skipped, e.g. a bare model in tests). A store trains only through
+    the RSBF executor (an eager training step would leave the shard gradients unreduced), on
+    one stage without TP / CP; the shard-axis SUM of finalize needs the per-token loss; TE's
+    delayed wgrad would run after the segment's reduce-scatter; the store gathers bf16 (no FP8
+    primary weights) and a cached FP8 transpose would pin a quantized copy per layer; the shard
+    gradients are DDP's fp32 ``main_grad``; one distributed-optimizer instance (the grid's);
+    no pre-scaling inside the collective (per-token loss); no module GTP (only the grid).
+    Collects every violation and raises one ``ValueError``.
+    """
+    del store_config
+    quantized = getattr(config, "fp8", None) is not None or getattr(config, "fp4", None) is not None
+    unsupported = {
+        STORE_WITHOUT_RSBF: getattr(config, "loop_schedule", "standard") != "rsbf",
+        STORE_PIPELINE: getattr(config, "pipeline_model_parallel_size", 1) > 1,
+        STORE_TP: getattr(config, "tensor_model_parallel_size", 1) > 1,
+        STORE_CP: getattr(config, "context_parallel_size", 1) > 1,
+        # Its side stream reads the shared-expert weights outside the store's events.
+        STORE_SHARED_EXPERT_OVERLAP: bool(getattr(config, "moe_shared_expert_overlap", False)),
+        STORE_SUM_LOSS: not getattr(config, "calculate_per_token_loss", False),
+        STORE_DELAYED_WGRAD: bool(getattr(config, "delay_wgrad_compute", False)),
+        STORE_FP8_PARAMS: bool(getattr(config, "fp8_param", False))
+        or bool(getattr(ddp_config, "fp8_param_gather", False)),
+        STORE_TRANSPOSE_CACHE: quantized
+        and not getattr(config, "disable_parameter_transpose_cache", False),
+        STORE_MODULE_GTP: getattr(config, "gtp_weight_remat_size", 1) > 1,
+    }
+    if ddp_config is not None:
+        unsupported.update(
+            {
+                STORE_GRAD_REDUCE_DTYPE: not getattr(ddp_config, "grad_reduce_in_fp32", False),
+                STORE_SHARDED_DP: bool(getattr(ddp_config, "use_megatron_fsdp", False))
+                or bool(getattr(ddp_config, "use_custom_fsdp", False)),
+                STORE_OPTIMIZER_INSTANCES: getattr(
+                    ddp_config, "num_distributed_optimizer_instances", 1
+                )
+                > 1,
+                STORE_AVERAGE_IN_COLLECTIVE: bool(
+                    getattr(ddp_config, "average_in_collective", False)
+                ),
+            }
+        )
+    violations = [name for name, value in unsupported.items() if value]
+    if violations:
+        raise ValueError("Loop parameter store does not support: " + ", ".join(violations))
+
+
 def validate_rsbf_data_parallel(model: Any) -> None:
     """Reject a sharded data-parallel wrapper around a model run by the RSBF executor.
 

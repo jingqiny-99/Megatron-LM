@@ -34,6 +34,17 @@ a nested item first rebuilds a prefix of the core forward-only. ``core_b_segment
 CORE-B calls into those segments; the nulls (``run_null(core_plan=...)``) and the call check
 (``LockstepPlan.end_item(core_plan=...)``) follow them, so every EU of a CORE-B sub-round issues
 the same sequence. For the whole-round plan this is the single segment of stage 3.
+
+With the loop parameter store (``loop/param_store.py``) a real item runs one backward per
+*segment* (a stack sublayer, the adapter, the embedding call, the head) and the store issues
+all-gathers and reduce-scatters at fixed points of the sub-round's segment ops. A null then walks
+the same segment ops (``run_null(store_visitor=..., segment_ops=...)``): at each op it runs the
+store's events (``NullVisitor.before`` / ``after``) around the lockstep MoE calls of that segment
+(``segment_entries``: a decoder sublayer's module, or the MTP depths' modules for the head),
+forward from a fresh zero leaf at a forward op, and their backward of zeros at the segment's
+backward op. So every rank issues, for every communicator (the store's shard all-gathers and
+reduce-scatters, the EP dispatch / combine), the same calls in the same relative order, whether
+its item is real or null.
 """
 
 import contextlib
@@ -62,6 +73,7 @@ __all__ = [
     "core_b_segments",
     "register_lockstep_module",
     "run_null",
+    "segment_entries",
 ]
 
 # Null forms (the design's form Z and form P).
@@ -324,7 +336,8 @@ class LockstepEntry:
     a name for messages, ``wrap``, the extra quantization context a real call of an MTP
     depth runs in (``MultiTokenPredictionLayer.get_inner_quantization_context``), and
     ``stack_index``, the hosting sublayer's index in its stack (the decoder's, or the MTP
-    depth's inner stack), independent of the pipeline layer offset."""
+    depth's inner stack), independent of the pipeline layer offset; ``mtp``: the module is in
+    an MTP depth's stack (called inside the model head)."""
 
     module: nn.Module
     adapter: LockstepAdapter
@@ -334,6 +347,7 @@ class LockstepEntry:
     name: str
     wrap: Optional[Callable[[], ContextManager]] = None
     stack_index: int = -1
+    mtp: bool = False
 
 
 @dataclass(frozen=True)
@@ -512,9 +526,12 @@ def _ignore(module: nn.Module) -> None:
     del module
 
 
-def _scan(stack, start: int, end: int, prefix: str, wrap, budget: list, seen: set) -> list:
+def _scan(
+    stack, start: int, end: int, prefix: str, wrap, budget: list, seen: set, *, mtp: bool = False
+) -> list:
     """The lockstep entries of ``stack.layers[start:end]`` in order (one module per sublayer
-    at most); every registered module is also added to ``budget`` once."""
+    at most); every registered module is also added to ``budget`` once. ``mtp``: the stack is
+    an MTP depth's."""
     entries = []
     for index in range(start, end):
         layer = stack.layers[index]
@@ -547,6 +564,7 @@ def _scan(stack, start: int, end: int, prefix: str, wrap, budget: list, seen: se
                 name=full_name,
                 wrap=wrap,
                 stack_index=index,
+                mtp=mtp,
             )
         )
     return entries
@@ -580,7 +598,14 @@ def build_lockstep_plan(program) -> LockstepPlan:
             )
         wrap = getattr(layer, "get_inner_quantization_context", None)
         coda = coda + _scan(
-            inner, 0, len(inner.layers), f"mtp.layers.{index}.mtp_model_layer", wrap, budget, seen
+            inner,
+            0,
+            len(inner.layers),
+            f"mtp.layers.{index}.mtp_model_layer",
+            wrap,
+            budget,
+            seen,
+            mtp=True,
         )
     by_type = {
         SubRoundType.PRELUDE_F: tuple(prelude),
@@ -614,6 +639,79 @@ def build_lockstep_plan(program) -> LockstepPlan:
     return plan
 
 
+def segment_entries(entries: Sequence[LockstepEntry], segment) -> tuple:
+    """The lockstep entries a store segment (``param_store_schedule.SegmentKey``) calls, in call
+    order: a decoder sublayer's module for ``("sub", i)``, every MTP depth's modules for the
+    head, none for the adapter and the embedding call."""
+    if segment.kind == "sub":
+        return tuple(e for e in entries if not e.mtp and e.stack_index == segment.index)
+    if segment.kind == "head":
+        return tuple(e for e in entries if e.mtp)
+    return ()
+
+
+def _null_forward_chain(plan, entries, *, sequence, device, inner_context, output=None):
+    """The null calls of ``entries``, chained from ``output`` (a fresh zero leaf when None)."""
+    for entry in entries:
+        signature = plan.signature[entry.module]
+        if output is None:
+            rows = 0 if entry.form == FORM_EMPTY else sequence
+            hidden = torch.zeros(
+                (rows, 1, entry.layer_config.hidden_size),
+                dtype=signature.hidden_dtype,
+                device=device,
+                requires_grad=signature.hidden_requires_grad,
+            )
+        else:
+            # Chained: the backward visits the modules in reverse, as a real item's does.
+            hidden = output.to(signature.hidden_dtype)
+        wrap = entry.wrap() if entry.wrap is not None else contextlib.nullcontext()
+        with wrap, inner_context(entry.layer_config, entry.layer_number):
+            output = entry.adapter.null_forward(entry, hidden, signature)
+    return output
+
+
+def _run_store_null(
+    plan: LockstepPlan,
+    kind_type: SubRoundType,
+    *,
+    store_visitor,
+    segment_ops,
+    outer_context: ContextManager,
+    inner_context: Callable[[Any, int], ContextManager],
+    sequence: int,
+    device: torch.device,
+) -> int:
+    """``run_null`` with a parameter store: the sub-round's segment ops in order, the store's
+    null events around each op's lockstep MoE calls (see the module docstring)."""
+    entries = plan.by_type[kind_type]
+    backward_type = kind_type in _BACKWARD_TYPES
+    pending: dict = {}
+    calls = 0
+    for k, op in enumerate(segment_ops):
+        store_visitor.before(k)
+        selected = segment_entries(entries, op.segment)
+        if selected and op.direction == "fwd":
+            with torch.enable_grad(), outer_context:
+                output = _null_forward_chain(
+                    plan, selected, sequence=sequence, device=device, inner_context=inner_context
+                )
+            calls += len(selected)
+            # A segment forwarded under "sweep" (a sweep, a nested item's rebuild) has no
+            # backward op; the others are back-propagated at their backward op.
+            if backward_type and op.policy != "sweep" and output.requires_grad:
+                pending[op.segment] = output
+        elif selected:
+            output = pending.pop(op.segment, None)
+            if output is not None:
+                with torch.enable_grad(), outer_context:
+                    torch.autograd.backward(output, torch.zeros_like(output))
+        store_visitor.after(k)
+    if pending:  # pragma: no cover - every kept forward op has its backward op
+        raise AssertionError(f"null segments {sorted(map(str, pending))} were not back-propagated")
+    return calls
+
+
 def run_null(
     plan: LockstepPlan,
     kind_type: SubRoundType,
@@ -624,6 +722,8 @@ def run_null(
     device: torch.device,
     core_plan: Optional["CoreBackwardPlan"] = None,
     core_start: int = 0,
+    store_visitor=None,
+    segment_ops: Optional[Sequence] = None,
 ) -> int:
     """Run the null item of ``kind_type``: every lockstep MoE call of the type on an empty
     input (rows per the entry's form, ``sequence`` x 1 for "nominal"), chained, then for the
@@ -631,7 +731,23 @@ def run_null(
     plan's segments (``core_b_segments``) in order, each chained from a fresh zero leaf and
     back-propagated when the segment is. ``outer_context`` and
     ``inner_context(layer_config, layer_number)`` are the stack's quantization contexts (as
-    the cells and ``HybridStack._run_layer`` enter them). Returns the number of MoE calls."""
+    the cells and ``HybridStack._run_layer`` enter them). Returns the number of MoE calls.
+
+    With a parameter store, ``store_visitor`` (``LoopParamStore.null_visitor(kind_type)``)
+    and ``segment_ops`` (its sub-round's segment ops): the null walks the segment ops, running
+    the store's events around each op's MoE calls (``segment_entries``), one backward of zeros
+    per segment at its backward op (the per-segment split of the real items)."""
+    if store_visitor is not None:
+        return _run_store_null(
+            plan,
+            kind_type,
+            store_visitor=store_visitor,
+            segment_ops=store_visitor.ops if segment_ops is None else segment_ops,
+            outer_context=outer_context,
+            inner_context=inner_context,
+            sequence=sequence,
+            device=device,
+        )
     if kind_type is SubRoundType.CORE_B and core_plan is not None:
         segments = core_b_segments(plan, core_plan, core_start)
     else:
@@ -639,25 +755,10 @@ def run_null(
         segments = (CallSegment(tuple(entries), kind_type in _BACKWARD_TYPES),) if entries else ()
     calls = 0
     for segment in segments:
-        output = None
         with torch.enable_grad(), outer_context:
-            for entry in segment.entries:
-                signature = plan.signature[entry.module]
-                if output is None:
-                    rows = 0 if entry.form == FORM_EMPTY else sequence
-                    hidden = torch.zeros(
-                        (rows, 1, entry.layer_config.hidden_size),
-                        dtype=signature.hidden_dtype,
-                        device=device,
-                        requires_grad=signature.hidden_requires_grad,
-                    )
-                else:
-                    # Chained: the backward visits the modules in reverse, as a real item's
-                    # does.
-                    hidden = output.to(signature.hidden_dtype)
-                wrap = entry.wrap() if entry.wrap is not None else contextlib.nullcontext()
-                with wrap, inner_context(entry.layer_config, entry.layer_number):
-                    output = entry.adapter.null_forward(entry, hidden, signature)
+            output = _null_forward_chain(
+                plan, segment.entries, sequence=sequence, device=device, inner_context=inner_context
+            )
             if segment.backward and output.requires_grad:
                 torch.autograd.backward(output, torch.zeros_like(output))
         calls += len(segment.entries)

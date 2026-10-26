@@ -29,6 +29,7 @@ __all__ = [
     "PlannerUnsupported",
     "PRO_DIMS",
     "Placement",
+    "STORE_GROUP_OF",
     "SeqPhase",
     "UnitCosts",
     "c2c_traffic",
@@ -69,6 +70,7 @@ MEM_INDEXER = "indexer buffers (dense fallback, 1 CSA layer live)"
 MEM_MXFP8 = "MXFP8 per-layer weight casts (transient)"
 MEM_GRAPH_IO = "graph I/O + chain records in flight"
 MEM_STORE = "state store (peak, from sim)"
+MEM_TE_DUMMY = "TE fused-wgrad dummy gradients (one per dense weight shape)"
 MEM_RESERVE = "NCCL / HybridEP buffers"
 MEM_MISC = "misc (context, workspaces, fragmentation)"
 
@@ -277,6 +279,10 @@ class ModelShape:
     grace_optimizer_bytes_per_param: int = 12
     ce_bytes_per_token: Optional[float] = None
     distributed_optimizer: bool = True
+    # The loop parameter store's runtime terms per (modes, item form) variant
+    # (``LoopParamStore.planner_terms``: ``store_variant_key -> StoreMemoryTerms`` or the reason
+    # the store cannot run it); None: the cost model's dense terms (``from_dims``, no store).
+    store_terms: Optional[Mapping[str, Any]] = None
 
     def __post_init__(self):
         # The Layer-window gathers are charged per layer kind (``unit_costs``): every kind of
@@ -397,8 +403,19 @@ class ModelShape:
         depths)`` (est.: the unfused cross entropy's bf16 logits and fp32 softmax per head, all
         heads alive at the coda backward; the cost model's ``2 V 2 / 8`` assumes 8 fused CE
         chunks). ``expert_parallel_size`` is required: this rank holds ``1 / EP`` of the routed
-        experts."""
+        experts. With a loop parameter store installed the counts are logical
+        (``named_logical_parameters``: the hidden compute parameters at their logical size, the
+        store's mirror of canonical shards skipped), so they equal the model's before the
+        install and stay the same while the compute parameters are unbound; the store's
+        runtime terms come in through ``overrides`` (``store_terms``)."""
         from megatron.core.models.hybrid.layers.utils import Symbols
+        from megatron.core.transformer.loop.param_store_binding import named_logical_parameters
+
+        def logical(owner):
+            # The registered parameters plus the loop parameter store's hidden compute
+            # parameters (the store's mirror of canonical shards is skipped), so the counts are
+            # the same before and after a store is installed, bound or not.
+            return [p for _, p in named_logical_parameters(owner)]
 
         if expert_parallel_size < 1:
             raise ValueError(f"expert_parallel_size must be >= 1, got {expert_parallel_size}")
@@ -447,10 +464,14 @@ class ModelShape:
         def split_count(params):
             dense = expert = 0
             for p in params:
+                # A store tensor's logical size (its compute parameter may be unbound, or a
+                # shard-shaped DistributedWeight stand-in).
+                tensor = getattr(p, "loop_store_tensor", None)
+                numel = tensor.numel if tensor is not None else p.numel()
                 if getattr(p, "allreduce", True):
-                    dense += p.numel()
+                    dense += numel
                 else:
-                    expert += p.numel() * expert_parallel_size
+                    expert += numel * expert_parallel_size
             return dense, expert
 
         role_pairs = {
@@ -465,7 +486,7 @@ class ModelShape:
         layer_of = {}
         for role, items in role_pairs.items():
             for i, kind, _ in items:
-                params = list(stack.layers[i].parameters()) + list(stack.layers[i + 1].parameters())
+                params = logical(stack.layers[i]) + logical(stack.layers[i + 1])
                 d_, e_ = split_count(params)
                 dense[role] += d_
                 routed += e_
@@ -473,7 +494,7 @@ class ModelShape:
                 largest = max(largest, d_)
                 layer_of.update((id(p), role) for p in params)
         seen = set(layer_of)
-        for name, p in stack.named_parameters():
+        for name, p in named_logical_parameters(stack):
             if id(p) in seen:
                 continue
             seen.add(id(p))
@@ -499,15 +520,15 @@ class ModelShape:
             # (``mtp_model_layer``), or the whole block when it has no such structure.
             for depth_layer in getattr(mtp_block, "layers", None) or [mtp_block]:
                 inner = getattr(depth_layer, "mtp_model_layer", depth_layer)
-                d_, _ = split_count(inner.parameters())
+                d_, _ = split_count(logical(inner))
                 by_kind[kind] = max(by_kind.get(kind, 0), d_)
-            for p in mtp_block.parameters():
+            for p in logical(mtp_block):
                 if id(p) not in seen:
                     seen.add(id(p))
                     d_, e_ = split_count([p])
                     dense["mtp"] += d_
                     routed += e_
-        for p in module.parameters():
+        for p in logical(module):
             if id(p) not in seen:
                 seen.add(id(p))
                 d_, e_ = split_count([p])
@@ -1004,6 +1025,7 @@ def memory_components(
     edges_mode: str = "Resident",
     emb_mode: str = "Resident",
     z_lw: int = 64,
+    store_terms: Any = None,
 ) -> Tuple[Dict[str, float], float]:
     """Per-GPU HBM components (bytes, ``dsv4.memory`` names and order) and the Grace bytes of
     the Adam state when ``adam_on_grace``.
@@ -1013,7 +1035,20 @@ def memory_components(
     Resident, no shard buffers: ``proxy_v2.core_resident``). ``nested``: the nested arena
     (``L_core`` layer inputs + one layer); ``block_stride`` ``s``: ``s`` layers + the block input
     (``s = L_core`` is the whole round), the stash is placed by the caller; ``block_window``: the
-    block's gathered weights stay resident (``layer_window`` only)."""
+    block's gathered weights stay resident (``layer_window`` only).
+
+    ``store_terms``: the loop parameter store's runtime terms of this option
+    (``StoreMemoryTerms``; None: the cost model's terms above). Then the dense groups follow the
+    store exactly: per group the stored elements by the store's mode (Resident: compute copy +
+    fp32 accumulator; Resident + sharded grads: compute copy; Layer window: nothing) plus the
+    canonical shards and their fp32 gradients of **every** stored group, the rest of the group
+    replicated (weight + fp32 gradient); the window slots and fp32 scratch pool as the store
+    sized them (``MEM_DENSE_BUF``, no separate block window); the distributed optimizer over the
+    replicate group (``N / z`` ranks: stored shards and replicated parameters), experts over
+    ``N``; the coda item arena adds the head and sharded-grad transient targets and the
+    hook-class embedding ``.grad``, the prelude item arena (not modelled otherwise) the same of
+    the embed segment; the FP8 cast term covers the window units an item keeps; TE's fused-wgrad
+    dummies are a persistent term."""
     if layout not in ("layer_window", "resident"):
         raise ValueError(f"unknown layout {layout!r}")
     if layout == "resident":
@@ -1027,41 +1062,54 @@ def memory_components(
     r[MEM_EXPERT_W] = 2 * P_e / EP
     r[MEM_EXPERT_G] = shape.expert_grad_bytes * P_e / EP
     pl_max = params.largest_dense_layer
-    dense_res = 0.0
-    dense_sh = 0.0
-    modes = {
-        "emb+head": emb_mode,
-        "prelude dense": edges_mode,
-        "coda dense": edges_mode,
-        "MTP dense": edges_mode,
-        "core dense": "Layer window",
-    }
-    any_sharded = False
-    for k, P in groups.items():
-        m = modes[k]
-        if m == "Resident":
-            dense_res += 6 * P
-        elif m == "Resident + sharded grads":
-            dense_res += 2 * P
-            dense_sh += 6 * P / z_lw
-            any_sharded = True
-        else:
-            dense_sh += 6 * P / z_lw
-            any_sharded = True
-    r[MEM_DENSE_RES] = dense_res
-    r[MEM_DENSE_SH] = dense_sh
-    r[MEM_DENSE_BUF] = 12 * pl_max if any_sharded else 0.0
-    if layout == "resident":
-        r[MEM_DENSE_RES] += 6 * groups["core dense"]
-        r[MEM_DENSE_SH] = 0.0
-        r[MEM_DENSE_BUF] = 0.0
     P_d = sum(groups.values())
-    if shape.distributed_optimizer:
-        opt = shape.optimizer_bytes_per_param * (P_d + P_e) / N
-        opt_grace = shape.grace_optimizer_bytes_per_param * (P_d + P_e) / N
+    if store_terms is not None:
+        r[MEM_DENSE_RES], r[MEM_DENSE_SH] = _store_dense_bytes(groups, store_terms)
+        r[MEM_DENSE_BUF] = float(store_terms.buffer_bytes)
+        z = store_terms.shard_axis
+        stored = sum(store_terms.group_numel.values())
+        shards = sum(store_terms.group_shard_numel.values())
+        if shape.distributed_optimizer:
+            per_gpu = ((shards + (P_d - stored)) * z + P_e) / N
+        else:
+            per_gpu = shards + (P_d - stored) + P_e / EP
+        opt = shape.optimizer_bytes_per_param * per_gpu
+        opt_grace = shape.grace_optimizer_bytes_per_param * per_gpu
     else:
-        opt = shape.optimizer_bytes_per_param * (P_d + P_e / EP)
-        opt_grace = shape.grace_optimizer_bytes_per_param * (P_d + P_e / EP)
+        dense_res = 0.0
+        dense_sh = 0.0
+        modes = {
+            "emb+head": emb_mode,
+            "prelude dense": edges_mode,
+            "coda dense": edges_mode,
+            "MTP dense": edges_mode,
+            "core dense": "Layer window",
+        }
+        any_sharded = False
+        for k, P in groups.items():
+            m = modes[k]
+            if m == "Resident":
+                dense_res += 6 * P
+            elif m == "Resident + sharded grads":
+                dense_res += 2 * P
+                dense_sh += 6 * P / z_lw
+                any_sharded = True
+            else:
+                dense_sh += 6 * P / z_lw
+                any_sharded = True
+        r[MEM_DENSE_RES] = dense_res
+        r[MEM_DENSE_SH] = dense_sh
+        r[MEM_DENSE_BUF] = 12 * pl_max if any_sharded else 0.0
+        if layout == "resident":
+            r[MEM_DENSE_RES] += 6 * groups["core dense"]
+            r[MEM_DENSE_SH] = 0.0
+            r[MEM_DENSE_BUF] = 0.0
+        if shape.distributed_optimizer:
+            opt = shape.optimizer_bytes_per_param * (P_d + P_e) / N
+            opt_grace = shape.grace_optimizer_bytes_per_param * (P_d + P_e) / N
+        else:
+            opt = shape.optimizer_bytes_per_param * (P_d + P_e / EP)
+            opt_grace = shape.grace_optimizer_bytes_per_param * (P_d + P_e / EP)
     r[MEM_OPT] = 0.0 if adam_on_grace else opt
     act_layer = shape.act_bytes_per_token_layer * T * act_frag
     state_tok = shape.state_bytes_per_token
@@ -1078,24 +1126,73 @@ def memory_components(
     ) * T * act_frag + ce
     if coda_rc:
         coda_item -= shape.coda_dsv4_attentions * shape.mla_up_bytes_per_token * T * act_frag
+    prelude_item = 0.0
+    if store_terms is not None:
+        coda_item += (
+            store_terms.head_scratch_coda
+            + store_terms.rsg_transient_coda
+            + store_terms.hook_grad_coda
+        )
+        prelude_item = store_terms.rsg_transient_prelude + store_terms.hook_grad_prelude
     if block_stride is not None:
         if nested:
             raise ValueError("block checkpoint: pass nested=False")
         core_item = block_stride * act_layer + T * state_tok
-        r[MEM_ACT_BLOCK] = max(core_item, coda_item)
+        r[MEM_ACT_BLOCK] = max(core_item, coda_item, prelude_item)
     else:
-        r[MEM_ACT_NESTED] = max(core_item, coda_item)
-    if block_stride is not None and block_window and layout == "layer_window":
+        r[MEM_ACT_NESTED] = max(core_item, coda_item, prelude_item)
+    if (
+        store_terms is None
+        and block_stride is not None
+        and block_window
+        and layout == "layer_window"
+    ):
         r[MEM_WINDOW] = (block_stride - 1) * 2 * pl_max
     r[MEM_INDEXER] = T * ph.S * 4 if shape.has_csa else 0.0
     if prec == "mxfp8":
-        r[MEM_MXFP8] = 2.06 * (pl_max + (shape.dims.NEXP // EP if EP else 0) * params.expert_params)
+        cast = pl_max
+        if store_terms is not None:
+            cast = max(1, store_terms.cast_units_kept) * (
+                store_terms.unit_bytes_max / store_terms.elem_bytes
+            )
+        r[MEM_MXFP8] = 2.06 * (cast + (shape.dims.NEXP // EP if EP else 0) * params.expert_params)
+    if store_terms is not None and store_terms.te_dummy_wgrad:
+        r[MEM_TE_DUMMY] = float(store_terms.te_dummy_wgrad)
     st = peak_units * ph.state_gpu
     r[MEM_GRAPH_IO] = 6 * ph.state_gpu
     r[MEM_STORE] = st
     r[MEM_RESERVE] = hw.ep_reserve_bytes
     r[MEM_MISC] = hw.misc_bytes
     return r, (opt_grace if adam_on_grace else 0.0)
+
+
+# The planner's dense groups (``ParamGroups.groups``) -> the loop parameter store's groups.
+STORE_GROUP_OF = {
+    "emb+head": "emb_head",
+    "prelude dense": "prelude",
+    "core dense": "core",
+    "coda dense": "coda",
+    "MTP dense": "mtp",
+}
+
+
+def _store_dense_bytes(groups: Mapping[str, float], terms: Any) -> Tuple[float, float]:
+    """``(MEM_DENSE_RES, MEM_DENSE_SH)`` of the dense groups under a parameter store: the
+    replicated part of each group (weight + fp32 gradient), the stored part by its mode (copy +
+    accumulator / copy / nothing), and the canonical shards + fp32 shard gradients."""
+    e = terms.elem_bytes
+    resident = shards = 0.0
+    for name, P in groups.items():
+        group = STORE_GROUP_OF[name]
+        resident += (e + 4) * (P - terms.group_numel.get(group, 0))
+        shards += (e + 4) * terms.group_shard_numel.get(group, 0)
+        copy = terms.group_copy_numel.get(group, 0)
+        mode = terms.group_modes.get(group, "resident")
+        if mode == "resident":
+            resident += (e + 4) * copy
+        elif mode == "resident_sharded_grads":
+            resident += e * copy
+    return resident, shards
 
 
 @dataclass(frozen=True)

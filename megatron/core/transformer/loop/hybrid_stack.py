@@ -92,6 +92,11 @@ class LoopHybridStack(HybridStack):
     function reports every loop metric by ``loop/reporting.py``'s rule.
     """
 
+    # The loop parameter store's visit hook (``LoopParamStore.install`` sets it on the instance):
+    # every sublayer call of ``_run_range`` and the adapter call of ``_adapt`` run inside its
+    # segment visits. None without a store (the stage-5 path, op for op).
+    _loop_store_hook = None
+
     def __init__(
         self,
         config,
@@ -306,11 +311,17 @@ class LoopHybridStack(HybridStack):
         (``indexer_loss_padding_mask``): padded and frozen rows do not train the indexer. The
         scope is entered here, inside every replay of the range, so activation recomputes
         see it too.
+
+        With a loop parameter store each sublayer call runs inside the store's visit of its
+        segment (``SegmentKey("sub", index)``): the sublayer's weights are bound there (an
+        RSBF sub-round's schedule, or an eager no-grad visit).
         """
+        hook = self._loop_store_hook
         with indexer_loss_padding_mask(ctx.padding_mask):
             for index in range(start, end):
                 layer = self.layers[index]
-                with torch.profiler.record_function(f"{label}/layer={index}"):
+                visit = nullcontext() if hook is None else hook.visit("sub", index)
+                with visit, torch.profiler.record_function(f"{label}/layer={index}"):
                     if x.shape[0] == 0:
                         residual_accumulator = x
                         if getattr(layer, "is_moe_layer", False):
@@ -422,14 +433,24 @@ class LoopHybridStack(HybridStack):
         terms.append((mtp_depths * logits, 1 if self.config.mtp_detach_heads else 2))
         return terms
 
+    @property
+    def _loop_round_group(self):
+        """The group whose ranks must run the same number of eager rounds: TP x EP, or, when a
+        loop parameter store keeps units in a Layer window, the RSBF domain (every eager visit
+        of a windowed unit all-gathers it over the shard axis inside the domain)."""
+        hook = self._loop_store_hook
+        if hook is not None and hook.windows:
+            return hook.groups.domain
+        return getattr(self.pg_collection, "tp_ep", None)
+
     def _depth(self, device):
         if not self.config.loop_sample_depth or not self.training:
             return self.config.loop_iterations
         depth = torch.tensor([1, 2, 4, 8])[torch.randint(4, (1,))].to(device)
         # PP=CP=1. TP+EP ranks must take the same number of collective calls.
         # DP-only domains are allowed different depths; their backward remains
-        # one reduction per unique parameter.
-        group = getattr(self.pg_collection, "tp_ep", None)
+        # one reduction per unique parameter (a windowing parameter store: the domain).
+        group = self._loop_round_group
         if group is not None and dist.get_world_size(group) > 1:
             dist.broadcast(depth, src=dist.get_global_rank(group, 0), group=group)
         return int(depth.item())
@@ -451,20 +472,26 @@ class LoopHybridStack(HybridStack):
             )
         # (max, -min) in one MAX all-reduce.
         agreed = bounds.flip(0) * torch.tensor([1, -1], dtype=torch.int64, device=bounds.device)
-        group = getattr(self.pg_collection, "tp_ep", None)
+        group = self._loop_round_group
         if group is not None and dist.get_world_size(group) > 1:
-            # EP ranks must run the same number of rounds (MoE collectives).
+            # EP ranks must run the same number of rounds (MoE collectives; a windowing
+            # parameter store: the gathers of the whole domain).
             dist.all_reduce(agreed, op=dist.ReduceOp.MAX, group=group)
         rounds, negative_low = agreed.tolist()
         return rounds, -negative_low
 
     def _adapt(self, state, injection):
-        """The shared ``[h, 2h]`` adapter on ``[state, injection]``, stream by stream."""
-        if self.loop_num_streams == 1:
-            return self.loop_adapter(torch.cat((state, injection), -1))
-        split = (*state.shape[:-1], self.loop_num_streams, self.config.hidden_size)
-        adapted = self.loop_adapter(torch.cat((state.reshape(split), injection.reshape(split)), -1))
-        return adapted.reshape(state.shape)
+        """The shared ``[h, 2h]`` adapter on ``[state, injection]``, stream by stream (inside
+        the loop parameter store's adapter visit when a store is installed)."""
+        hook = self._loop_store_hook
+        with nullcontext() if hook is None else hook.visit("adapter"):
+            if self.loop_num_streams == 1:
+                return self.loop_adapter(torch.cat((state, injection), -1))
+            split = (*state.shape[:-1], self.loop_num_streams, self.config.hidden_size)
+            adapted = self.loop_adapter(
+                torch.cat((state.reshape(split), injection.reshape(split)), -1)
+            )
+            return adapted.reshape(state.shape)
 
     def _huginn(self, embedding, ctx, label, depths=None):
         sequence, batch = embedding.shape[:2]

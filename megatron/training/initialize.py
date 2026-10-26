@@ -416,6 +416,8 @@ def _initialize_distributed(
                     "Set both --gtp_remat-weight-remat-size and "
                     "--expert-generalized-tensor-parallel-remat-size to 1 to disable GTP."
                 )
+            from megatron.training.loop_param_store_setup import loop_param_store_grid_size
+
             mpu.initialize_model_parallel(
                 args.tensor_model_parallel_size,
                 args.pipeline_model_parallel_size,
@@ -423,8 +425,11 @@ def _initialize_distributed(
                 pipeline_model_parallel_comm_backend=args.pipeline_model_parallel_comm_backend,
                 use_sharp=args.use_sharp,
                 # GTP_remat/EGTP_remat need world divisible by TP*PP*CP*GTP_remat (expert grid
-                # by ETP*EP*PP*EGTP_remat). Inactive when the remat sizes are 1.
-                gtp_remat_size=args.gtp_weight_remat_size,
+                # by ETP*EP*PP*EGTP_remat). Inactive when the remat sizes are 1. The loop
+                # parameter store (--loop-param-store-shard-size z) uses the same grid with
+                # gtp_remat_size = z but no module GTP (the HAVE_GTP assert above is only for
+                # module GTP: the grid itself needs no TE >= 2.19).
+                gtp_remat_size=loop_param_store_grid_size(args),
                 expert_gtp_remat_size=args.expert_gtp_weight_remat_size,
                 context_parallel_size=args.context_parallel_size,
                 hierarchical_context_parallel_sizes=args.hierarchical_context_parallel_sizes,

@@ -3,8 +3,10 @@
 """Lockstep MoE across the EUs of an RSBF domain (``loop/null_items.py``).
 
 CPU cases (no process group beyond the module's one-rank world): the null runner (call order,
-leaves, rows per form, backward only for the backward types, quantization contexts), the CORE-B
-call segments of block-checkpoint and nested backward plans (``core_b_segments``, the null and
+leaves, rows per form, backward only for the backward types, quantization contexts), the null
+with a loop parameter store (the store's ``before`` / ``after`` of every segment op around that
+segment's MoE calls, forward at the forward op and backward at the backward op;
+``segment_entries``), the CORE-B call segments of block-checkpoint and nested backward plans (``core_b_segments``, the null and
 the call check following them), the plan's real-call checks (signatures with the detached-input
 hint, the per-item call log), the static-budget flags, the
 adapter registry, discovery on a stub 'E' model (``build_lockstep_plan``), the ``MoELayer``
@@ -63,6 +65,7 @@ module):
 
 import contextlib
 import copy
+import dataclasses
 import os
 import re
 from types import SimpleNamespace
@@ -86,7 +89,9 @@ from megatron.core.transformer.loop.null_items import (
     core_b_segments,
     register_lockstep_module,
     run_null,
+    segment_entries,
 )
+from megatron.core.transformer.loop.param_store_schedule import SegmentKey, segment_ops
 from megatron.core.transformer.loop.program import (
     CoreBackwardPlan,
     LoopProgram,
@@ -310,6 +315,137 @@ def test_run_null_nominal_rows_and_empty_types():
         )
         == 0
     )
+
+
+# ---------------------------------------------------------------------------------------------
+# CPU: the null with a loop parameter store (the store's segment ops around the MoE calls)
+# ---------------------------------------------------------------------------------------------
+
+
+class _StoreVisitor:
+    """A stand-in for ``LoopParamStore.null_visitor``: logs ``before`` / ``after`` per op."""
+
+    def __init__(self, ops, log):
+        self.ops = tuple(ops)
+        self.log = log
+
+    def before(self, k):
+        self.log.append(("before", k))
+
+    def after(self, k):
+        self.log.append(("after", k))
+
+
+def _store_plan(log):
+    """Decoder MoE modules at stack sublayers 3 and 5 ('*E*E' core from 2) and 7 (coda), and
+    an MTP module."""
+    plan, modules, log = _plan(["e3", "e5", "e7", "mtp"], log=log, stack_indices=[3, 5, 7, 0])
+    for kind_type in SubRoundType:
+        plan.by_type[kind_type] = tuple(
+            dataclasses.replace(entry, mtp=entry.module.name == "mtp")
+            for entry in plan.by_type[kind_type]
+        )
+    return plan, modules
+
+
+def _run_store_null(plan, kind_type, ops, log):
+    return run_null(
+        plan,
+        kind_type,
+        outer_context=contextlib.nullcontext(),
+        inner_context=lambda config, number: contextlib.nullcontext(),
+        sequence=16,
+        device=torch.device("cpu"),
+        store_visitor=_StoreVisitor(ops, log),
+    )
+
+
+def _calls(log):
+    return [entry if entry[0] in ("before", "after") else entry[:2] for entry in log]
+
+
+@cpu_only
+def test_store_null_walks_the_segment_ops_of_a_nested_core_item():
+    """CORE-B of a nested item (stride 2 on the 4-sublayer core): the rebuild's MoE call is
+    forward only (its ops are ``sweep``), each block's call is forwarded at its forward op and
+    back-propagated at its backward op, each between the store's ``before`` / ``after`` of that
+    op; the adapter ops make no MoE call."""
+    log = []
+    plan, _ = _store_plan(log)
+    ops = segment_ops(
+        SubRoundType.CORE_B, prelude=2, core=4, coda=2, core_plan=CoreBackwardPlan.nested(4, 2)
+    )
+    calls = _run_store_null(plan, SubRoundType.CORE_B, ops, log)
+    moe = {3: "e3", 5: "e5"}
+    expected = []
+    for k, op in enumerate(ops):
+        expected.append(("before", k))
+        name = moe.get(op.segment.index) if op.segment.kind == "sub" else None
+        if name is not None:
+            expected.append((op.direction, name))
+        expected.append(("after", k))
+    assert _calls(log) == expected
+    # The rebuild's e3 (forward only), then e5's block, then e3's block.
+    assert [entry for entry in _calls(log) if entry[0] in ("fwd", "bwd")] == [
+        ("fwd", "e3"),
+        ("fwd", "e5"),
+        ("bwd", "e5"),
+        ("fwd", "e3"),
+        ("bwd", "e3"),
+    ]
+    assert calls == 3
+
+
+@cpu_only
+def test_store_null_runs_the_mtp_calls_in_the_head_segment():
+    """CODA: the coda sublayer's call at its op, the MTP calls at the head op (forward) and
+    the head's backward op; the backward order is the real item's (head, then the coda
+    sublayer)."""
+    log = []
+    plan, _ = _store_plan(log)
+    ops = segment_ops(SubRoundType.CODA, prelude=2, core=4, coda=2)
+    _run_store_null(plan, SubRoundType.CODA, ops, log)
+    moe_calls = [entry for entry in _calls(log) if entry[0] in ("fwd", "bwd")]
+    assert moe_calls == [("fwd", "e7"), ("fwd", "mtp"), ("bwd", "mtp"), ("bwd", "e7")]
+    head = [i for i, op in enumerate(ops) if op.segment == SegmentKey("head")]
+    fwd_head, bwd_head = head
+    assert _calls(log).index(("fwd", "mtp")) == _calls(log).index(("before", fwd_head)) + 1
+    assert _calls(log).index(("bwd", "mtp")) == _calls(log).index(("before", bwd_head)) + 1
+
+
+@cpu_only
+def test_store_null_forward_types_and_dense_models():
+    """A sweep type calls its modules forward only; without lockstep modules (dense, EP = 1) the
+    null still walks every op of the store's schedule."""
+    log = []
+    plan, _ = _store_plan(log)
+    ops = segment_ops(SubRoundType.CORE_F, prelude=2, core=4, coda=2)
+    assert _run_store_null(plan, SubRoundType.CORE_F, ops, log) == 2
+    assert [entry for entry in _calls(log) if entry[0] in ("fwd", "bwd")] == [
+        ("fwd", "e3"),
+        ("fwd", "e5"),
+    ]
+    log.clear()
+    empty = LockstepPlan(by_type={t: () for t in SubRoundType})
+    ops = segment_ops(SubRoundType.PRELUDE_B, prelude=2, core=4, coda=2)
+    assert _run_store_null(empty, SubRoundType.PRELUDE_B, ops, log) == 0
+    assert log == [(when, k) for k in range(len(ops)) for when in ("before", "after")]
+
+
+@cpu_only
+def test_segment_entries():
+    log = []
+    plan, _ = _store_plan(log)
+    entries = plan.by_type[SubRoundType.CODA]
+
+    def names(selected):
+        return [e.module.name for e in selected]
+
+    assert names(segment_entries(entries, SegmentKey("sub", 7))) == ["e7"]
+    assert names(segment_entries(entries, SegmentKey("sub", 0))) == []  # the MTP's index 0
+    assert names(segment_entries(entries, SegmentKey("head"))) == ["mtp"]
+    assert segment_entries(entries, SegmentKey("adapter")) == ()
+    assert segment_entries(entries, SegmentKey("embed")) == ()
 
 
 # ---------------------------------------------------------------------------------------------

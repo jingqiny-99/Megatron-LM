@@ -3882,6 +3882,15 @@ def get_model(
     if has_nvidia_modelopt:
         maybe_enable_modelopt(args)
 
+    # The loop parameter store (z > 1) uses the GTP-remat grid as a grid only: the model is
+    # built with the gtp axes of its collection nulled (no module attaches GTPShardedParam),
+    # the store is installed below before the DDP wrap, and DDP gets the full collection.
+    model_pg_collection = pg_collection
+    if getattr(args, "loop_param_store_shard_size", 1) > 1:
+        from megatron.training.loop_param_store_setup import loop_model_pg_collection
+
+        model_pg_collection = loop_model_pg_collection(pg_collection)
+
     # Build model.
     def build_model():
         if (
@@ -3915,7 +3924,7 @@ def get_model(
                 pre_process=pre_process,
                 post_process=post_process,
                 config=config,
-                pg_collection=pg_collection,
+                pg_collection=model_pg_collection,
             )
             model.model_type = model_type
         return model
@@ -3987,6 +3996,11 @@ def get_model(
     #               the amax_history back.
     # After TE2.x: Below function is an empty function and does nothing.
     correct_amax_history_if_needed(model)
+
+    if model_pg_collection is not pg_collection:
+        from megatron.training.loop_param_store_setup import install_loop_param_store
+
+        install_loop_param_store(model, args, pg_collection)
 
     if wrap_with_ddp:
         if args.use_torch_fsdp2:
@@ -4189,6 +4203,43 @@ def get_megatron_ddp_config(args: argparse.Namespace) -> DistributedDataParallel
         return DistributedDataParallelConfig(**kwargs)
 
 
+def _build_loop_param_store_models(builder, cfg, args, pg_collection, wrap_with_ddp):
+    """The config-container model build with the loop parameter store: the builder's chunks
+    built with the gtp axes of the collection nulled and wrapped for mixed precision (no DDP),
+    the store installed, then the DDP wrap over the full collection (the replicate group)."""
+    from megatron.training.loop_param_store_setup import (
+        install_loop_param_store,
+        loop_model_pg_collection,
+    )
+    from megatron.training.models.dist_utils import _ddp_wrap
+
+    if pg_collection is None:
+        pg_collection = ProcessGroupCollection.use_mpu_process_groups()
+    model = builder.build_distributed_models(
+        pg_collection=loop_model_pg_collection(pg_collection),
+        ddp_config=cfg.ddp,
+        overlap_param_gather_with_optimizer_step=cfg.optimizer.overlap_param_gather_with_optimizer_step,
+        use_megatron_fsdp=cfg.dist.use_megatron_fsdp,
+        use_torch_fsdp2=cfg.dist.use_torch_fsdp2,
+        wrap_with_ddp=False,
+        data_parallel_random_init=cfg.rng.data_parallel_random_init,
+        use_layer_wise_distributed_optimizer=cfg.optimizer.use_layer_wise_distributed_optimizer,
+    )
+    install_loop_param_store(model, args, pg_collection)
+    if not wrap_with_ddp:
+        return model
+    return _ddp_wrap(
+        model,
+        cfg.rng.data_parallel_random_init,
+        cfg.ddp,
+        cfg.optimizer.overlap_param_gather_with_optimizer_step,
+        use_megatron_fsdp=cfg.dist.use_megatron_fsdp,
+        use_torch_fsdp2=cfg.dist.use_torch_fsdp2,
+        pg_collection=pg_collection,
+        use_layer_wise_distributed_optimizer=cfg.optimizer.use_layer_wise_distributed_optimizer,
+    )
+
+
 def setup_model_and_optimizer(
     model_type,
     model_provider_func=None,
@@ -4234,6 +4285,11 @@ def setup_model_and_optimizer(
                 freeze_all_layers=args.freeze_all_layers,
                 freeze_base_model_for_mtp=args.freeze_base_model_for_mtp,
             )
+
+            if getattr(args, "loop_param_store_shard_size", 1) > 1:
+                return _build_loop_param_store_models(
+                    builder, cfg, args, pg_collection, wrap_with_ddp
+                )
 
             return builder.build_distributed_models(
                 pg_collection=pg_collection,
@@ -4284,8 +4340,16 @@ def setup_model_and_optimizer(
     model = _build_model_wrapper(wrap_with_ddp)
     unwrapped_model = unwrap_model(model)
 
+    # Loop parameter store: its residency modes (explicit or auto) before the planner's report
+    # reads them; under --loop-planner apply the planner sets them instead.
+    if getattr(args, "loop_param_store_shard_size", 1) > 1:
+        from megatron.training.loop_param_store_setup import configure_loop_param_store
+
+        configure_loop_param_store(args, model)
+
     # RSBF loop planner: plans (and in apply mode sets) the item form, stride, waves, D42 and
-    # Adam to Grace on the built model's config and args, before the optimizer config is read.
+    # Adam to Grace on the built model's config and args, before the optimizer config is read
+    # (with the store also its dense layout and the moves E / M).
     if getattr(args, "loop_planner", "off") != "off":
         from megatron.training.loop_rsbf_planning import plan_loop_rsbf
 
@@ -5122,6 +5186,17 @@ def _get_indexer_logging_layer_counts(args) -> tuple[int, int | None]:
     return tracker_layers, 0 if args.csa_dense_mode else indexer_layers
 
 
+def metric_data_parallel_group(pg_collection):
+    """The data-parallel group a per-rank metric is averaged over: every rank holding distinct
+    microbatches. Under the GTP-remat grid (the loop parameter store's shard axis) that is
+    ``dp_gtp_remat`` (replicate ``dp`` x ``gtp_remat``); ``pg_collection.dp`` is then only the
+    replicate group. Without the grid (the two have the same size) ``dp``, as before."""
+    full = getattr(pg_collection, "dp_gtp_remat", None)
+    if full is not None and get_pg_size(full) != get_pg_size(pg_collection.dp):
+        return full
+    return pg_collection.dp
+
+
 def training_log(
     loss_dict,
     total_loss_dict,
@@ -5461,7 +5536,11 @@ def training_log(
         dynamic_cp_parent_group = None
         if dsa_metric_pg_collection is not None:
             pp_group = dsa_metric_pg_collection.pp
-            dp_group = dsa_metric_pg_collection.dp
+            dp_group = (
+                dsa_metric_pg_collection.dp
+                if args.dynamic_context_parallel
+                else metric_data_parallel_group(dsa_metric_pg_collection)
+            )
         if args.dynamic_context_parallel:
             if dsa_metric_pg_collection is not None:
                 dynamic_cp_parent_group = dsa_metric_pg_collection.dp_cp
@@ -6293,9 +6372,14 @@ def get_loop_rsbf_forward_backward_func(config, args):
 def loop_rsbf_status_group(args):
     """The Gloo data-parallel group for the multi-EU RSBF status exchange, or None without
     data parallelism or without Gloo process groups (known-depth criteria, the only ones the
-    config builds, never exchange status)."""
+    config builds, never exchange status). With the loop parameter store the grid disables
+    dev's Gloo groups: a loop-owned Gloo group over the full data-parallel ranks."""
     if not (torch.distributed.is_initialized() and mpu.model_parallel_is_initialized()):
         return None
+    if getattr(args, "loop_param_store_shard_size", 1) > 1:
+        from megatron.training.loop_param_store_setup import loop_rsbf_status_gloo_group
+
+        return loop_rsbf_status_gloo_group(args)
     if mpu.get_data_parallel_world_size() <= 1 or not getattr(
         args, "use_gloo_process_groups", True
     ):
@@ -7453,6 +7537,13 @@ def evaluate(
     # Turn on evaluation mode which disables dropout.
     for model_module in model:
         model_module.eval()
+
+    # Loop parameter store: the Resident / sharded-grads compute copies are stale after an
+    # optimizer step; the evaluation's eager visits gather the Layer-window units.
+    if getattr(args, "loop_param_store_shard_size", 1) > 1:
+        from megatron.training.loop_param_store_setup import refresh_loop_param_store
+
+        refresh_loop_param_store(model)
 
     # Disable result validation during evaluation
     rerun_state_machine = get_rerun_state_machine()

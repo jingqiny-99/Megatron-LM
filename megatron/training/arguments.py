@@ -89,6 +89,7 @@ def add_megatron_arguments(parser: argparse.ArgumentParser):
     parser = _add_heterogeneous_args(parser)
     parser = _add_logging_args(parser)
     parser = _add_loop_planner_args(parser)
+    parser = _add_loop_param_store_args(parser)
     parser = _add_straggler_detector_args(parser)
     parser = _add_workload_inspector_server_args(parser)
     parser = _add_inference_args(parser)
@@ -605,6 +606,21 @@ def _validate_loop_planner(args):
             )
 
 
+def _validate_loop_param_store(args):
+    """``--loop-param-store-*`` (the loop parameter store, z = ``--loop-param-store-shard-size``
+    > 1): every rule of ``loop_param_store_setup.loop_param_store_problems`` (the RSBF schedule
+    on a hybrid Huginn loop, z dividing the RSBF domain, no module GTP / TP / PP / CP, the
+    per-token loss, fp32 gradient reduction, no FSDP / delayed wgrad / FP8 primary weights /
+    shared-expert overlap, Adam or SGD, no checkpoint save / load (M3c), the store modes
+    against ``--loop-planner apply``); the store flags need z > 1. ``args.data_parallel_size``
+    stays the full data-distribution degree (z is not folded into ``total_model_size``)."""
+    from megatron.training.loop_param_store_setup import loop_param_store_problems
+
+    problems = loop_param_store_problems(args)
+    if problems:
+        raise ValueError('loop parameter store: ' + '; '.join(problems))
+
+
 def _validate_sbhd_document_packing(args):
     """``--sbhd-document-packing`` (whole documents per SBHD row, row-tail padding): reject the
     options that would split documents differently, isolate documents, need THD, or let the
@@ -987,6 +1003,7 @@ def validate_args(args, defaults={}):
     _validate_loop_rsbf_waves(args)
     _validate_loop_exit_histogram(args)
     _validate_loop_planner(args)
+    _validate_loop_param_store(args)
 
     # === Hybrid layer pattern: deprecation handling and validation ===
 
@@ -3942,6 +3959,82 @@ def _add_loop_planner_args(parser):
         type=str,
         default=None,
         help='Write the plan with every evaluated option as JSON to this file (rank 0).',
+    )
+    return parser
+
+
+def _add_loop_param_store_args(parser):
+    """The loop parameter store group (M3: ``megatron/training/loop_param_store_setup.py``)."""
+    group = parser.add_argument_group(title='loop parameter store')
+    group.add_argument(
+        '--loop-param-store-shard-size',
+        type=int,
+        default=1,
+        help='Loop RSBF runs (hybrid Huginn loop, --loop-schedule rsbf): hold the dense '
+        'parameters as canonical shards on a shard axis of this many data-parallel ranks (the '
+        'GTP-remat grid, used as a grid only; DDP and the distributed optimizer run over the '
+        'replicate group of world / z ranks) and bind full weights per residency mode '
+        '(--loop-param-store-modes). 1 = no store (default).',
+    )
+    group.add_argument(
+        '--loop-param-store-modes',
+        type=str,
+        default='auto',
+        help='Residency mode of each store group, e.g. "core=lw,edges=lw,emb_head=rsg": groups '
+        'core (core layers + loop adapter), prelude, coda, mtp (edges = the three), emb_head, '
+        'all; modes r (Resident), rsg (Resident + sharded grads), lw (Layer window; not '
+        'emb_head); core_regather=on / edge_regather=on re-gather windowed units for the '
+        'backward. auto (default): core Layer window when the planner\'s memory model says the '
+        'Resident core does not fit (--loop-planner-hardware), else Resident. Under '
+        '--loop-planner apply the planner sets the modes (leave auto).',
+    )
+    group.add_argument(
+        '--loop-param-store-min-numel',
+        type=int,
+        default=1 << 20,
+        help='Dense parameters with fewer elements stay replicated (default 1048576).',
+    )
+    group.add_argument(
+        '--loop-param-store-binding',
+        type=str,
+        default='data',
+        choices=['data', 'distributed_weight'],
+        help='How full weights are bound: data (rebind each compute parameter\'s .data onto '
+        'the gathered buffer; every TE) or distributed_weight (TE\'s DistributedWeight '
+        'protocol, TE >= 2.19, TE linear weights only).',
+    )
+    group.add_argument(
+        '--loop-param-store-separate-rs-group',
+        action='store_true',
+        help='Run the store\'s reduce-scatters on a second communicator of the shard ranks.',
+    )
+    group.add_argument(
+        '--loop-param-store-gather-engine',
+        type=str,
+        default='nccl',
+        choices=['nccl', 'copy'],
+        help='How the store all-gathers inside a step: nccl (default) or copy (copy-engine '
+        'pulls from a symmetric-memory mirror of the shards, no SMs taken from the overlapped '
+        'compute; CUDA, the shard group inside one NVLink domain; one more copy of this '
+        'rank\'s shards).',
+    )
+    group.add_argument(
+        '--loop-param-store-reduce-engine',
+        type=str,
+        default='nccl',
+        choices=['nccl', 'copy'],
+        help='How the store reduce-scatters gradients: nccl (default) or copy (copy-engine '
+        'pushes into symmetric receive slots and one short sum kernel, no long-lived NCCL '
+        'kernel during the backward; CUDA, the shard group inside one NVLink domain; '
+        'deterministic but associated differently from NCCL, equal within fp32 rounding).',
+    )
+    group.add_argument(
+        '--loop-param-store-debug',
+        type=str,
+        default='off',
+        help='Store debug switches, a comma list: check (every windowed module runs bound), '
+        'poison (NaN-fill released windows), verify (compare gathers with a reference), timing '
+        '(per-gather exposure); off (default).',
     )
     return parser
 
