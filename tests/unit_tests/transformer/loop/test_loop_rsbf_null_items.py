@@ -1798,14 +1798,15 @@ HYBRIDEP = dict(
 @contextlib.contextmanager
 def _hybridep_dispatch_log(model):
     """Logs every HybridEP dispatch of ``model``'s MoE layers on this rank, in call order:
-    whether a null made it, the rows and padded rows passed, the routes sent per global expert
-    (after the manager's padding exclusion), the static budget (``num_permuted_tokens``) and
-    the tokens received per local expert. Yields the list of per-call dicts (host values)."""
+    whether a null made it, whether the layer is in the MTP depth, the rows and padded rows
+    passed, the routes sent per global expert (after the manager's padding exclusion), the
+    static budget (``num_permuted_tokens``) and the tokens received per local expert. Yields
+    the list of per-call dicts (host values)."""
     from megatron.core.transformer.moe.moe_layer import MoELayer
 
     calls, state, restore = [], {"null": False}, []
 
-    def wrap(manager):
+    def wrap(manager, mtp):
         setup, dispatch = manager.setup_metadata, manager.dispatch
 
         def setup_metadata(routing_map, probs, padding_mask=None):
@@ -1818,6 +1819,7 @@ def _hybridep_dispatch_log(model):
             calls.append(
                 dict(
                     null=state["null"],
+                    mtp=mtp,
                     rows=routing_map.shape[0],
                     padded=None if padding_mask is None else padding_mask.sum(),
                     sent=sent.detach().clone(),
@@ -1834,9 +1836,10 @@ def _hybridep_dispatch_log(model):
         manager.setup_metadata, manager.dispatch = setup_metadata, dispatch_
         restore.append(manager)
 
-    for module in model.modules():
+    for name, module in model.named_modules():
         if isinstance(module, MoELayer):
-            wrap(module.token_dispatcher._comm_manager)  # pylint: disable=protected-access
+            mtp = name.startswith("mtp.") or ".mtp." in name
+            wrap(module.token_dispatcher._comm_manager, mtp)  # pylint: disable=protected-access
     real_null_forward = null_items.MoELockstepAdapter.null_forward
 
     def null_forward(adapter, entry, hidden, signature):
@@ -1940,11 +1943,18 @@ def test_hybridep_static_budget_nulls(deterministic):
         )
         assert padded_executor.stats.flagged_ranks["over_budget"] == []
         assert padded_budgets == budgets
-        # A quarter of the sample (the MTP depth's rolled mask may differ by one row).
-        assert all(abs(call["padded"] - SEQ_GPU // 4) <= 1 for call in padded_real), padded_real
-        any_padded = torch.tensor([len(padded_real)], device="cuda")
+        # A quarter of every odd sample, nothing of an even one. The MTP depth rolls the mask one
+        # row left and fills the vacated last row with True (the MTP roll's ``padding_mask`` fill
+        # value), so its calls carry one padded row more: 65 for an odd sample, 1 for an even one.
+        assert all(
+            call["padded"] - int(call["mtp"]) in (0, SEQ_GPU // 4) for call in padded_real
+        ), padded_real
+        real_mtp = [call for call in padded_calls if call["mtp"] and not call["null"]]
+        assert real_mtp and all(call["padded"] >= 1 for call in real_mtp), real_mtp
+        quarter = [call for call in padded_real if call["padded"] - int(call["mtp"]) > 0]
+        any_padded = torch.tensor([len(quarter)], device="cuda")
         dist.all_reduce(any_padded)
-        assert any_padded.item() > 0, "no real call received a padding mask"
+        assert any_padded.item() > 0, "no real call received a padded quarter"
         first_grads = _dense_summed(static, first_grads)
         dynamic = _dsv4_model(
             use_transformer_engine_op_fuser=True,

@@ -1308,8 +1308,10 @@ def bwd_fused_indexer_loss_naive(
                 dtype=torch.float32, device=attention_scores_normalized.device
             )
             if query_valid_rows is not None
-            else torch.tensor(
-                float(b * sq), dtype=torch.float32, device=attention_scores_normalized.device
+            # A device fill, not torch.tensor(..., device=...): the latter is a pageable
+            # host-to-device copy, which CUDA graph capture rejects.
+            else torch.full(
+                (), float(b * sq), dtype=torch.float32, device=attention_scores_normalized.device
             )
         ).clamp_min(1.0)
         grad_kl_per_row = grad_kl_div / valid_row_count  # scalar value for each real row

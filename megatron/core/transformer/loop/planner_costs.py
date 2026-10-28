@@ -71,6 +71,7 @@ MEM_MXFP8 = "MXFP8 per-layer weight casts (transient)"
 MEM_GRAPH_IO = "graph I/O + chain records in flight"
 MEM_STORE = "state store (peak, from sim)"
 MEM_TE_DUMMY = "TE fused-wgrad dummy gradients (one per dense weight shape)"
+MEM_COPY_ENGINE = "store copy engines: symmetric buffers (gather mirror + reduce slots)"
 MEM_RESERVE = "NCCL / HybridEP buffers"
 MEM_MISC = "misc (context, workspaces, fragmentation)"
 
@@ -1048,7 +1049,8 @@ def memory_components(
     ``N``; the coda item arena adds the head and sharded-grad transient targets and the
     hook-class embedding ``.grad``, the prelude item arena (not modelled otherwise) the same of
     the embed segment; the FP8 cast term covers the window units an item keeps; TE's fused-wgrad
-    dummies are a persistent term."""
+    dummies are a persistent term; a store with copy engines adds their symmetric buffers
+    (``MEM_COPY_ENGINE``, only when above 0: NCCL stores keep the same components)."""
     if layout not in ("layer_window", "resident"):
         raise ValueError(f"unknown layout {layout!r}")
     if layout == "resident":
@@ -1158,6 +1160,9 @@ def memory_components(
         r[MEM_MXFP8] = 2.06 * (cast + (shape.dims.NEXP // EP if EP else 0) * params.expert_params)
     if store_terms is not None and store_terms.te_dummy_wgrad:
         r[MEM_TE_DUMMY] = float(store_terms.te_dummy_wgrad)
+    copy_engine = 0 if store_terms is None else getattr(store_terms, "copy_engine_bytes", 0)
+    if copy_engine > 0:
+        r[MEM_COPY_ENGINE] = float(copy_engine)
     st = peak_units * ph.state_gpu
     r[MEM_GRAPH_IO] = 6 * ph.state_gpu
     r[MEM_STORE] = st

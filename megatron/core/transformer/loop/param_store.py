@@ -47,6 +47,7 @@ import enum
 import math
 import re
 import types
+import warnings
 import weakref
 from dataclasses import dataclass, field
 from typing import (
@@ -94,6 +95,7 @@ from megatron.core.transformer.loop.param_store_binding import (
     unbind_weight,
 )
 from megatron.core.transformer.loop.param_store_comm import (
+    COPY_ENGINE_EXPERIMENTAL_NOTE,
     GATHER_ENGINES,
     REDUCE_ENGINES,
     StoreComm,
@@ -122,11 +124,13 @@ __all__ = [
     "StoreModes",
     "StoreStats",
     "StoreUnit",
+    "copy_engine_bytes_estimate",
     "find_param_store",
     "named_logical_parameters",
     "store_variant_key",
     "te_distributed_weight_available",
     "unwrap_hybrid_model",
+    "warn_copy_engines_experimental",
 ]
 
 TRAIN_OUTSIDE_RSBF = (
@@ -277,6 +281,10 @@ class LoopParamStoreConfig:
     NVLink domain; ``z`` slots of the largest unit's fp32 shard, in ``copy_engine_bytes``).
     Deterministic and equal across store modes, but associated differently from NCCL's ring:
     equal to the NCCL engine within the fp32 association bound, not bitwise.
+    The copy engines are **experimental** (``COPY_ENGINE_EXPERIMENTAL_NOTE``; a warning at store
+    construction). ``copy_engine_timeout_ms``: their in-step symmetric-memory barrier timeout
+    (0, the default: wait forever, like NCCL; a finite value turns a hang into a device-side
+    trap that loses the CUDA context, for tests and benchmarks).
     """
 
     shard_size: int
@@ -296,6 +304,48 @@ class LoopParamStoreConfig:
     gather_engine: Literal["nccl", "copy"] = "nccl"
     copy_streams: int = 1
     reduce_engine: Literal["nccl", "copy"] = "nccl"
+    copy_engine_timeout_ms: int = 0
+
+
+def warn_copy_engines_experimental(config: LoopParamStoreConfig) -> bool:
+    """Warn (``UserWarning``, ``COPY_ENGINE_EXPERIMENTAL_NOTE``) when ``config`` selects a copy
+    engine; returns whether it did."""
+    if config.gather_engine == "copy" or config.reduce_engine == "copy":
+        warnings.warn(COPY_ENGINE_EXPERIMENTAL_NOTE, UserWarning, stacklevel=2)
+        return True
+    return False
+
+
+def copy_engine_bytes_estimate(
+    unit_tensor_numels: Sequence[Sequence[int]],
+    dtype: torch.dtype,
+    z: int,
+    gather_engine: str,
+    reduce_engine: str,
+) -> int:
+    """The copy engines' symmetric payload bytes on one rank before setup (pure): the gather
+    mirror (every unit's tensors' shards, each at a 256-B aligned offset, ``dtype``) for
+    ``gather_engine="copy"`` and the reduce-scatter receive slots (``z`` slots of the largest
+    unit's aligned fp32 shard) for ``reduce_engine="copy"``; 0 for the NCCL engines.
+    ``unit_tensor_numels``: per unit, its tensors' padded element counts (``numel_padded``)."""
+    total = 0
+    if gather_engine == "copy":
+        mirror = 0
+        for numels in unit_tensor_numels:
+            for numel in numels:
+                mirror = align_elements(mirror, dtype, 256)
+                mirror += int(numel) // z
+        total += max(mirror, 1) * _elem(dtype)
+    if reduce_engine == "copy":
+        slot = 0
+        for numels in unit_tensor_numels:
+            offset = 0
+            for numel in numels:
+                offset = align_elements(offset, torch.float32, 256)
+                offset += int(numel) // z
+            slot = max(slot, align_elements(offset, torch.float32, 256))
+        total += max(z * max(slot, 1), 1) * 4
+    return total
 
 
 @dataclass(frozen=True)
@@ -439,6 +489,9 @@ class StoreMemoryTerms:
     group_numel: Mapping[str, int] = field(default_factory=dict)
     group_copy_numel: Mapping[str, int] = field(default_factory=dict)
     group_shard_numel: Mapping[str, int] = field(default_factory=dict)
+    # The copy engines' symmetric buffers (``copy_engine_bytes_estimate`` for the store's
+    # engines; 0 for NCCL): the planner charges them only when above 0.
+    copy_engine_bytes: int = 0
 
     @property
     def buffer_bytes(self) -> int:
@@ -639,6 +692,7 @@ class LoopParamStore(nn.Module):
         problems = self._validate(config, groups)
         if problems:
             raise ValueError("loop parameter store: " + "; ".join(problems))
+        warn_copy_engines_experimental(config)
         object.__setattr__(self, "_hybrid_ref", weakref.ref(hybrid))
         self.config = config
         self.groups = groups
@@ -717,6 +771,10 @@ class LoopParamStore(nn.Module):
             problems.append("reduce_engine='copy' needs a shard axis z > 1")
         if config.copy_streams < 1:
             problems.append("copy_streams must be >= 1")
+        if config.copy_engine_timeout_ms < 0:
+            problems.append(
+                f"copy_engine_timeout_ms must be >= 0, got {config.copy_engine_timeout_ms}"
+            )
         if groups.shard is None or groups.domain is None or groups.replicate is None:
             problems.append("the shard, domain and replicate groups are required")
             return problems
@@ -972,6 +1030,7 @@ class LoopParamStore(nn.Module):
             gather_engine=config.gather_engine,
             copy_streams=config.copy_streams,
             reduce_engine=config.reduce_engine,
+            copy_engine_timeout_ms=config.copy_engine_timeout_ms,
         )
 
     def _eligible(
@@ -1375,6 +1434,49 @@ class LoopParamStore(nn.Module):
             return  # the copies are fresh inside a step
         self._allocate()
         self._gather_copies(now=True)
+
+    def _measure_unit_collectives(
+        self, *, repeat: int = 10, unit_key: Optional[str] = None
+    ) -> Dict[str, float]:
+        """Diagnostic (benchmarks; not part of the training API): the standalone all-gather and
+        reduce-scatter time of one unit with the store's engines (``StoreComm.
+        _measure_unit_collectives``), between steps, after a step has set the buffers up.
+        ``unit_key``: the unit (default: the largest core unit, else the largest unit). Gathers
+        into a free window slot when one is large enough (else a temporary buffer) and
+        reduce-scatters a scratch entry (else a zero buffer) into dropped outputs: no shard,
+        ``main_grad``, statistic or call log changes. Returns ``{"gather_ms", "reduce_ms",
+        "unit_bytes", "unit"}``."""
+        if self._in_step or self._cursor is not None:
+            raise RuntimeError("store: _measure_unit_collectives inside a step")
+        if self.comm is None or not self.comm.cuda or self.trivial:
+            raise RuntimeError("store: collectives are measured on CUDA with a shard axis z > 1")
+        if not self.comm.copy_engines_ready:
+            raise RuntimeError("store: run a step before measuring the copy engines")
+        if unit_key is not None:
+            matches = [unit for unit in self.units if unit.key == unit_key]
+            if not matches:
+                raise ValueError(f"store: no unit {unit_key!r}")
+            unit = matches[0]
+        else:
+            core = [unit for unit in self.units if unit.group == "core"] or list(self.units)
+            unit = max(core, key=lambda u: u.numel_padded)
+        span = max(t.offset + t.numel_padded for t in unit.tensors)
+        in_slot = bool(self._slots) and self.slot_numel >= span
+        if in_slot:
+            dest = self._slots[0]
+        else:
+            dest = torch.empty(max(span, unit.numel_padded), dtype=self.dtype, device=self.device)
+        src = self._scratch[0] if self._scratch and self.scratch_numel >= span else None
+        comm = self.comm
+        result = dict(
+            comm._measure_unit_collectives(  # pylint: disable=protected-access
+                unit, dest, repeat=repeat, reduce_src=src
+            )
+        )
+        if in_slot and self.config.poison_released:
+            dest.fill_(float("nan"))  # a released slot stays poisoned
+        result["unit"] = unit.key
+        return result
 
     def _drop_lookahead(self) -> None:
         """Release a prefetched or carried unit that no sub-round used."""
@@ -1797,31 +1899,23 @@ class LoopParamStore(nn.Module):
         """The copy engines' symmetric buffers on this rank: the gather mirror (every unit's
         shards, 256-B aligned) and the reduce-scatter receive slots (``z`` slots of the largest
         unit's aligned fp32 shard). Once set up, the actual buffers (a buffer shared with an
-        earlier, larger store of the process can exceed this store's layout)."""
-        gather = self.config.gather_engine == "copy"
-        reduce = self.config.reduce_engine == "copy"
-        if not (gather or reduce):
+        earlier, larger store of the process can exceed this store's layout); before,
+        ``copy_engine_bytes_estimate``."""
+        if self.config.gather_engine != "copy" and self.config.reduce_engine != "copy":
             return 0
         if self.comm is not None and self.comm.copy_engines_ready:
             return self.comm.copy_engine_bytes
-        total = 0
-        if gather:
-            mirror = 0
-            for unit in self.units:
-                for tensor in unit.tensors:
-                    mirror = align_elements(mirror, self.dtype, 256)
-                    mirror += tensor.numel_padded // self.shard_size
-            total += max(mirror, 1) * _elem(self.dtype)
-        if reduce:
-            slot = 0
-            for unit in self.units:
-                offset = 0
-                for tensor in unit.tensors:
-                    offset = align_elements(offset, torch.float32, 256)
-                    offset += tensor.numel_padded // self.shard_size
-                slot = max(slot, align_elements(offset, torch.float32, 256))
-            total += max(self.shard_size * max(slot, 1), 1) * 4
-        return total
+        return self._copy_engine_estimate()
+
+    def _copy_engine_estimate(self) -> int:
+        """``copy_engine_bytes_estimate`` of this store's units and engines."""
+        return copy_engine_bytes_estimate(
+            [[tensor.numel_padded for tensor in unit.tensors] for unit in self.units],
+            self.dtype,
+            self.shard_size,
+            self.config.gather_engine,
+            self.config.reduce_engine,
+        )
 
     def _transient_peak(self, schedule: SubRoundSchedule, head: Optional[bool] = None) -> int:
         """The peak of the transient (beyond the pool) fp32 gradient targets of ``schedule``;
@@ -1932,6 +2026,7 @@ class LoopParamStore(nn.Module):
             group_numel={group: group_numel.get(group, 0) for group in STORE_GROUPS},
             group_copy_numel={group: group_copy.get(group, 0) for group in STORE_GROUPS},
             group_shard_numel={group: group_shard.get(group, 0) for group in STORE_GROUPS},
+            copy_engine_bytes=self._copy_engine_estimate(),
         )
 
     def planner_terms(

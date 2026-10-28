@@ -67,6 +67,7 @@ STORE_DEFAULTS = dict(
     loop_param_store_debug="off",
     loop_param_store_gather_engine="nccl",
     loop_param_store_reduce_engine="nccl",
+    loop_param_store_copy_engine_timeout_ms=0,
 )
 RSBF = dict(
     loop_schedule="rsbf",
@@ -160,7 +161,8 @@ def test_cli_defaults_and_values(monkeypatch):
         "test --loop-param-store-shard-size 8 --loop-param-store-modes core=lw,edges=lw "
         "--loop-param-store-min-numel 65536 --loop-param-store-binding distributed_weight "
         "--loop-param-store-separate-rs-group --loop-param-store-debug check,timing "
-        "--loop-param-store-gather-engine copy --loop-param-store-reduce-engine copy".split(),
+        "--loop-param-store-gather-engine copy --loop-param-store-reduce-engine copy "
+        "--loop-param-store-copy-engine-timeout-ms 60000".split(),
     )
     args = parse_args()
     assert {name: getattr(args, name) for name in STORE_DEFAULTS} == dict(
@@ -172,6 +174,7 @@ def test_cli_defaults_and_values(monkeypatch):
         loop_param_store_debug="check,timing",
         loop_param_store_gather_engine="copy",
         loop_param_store_reduce_engine="copy",
+        loop_param_store_copy_engine_timeout_ms=60000,
     )
 
 
@@ -184,6 +187,8 @@ def test_the_valid_run_and_the_default_have_no_problems():
         dict(loop_param_store_shard_size=2, loop_param_store_debug="check,poison,verify,timing"),
         dict(optimizer="sgd", loop_planner="apply"),
         dict(loop_param_store_gather_engine="copy", loop_param_store_reduce_engine="copy"),
+        dict(loop_param_store_gather_engine="copy", loop_param_store_copy_engine_timeout_ms=9),
+        dict(loop_param_store_reduce_engine="copy", loop_param_store_copy_engine_timeout_ms=9),
         dict(fp8="hybrid", disable_parameter_transpose_cache=True),
     ):
         assert setup.loop_param_store_problems(_args(**overrides)) == [], overrides
@@ -205,6 +210,15 @@ def test_the_valid_run_and_the_default_have_no_problems():
         (dict(loop_param_store_shard_size=1, loop_param_store_gather_engine="copy"), "need"),
         (dict(loop_param_store_reduce_engine="nvls"), "--loop-param-store-reduce-engine 'nvls'"),
         (dict(loop_param_store_shard_size=1, loop_param_store_reduce_engine="copy"), "need"),
+        (
+            dict(loop_param_store_shard_size=1, loop_param_store_copy_engine_timeout_ms=5),
+            "--loop-param-store-copy-engine-timeout-ms need --loop-param-store-shard-size > 1",
+        ),
+        (dict(loop_param_store_copy_engine_timeout_ms=-1), "timeout-ms must be >= 0"),
+        (
+            dict(loop_param_store_copy_engine_timeout_ms=5),
+            "timeout-ms needs --loop-param-store-gather-engine or --loop-param-store-reduce-engine",
+        ),
         (dict(loop_schedule="standard"), "trains only through --loop-schedule rsbf"),
         (dict(loop_architecture="mor"), "needs a hybrid Huginn loop"),
         (dict(loop_prelude_sublayers=None), "needs a hybrid Huginn loop"),
@@ -279,6 +293,41 @@ def test_grid_size_and_store_config():
         == "copy"
     )
     assert setup.loop_param_store_debug(Namespace(loop_param_store_debug="off")) == ()
+    assert config.copy_engine_timeout_ms == 0
+    assert setup.loop_param_store_config(Namespace()).copy_engine_timeout_ms == 0
+    timed = setup.loop_param_store_config(_args(loop_param_store_copy_engine_timeout_ms=300))
+    assert timed.copy_engine_timeout_ms == 300
+
+
+def test_copy_engine_flags_are_marked_experimental():
+    import argparse
+
+    from megatron.training.arguments import _add_loop_param_store_args
+
+    parser = _add_loop_param_store_args(argparse.ArgumentParser())
+    actions = {action.dest: action for action in parser._actions}
+    for name in ("loop_param_store_gather_engine", "loop_param_store_reduce_engine"):
+        assert actions[name].help.startswith("(experimental)"), name
+    timeout = actions["loop_param_store_copy_engine_timeout_ms"]
+    assert timeout.default == 0 and timeout.type is int
+    assert "traps the device" in timeout.help
+
+
+def test_configure_logs_the_copy_engine_warning_under_planner_apply(monkeypatch, capsys):
+    """Rank 0 logs the copy engines' experimental warning also under ``--loop-planner apply``
+    (where the planner, not ``configure_loop_param_store``, sets the modes and the function
+    returns early)."""
+    from megatron.core.transformer.loop.param_store_comm import COPY_ENGINE_EXPERIMENTAL_NOTE
+
+    config = Namespace(gather_engine="nccl", reduce_engine="copy")
+    monkeypatch.setattr(setup, "find_param_store", lambda model: Namespace(config=config))
+    monkeypatch.setattr(torch.distributed, "is_initialized", lambda: True)
+    monkeypatch.setattr(torch.distributed, "get_rank", lambda group=None: 0)
+    assert setup.configure_loop_param_store(_args(loop_planner="apply"), None) is None
+    assert f"> WARNING: {COPY_ENGINE_EXPERIMENTAL_NOTE}" in capsys.readouterr().out
+    config.reduce_engine = "nccl"
+    setup.configure_loop_param_store(_args(loop_planner="apply"), None)
+    assert "WARNING" not in capsys.readouterr().out
 
 
 def test_args_data_parallel_size_stays_the_full_axis(monkeypatch):

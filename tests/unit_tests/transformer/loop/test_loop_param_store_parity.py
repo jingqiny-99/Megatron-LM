@@ -35,6 +35,11 @@ Gates:
 * the literal case (D-S6-9): one sample per EU, depth 1, no MTP, ``no_overwrite``: Layer window
   (kept, re-gathered) and Resident + sharded grads == store Resident, every gradient and the
   losses **bitwise**, with fusion off and on;
+* copy engines (experimental; in-step barriers with a 60 s timeout, so a hang traps instead of
+  stalling the job): gathers bitwise equal to NCCL, reduce-scatters within the fp32 association
+  bound, stores rebuilt on sub-world shard groups (R3-A), the setup agreement check raising on
+  every rank, and the standalone collective timing of the microbenchmark
+  (``_measure_unit_collectives``: no shard, ``main_grad`` or statistic changes);
 * the ``DistributedWeight`` binding: Layer window with ``binding="distributed_weight"`` ==
   ``binding="data"`` bitwise; skipped on TE < 2.19 (the CI image has TE 2.16, E1 / E2).
 """
@@ -580,7 +585,9 @@ def test_copy_engine_gathers_equal_nccl(store_groups, deterministic, form):
         copy = _run(
             store_groups,
             MODES[name],
-            store_config=dict(gather_engine="copy", verify_gathers=True),
+            store_config=dict(
+                gather_engine="copy", verify_gathers=True, copy_engine_timeout_ms=60_000
+            ),
             **common,
         )
         _assert_losses_bitwise(copy, nccl, f"copy engine {name}")
@@ -604,7 +611,12 @@ def test_copy_engine_reduce_scatters(store_groups, deterministic, form):
     if reason is not None:
         pytest.skip(reason)
     common = dict(form=form, waves=2, per_rank=2 * PER_RANK, steps=2)
-    copy_config = dict(gather_engine="copy", reduce_engine="copy", verify_gathers=True)
+    copy_config = dict(
+        gather_engine="copy",
+        reduce_engine="copy",
+        verify_gathers=True,
+        copy_engine_timeout_ms=60_000,
+    )
     runs = {}
     for name in ("rsg", "lw", "lw_regather"):
         nccl = _run(store_groups, MODES[name], **common)
@@ -720,7 +732,9 @@ def test_copy_engine_stores_rebuilt_on_sub_world_shard_groups(half_store_groups)
     nccl = StoreComm(shard, device)
     shared = []
     for seed, scale in enumerate((1, 1, 2)):
-        copy = StoreComm(shard, device, gather_engine="copy", reduce_engine="copy")
+        copy = StoreComm(
+            shard, device, gather_engine="copy", reduce_engine="copy", copy_engine_timeout_ms=60_000
+        )
         units = _fake_units(z, scale, seed)
         copy.setup_copy_engine(units, torch.bfloat16)
         shared.append((copy.copy_engine.shared, copy.copy_reduce.shared))
@@ -736,8 +750,8 @@ def test_copy_engine_stores_rebuilt_on_sub_world_shard_groups(half_store_groups)
         torch.cuda.empty_cache()
     assert shared[1][0] is shared[0][0] and shared[1][1] is shared[0][1]
     assert shared[2][0] is not shared[0][0] and shared[2][1] is not shared[0][1]
-    first = StoreComm(shard, device, gather_engine="copy")
-    second = StoreComm(shard, device, gather_engine="copy")
+    first = StoreComm(shard, device, gather_engine="copy", copy_engine_timeout_ms=60_000)
+    second = StoreComm(shard, device, gather_engine="copy", copy_engine_timeout_ms=60_000)
     units = _fake_units(z, 1, 99)
     first.setup_copy_engine(units, torch.bfloat16)
     second.setup_copy_engine(units, torch.bfloat16)
@@ -749,6 +763,70 @@ def test_copy_engine_stores_rebuilt_on_sub_world_shard_groups(half_store_groups)
     second.join()
     first.join()
     torch.cuda.synchronize()
+
+
+def test_copy_engine_agreement_check_raises_on_every_rank(store_groups):
+    """The setup-time agreement check: a copy-engine store whose rank 0 asks a larger mirror
+    than its peers (rank 0 would allocate and rendezvous while the others reuse: the R3-A class
+    of a divergent setup) raises the agreement RuntimeError on every rank before any
+    allocation, within the NCCL all-gather (no hang); the buffer cache is unchanged, so a later
+    agreeing store reuses the earlier buffer. Every buffer is handshaken (finite barrier)."""
+    from megatron.core.transformer.loop.param_store_comm import StoreComm
+
+    reason = _copy_engine_unavailable_reason()
+    if reason is not None:
+        pytest.skip(reason)
+    shard = store_groups.shard
+    device = torch.device("cuda", torch.cuda.current_device())
+    timeout = dict(gather_engine="copy", copy_engine_timeout_ms=60_000)
+    first = StoreComm(shard, device, **timeout)
+    first.setup_copy_engine(_fake_units(WORLD, 1, 50), torch.bfloat16)
+    second = StoreComm(shard, device, **timeout)
+    larger = _fake_units(WORLD, 2 if dist.get_rank() == 0 else 1, 51)
+    with pytest.raises(RuntimeError, match="disagree on the gather buffer"):
+        second.setup_copy_engine(larger, torch.bfloat16)
+    assert second.copy_engine is None
+    third = StoreComm(shard, device, **timeout)
+    third.setup_copy_engine(_fake_units(WORLD, 1, 52), torch.bfloat16)
+    assert third.copy_engine.shared is first.copy_engine.shared
+    torch.cuda.synchronize()
+    dist.barrier()
+
+
+def test_measure_unit_collectives(store_groups):
+    """``LoopParamStore._measure_unit_collectives`` (the microbenchmark's standalone collective
+    time), NCCL and copy engines, between steps after one RSBF step: positive gather and
+    reduce-scatter times of the largest core unit; every shard and ``main_grad`` unchanged
+    bitwise (a -0.0 planted in a ``main_grad`` keeps its sign: the reduce-scatters write scratch
+    outputs, never ``main_grad``); the step statistics unchanged; a call inside a step raises."""
+    engines = {"nccl": {}}
+    if _copy_engine_unavailable_reason() is None:
+        engines["copy"] = dict(
+            gather_engine="copy", reduce_engine="copy", copy_engine_timeout_ms=60_000
+        )
+    for name, config in engines.items():
+        store = _run(store_groups, MODES["lw"], store_config=config)["store"]
+        planted = next(store.tensors()).shard.main_grad
+        planted.view(-1)[0] = -0.0
+        grads = {t.name: t.shard.main_grad.clone() for t in store.tensors()}
+        shards = {t.name: t.shard.detach().clone() for t in store.tensors()}
+        stats = repr(store.stats)
+        result = store._measure_unit_collectives(repeat=3)
+        assert result["gather_ms"] > 0 and result["reduce_ms"] > 0, (name, result)
+        assert result["unit_bytes"] > 0 and result["unit"].startswith("core:"), (name, result)
+        for tensor in store.tensors():
+            assert torch.equal(tensor.shard.main_grad, grads[tensor.name]), (name, tensor.name)
+            assert torch.equal(tensor.shard.detach(), shards[tensor.name]), (name, tensor.name)
+        assert torch.signbit(planted.view(-1)[0]).item(), name
+        assert repr(store.stats) == stats, name
+        store.begin_step()
+        try:
+            with pytest.raises(RuntimeError, match="inside a step"):
+                store._measure_unit_collectives()
+        finally:
+            store.abort_step()
+        torch.cuda.synchronize()
+        dist.barrier()
 
 
 def test_distributed_weight_binding_equals_the_data_binding(store_groups, deterministic):

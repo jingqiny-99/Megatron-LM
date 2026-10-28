@@ -410,3 +410,69 @@ def test_apply_plan_to_store():
     without = dataclasses.replace(plan, capabilities=_caps(layer_window=False))
     with pytest.raises(P.PlannerUnsupported, match="without the parameter store"):
         P.apply_plan_to_store(store, without, core_plan=core_plan)
+
+
+# ----------------------------------------------------------------------------- copy engines
+def test_copy_engine_bytes_estimate_is_pure_and_matches_the_store(monkeypatch):
+    """``copy_engine_bytes_estimate``: 0 for the NCCL engines; the gather mirror (every unit's
+    tensors' shards at 256-B aligned offsets, the store dtype) for ``copy`` gathers; plus ``z``
+    slots of the largest unit's aligned fp32 shard for ``copy`` reduce-scatters. Equal to the
+    store's pre-setup estimate and to its planner terms for the same units and engines."""
+    import torch
+
+    from megatron.core.transformer.loop import param_store as ps
+
+    numels = [[1000, 77 * 4], [4096 * 4, 3 * 4]]  # padded numels at z = 4
+    estimate = ps.copy_engine_bytes_estimate
+    assert estimate(numels, torch.bfloat16, 4, "nccl", "nccl") == 0
+    # Mirror (bf16, 128-element alignment): 250 -> 256 + 77 -> 384 + 4096 -> 4480 + 3 = 4483.
+    assert estimate(numels, torch.bfloat16, 4, "copy", "nccl") == 4483 * 2
+    # Slots (fp32, 64-element alignment): unit 0 384, unit 1 4096 -> 4096 + 3 -> 4160; 4 slots.
+    assert estimate(numels, torch.bfloat16, 4, "nccl", "copy") == 4 * 4160 * 4
+    assert estimate(numels, torch.bfloat16, 4, "copy", "copy") == 4483 * 2 + 4 * 4160 * 4
+    assert estimate([], torch.bfloat16, 4, "copy", "copy") == 2 + 4 * 4  # never empty buffers
+
+    model = _model()
+    store = _store(model)
+    store.configure_modes(StoreModes(), core_plan=CoreBackwardPlan.whole_round(CORE_SUBLAYERS))
+    units = [[t.numel_padded for t in unit.tensors] for unit in store.units]
+    assert store._copy_engine_bytes() == 0  # NCCL engines
+    assert store.memory_terms().copy_engine_bytes == 0
+    copy = dataclasses.replace(store.config, gather_engine="copy", reduce_engine="copy")
+    monkeypatch.setattr(store, "config", copy)
+    monkeypatch.setattr(store, "comm", None)  # not set up: the pre-setup estimate
+    expected = estimate(units, store.dtype, store.shard_size, "copy", "copy")
+    assert expected > 0
+    assert store._copy_engine_bytes() == expected
+    assert store.memory_report().copy_engine_bytes == expected
+    assert store.memory_terms().copy_engine_bytes == expected
+
+
+def test_copy_engine_bytes_charged_by_the_planner():
+    """``memory_components`` charges ``MEM_COPY_ENGINE`` exactly when the store's terms carry
+    copy-engine bytes; NCCL terms and the cost model (no terms) keep the same dict and order."""
+    model = _model()
+    store = _store(model)
+    modes = StoreModes.parse("core=lw,edges=lw,emb_head=rsg")
+    terms = store.memory_terms(modes, core_plan=CoreBackwardPlan.whole_round(CORE_SUBLAYERS))
+    assert terms.copy_engine_bytes == 0
+    shape = C.ModelShape.from_model(model, vocab_size=VOCAB, expert_parallel_size=1)
+    ph = C.SeqPhase.of(shape, 4096, 1)
+    hw = P.PlannerHardware.preset("h100")
+    kwargs = dict(EP=1, N=8, prec="bf16", layout="layer_window", nested=True)
+    base, _ = C.memory_components(shape, ph, hw, 0.0, store_terms=terms, **kwargs)
+    charged, _ = C.memory_components(
+        shape,
+        ph,
+        hw,
+        0.0,
+        store_terms=dataclasses.replace(terms, copy_engine_bytes=12345),
+        **kwargs,
+    )
+    assert C.MEM_COPY_ENGINE not in base
+    assert charged[C.MEM_COPY_ENGINE] == 12345.0
+    assert set(charged) - set(base) == {C.MEM_COPY_ENGINE}
+    assert [k for k in charged if k != C.MEM_COPY_ENGINE] == list(base)
+    assert all(charged[k] == v for k, v in base.items())
+    cost, _ = C.memory_components(shape, ph, hw, 0.0, **kwargs)
+    assert C.MEM_COPY_ENGINE not in cost

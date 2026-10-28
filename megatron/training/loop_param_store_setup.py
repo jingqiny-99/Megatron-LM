@@ -35,6 +35,7 @@ from megatron.core.transformer.loop.param_store import (
     find_param_store,
     unwrap_hybrid_model,
 )
+from megatron.core.transformer.loop.param_store_comm import COPY_ENGINE_EXPERIMENTAL_NOTE
 
 __all__ = [
     "LOOP_PARAM_STORE_DEBUG",
@@ -122,6 +123,15 @@ def loop_param_store_problems(args) -> List[str]:
     reduce_engine = getattr(args, "loop_param_store_reduce_engine", "nccl")
     if reduce_engine not in ("nccl", "copy"):
         problems.append(f"--loop-param-store-reduce-engine {reduce_engine!r} (nccl or copy)")
+    timeout_ms = getattr(args, "loop_param_store_copy_engine_timeout_ms", 0) or 0
+    if timeout_ms < 0:
+        problems.append("--loop-param-store-copy-engine-timeout-ms must be >= 0 (0 = wait)")
+    elif timeout_ms > 0 and "copy" not in (engine, reduce_engine):
+        problems.append(
+            "--loop-param-store-copy-engine-timeout-ms needs --loop-param-store-gather-engine "
+            "or --loop-param-store-reduce-engine copy (the NCCL engines have no barrier to time "
+            "out)"
+        )
     if z < 1:
         problems.append(f"--loop-param-store-shard-size must be >= 1, got {z}")
         return problems
@@ -133,6 +143,7 @@ def loop_param_store_problems(args) -> List[str]:
                 ("--loop-param-store-binding", binding != "data"),
                 ("--loop-param-store-gather-engine", engine != "nccl"),
                 ("--loop-param-store-reduce-engine", reduce_engine != "nccl"),
+                ("--loop-param-store-copy-engine-timeout-ms", timeout_ms != 0),
                 (
                     "--loop-param-store-separate-rs-group",
                     getattr(args, "loop_param_store_separate_rs_group", False),
@@ -281,6 +292,9 @@ def loop_param_store_config(args) -> LoopParamStoreConfig:
         separate_rs_group=bool(getattr(args, "loop_param_store_separate_rs_group", False)),
         gather_engine=getattr(args, "loop_param_store_gather_engine", "nccl"),
         reduce_engine=getattr(args, "loop_param_store_reduce_engine", "nccl"),
+        copy_engine_timeout_ms=int(
+            getattr(args, "loop_param_store_copy_engine_timeout_ms", 0) or 0
+        ),
         **{field: name in debug for name, field in LOOP_PARAM_STORE_DEBUG.items()},
     )
 
@@ -411,7 +425,13 @@ def configure_loop_param_store(args, model: Any) -> Optional[StoreModes]:
     on the config's core item plan. A no-op without a store; under ``--loop-planner apply``
     the planner sets them (``apply_plan_to_store``)."""
     store = find_param_store(model)
-    if store is None or getattr(args, "loop_planner", "off") == "apply":
+    if store is None:
+        return None
+    rank0 = torch.distributed.is_initialized() and torch.distributed.get_rank() == 0
+    # Before the planner's early return: the warning holds whoever sets the modes.
+    if rank0 and "copy" in (store.config.gather_engine, store.config.reduce_engine):
+        print(f"> WARNING: {COPY_ENGINE_EXPERIMENTAL_NOTE}", flush=True)
+    if getattr(args, "loop_planner", "off") == "apply":
         return None
     # pylint: disable=import-outside-toplevel
     from megatron.core.transformer.loop.program import build_core_plan
@@ -421,7 +441,7 @@ def configure_loop_param_store(args, model: Any) -> Optional[StoreModes]:
     store.configure_modes(
         modes, core_plan=build_core_plan(hybrid.config, hybrid.decoder.loop_roles)
     )
-    if torch.distributed.is_initialized() and torch.distributed.get_rank() == 0:
+    if rank0:
         print(f"> loop parameter store modes: {modes.describe()} ({how})", flush=True)
     return modes
 

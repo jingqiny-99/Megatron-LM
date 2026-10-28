@@ -4013,7 +4013,8 @@ def _add_loop_param_store_args(parser):
         type=str,
         default='nccl',
         choices=['nccl', 'copy'],
-        help='How the store all-gathers inside a step: nccl (default) or copy (copy-engine '
+        help='(experimental) How the store all-gathers inside a step: nccl (default) or copy '
+        '(copy-engine '
         'pulls from a symmetric-memory mirror of the shards, no SMs taken from the overlapped '
         'compute; CUDA, the shard group inside one NVLink domain; one more copy of this '
         'rank\'s shards).',
@@ -4023,10 +4024,20 @@ def _add_loop_param_store_args(parser):
         type=str,
         default='nccl',
         choices=['nccl', 'copy'],
-        help='How the store reduce-scatters gradients: nccl (default) or copy (copy-engine '
+        help='(experimental) How the store reduce-scatters gradients: nccl (default) or copy '
+        '(copy-engine '
         'pushes into symmetric receive slots and one short sum kernel, no long-lived NCCL '
         'kernel during the backward; CUDA, the shard group inside one NVLink domain; '
         'deterministic but associated differently from NCCL, equal within fp32 rounding).',
+    )
+    group.add_argument(
+        '--loop-param-store-copy-engine-timeout-ms',
+        type=int,
+        default=0,
+        help='The copy engines\' in-step symmetric-memory barrier timeout in ms (with '
+        '--loop-param-store-gather-engine / --loop-param-store-reduce-engine copy). 0 (default) '
+        'waits forever, like NCCL; a finite value traps the device on a hang and kills the '
+        'process (the CUDA context is lost), so use it for debugging only.',
     )
     group.add_argument(
         '--loop-param-store-debug',

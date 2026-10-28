@@ -22,16 +22,28 @@ given (``groups.shard_rs``): torch's per-group NCCL stream then serializes them,
 issue order safe. On CPU (Gloo) every call is synchronous and the events are None. A trivial
 shard axis (``z = 1``, tests only) runs no collective: the gather copies, the reduce adds.
 
-Copy engines (CUDA, one NVLink domain per shard group). ``gather_engine="copy"`` pulls the in-step
-gathers from a symmetric-memory mirror of the shards (``_CopyEngineGather``);
-``reduce_engine="copy"`` pushes each rank's rows of a gradient into the owners' symmetric receive
-slots and sums the slots with one short kernel (``_CopyEngineReduce``). Both move the bytes with
-``cudaMemcpyAsync`` (no SMs taken from the overlapped compute). Their symmetric buffers are
-allocated once per process and shard group (``_shared_symmetric_buffer``) and never freed: a
-store built later in the same process (a re-initialization, a test, a benchmark arm) reuses them.
+Copy engines (CUDA, one NVLink domain per shard group; **experimental** and opt-in,
+``COPY_ENGINE_EXPERIMENTAL_NOTE``). ``gather_engine="copy"`` pulls the in-step gathers from a
+symmetric-memory mirror of the shards (``_CopyEngineGather``); ``reduce_engine="copy"`` pushes
+each rank's rows of a gradient into the owners' symmetric receive slots and sums the slots with
+one short kernel (``_CopyEngineReduce``). Both move the bytes with ``cudaMemcpyAsync`` (no SMs
+taken from the overlapped compute). Their symmetric buffers are allocated once per process and
+shard group (``_shared_symmetric_buffer``) and never freed: a store built later in the same
+process (a re-initialization, a test, a benchmark arm) reuses them. Guard rails: torch's
+symmetric-memory API is checked before the first allocation (``copy_engine_api_check``); a
+buffer never comes from torch's implicit symmetric pool (``_symmetric_empty``); every reuse /
+allocate decision is checked to agree across the group (``_check_group_agreement``) and every
+buffer is handshaken through its peers' header words under a finite barrier at setup
+(``_SymmetricBuffer._handshake``), so a stale or mismatched symmetric handle fails loudly at
+setup instead of deadlocking a step; the in-step barriers take an optional finite timeout
+(``copy_engine_timeout_ms``; 0 = wait forever, like NCCL; a finite timeout traps the device).
 """
 
+import importlib
+import inspect
 import itertools
+import logging
+import secrets
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import torch
@@ -39,7 +51,25 @@ import torch.distributed as dist
 
 from megatron.core.transformer.loop.param_store_binding import align_elements, tensor_region
 
-__all__ = ["GATHER_ENGINES", "REDUCE_ENGINES", "StoreComm"]
+__all__ = [
+    "COPY_ENGINE_EXPERIMENTAL_NOTE",
+    "GATHER_ENGINES",
+    "REDUCE_ENGINES",
+    "StoreComm",
+    "copy_engine_allocation_paths",
+    "copy_engine_api_check",
+    "copy_engine_buffer_bytes",
+    "copy_engine_unavailable_reason",
+]
+
+logger = logging.getLogger(__name__)
+
+COPY_ENGINE_EXPERIMENTAL_NOTE = (
+    "loop parameter store copy engines (gather_engine / reduce_engine = 'copy') are "
+    "experimental: the shard group must lie in one NVLink domain reachable by torch symmetric "
+    "memory; their symmetric buffers live for the process; the copy reduce-scatter is "
+    "deterministic but equals NCCL only within the fp32 association bound"
+)
 
 # "nccl": the all-gathers are NCCL collectives (SM kernels). "copy": the in-step all-gathers pull
 # the peers' shards from a symmetric-memory mirror with copy-engine copies (no SM; one NVLink
@@ -51,60 +81,262 @@ GATHER_ENGINES: Tuple[str, ...] = ("nccl", "copy")
 REDUCE_ENGINES: Tuple[str, ...] = ("nccl", "copy")
 
 
-def _symmetric_empty(numel: int, dtype: torch.dtype, device: torch.device) -> torch.Tensor:
+def _symmetric_memory_class():
+    """torch's ``_SymmetricMemory`` (one place, so tests can substitute it)."""
+    # pylint: disable-next=import-outside-toplevel,no-name-in-module
+    from torch._C._distributed_c10d import _SymmetricMemory
+
+    return _SymmetricMemory
+
+
+def _accepts_keyword(function: Any, name: str) -> bool:
+    """Whether ``function`` takes the keyword ``name``: its signature, or for a pybind method
+    (no introspectable signature, or only ``**kwargs``) its docstring's signature lines."""
+    try:
+        parameters = inspect.signature(function).parameters
+    except (TypeError, ValueError):
+        parameters = None
+    if parameters is not None and not any(
+        p.kind is inspect.Parameter.VAR_KEYWORD for p in parameters.values()
+    ):
+        return name in parameters
+    doc = getattr(function, "__doc__", None) or ""
+    return f"{name}:" in doc or f"{name}=" in doc
+
+
+def copy_engine_api_check() -> Dict[str, object]:
+    """Pure introspection of the torch symmetric-memory API the copy engines need:
+    ``{"symmetric_memory": importable, "empty_strided_p2p": the dedicated allocator,
+    "barrier_timeout_ms": barrier(timeout_ms=) accepted, "torch": version}``. No allocation, no
+    collective (the GPU job envprobes print it)."""
+    result: Dict[str, object] = {
+        "symmetric_memory": False,
+        "empty_strided_p2p": False,
+        "barrier_timeout_ms": False,
+        "torch": torch.__version__,
+    }
+    try:
+        importlib.import_module("torch.distributed._symmetric_memory")
+        cls = _symmetric_memory_class()
+    except (ImportError, AttributeError):
+        return result
+    result["symmetric_memory"] = True
+    result["empty_strided_p2p"] = callable(getattr(cls, "empty_strided_p2p", None))
+    barrier = getattr(cls, "barrier", None)
+    result["barrier_timeout_ms"] = barrier is not None and _accepts_keyword(barrier, "timeout_ms")
+    return result
+
+
+def copy_engine_unavailable_reason() -> Optional[str]:
+    """None when the copy engines' torch API is present, else the reason naming every missing
+    piece (reported as "unavailable", never mistaken for an R3-A regression)."""
+    check = copy_engine_api_check()
+    missing = [
+        what
+        for key, what in (
+            ("symmetric_memory", "torch.distributed._symmetric_memory"),
+            ("empty_strided_p2p", "_SymmetricMemory.empty_strided_p2p"),
+            ("barrier_timeout_ms", "_SymmetricMemory.barrier(timeout_ms=)"),
+        )
+        if not check[key]
+    ]
+    if not missing:
+        return None
+    return (
+        f"copy engines unavailable in this torch ({check['torch']}): missing "
+        f"{', '.join(missing)}; use the NCCL engines"
+    )
+
+
+# (group name, purpose) -> how the latest symmetric buffer of that purpose was allocated.
+_ALLOCATION_PATHS: Dict[Tuple[str, str], str] = {}
+
+
+def copy_engine_allocation_paths() -> Dict[Tuple[str, str], str]:
+    """``(group name, purpose) -> allocator`` of every symmetric buffer this process allocated
+    (always ``"empty_strided_p2p"``: the implicit-pool fallback is refused)."""
+    return dict(_ALLOCATION_PATHS)
+
+
+def _symmetric_empty(
+    numel: int, dtype: torch.dtype, device: torch.device, *, group_name: str, purpose: str
+) -> torch.Tensor:
     """A dedicated symmetric-memory allocation of ``numel`` elements.
 
-    Allocated directly by the symmetric-memory allocator, not from torch's implicit symmetric
+    Allocated directly by the symmetric-memory allocator, never from torch's implicit symmetric
     MemPool (``symm_mem.empty``'s default): a pool hands a freed block back to the next request
     together with the block's cached rendezvous, so a store built after another one could get a
     reused allocation on some ranks and a fresh one on others (R3-A: the second copy-engine store
     on a sub-world shard group deadlocked in a barrier). A dedicated allocation starts at offset
-    0 of its own rendezvous, and ``_shared_symmetric_buffer`` never frees it."""
-    # pylint: disable-next=import-outside-toplevel
-    import torch.distributed._symmetric_memory as symm_mem
-
-    # pylint: disable-next=import-outside-toplevel,no-name-in-module
-    from torch._C._distributed_c10d import _SymmetricMemory
-
+    0 of its own rendezvous, and ``_shared_symmetric_buffer`` never frees it. A torch whose
+    allocator takes another signature is refused (no silent pool fallback)."""
     try:
-        return _SymmetricMemory.empty_strided_p2p((numel,), (1,), dtype, device)
-    except TypeError:  # pragma: no cover - torch builds with another signature
-        return symm_mem.empty(numel, dtype=dtype, device=device)
+        tensor = _symmetric_memory_class().empty_strided_p2p((int(numel),), (1,), dtype, device)
+    except TypeError as error:
+        raise RuntimeError(
+            f"copy engine: torch's symmetric allocator signature is unsupported ({error}); the "
+            "implicit-pool fallback is refused (R3-A); use the NCCL engines"
+        ) from error
+    _ALLOCATION_PATHS[(str(group_name), str(purpose))] = "empty_strided_p2p"
+    return tensor
+
+
+def _all_gather_ints(group, device: torch.device, values: Sequence[int]) -> List[List[int]]:
+    """Every group rank's ``values`` (int64, one all-gather on ``device``), in group-rank
+    order. Setup-time only (a host synchronization)."""
+    local = torch.tensor([int(v) for v in values], dtype=torch.int64, device=device)
+    out = torch.empty(group.size() * local.numel(), dtype=torch.int64, device=device)
+    dist.all_gather_into_tensor(out, local, group=group)
+    return out.view(group.size(), local.numel()).tolist()
+
+
+def _agreement_mismatch(records: Sequence[Sequence[int]]) -> Optional[str]:
+    """Pure: None when every rank's record is equal, else a message listing every rank's."""
+    first = tuple(records[0]) if records else ()
+    if all(tuple(record) == first for record in records):
+        return None
+    return "; ".join(f"rank {r}: {tuple(record)}" for r, record in enumerate(records))
+
+
+def _check_group_agreement(
+    group, device: torch.device, record: Sequence[int], what: str, *, private: Sequence[int] = ()
+) -> List[Tuple[int, ...]]:
+    """All-gather ``record`` (and ``private``, not compared) over ``group``; raise RuntimeError
+    on every rank with ``_agreement_mismatch``'s message when the records differ. Returns every
+    group rank's ``private`` words. Setup-time only (never inside a step).
+
+    It guards the Python-level reuse / allocate split (deterministic today, so a regression
+    guard: a rank allocating while its peers reuse would hang in the rendezvous); the state
+    below Python is covered by ``_SymmetricBuffer._handshake``."""
+    rows = _all_gather_ints(group, device, list(record) + list(private))
+    count = len(record)
+    message = _agreement_mismatch([row[:count] for row in rows])
+    if message is not None:
+        ranks = dist.get_process_group_ranks(group)
+        raise RuntimeError(
+            f"copy engine: the ranks of shard group {ranks} disagree on the {what} "
+            f"((reuse, requested elements, generation, handshake sequence) per group rank: "
+            f"{message}); every rank "
+            "must build the same copy-engine stores in the same order"
+        )
+    return [tuple(row[count:]) for row in rows]
+
+
+_NONCE: List[int] = []
+
+
+def _process_nonce() -> int:
+    """A random int64 drawn once per process (the handshake's identity of this rank)."""
+    if not _NONCE:
+        _NONCE.append(secrets.randbits(62))
+    return _NONCE[0]
 
 
 class _SymmetricBuffer:
     """One symmetric allocation rendezvoused on a group, kept for the process.
 
-    ``peers[r]`` is rank ``r``'s buffer (this rank's own at ``rank``). ``last_use`` is an event
+    ``buffer`` is this rank's payload (``numel`` elements of ``dtype`` at offset 0 of the
+    allocation) and ``peers[r]`` rank ``r``'s (this rank's own at ``rank``). After the payload,
+    at a 256-B aligned offset, ``HEADER_INT64`` header words per rank carry the setup handshake
+    (``_handshake``; not part of the payload or of ``nbytes``): magic, generation, the
+    handshake's sequence number (so a reuse handshake cannot pass on the previous one's words),
+    group rank and process nonce. ``last_use`` is an event
     recorded after the latest operation on the buffer (by any store, on its side stream); the
     next operation's stream waits it first (``acquire``), so stores built one after another
     never overlap on the device. ``owner`` is the token of the store whose data the buffer holds
-    (the gather mirror, claimed at each refresh)."""
+    (the gather mirror, claimed at each refresh). ``timeout_ms``: the default barrier timeout
+    (0 = wait forever); ``handshake_timeout_ms``: the setup handshake's, always finite."""
 
-    def __init__(self, group, device: torch.device, dtype: torch.dtype, numel: int):
+    HEADER_INT64 = 5  # (magic, generation, handshake sequence, group rank, process nonce)
+    MAGIC = 0x4C50535354524331  # "LPSSTRC1"
+
+    def __init__(
+        self,
+        group,
+        device: torch.device,
+        dtype: torch.dtype,
+        numel: int,
+        *,
+        purpose: str = "",
+        timeout_ms: int = 0,
+        generation: int = 1,
+        handshake_timeout_ms: int = 60_000,
+    ):
         # pylint: disable-next=import-outside-toplevel
         import torch.distributed._symmetric_memory as symm_mem
 
         self.group = group  # kept alive: the cache key's group name must name this group
         self.numel = int(numel)
         self.dtype = dtype
-        self.buffer = _symmetric_empty(self.numel, dtype, device)
-        self.handle = symm_mem.rendezvous(self.buffer, group.group_name)
+        self.purpose = purpose
+        self.timeout_ms = int(timeout_ms)
+        self.handshake_timeout_ms = int(handshake_timeout_ms)
+        self.generation = int(generation)
+        self.group_ranks = tuple(dist.get_process_group_ranks(group))
+        self.payload_bytes = self.numel * torch.empty((), dtype=dtype).element_size()
+        self.header_offset = align_elements(self.payload_bytes, torch.uint8, 256)  # bytes
+        self.raw = _symmetric_empty(
+            self.header_offset + self.HEADER_INT64 * 8,
+            torch.uint8,
+            device,
+            group_name=group.group_name,
+            purpose=purpose,
+        )
+        try:
+            self._attach(symm_mem, group, dtype)
+        except BaseException:
+            # The allocation may already be rendezvoused: like an outgrown buffer, it is kept
+            # (retired, counted in ``copy_engine_buffer_bytes``), never freed.
+            _RETIRED_SYMMETRIC_BUFFERS.append(self)
+            raise
+        self.last_use: Optional[Any] = None
+        self.owner: Optional[int] = None
+
+    def _attach(self, symm_mem, group, dtype: torch.dtype) -> None:
+        """Rendezvous ``raw`` over ``group`` and build the payload / header views (own and
+        peers'); raises ``RuntimeError`` when the group does not map onto the handle."""
+        where = (
+            f"the {self.purpose} buffer on shard group ranks {list(self.group_ranks)} (the shard "
+            "group must lie in one NVLink domain reachable by torch symmetric memory)"
+        )
+        try:
+            self.handle = symm_mem.rendezvous(self.raw, group.group_name)
+        except Exception as error:  # pylint: disable=broad-except
+            raise RuntimeError(
+                f"copy engine: symmetric-memory rendezvous of {where} failed: {error}"
+            ) from error
         if self.handle is None or self.handle.world_size != group.size():
-            raise RuntimeError("copy engine: symmetric-memory rendezvous failed")
+            raise RuntimeError(f"copy engine: symmetric-memory rendezvous of {where} failed")
         self.rank = self.handle.rank
         self.size = self.handle.world_size
+        if self.rank != dist.get_rank(group):
+            raise RuntimeError(
+                f"copy engine: symmetric-memory rank {self.rank} != group rank "
+                f"{dist.get_rank(group)} for {where}"
+            )
+        self.buffer = self.raw.narrow(0, 0, self.payload_bytes).view(dtype)
+        self.header = self.raw.narrow(0, self.header_offset, self.HEADER_INT64 * 8).view(
+            torch.int64
+        )
         self.peers = [
             self.buffer if r == self.rank else self.handle.get_buffer(r, (self.numel,), dtype)
             for r in range(self.size)
         ]
-        self.last_use: Optional[Any] = None
-        self.owner: Optional[int] = None
+        self.peer_headers = [
+            (
+                self.header
+                if r == self.rank
+                else self.handle.get_buffer(
+                    r, (self.HEADER_INT64,), torch.int64, self.header_offset // 8
+                )
+            )
+            for r in range(self.size)
+        ]
 
     @property
     def nbytes(self) -> int:
-        """This rank's bytes of the allocation."""
-        return self.numel * self.buffer.element_size()
+        """This rank's payload bytes of the allocation (the header words excluded)."""
+        return self.payload_bytes
 
     def acquire(self, stream) -> None:
         """``stream`` waits the latest operation on the buffer."""
@@ -117,30 +349,154 @@ class _SymmetricBuffer:
         event.record(stream)
         self.last_use = event
 
+    def barrier(self, what: str = "", timeout_ms: Optional[int] = None) -> None:
+        """A symmetric-memory barrier of the group on the current stream (channel 0).
+        ``timeout_ms`` (default ``self.timeout_ms``; 0 = wait forever): a finite timeout turns
+        a hang into a device-side trap with torch's message (the CUDA context is lost). With
+        DEBUG logging, a host line names the engine, the group ranks and the generation first
+        (the trap text itself does not). The store has no debug switch of its own: this
+        module's logger level is the switch."""
+        timeout = self.timeout_ms if timeout_ms is None else int(timeout_ms)
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug(
+                "copy engine %s barrier (%s buffer): shard group ranks %s, generation %d, "
+                "timeout %d ms",
+                what,
+                self.purpose,
+                list(self.group_ranks),
+                self.generation,
+                timeout,
+            )
+        self.handle.barrier(channel=0, timeout_ms=timeout)
+
+    def _expected_header(self, generation: int, sequence: int, rank: int, nonce: int):
+        return [self.MAGIC, int(generation), int(sequence), int(rank), int(nonce)]
+
+    def _handshake(self, generation: int, nonces: Sequence[int], sequence: int = 1) -> None:
+        """Setup-time check that every peer mapping reaches the peer's current buffer.
+
+        On the current stream, after the buffer's last operation: write (MAGIC, generation,
+        ``sequence``, group rank, this process's nonce) into this rank's header words; a barrier
+        with the finite ``handshake_timeout_ms``; read every peer's header through its mapping
+        and compare with (MAGIC, ``generation``, ``sequence``, peer rank, ``nonces[peer]``);
+        all-gather the verdicts over the group (NCCL) and raise RuntimeError on every rank
+        naming each disagreeing (rank, peer) pair. ``sequence`` (agreed across the group, one
+        more per handshake of the buffer's key) makes every handshake's words new, so a peer
+        whose write did not land fails on a reuse too. A stale handle or signal pad (the R3-A
+        hypothesis) or a peer at another generation fails here, loudly, instead of deadlocking
+        a step."""
+        device = self.buffer.device
+        current = torch.cuda.current_stream(device)
+        self.acquire(current)
+        mine = self._expected_header(generation, sequence, self.rank, nonces[self.rank])
+        self.header.copy_(torch.tensor(mine, dtype=torch.int64, device=device))
+        self.barrier("handshake", timeout_ms=self.handshake_timeout_ms)
+        seen = torch.stack([header.clone() for header in self.peer_headers])
+        expected = torch.tensor(
+            [self._expected_header(generation, sequence, r, nonces[r]) for r in range(self.size)],
+            dtype=torch.int64,
+            device=device,
+        )
+        bad = (seen != expected).any(dim=1).to(torch.int64)
+        verdict = torch.cat([bad, seen.reshape(-1)])
+        gathered = torch.empty(self.size * verdict.numel(), dtype=torch.int64, device=device)
+        dist.all_gather_into_tensor(gathered, verdict, group=self.group)
+        self.release(current)
+        problems = []
+        words = self.HEADER_INT64
+        for rank, row in enumerate(gathered.view(self.size, -1).tolist()):
+            for peer in range(self.size):
+                if row[peer]:
+                    magic, gen, seq, peer_rank, nonce = row[
+                        self.size + words * peer : self.size + words * (peer + 1)
+                    ]
+                    problems.append(
+                        f"rank {rank} sees peer {peer} at (magic {magic:#x}, generation {gen}, "
+                        f"sequence {seq}, rank {peer_rank}, nonce {nonce}) != (magic "
+                        f"{self.MAGIC:#x}, generation {generation}, sequence {sequence}, rank "
+                        f"{peer}, nonce {nonces[peer]})"
+                    )
+        if problems:
+            raise RuntimeError(
+                f"copy engine: symmetric buffer handshake failed for the {self.purpose} buffer "
+                f"on shard group ranks {list(self.group_ranks)} (a stale or mismatched "
+                "symmetric handle, the R3-A class): " + "; ".join(problems[:8])
+            )
+
 
 # (group name, purpose, dtype, device index) -> the process's buffer. Never freed (see
 # ``_symmetric_empty``): a larger request allocates a new buffer and retires the old one, which
 # stays allocated (``_RETIRED_SYMMETRIC_BUFFERS``) so its memory is never handed out again.
 _SYMMETRIC_BUFFERS: Dict[Tuple[str, str, torch.dtype, int], _SymmetricBuffer] = {}
 _RETIRED_SYMMETRIC_BUFFERS: List[_SymmetricBuffer] = []
+# The same keys -> buffers allocated so far (a buffer's generation is its allocation count).
+_SYMMETRIC_GENERATIONS: Dict[Tuple[str, str, torch.dtype, int], int] = {}
+# The same keys -> handshakes requested so far (each handshake writes the next number).
+_HANDSHAKE_SEQUENCES: Dict[Tuple[str, str, torch.dtype, int], int] = {}
 _OWNER_TOKENS = itertools.count(1)
 
 
+def copy_engine_buffer_bytes() -> Dict[str, int]:
+    """This process's symmetric payload bytes: ``live`` (the cached buffers) and ``retired``
+    (outgrown buffers, kept allocated)."""
+    return {
+        "live": sum(entry.nbytes for entry in _SYMMETRIC_BUFFERS.values()),
+        "retired": sum(entry.nbytes for entry in _RETIRED_SYMMETRIC_BUFFERS),
+    }
+
+
 def _shared_symmetric_buffer(
-    group, device: torch.device, dtype: torch.dtype, numel: int, purpose: str
+    group, device: torch.device, dtype: torch.dtype, numel: int, purpose: str, *, timeout_ms: int
 ) -> _SymmetricBuffer:
     """The process's symmetric buffer of ``purpose`` on ``group`` with at least ``numel``
     elements: the cached one when it fits, else a new one (a collective over ``group``: every
-    rank of the group makes the same requests in the same order, so the ranks agree)."""
+    rank of the group makes the same requests in the same order, so the ranks agree; checked by
+    ``_check_group_agreement`` before any allocation, and the buffer is handshaken after).
+
+    The cache changes only after success: a new buffer replaces (and retires) the cached one
+    once it is built, and a buffer whose handshake fails is evicted to the retired list (kept
+    allocated, never handed out again), so a failed request leaves no half-updated entry and
+    the next request allocates afresh. The handshake sequence number advances on every request
+    of every rank (also a failed one), so the ranks stay in step."""
     device = torch.device(device)
+    numel = max(1, int(numel))
     key = (group.group_name, purpose, dtype, device.index or 0)
     entry = _SYMMETRIC_BUFFERS.get(key)
-    if entry is not None and entry.group is group and entry.numel >= numel:
-        return entry
-    if entry is not None:
-        _RETIRED_SYMMETRIC_BUFFERS.append(entry)
-    entry = _SymmetricBuffer(group, device, dtype, max(1, int(numel)))
-    _SYMMETRIC_BUFFERS[key] = entry
+    reuse = entry is not None and entry.group is group and entry.numel >= numel
+    generation = _SYMMETRIC_GENERATIONS.get(key, 0)
+    sequence = _HANDSHAKE_SEQUENCES.get(key, 0) + 1
+    _HANDSHAKE_SEQUENCES[key] = sequence
+    nonces = _check_group_agreement(
+        group,
+        device,
+        (int(reuse), numel, generation, sequence),
+        f"{purpose} buffer",
+        private=(_process_nonce(),),
+    )
+    if not reuse:
+        new_entry = _SymmetricBuffer(
+            group,
+            device,
+            dtype,
+            numel,
+            purpose=purpose,
+            timeout_ms=timeout_ms,
+            generation=generation + 1,
+        )
+        if entry is not None:
+            _RETIRED_SYMMETRIC_BUFFERS.append(entry)
+        entry = new_entry
+        _SYMMETRIC_GENERATIONS[key] = entry.generation
+        _SYMMETRIC_BUFFERS[key] = entry
+    try:
+        entry._handshake(  # pylint: disable=protected-access
+            entry.generation, [row[0] for row in nonces], sequence
+        )
+    except BaseException:
+        if _SYMMETRIC_BUFFERS.get(key) is entry:
+            del _SYMMETRIC_BUFFERS[key]
+            _RETIRED_SYMMETRIC_BUFFERS.append(entry)
+        raise
     return entry
 
 
@@ -169,9 +525,17 @@ class _CopyEngineGather:
     """
 
     def __init__(
-        self, group, device: torch.device, units: Sequence[Any], dtype: torch.dtype, streams: int
+        self,
+        group,
+        device: torch.device,
+        units: Sequence[Any],
+        dtype: torch.dtype,
+        streams: int,
+        *,
+        timeout_ms: int = 0,
     ):
         self.size = group.size()
+        self.timeout_ms = int(timeout_ms)
         self.offsets: Dict[Tuple[int, int], int] = {}
         total = 0
         for unit in units:
@@ -185,7 +549,9 @@ class _CopyEngineGather:
                 total += tensor.numel_padded // self.size
         self.numel = max(total, 1)
         self.dtype = dtype
-        self.shared = _shared_symmetric_buffer(group, device, dtype, self.numel, "gather")
+        self.shared = _shared_symmetric_buffer(
+            group, device, dtype, self.numel, "gather", timeout_ms=self.timeout_ms
+        )
         self.token = next(_OWNER_TOKENS)
         self.streams = [torch.cuda.Stream(device=device) for _ in range(max(1, int(streams)))]
 
@@ -200,12 +566,12 @@ class _CopyEngineGather:
         current = torch.cuda.current_stream(shared.buffer.device)
         shared.acquire(current)
         shared.owner = self.token
-        shared.handle.barrier(channel=0)
+        shared.barrier("gather refresh", timeout_ms=self.timeout_ms)
         for unit in units:
             for index, tensor in enumerate(unit.tensors):
                 shard = tensor.shard.detach().reshape(-1)
                 shared.buffer.narrow(0, self.offsets[(unit.uid, index)], shard.numel()).copy_(shard)
-        shared.handle.barrier(channel=0)
+        shared.barrier("gather refresh", timeout_ms=self.timeout_ms)
         shared.release(current)
 
     def gather(self, unit, dest_flat: torch.Tensor) -> None:
@@ -257,8 +623,17 @@ class _CopyEngineReduce:
     (one unit's fp32 gradient), two barrier kernels per reduce.
     """
 
-    def __init__(self, group, device: torch.device, units: Sequence[Any], streams: int):
+    def __init__(
+        self,
+        group,
+        device: torch.device,
+        units: Sequence[Any],
+        streams: int,
+        *,
+        timeout_ms: int = 0,
+    ):
         self.size = group.size()
+        self.timeout_ms = int(timeout_ms)
         self.offsets: Dict[Tuple[int, int], int] = {}
         slot = 0
         for unit in units:
@@ -270,7 +645,12 @@ class _CopyEngineReduce:
             slot = max(slot, align_elements(offset, torch.float32, 256))
         self.slot = max(slot, 1)
         self.shared = _shared_symmetric_buffer(
-            group, device, torch.float32, self.size * self.slot, "reduce"
+            group,
+            device,
+            torch.float32,
+            self.size * self.slot,
+            "reduce",
+            timeout_ms=self.timeout_ms,
         )
         self.streams = [torch.cuda.Stream(device=device) for _ in range(max(1, int(streams)))]
 
@@ -285,7 +665,7 @@ class _CopyEngineReduce:
         shared = self.shared
         current = torch.cuda.current_stream(src_flat.device)
         shared.acquire(current)
-        shared.handle.barrier(channel=0)
+        shared.barrier("reduce", timeout_ms=self.timeout_ms)
         used = min(len(self.streams), self.size)
         for stream in self.streams[:used]:
             stream.wait_stream(current)
@@ -302,7 +682,7 @@ class _CopyEngineReduce:
                     )
         for stream in self.streams[:used]:
             current.wait_stream(stream)
-        shared.handle.barrier(channel=0)
+        shared.barrier("reduce", timeout_ms=self.timeout_ms)
         slots = shared.buffer.narrow(0, 0, self.size * self.slot).view(self.size, self.slot)
         outs = []
         for index, tensor in enumerate(unit.tensors):
@@ -331,6 +711,12 @@ class StoreComm:
         reduce_engine: ``"nccl"`` or ``"copy"`` (the reduce-scatters by copy-engine pushes into
             symmetric receive slots and one local sum, ``_CopyEngineReduce``; CUDA, non-trivial
             axis; set up by ``setup_copy_engine``).
+        copy_engine_timeout_ms: the copy engines' in-step symmetric-memory barrier timeout
+            (0 = wait forever, like NCCL; a finite value traps the device on a hang, which
+            loses the CUDA context: tests and benchmarks only). The setup handshake always
+            uses a finite timeout.
+
+    The copy engines are experimental (``COPY_ENGINE_EXPERIMENTAL_NOTE``).
     """
 
     def __init__(
@@ -346,6 +732,7 @@ class StoreComm:
         gather_engine: str = "nccl",
         copy_streams: int = 1,
         reduce_engine: str = "nccl",
+        copy_engine_timeout_ms: int = 0,
     ):
         if gather_engine not in GATHER_ENGINES:
             raise ValueError(f"unknown gather engine {gather_engine!r} (one of {GATHER_ENGINES})")
@@ -357,6 +744,9 @@ class StoreComm:
                 raise ValueError(
                     f"the copy-engine {what} needs CUDA and a non-trivial shard axis (z > 1)"
                 )
+        if int(copy_engine_timeout_ms) < 0:
+            raise ValueError(f"copy_engine_timeout_ms must be >= 0, got {copy_engine_timeout_ms}")
+        self.copy_engine_timeout_ms = int(copy_engine_timeout_ms)
         self.gather_engine = gather_engine
         self.reduce_engine = reduce_engine
         self.copy_streams = int(copy_streams)
@@ -403,15 +793,31 @@ class StoreComm:
         """Set up the copy engines: the gather's symmetric mirror of ``units``' shards and the
         reduce-scatter's symmetric receive slots (collectives over the shard / reduce-scatter
         group, every rank with the same units, the first time a group needs them); a no-op for
-        the NCCL engines or when set up already."""
-        if self.gather_engine == "copy" and self.copy_engine is None:
+        the NCCL engines or when set up already. Raises RuntimeError before any allocation when
+        this torch lacks the symmetric-memory API (``copy_engine_unavailable_reason``)."""
+        gather = self.gather_engine == "copy" and self.copy_engine is None
+        reduce = self.reduce_engine == "copy" and self.copy_reduce is None
+        if gather or reduce:
+            reason = copy_engine_unavailable_reason()
+            if reason is not None:
+                raise RuntimeError(reason)
+        if gather:
             self._copy_units = tuple(units)
             self.copy_engine = _CopyEngineGather(
-                self.ag_group, self.device, self._copy_units, dtype, self.copy_streams
+                self.ag_group,
+                self.device,
+                self._copy_units,
+                dtype,
+                self.copy_streams,
+                timeout_ms=self.copy_engine_timeout_ms,
             )
-        if self.reduce_engine == "copy" and self.copy_reduce is None:
+        if reduce:
             self.copy_reduce = _CopyEngineReduce(
-                self.rs_group, self.device, tuple(units), self.copy_streams
+                self.rs_group,
+                self.device,
+                tuple(units),
+                self.copy_streams,
+                timeout_ms=self.copy_engine_timeout_ms,
             )
 
     @property
@@ -448,6 +854,81 @@ class StoreComm:
             current = torch.cuda.current_stream(self.device)
             current.wait_stream(self.ag_stream)
             current.wait_stream(self.rs_stream)
+
+    def _measure_unit_collectives(
+        self,
+        unit,
+        gather_dest: torch.Tensor,
+        *,
+        repeat: int = 10,
+        reduce_src: Optional[torch.Tensor] = None,
+    ) -> Dict[str, float]:
+        """Diagnostic (benchmarks, between steps, CUDA, non-trivial axis): the standalone time
+        of ``unit``'s all-gather and reduce-scatter with the configured engines, on the side
+        streams. ``repeat`` timed gathers into ``gather_dest`` (copy engine: the mirror is
+        refreshed first, as ``step_begin`` does), then ``repeat`` timed reduce-scatters of
+        ``reduce_src`` (fp32, the unit's padded layout; a zero buffer when None) into scratch
+        outputs that are dropped (never ``main_grad``: adding +0.0 would turn a -0.0 into
+        +0.0); each timed series follows one untimed call (it absorbs the ranks' arrival skew).
+        Nothing is logged. Returns ``{"gather_ms", "reduce_ms", "unit_bytes"}`` (ms per call,
+        the unit's gathered bytes)."""
+        if not self.cuda or self.trivial:
+            raise RuntimeError("store collectives are measured on CUDA with a shard axis z > 1")
+        if not self.copy_engines_ready:
+            raise RuntimeError("copy engine: setup_copy_engine was not called")
+        repeat = max(1, int(repeat))
+        span = max(t.offset + t.numel_padded for t in unit.tensors)
+        if reduce_src is None:
+            reduce_src = torch.zeros(span, dtype=torch.float32, device=self.device)
+        current = torch.cuda.current_stream(self.device)
+        self.ag_stream.wait_stream(current)
+        self.rs_stream.wait_stream(current)
+        timing = [torch.cuda.Event(enable_timing=True) for _ in range(4)]
+
+        def gather() -> None:
+            if self.copy_engine is not None:
+                self.copy_engine.gather(unit, gather_dest)
+            else:
+                self._all_gather(unit, gather_dest)
+
+        def reduce() -> None:
+            if self.copy_reduce is not None:
+                self.copy_reduce.reduce(unit, reduce_src)
+                return
+            regions = [tensor_region(reduce_src, t, padded=True) for t in unit.tensors]
+            outs = [
+                torch.empty(r.numel() // self.rs_group.size(), dtype=r.dtype, device=r.device)
+                for r in regions
+            ]
+            _coalesced(
+                dist.reduce_scatter_tensor, outs, regions, group=self.rs_group, device=self.device
+            )
+
+        # One untimed call of each before its timed loop: the first collective of a series
+        # absorbs the ranks' arrival skew (and lazy communicator setup), not transfer time.
+        with torch.cuda.stream(self.ag_stream):
+            if self.copy_engine is not None:
+                self.copy_engine.refresh(self._copy_units)
+            gather()
+            timing[0].record(self.ag_stream)
+            for _ in range(repeat):
+                gather()
+            timing[1].record(self.ag_stream)
+        with torch.cuda.stream(self.rs_stream):
+            self.rs_stream.wait_event(timing[1])  # measured alone, not against the gathers
+            reduce()
+            timing[2].record(self.rs_stream)
+            for _ in range(repeat):
+                reduce()
+            timing[3].record(self.rs_stream)
+        self.join()
+        torch.cuda.synchronize(self.device)
+        elem = gather_dest.element_size()
+        return {
+            "gather_ms": timing[0].elapsed_time(timing[1]) / repeat,
+            "reduce_ms": timing[2].elapsed_time(timing[3]) / repeat,
+            "unit_bytes": sum(t.numel_padded for t in unit.tensors) * elem,
+        }
 
     # -----------------------------------------------------------------------------------------
     # Collectives

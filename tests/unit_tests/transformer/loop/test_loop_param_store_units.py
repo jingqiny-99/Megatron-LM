@@ -276,46 +276,368 @@ def test_install_guards_and_find_param_store():
     assert qkv.weight is by_name["decoder.layers.2.self_attention.linear_qkv.weight"].compute
 
 
+class _FakeGroup:
+    def __init__(self, name):
+        self.group_name = name
+
+
 def test_copy_engine_buffers_are_shared_and_never_freed(monkeypatch):
     """R3-A: the copy engines' symmetric buffers are allocated once per (group, purpose, dtype,
     device) and reused by every later store that fits; a larger request retires the old buffer
     (kept allocated, never handed back) and allocates a new one; a new group object with a
-    reused name gets its own buffer. Host logic only (the allocation is stubbed)."""
+    reused name gets its own buffer. Every request first checks the group's agreement on
+    (reuse, requested elements, generation, handshake sequence) and then handshakes the buffer
+    at its generation and the request's sequence number (one more per request of the key, so a
+    reuse handshake writes new words) with every rank's process nonce. Host logic only
+    (allocation and collectives stubbed)."""
     from megatron.core.transformer.loop import param_store_comm as comm
 
-    made = []
+    made, handshakes, agreements = [], [], []
 
     class FakeBuffer:
-        def __init__(self, group, device, dtype, numel):
+        def __init__(self, group, device, dtype, numel, *, purpose, timeout_ms, generation):
             self.group, self.numel, self.dtype = group, numel, dtype
+            self.purpose, self.timeout_ms, self.generation = purpose, timeout_ms, generation
+            self.nbytes = numel * torch.empty((), dtype=dtype).element_size()
             made.append(self)
 
-    class FakeGroup:
-        def __init__(self, name):
-            self.group_name = name
+        def _handshake(self, generation, nonces, sequence):
+            handshakes.append((self, generation, tuple(nonces), sequence))
+
+    def one_rank_gather(group, device, values):
+        agreements.append(tuple(values))
+        return [list(values)]
 
     monkeypatch.setattr(comm, "_SymmetricBuffer", FakeBuffer)
     monkeypatch.setattr(comm, "_SYMMETRIC_BUFFERS", {})
     monkeypatch.setattr(comm, "_RETIRED_SYMMETRIC_BUFFERS", [])
+    monkeypatch.setattr(comm, "_SYMMETRIC_GENERATIONS", {})
+    monkeypatch.setattr(comm, "_HANDSHAKE_SEQUENCES", {})
+    monkeypatch.setattr(comm, "_all_gather_ints", one_rank_gather)
+    nonce = comm._process_nonce()
+    assert nonce == comm._process_nonce()  # once per process
     device = torch.device("cuda", 0)
-    group = FakeGroup("7")
-    first = comm._shared_symmetric_buffer(group, device, torch.bfloat16, 100, "gather")
-    assert comm._shared_symmetric_buffer(group, device, torch.bfloat16, 100, "gather") is first
-    assert comm._shared_symmetric_buffer(group, device, torch.bfloat16, 60, "gather") is first
-    reduce = comm._shared_symmetric_buffer(group, device, torch.float32, 100, "reduce")
+    group = _FakeGroup("7")
+
+    def shared(group, numel, purpose="gather", dtype=torch.bfloat16, device=device):
+        return comm._shared_symmetric_buffer(group, device, dtype, numel, purpose, timeout_ms=5)
+
+    first = shared(group, 100)
+    assert (first.purpose, first.timeout_ms, first.generation) == ("gather", 5, 1)
+    assert shared(group, 100) is first
+    assert shared(group, 60) is first
+    reduce = shared(group, 100, "reduce", torch.float32)
     assert reduce is not first and len(made) == 2
-    grown = comm._shared_symmetric_buffer(group, device, torch.bfloat16, 101, "gather")
-    assert grown is not first and grown.numel == 101
+    grown = shared(group, 101)
+    assert grown is not first and grown.numel == 101 and grown.generation == 2
     assert comm._RETIRED_SYMMETRIC_BUFFERS == [first]
-    assert comm._shared_symmetric_buffer(group, device, torch.bfloat16, 50, "gather") is grown
-    renamed = FakeGroup("7")  # a later group object reusing the name of a destroyed one
-    fresh = comm._shared_symmetric_buffer(renamed, device, torch.bfloat16, 50, "gather")
-    assert fresh is not grown and fresh.group is renamed
+    assert shared(group, 50) is grown
+    renamed = _FakeGroup("7")  # a later group object reusing the name of a destroyed one
+    fresh = shared(renamed, 50)
+    assert fresh is not grown and fresh.group is renamed and fresh.generation == 3
     assert comm._RETIRED_SYMMETRIC_BUFFERS == [first, grown]
-    other_device = comm._shared_symmetric_buffer(
-        renamed, torch.device("cuda", 1), torch.bfloat16, 50, "gather"
+    other_device = shared(renamed, 50, device=torch.device("cuda", 1))
+    assert other_device is not fresh and len(made) == 5 and other_device.generation == 1
+    # (reuse, requested elements, generation before the request, handshake sequence of the
+    # key) + the private nonce, per call.
+    assert agreements == [
+        (0, 100, 0, 1, nonce),
+        (1, 100, 1, 2, nonce),
+        (1, 60, 1, 3, nonce),
+        (0, 100, 0, 1, nonce),
+        (0, 101, 1, 4, nonce),
+        (1, 50, 2, 5, nonce),
+        (0, 50, 2, 6, nonce),
+        (0, 50, 0, 1, nonce),
+    ]
+    # Every request (reuse included) handshakes the buffer it returns, at its generation and
+    # the request's sequence number.
+    assert [(buffer, generation, seq) for buffer, generation, _, seq in handshakes] == [
+        (first, 1, 1),
+        (first, 1, 2),
+        (first, 1, 3),
+        (reduce, 1, 1),
+        (grown, 2, 4),
+        (grown, 2, 5),
+        (fresh, 3, 6),
+        (other_device, 1, 1),
+    ]
+    assert all(nonces == (nonce,) for _, _, nonces, _ in handshakes)
+    held = comm.copy_engine_buffer_bytes()
+    assert held["retired"] == (100 + 101) * 2
+    assert held["live"] == 100 * 4 + 50 * 2 + 50 * 2
+
+
+def test_copy_engine_buffer_cache_is_unchanged_by_a_failed_request(monkeypatch):
+    """A request that fails leaves no half-updated cache: a construction (rendezvous) failure
+    keeps the cached buffer cached, not retired, at its generation; a handshake failure
+    evicts the buffer it was checking to the retired list (counted once), so the next request
+    allocates afresh instead of reusing it. The handshake sequence advances on every request."""
+    from megatron.core.transformer.loop import param_store_comm as comm
+
+    made, handshakes = [], []
+    fail = {"build": False, "handshake": False}
+
+    class FakeBuffer:
+        def __init__(self, group, device, dtype, numel, *, purpose, timeout_ms, generation):
+            if fail["build"]:
+                raise RuntimeError("rendezvous failed")
+            self.group, self.numel, self.generation = group, numel, generation
+            self.nbytes = numel * torch.empty((), dtype=dtype).element_size()
+            made.append(self)
+
+        def _handshake(self, generation, nonces, sequence):
+            handshakes.append((self, sequence))
+            if fail["handshake"]:
+                raise RuntimeError("handshake failed")
+
+    monkeypatch.setattr(comm, "_SymmetricBuffer", FakeBuffer)
+    monkeypatch.setattr(comm, "_SYMMETRIC_BUFFERS", {})
+    monkeypatch.setattr(comm, "_RETIRED_SYMMETRIC_BUFFERS", [])
+    monkeypatch.setattr(comm, "_SYMMETRIC_GENERATIONS", {})
+    monkeypatch.setattr(comm, "_HANDSHAKE_SEQUENCES", {})
+    monkeypatch.setattr(comm, "_all_gather_ints", lambda group, device, values: [list(values)])
+    group, device = _FakeGroup("9"), torch.device("cuda", 0)
+    key = ("9", "gather", torch.bfloat16, 0)
+
+    def shared(numel):
+        return comm._shared_symmetric_buffer(
+            group, device, torch.bfloat16, numel, "gather", timeout_ms=0
+        )
+
+    first = shared(100)
+    fail["build"] = True
+    with pytest.raises(RuntimeError, match="rendezvous failed"):
+        shared(200)  # grow: the new buffer's construction fails
+    assert comm._SYMMETRIC_BUFFERS[key] is first and not comm._RETIRED_SYMMETRIC_BUFFERS
+    assert comm._SYMMETRIC_GENERATIONS[key] == 1
+    assert comm.copy_engine_buffer_bytes() == {"live": 200, "retired": 0}
+    fail["build"] = False
+    fail["handshake"] = True
+    with pytest.raises(RuntimeError, match="handshake failed"):
+        shared(100)  # a reuse whose handshake fails
+    assert key not in comm._SYMMETRIC_BUFFERS and comm._RETIRED_SYMMETRIC_BUFFERS == [first]
+    with pytest.raises(RuntimeError, match="handshake failed"):
+        shared(100)  # a new buffer whose handshake fails
+    second = made[-1]
+    assert second is not first and second.generation == 2
+    assert key not in comm._SYMMETRIC_BUFFERS
+    assert comm._RETIRED_SYMMETRIC_BUFFERS == [first, second]
+    assert comm.copy_engine_buffer_bytes() == {"live": 0, "retired": 400}
+    fail["handshake"] = False
+    third = shared(100)
+    assert third is not second and third.generation == 3
+    assert comm._SYMMETRIC_BUFFERS[key] is third
+    assert comm.copy_engine_buffer_bytes() == {"live": 200, "retired": 400}
+    # One sequence number per request, failed ones included (request 2 failed before it).
+    assert [seq for _, seq in handshakes] == [1, 3, 4, 5]
+
+
+def test_copy_engine_buffer_kept_when_construction_fails_after_allocation(monkeypatch):
+    """R3-A "never freed": a ``_SymmetricBuffer`` whose constructor raises after the allocation
+    (rendezvous error, a handle of another world size, a rank that does not map onto the group)
+    keeps the allocation on the retired list (counted in ``copy_engine_buffer_bytes``) instead
+    of letting it be garbage-collected. Allocation and rendezvous stubbed on CPU."""
+    import torch.distributed._symmetric_memory as symm_mem
+
+    from megatron.core.transformer.loop import param_store_comm as comm
+
+    class Group(_FakeGroup):
+        def size(self):
+            return 2
+
+    class Handle:
+        def __init__(self, world_size, rank):
+            self.world_size, self.rank = world_size, rank
+
+    allocated = []
+
+    def fake_empty(nbytes, dtype, device, *, group_name, purpose):
+        allocated.append(torch.empty(nbytes, dtype=dtype, device=device))
+        return allocated[-1]
+
+    monkeypatch.setattr(comm, "_RETIRED_SYMMETRIC_BUFFERS", [])
+    monkeypatch.setattr(comm, "_symmetric_empty", fake_empty)
+    monkeypatch.setattr(comm.dist, "get_process_group_ranks", lambda group: [4, 5])
+    monkeypatch.setattr(comm.dist, "get_rank", lambda group=None: 0)
+
+    def rendezvous_error(raw, group_name):
+        raise RuntimeError("no NVLink peer")
+
+    for rendezvous, match in (
+        (rendezvous_error, "rendezvous of the gather buffer .* failed: no NVLink peer"),
+        (lambda raw, group_name: Handle(4, 0), "rendezvous of the gather buffer .* failed"),
+        (lambda raw, group_name: Handle(2, 1), "symmetric-memory rank 1 != group rank 0"),
+    ):
+        monkeypatch.setattr(symm_mem, "rendezvous", rendezvous)
+        with pytest.raises(RuntimeError, match=match):
+            comm._SymmetricBuffer(
+                Group("5"), torch.device("cpu"), torch.bfloat16, 100, purpose="gather"
+            )
+    retired = comm._RETIRED_SYMMETRIC_BUFFERS
+    assert len(retired) == 3 and [entry.raw for entry in retired] == allocated
+    assert all(entry.nbytes == 200 for entry in retired)
+    assert comm.copy_engine_buffer_bytes()["retired"] == 600
+
+
+def test_copy_engine_agreement_mismatch_names_disagreeing_ranks(monkeypatch):
+    """The setup-time agreement check: equal records pass; differing ones raise on every rank
+    (before any allocation) with every rank's record."""
+    from megatron.core.transformer.loop import param_store_comm as comm
+
+    assert comm._agreement_mismatch([(1, 100, 2), (1, 100, 2)]) is None
+    assert comm._agreement_mismatch([(1, 100, 2)]) is None
+    message = comm._agreement_mismatch([(1, 100, 2), (0, 101, 2), (1, 100, 2)])
+    assert message == "rank 0: (1, 100, 2); rank 1: (0, 101, 2); rank 2: (1, 100, 2)"
+
+    made = []
+    monkeypatch.setattr(comm, "_SymmetricBuffer", lambda *a, **k: made.append(a))
+    monkeypatch.setattr(comm, "_SYMMETRIC_BUFFERS", {})
+    monkeypatch.setattr(comm, "_RETIRED_SYMMETRIC_BUFFERS", [])
+    monkeypatch.setattr(comm, "_SYMMETRIC_GENERATIONS", {})
+    monkeypatch.setattr(comm, "_HANDSHAKE_SEQUENCES", {})
+    monkeypatch.setattr(comm.dist, "get_process_group_ranks", lambda group: [4, 5])
+    # Group rank 1 asks a larger buffer than rank 0 (rank 0 would reuse, rank 1 allocate).
+    monkeypatch.setattr(
+        comm, "_all_gather_ints", lambda group, device, values: [list(values), [0, 101, 0, 1, 9]]
     )
-    assert other_device is not fresh and len(made) == 5
+    with pytest.raises(
+        RuntimeError, match=r"\[4, 5\] disagree on the gather buffer .*rank 1: \(0, 101, 0, 1\)"
+    ):
+        comm._shared_symmetric_buffer(
+            _FakeGroup("3"), torch.device("cuda", 0), torch.bfloat16, 100, "gather", timeout_ms=0
+        )
+    assert not made and not comm._SYMMETRIC_BUFFERS and not comm._SYMMETRIC_GENERATIONS
+    # The private words (the nonces) are returned, not compared.
+    monkeypatch.setattr(
+        comm, "_all_gather_ints", lambda group, device, values: [[1, 2, 11], [1, 2, 12]]
+    )
+    assert comm._check_group_agreement(None, None, (1, 2), "x", private=(11,)) == [(11,), (12,)]
+
+
+def test_copy_engine_allocation_refuses_the_pool_fallback(monkeypatch):
+    """R3-A: a torch whose dedicated symmetric allocator takes another signature is refused;
+    the implicit symmetric MemPool is never used. A dedicated allocation records its path."""
+    from megatron.core.transformer.loop import param_store_comm as comm
+
+    class OtherSignature:
+        @staticmethod
+        def empty_strided_p2p(*args, **kwargs):
+            raise TypeError("empty_strided_p2p(): incompatible function arguments")
+
+    class Dedicated:
+        @staticmethod
+        def empty_strided_p2p(size, stride, dtype, device, group_name=None, alloc_id=None):
+            return torch.empty(size, dtype=dtype, device=device)
+
+    monkeypatch.setattr(comm, "_ALLOCATION_PATHS", {})
+    monkeypatch.setattr(comm, "_symmetric_memory_class", lambda: OtherSignature)
+    with pytest.raises(RuntimeError, match=r"implicit-pool fallback is refused \(R3-A\)"):
+        comm._symmetric_empty(8, torch.uint8, torch.device("cpu"), group_name="7", purpose="gather")
+    assert comm.copy_engine_allocation_paths() == {}
+    monkeypatch.setattr(comm, "_symmetric_memory_class", lambda: Dedicated)
+    tensor = comm._symmetric_empty(
+        8, torch.uint8, torch.device("cpu"), group_name="7", purpose="reduce"
+    )
+    assert tensor.shape == (8,) and tensor.dtype == torch.uint8
+    assert comm.copy_engine_allocation_paths() == {("7", "reduce"): "empty_strided_p2p"}
+
+
+def test_copy_engine_api_check_reports_missing_pieces(monkeypatch):
+    """The API check names every missing piece of torch's symmetric memory, and the copy-engine
+    setup refuses with that reason before any allocation ("unavailable", not an R3-A hang)."""
+    from types import SimpleNamespace
+
+    from megatron.core.transformer.loop import param_store_comm as comm
+
+    real = comm.copy_engine_api_check()
+    assert real["torch"] == torch.__version__
+    assert set(real) == {"symmetric_memory", "empty_strided_p2p", "barrier_timeout_ms", "torch"}
+    if not real["symmetric_memory"]:
+        pytest.skip("torch.distributed._symmetric_memory does not import in this build")
+
+    class Missing:
+        def barrier(self, channel=0):  # no timeout_ms
+            pass
+
+    class Complete:
+        @staticmethod
+        def empty_strided_p2p(size, stride, dtype, device, group_name=None, alloc_id=None):
+            pass
+
+        def barrier(self, channel=0, timeout_ms=0):
+            pass
+
+    monkeypatch.setattr(comm, "_symmetric_memory_class", lambda: Missing)
+    check = comm.copy_engine_api_check()
+    assert check["symmetric_memory"] and not check["empty_strided_p2p"]
+    assert not check["barrier_timeout_ms"]
+    reason = comm.copy_engine_unavailable_reason()
+    assert "copy engines unavailable" in reason and "empty_strided_p2p" in reason
+    assert "barrier(timeout_ms=)" in reason
+    for gather, reduce in (("copy", "nccl"), ("nccl", "copy")):
+        stand_in = SimpleNamespace(
+            gather_engine=gather, reduce_engine=reduce, copy_engine=None, copy_reduce=None
+        )
+        with pytest.raises(RuntimeError, match="copy engines unavailable.*empty_strided_p2p"):
+            StoreComm.setup_copy_engine(stand_in, (), torch.bfloat16)
+    # The NCCL engines never check.
+    StoreComm.setup_copy_engine(
+        SimpleNamespace(gather_engine="nccl", reduce_engine="nccl", copy_engine=None),
+        (),
+        torch.bfloat16,
+    )
+    monkeypatch.setattr(comm, "_symmetric_memory_class", lambda: Complete)
+    check = comm.copy_engine_api_check()
+    assert check["empty_strided_p2p"] and check["barrier_timeout_ms"]
+    assert comm.copy_engine_unavailable_reason() is None
+    # The pybind form: no signature, the docstring's first line names the keywords.
+    pybind = SimpleNamespace(
+        __doc__="barrier(self: _SymmetricMemory, channel: int = 0, timeout_ms: int = 0) -> None"
+    )
+    assert comm._accepts_keyword(pybind, "timeout_ms")
+    assert not comm._accepts_keyword(pybind, "group_name")
+
+
+def test_copy_engine_timeout_config_validated():
+    assert LoopParamStoreConfig(1).copy_engine_timeout_ms == 0
+    with pytest.raises(ValueError, match="copy_engine_timeout_ms must be >= 0, got -1"):
+        LoopParamStore.install(
+            _model(),
+            LoopParamStoreConfig(1, allow_trivial_shard=True, copy_engine_timeout_ms=-1),
+            _groups(),
+        )
+    _, store = _store(copy_engine_timeout_ms=60_000)
+    assert store.comm.copy_engine_timeout_ms == 60_000
+    _, store = _store()
+    assert store.comm.copy_engine_timeout_ms == 0
+    with pytest.raises(ValueError, match="copy_engine_timeout_ms must be >= 0"):
+        StoreComm(None, torch.device("cpu"), trivial=True, copy_engine_timeout_ms=-1)
+
+
+def test_copy_engine_experimental_warning():
+    """Selecting a copy engine warns (the store calls the helper at construction; a CPU store
+    cannot use copy engines, so the helper is checked directly)."""
+    import warnings
+
+    from megatron.core.transformer.loop.param_store_comm import COPY_ENGINE_EXPERIMENTAL_NOTE
+
+    assert "experimental" in COPY_ENGINE_EXPERIMENTAL_NOTE
+    for engines in (dict(gather_engine="copy"), dict(reduce_engine="copy")):
+        with pytest.warns(UserWarning, match="copy engines .* are experimental"):
+            assert ps.warn_copy_engines_experimental(LoopParamStoreConfig(8, **engines))
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", UserWarning)
+        assert not ps.warn_copy_engines_experimental(LoopParamStoreConfig(8))
+
+
+def test_store_construction_calls_the_experimental_warning(monkeypatch):
+    """The store's constructor passes its config to ``warn_copy_engines_experimental`` (the
+    helper above), so removing the call fails here."""
+    calls = []
+    monkeypatch.setattr(ps, "warn_copy_engines_experimental", calls.append)
+    _, store = _store()
+    assert len(calls) == 1 and calls[0] is store.config
 
 
 def test_grad_capture_classes_and_local_fusion_switch():
