@@ -98,6 +98,14 @@ products:
         scope: [mr, mr-github, mr-github-slim]
         platforms: [dgx_h100]
 
+  - test_case: [hybrid_loop_dsv4_tiny_resume_torch_dist]
+    products:
+      # The eager hybrid loop's checkpoint resume (M3c). Disabled until its
+      # golden_values_dev_dgx_h100.json is recorded from an H100 run of the case.
+      - environment: [dev]
+        scope: [mr-broken, mr-github-broken]
+        platforms: [dgx_h100]
+
   - test_case: [hybrid_mr_mcore_te_tp2_pp1_cp1_dgx_a100_1N8G]
     products:
       - environment: [dev]

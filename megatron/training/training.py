@@ -4355,6 +4355,15 @@ def setup_model_and_optimizer(
 
         plan_loop_rsbf(args, model, apply=args.loop_planner == "apply")
 
+    # Hybrid loop checkpoints: every parameter and persistent buffer has a sharded entry, checked
+    # here so a chained job fails at setup, not at its first save (a no-op for other models).
+    if (getattr(args, "save", None) or getattr(args, "load", None)) and getattr(
+        args, "ckpt_format", None
+    ) == "torch_dist":
+        from megatron.training.loop_checkpoint import check_loop_sharded_state_dict
+
+        check_loop_sharded_state_dict(model, when="setup")
+
     # Classify each GTP param's prefetch chain after model build + DDP wrap, before the
     # first forward. Placed here (not in get_model) so it also covers the config-container
     # builder path.

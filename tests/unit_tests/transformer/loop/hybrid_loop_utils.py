@@ -61,6 +61,28 @@ def _free_port():
 
 
 @contextlib.contextmanager
+def determinism_env():
+    """Training's ``--deterministic-mode`` environment for a GPU test module: the canonical
+    values of ``megatron/training/determinism.py`` (``NCCL_ALGO``, ``CUBLAS_WORKSPACE_CONFIG``,
+    ``NVTE_ALLOW_NONDETERMINISTIC_ALGO``, ...), overriding the job's, the previous environment
+    restored on exit. Enter it before model parallelism and the first GEMM: the libraries read
+    these at communicator / handle creation."""
+    # pylint: disable=import-outside-toplevel
+    from megatron.training.determinism import DETERMINISM_ENV_VAR_DEFAULTS
+
+    previous = {name: os.environ.get(name) for name in DETERMINISM_ENV_VAR_DEFAULTS}
+    os.environ.update(DETERMINISM_ENV_VAR_DEFAULTS)
+    try:
+        yield
+    finally:
+        for name, value in previous.items():
+            if value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = value
+
+
+@contextlib.contextmanager
 def model_parallel_once(**parallel_sizes):
     """Initialize model parallelism (NCCL on CUDA, gloo on CPU) for one test module.
 

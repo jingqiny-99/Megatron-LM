@@ -15,8 +15,10 @@ residency modes are set before the first step (``configure_loop_param_store``: e
 the trainer keeps computing W.
 
 Also here: the Gloo status group of the RSBF executor (the grid disables dev's Gloo groups),
-the evaluation refresh of the Resident compute copies, the M3c checkpoint backstop and the
-argument rules (``loop_param_store_problems``, called by ``arguments._validate_loop_param_store``).
+the evaluation refresh of the Resident compute copies and the argument rules
+(``loop_param_store_problems``, called by ``arguments._validate_loop_param_store``). Checkpoints
+(M3c) save the canonical shards as row shards of the logical tensors on torch_dist; their rules
+are ``megatron/training/loop_checkpoint.py`` (``loop_checkpoint_problems``).
 """
 
 import copy
@@ -26,7 +28,6 @@ from typing import Any, List, Optional, Sequence, Tuple
 import torch
 
 from megatron.core.transformer.loop.param_store import (
-    CHECKPOINT_M3C,
     LoopParamStore,
     LoopParamStoreConfig,
     ResidencyMode,
@@ -39,7 +40,6 @@ from megatron.core.transformer.loop.param_store_comm import COPY_ENGINE_EXPERIME
 
 __all__ = [
     "LOOP_PARAM_STORE_DEBUG",
-    "check_loop_param_store_checkpoint",
     "configure_loop_param_store",
     "install_loop_param_store",
     "loop_model_pg_collection",
@@ -245,13 +245,6 @@ def loop_param_store_problems(args) -> List[str]:
             "--init-model-with-meta-device with the store (install needs materialized weights "
             "before the DDP wrap)"
         )
-    for name, flag in (
-        ("save", "--save"),
-        ("load", "--load"),
-        ("pretrained_checkpoint", "--pretrained-checkpoint"),
-    ):
-        if getattr(args, name, None):
-            problems.append(f"{flag}: {checkpoint_message(z)}")
     if modes != "auto":
         try:
             StoreModes.parse(modes)
@@ -272,14 +265,6 @@ def loop_param_store_problems(args) -> List[str]:
         if reason is not None:
             problems.append(f"--loop-param-store-binding distributed_weight: {reason}")
     return problems
-
-
-def checkpoint_message(z: int) -> str:
-    """The M3c refusal text."""
-    return (
-        f"checkpointing with the loop parameter store (z = {z}) is M3c (not implemented); run "
-        "with --loop-param-store-shard-size 1 to save or load"
-    )
 
 
 def loop_param_store_config(args) -> LoopParamStoreConfig:
@@ -461,14 +446,3 @@ def refresh_loop_param_store(model: Any) -> bool:
             store.refresh()  # the same modes on every rank: every shard peer gathers
             refreshed = True
     return refreshed
-
-
-def check_loop_param_store_checkpoint(model: Any, what: str) -> None:
-    """The M3c backstop at the entry of ``save_checkpoint`` / ``load_checkpoint``: raises
-    ``NotImplementedError`` when ``model`` holds a store (argument validation refuses
-    ``--save`` / ``--load`` with z > 1 first)."""
-    models = model if isinstance(model, (list, tuple)) else [model]
-    for chunk in models:
-        store = find_param_store(chunk)
-        if store is not None:
-            raise NotImplementedError(f"{what}: {CHECKPOINT_M3C} (z = {store.shard_size})")

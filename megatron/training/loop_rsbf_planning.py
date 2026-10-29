@@ -56,15 +56,26 @@ the same plan digest.
 every resume). A later phase switch (M11) calls it again: the plan is re-applied and the
 model's cached executor dropped (``LoopRSBFSchedule.invalidate``) so the next step rebuilds it.
 The session lives in this module, not on ``args`` (checkpoints pickle ``args``).
+
+**Resume (M3c).** An applied plan is recorded in the checkpoint's ``loop_resume`` common-state
+entry (``loop_plan_record``: the choice, the store modes, the depth distribution, the phase, the
+hardware preset, the digest). The planner runs before the checkpoint is loaded, so under
+``apply`` with ``--load`` (not finetuning) the session first reads that record
+(``read_saved_plan``) and **pins** the saved choice (``pin_saved_plan``) when this run's menu
+holds it and the planner's own filter accepts it at this run's sizes (it fits, it is applicable,
+the form policy allows it); otherwise it plans afresh and ``check_resume_plan`` (called by the
+resume check in ``megatron/training/loop_checkpoint.py``) reports the difference, which
+``--loop-resume-changes refuse`` (the default) turns into an error.
 """
 
 import dataclasses
+import hashlib
 import json
 import logging
 import math
 import os
 from types import SimpleNamespace
-from typing import Any, List, Mapping, Optional, Sequence
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
 import torch
 
@@ -103,6 +114,7 @@ __all__ = [
     "LoopExitHistogramLog",
     "LoopPlannerSession",
     "check_resume_offload",
+    "check_resume_plan",
     "get_loop_exit_histogram_log",
     "get_loop_planner_session",
     "log_loop_exit_histogram",
@@ -122,8 +134,12 @@ __all__ = [
     "loop_planner_store_option",
     "loop_planner_user_flags",
     "loop_planner_with_store_terms",
+    "loop_plan_choice",
+    "loop_plan_record",
     "make_loop_planner",
+    "pin_saved_plan",
     "plan_loop_rsbf",
+    "read_saved_plan",
     "record_loop_exit_histogram",
     "reset_loop_exit_histogram_log",
     "reset_loop_planner_session",
@@ -800,12 +816,23 @@ class LoopPlannerSession:
         self.phase: Optional[PhaseGeometry] = None
         self.plan: Optional[LoopRSBFPlan] = None
         self.applied = False
+        # Resume: the checkpoint's plan record (``read_saved_plan``) and why its choice could
+        # not be pinned (None: pinned, or nothing to pin).
+        self.saved_plan: Optional[Dict[str, Any]] = None
+        self.pin_reason: Optional[str] = None
 
     def on_phase_start(self, args, model, *, apply: bool) -> Optional[LoopRSBFPlan]:
         """Plan the phase of ``args`` for ``model`` (a list of one model chunk, or the chunk),
         log the decision table and check the digest on every rank; ``apply`` sets the plan on
         the model config and ``args`` (module docstring), else the current option is checked.
-        Returns the plan (None when nothing fits in report mode; apply raises
+        On the first ``apply`` of a resume (``--load``, not finetuning) the checkpoint's applied
+        choice is pinned when this run's menu holds it and it is feasible (``pin_saved_plan``).
+        A feasible pin always wins: ``--loop-resume-changes allow`` only accepts the fresh plan
+        when the pin fails (the resume check's message 5 then names the change); there is no
+        "re-plan on resume" switch under ``apply``. To resume with another plan, use
+        ``--loop-planner report`` with the new choice set by hand (``--loop-rsbf-item-form`` /
+        ``--loop-rsbf-block-stride`` / ``--loop-rsbf-waves``) and ``--loop-resume-changes
+        allow``. Returns the plan (None when nothing fits in report mode; apply raises
         ``PlannerNoFit``)."""
         models = list(model) if isinstance(model, (list, tuple)) else [model]
         if len(models) != 1:
@@ -834,6 +861,7 @@ class LoopPlannerSession:
             # The store's runtime memory terms of every option of the menu.
             shape = loop_planner_with_store_terms(shape, planner, phase, module)
             planner = make_loop_planner(args, shape, hardware, capabilities)
+        saved = read_saved_plan(args) if apply and not rerun else None
         try:
             plan = planner.plan(phase, depth)
         except PlannerNoFit as error:
@@ -841,6 +869,23 @@ class LoopPlannerSession:
                 raise
             warn_rank_0(f"loop planner (report): {error}")
             return None
+        if saved is not None:
+            fresh = plan
+            plan, self.pin_reason = pin_saved_plan(plan, saved)
+            self.saved_plan = saved
+            if self.pin_reason is None and plan is not fresh:
+                print_rank_0(
+                    "loop planner: resumed with the checkpoint's plan "
+                    f"{_choice_text(loop_plan_choice(plan))} (planned afresh: "
+                    f"{_choice_text(loop_plan_choice(fresh))})"
+                )
+            elif self.pin_reason is not None:
+                warn_rank_0(
+                    "loop planner: the checkpoint's plan "
+                    f"{_choice_text(saved.get('choice') or {})} could not be pinned "
+                    f"({self.pin_reason}); planned afresh: "
+                    f"{_choice_text(loop_plan_choice(plan))}"
+                )
         _log_plan(args, plan)
         _check_plan_digest(plan.digest)
         if apply:
@@ -971,3 +1016,189 @@ def check_resume_offload(args, checkpoint_args) -> None:
             f"optimizer_cpu_offload={saved}; the optimizer state layouts differ. Pin it to the "
             f"checkpoint's with --loop-planner-optimizer-offload {'always' if saved else 'never'}"
         )
+
+
+# ----------------------------------------------------------------------------- resume (M3c)
+# Item forms whose resumes are bitwise interchangeable (the nested item equals the whole round
+# bitwise, stage 4); the block stride does not apply to them.
+SWAPPABLE_ITEM_FORMS = frozenset({"whole_round", "nested"})
+
+
+def _option_choice(option: Any, core_layers: int) -> Dict[str, Any]:
+    form, stride = option_item_form(option, core_layers)
+    return {
+        "item_form": form,
+        "block_stride": None if stride is None else int(stride),
+        "waves": int(option.waves),
+        "coda_recompute": bool(option.coda_recompute),
+        "optimizer_offload": "A" in option.moves,
+        "moves": str(option.moves),
+        "layout": str(option.layout),
+        "regather": bool(option.regather),
+    }
+
+
+def loop_plan_choice(plan: LoopRSBFPlan) -> Dict[str, Any]:
+    """The applied choice of ``plan`` in plain types: the four RSBF settings, Adam to Grace and
+    the store layout of its option (moves, dense layout, re-gathered blocks)."""
+    return _option_choice(plan.applied.option, plan.core_layers)
+
+
+def _choice_text(choice: Mapping[str, Any]) -> str:
+    return " ".join(f"{key}={choice.get(key)!r}" for key in sorted(choice))
+
+
+def loop_plan_record(plan: LoopRSBFPlan, *, depth_source: str = "config") -> Dict[str, Any]:
+    """The checkpoint record of an applied plan (``loop_resume["plan"]``), plain types only
+    (``torch.load(weights_only=True)``-safe): the choice (``loop_plan_choice``), the store modes
+    of the applied option, the depth distribution the planner used and its source
+    (``--loop-planner-depths``), the phase, the hardware preset and the digest."""
+    depth = plan.depth
+    return {
+        "choice": loop_plan_choice(plan),
+        "store_modes": plan.store_modes().describe(),
+        "depth": {
+            "kind": str(depth.kind),
+            "params": [float(value) for value in depth.params],
+            "max_rounds": int(depth.max_rounds),
+            "name": str(depth.name),
+            "source": str(depth_source),
+        },
+        "phase": json.loads(json.dumps(dataclasses.asdict(plan.phase))),
+        "hardware": str(plan.hardware.name),
+        "digest": str(plan.digest),
+    }
+
+
+def read_saved_plan(args) -> Optional[Dict[str, Any]]:
+    """The checkpoint's plan record under ``--loop-planner apply`` with ``--load`` set and not
+    finetuning: ``loop_resume["plan"]`` of the checkpoint's common state, read the way
+    ``load_args_from_checkpoint`` reads it (``_load_base_checkpoint(..., rank0=True)``, every
+    rank, ``--ckpt-step`` honoured); None otherwise or when the checkpoint has no record (no
+    checkpoint yet, a pre-M3c checkpoint, one saved without an applied plan, or
+    ``--non-persistent-ckpt-type local``, which has no rank-0 read).
+
+    Cost: a torch_dist checkpoint reads only ``common.pt``; a legacy ``torch`` checkpoint (no
+    store: the store saves torch_dist only) loads rank 0's whole ``model_optim_rng.pt`` on every
+    rank, as ``load_args_from_checkpoint`` (``--use-checkpoint-args``) already does. Accepted
+    for that rare combination (legacy format under ``apply``) to keep the planner free of a new
+    collective."""
+    if getattr(args, "loop_planner", "off") != "apply" or getattr(args, "finetune", False):
+        return None
+    load_dir = getattr(args, "load", None)
+    if not load_dir:
+        return None
+    if getattr(args, "non_persistent_ckpt_type", None) == "local":
+        # A local non-persistent checkpoint is read through the training's
+        # LocalCheckpointManager, which needs the model's sharded state dict: dev has no
+        # rank-0 read of it (--use-checkpoint-args refuses 'local' for the same reason). The
+        # saved choice is then not pinned; check_resume_plan still refuses a resume whose
+        # fresh plan differs from the loaded checkpoint's (message 5).
+        print_rank_0(
+            "loop planner: --non-persistent-ckpt-type local has no rank-0 checkpoint read; the "
+            "checkpoint's applied plan is not pinned (a changed plan is refused after the load)"
+        )
+        return None
+    # pylint: disable=import-outside-toplevel
+    from megatron.training.checkpointing import _load_base_checkpoint
+    from megatron.training.loop_checkpoint import LOOP_RESUME_KEY
+
+    state_dict, *_ = _load_base_checkpoint(load_dir, args, rank0=True)
+    if not state_dict:
+        return None
+    record = (state_dict.get(LOOP_RESUME_KEY) or {}).get("plan")
+    return dict(record) if record else None
+
+
+def pin_saved_plan(
+    plan: LoopRSBFPlan, saved: Mapping[str, Any]
+) -> Tuple[LoopRSBFPlan, Optional[str]]:
+    """``(plan, None)`` with the saved record's choice applied: ``plan`` itself when it already
+    chose it, else ``plan`` with the menu row of that choice as its applied option (a pinned
+    plan; its digest is derived from the fresh digest and the choice, the same on every rank).
+    ``(plan, reason)`` unchanged when the choice cannot be pinned: ``"not in this run's menu"``
+    or ``"infeasible: <the planner's refusals>"`` (it does not fit, is not applicable, or the
+    form policy excludes it)."""
+    choice = dict(saved.get("choice") or {})
+    if not choice:
+        return plan, "the checkpoint records no choice"
+    if loop_plan_choice(plan) == choice:
+        return plan, None
+    row = next(
+        (r for r in plan.table if _option_choice(r.option, plan.core_layers) == choice), None
+    )
+    if row is None:
+        return plan, "not in this run's menu"
+    if not (row.fits and row.applicable) or row.refusals:
+        return plan, "infeasible: " + "; ".join(row.refusals or ("does not fit",))
+    option = row.option
+    form, stride = option_item_form(option, plan.core_layers)
+    digest = hashlib.sha256(
+        json.dumps([plan.digest, "pinned", choice], sort_keys=True).encode()
+    ).hexdigest()
+    pinned = dataclasses.replace(
+        plan,
+        applied=row,
+        item_form=form,
+        block_stride=stride,
+        stride_layers=option.stride_layers,
+        waves=option.waves,
+        coda_recompute=option.coda_recompute,
+        optimizer_offload="A" in option.moves,
+        notes=plan.notes + (f"pinned to the checkpoint's choice ({_choice_text(choice)})",),
+        digest=digest,
+    )
+    return pinned, None
+
+
+def check_resume_plan(
+    args,
+    saved: Optional[Mapping[str, Any]],
+    current: Optional[LoopRSBFPlan],
+    *,
+    pin_reason: Optional[str] = None,
+) -> Tuple[Optional[str], List[str]]:
+    """``(problem, notes)`` of a resume whose applied plan may differ from the checkpoint's.
+
+    ``problem`` (None when equal, or when either side has no applied plan) names every changed
+    field of the choice (``loop_plan_choice``) and, when both runs plan from the exit criterion
+    (``--loop-planner-depths config``), a changed depth distribution; a measured histogram or
+    an R4 setting is a planner input, never a problem. The digest is not compared (memory-model
+    inputs that change no choice must not block a resume). A change between the whole round
+    and the nested item (bitwise interchangeable, the block stride ignored) is a note.
+    ``pin_reason`` (``LoopPlannerSession.pin_reason``) says why the saved choice was not
+    pinned."""
+    if saved is None or current is None:
+        return None, []
+    saved_choice = dict(saved.get("choice") or {})
+    now = loop_plan_choice(current)
+    changed = {
+        key: (saved_choice.get(key), now.get(key))
+        for key in sorted(set(saved_choice) | set(now))
+        if saved_choice.get(key) != now.get(key)
+    }
+    notes = []
+    forms = {saved_choice.get("item_form"), now.get("item_form")}
+    if changed and set(changed) <= {"item_form", "block_stride"} and forms <= SWAPPABLE_ITEM_FORMS:
+        notes.append(
+            f"loop resume: RSBF item form {saved_choice.get('item_form')} -> "
+            f"{now.get('item_form')} (bitwise interchangeable)"
+        )
+        changed = {}
+    saved_depth = dict(saved.get("depth") or {})
+    source = getattr(args, "loop_planner_depths", "config")
+    if saved_depth and saved_depth.get("source", "config") == "config" and source == "config":
+        depth_now = [
+            current.depth.kind,
+            [float(value) for value in current.depth.params],
+            current.depth.max_rounds,
+        ]
+        depth_then = [saved_depth.get(key) for key in ("kind", "params", "max_rounds")]
+        if depth_now != depth_then:
+            changed["depth distribution"] = (depth_then, depth_now)
+    if not changed:
+        return None, notes
+    text = ", ".join(f"{key}: {old!r} -> {new!r}" for key, (old, new) in changed.items())
+    if pin_reason is not None:
+        text += f"; the saved plan could not be pinned: {pin_reason}"
+    return f"the RSBF plan: {text}", notes

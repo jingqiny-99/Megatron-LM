@@ -35,6 +35,7 @@ from megatron.core.transformer.loop.param_store_binding import (
     is_placeholder,
     named_logical_parameters,
 )
+from megatron.core.transformer.loop.param_store_checkpoint import logical_view
 from megatron.core.transformer.loop.param_store_comm import StoreComm
 from megatron.core.transformer.loop.param_store_schedule import SegmentKey
 from megatron.core.transformer.loop.rsbf_plan import SubRoundType
@@ -217,8 +218,18 @@ def test_shards_tags_mirror_and_hidden_parameters():
     assert "loop_param_store.mirror.decoder.layers.2.self_attention.linear_qkv.weight" in (
         model.state_dict()
     )
-    with pytest.raises(NotImplementedError, match="M3c"):
+    # Checkpoints (M3c): the store's own entries exist only as {} inside the logical view (the
+    # shards are saved under their owners' logical keys); a direct call outside it raises.
+    with pytest.raises(RuntimeError, match="saved through HybridModel.sharded_state_dict"):
         store.sharded_state_dict()
+    assert not store.in_checkpoint_view
+    with logical_view(store, model):
+        assert store.in_checkpoint_view
+        assert store.sharded_state_dict() == {}
+        assert all(t.module._parameters[t.attr] is t.compute for t in store.tensors())
+    assert not store.in_checkpoint_view
+    assert all(t.attr not in t.module._parameters for t in store.tensors())
+    assert not any(key.startswith("loop_param_store") for key in model.sharded_state_dict())
 
 
 def test_install_guards_and_find_param_store():

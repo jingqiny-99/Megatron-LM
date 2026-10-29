@@ -15,6 +15,31 @@ layer call (``HybridStack._run_layer``). Two recurrences are supported, as on th
   round ``r`` runs the core on the tokens with depth ``>= r`` (masked or compacted).
 
 Eager only: no CUDA graphs, no pipeline / context / sequence parallelism (see the guards).
+
+Checkpoint keys (M3c). At PP = 1 (guarded) a sharded key equals the module path. The loop adds
+no key code of its own: ``HybridStack.sharded_state_dict`` writes sublayer ``i`` as
+``decoder.layers.i`` (mHC-wrapped sublayers nest their layer under ``inner_layer.`` next to
+``hyper_connection.*``; attention and MoE are separate sublayer indices; prelude / core / coda
+are roles in the config, not part of any key) and gives every other child and the stack's own
+tensors a replicated entry through the default walk:
+
+* ``decoder.loop_adapter.weight``, ``[h, 2h]``: the Huginn adapter (D34: shared by the mHC
+  streams);
+* ``decoder.loop_norm.weight``, ``[h]`` (``LoopRMSNorm``, one stream) or ``[n, h]``
+  (``LoopStreamRMSNorm``, D34's per-stream norm);
+* ``decoder.depth_router.0.weight`` ``[h, h]`` and ``decoder.depth_router.2.weight``
+  ``[R_max, h]``: the MoR router;
+* ``decoder.<name>`` / ``decoder.<child>.<...>``: anything registered on the stack later.
+
+A parameter or persistent buffer registered on the stack (a direct ``Parameter``, a child
+module, an ``nn.ParameterList``) or on a module inside a layer gets its entry without new code;
+``param_store_checkpoint.uncovered_state_names`` (raised on by ``megatron/training/
+loop_checkpoint.py`` at setup, the first save and every load) catches a module whose custom
+``sharded_state_dict`` drops one. The exit contraction is the stack's own ``hc_head_*`` (dev's
+keys); the cells own no parameters. With the loop parameter store installed, every stored weight
+keeps the same key and global shape: it is saved as row shards of the logical tensor
+(``param_store_checkpoint``; ``LoopHybridStack.sharded_state_dict`` / ``HybridModel.
+sharded_state_dict`` build in the store's logical view), so the keys do not depend on z.
 """
 
 import dataclasses
@@ -198,6 +223,23 @@ class LoopHybridStack(HybridStack):
         self._loop_depths: Optional[Tensor] = None
         self._loop_head = None
         self._work = [0.0, 0.0, 0.0]
+
+    def sharded_state_dict(
+        self, prefix: str = '', sharded_offsets: Optional[tuple] = None, metadata=None
+    ):
+        """``HybridStack.sharded_state_dict``; with a loop parameter store installed, in its
+        logical view (stored weights saved as row shards of the logical tensor under their own
+        keys; a nested call from ``HybridModel.sharded_state_dict`` converts once, there)."""
+        store = self.__dict__.get("_loop_store_hook")
+        if store is None:
+            return super().sharded_state_dict(prefix, sharded_offsets, metadata)
+        return store.logical_sharded_state_dict(
+            self,
+            lambda: super(LoopHybridStack, self).sharded_state_dict(
+                prefix, sharded_offsets, metadata
+            ),
+            prefix=prefix,
+        )
 
     def _compress_ratio(self, symbol, index):
         """The DSv4 compress ratio of a ``D`` sublayer, read from its built attention.

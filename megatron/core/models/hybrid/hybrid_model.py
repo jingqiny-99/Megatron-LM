@@ -549,6 +549,22 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
         assert len(input_tensor) == 1, 'input_tensor should only be length 1 for gpt/bert'
         self.decoder.set_input_tensor(input_tensor[0])
 
+    def sharded_state_dict(
+        self, prefix: str = '', sharded_offsets: tuple = (), metadata: Optional[dict] = None
+    ):
+        """``LanguageModule.sharded_state_dict``; with a loop parameter store installed
+        (``_loop_store_hook``), built in the store's logical view so every stored weight is
+        saved under its own key as row shards of the logical tensor
+        (``megatron/core/transformer/loop/param_store_checkpoint.py``)."""
+        store = self.__dict__.get("_loop_store_hook")
+        if store is None:
+            return super().sharded_state_dict(prefix, sharded_offsets, metadata)
+        return store.logical_sharded_state_dict(
+            self,
+            lambda: super(HybridModel, self).sharded_state_dict(prefix, sharded_offsets, metadata),
+            prefix=prefix,
+        )
+
     def preprocess_for_fine_grained_offloading(self):
         """Preprocess for fine-grained activation offloading."""
         off_interface.init_chunk_handler(

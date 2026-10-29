@@ -341,6 +341,29 @@ def restore_parameter(module: nn.Module, attr: str) -> nn.Parameter:
     return param
 
 
+def register_logical(tensor: "StoreTensor") -> None:
+    """Put ``tensor``'s compute ``Parameter`` back into its owner's ``_parameters`` (the
+    checkpoint's *logical view*, ``param_store_checkpoint.logical_view``): the owner's
+    ``sharded_state_dict`` / ``_save_to_state_dict`` then emit its entry under its original name.
+    The instance ``__dict__`` entry stays, so consumers still read ``tensor.weight``. Raises when
+    the slot holds another object."""
+    params = tensor.module._parameters  # pylint: disable=protected-access
+    current = params.get(tensor.attr)
+    if current is not None and current is not tensor.compute:
+        raise RuntimeError(
+            f"{tensor.name}: {type(tensor.module).__name__}.{tensor.attr} is registered as "
+            "another object; the logical view cannot register the stored weight"
+        )
+    params[tensor.attr] = tensor.compute
+
+
+def unregister_logical(tensor: "StoreTensor") -> None:
+    """Undo ``register_logical`` (only when the slot still holds ``tensor.compute``)."""
+    params = tensor.module._parameters  # pylint: disable=protected-access
+    if params.get(tensor.attr) is tensor.compute:
+        del params[tensor.attr]
+
+
 def named_logical_parameters(
     module: nn.Module, prefix: str = "", recurse: bool = True
 ) -> Iterator[Tuple[str, torch.Tensor]]:

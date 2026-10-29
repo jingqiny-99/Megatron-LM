@@ -17,7 +17,11 @@ Gates: no parameter is a module-GTP shard before the install; the store's groups
 group is a Gloo group over the full data-parallel ranks; step-1 per-sample losses bitwise equal
 to the same steps without a store, step-2 losses close; the eager evaluation path
 (``refresh_loop_param_store``, no-grad forward with windowed units) equals the store-free model's
-eager losses bitwise at the initial weights; the M3c checkpoint backstop raises with the store.
+eager losses bitwise at the initial weights; a torch_dist ``save_checkpoint`` of the trained
+store run (DDP + distributed optimizer, both optimizer formats) reloads through
+``load_checkpoint`` into fresh objects bitwise (canonical shards, fp32 mains, Adam moments), and
+a legacy-format save raises message 1 (M3c; the full matrix is
+``test_loop_checkpoint_store_gpu.py``).
 """
 
 import os
@@ -234,7 +238,15 @@ def _train(with_store):
         losses.append(torch.stack([report["lm loss"][0] for report in reports]))
         success, _, _ = optimizer.step()
         assert success
-    return dict(losses=losses, eager=eager, store=store, ddp=ddp, status=status, full=full)
+    return dict(
+        losses=losses,
+        eager=eager,
+        store=store,
+        ddp=ddp,
+        status=status,
+        full=full,
+        optimizer=optimizer,
+    )
 
 
 @pytest.fixture(scope="module")
@@ -267,7 +279,53 @@ def test_losses_match_the_storeless_run(runs):
     assert torch.equal(runs["store"]["eager"], runs["none"]["eager"])
 
 
-def test_checkpoint_backstop(runs):
-    with pytest.raises(NotImplementedError, match="M3c"):
-        setup.check_loop_param_store_checkpoint([runs["store"]["ddp"]], "save_checkpoint")
-    setup.check_loop_param_store_checkpoint([runs["none"]["ddp"]], "save_checkpoint")
+@pytest.mark.parametrize("fully_reshardable", [False, True])
+def test_checkpoint_save_load(runs, tmp_path_dist_ckpt, fully_reshardable):
+    from megatron.training.loop_checkpoint import check_loop_save_format
+    from tests.unit_tests.transformer.loop import store_ckpt_gpu_utils as cku
+
+    run = runs["store"]
+    with pytest.raises(RuntimeError, match=r"--ckpt-format torch with the loop parameter store"):
+        check_loop_save_format([run["ddp"]], ckpt_format="torch")
+    check_loop_save_format([runs["none"]["ddp"]], ckpt_format="torch")  # no store: silent
+    expected_weights = cku.logical_weights(run["store"], run["ddp"])
+    expected_states = cku.optimizer_states(run["optimizer"], run["ddp"])
+    name = f"store_training_ckpt_{int(fully_reshardable)}"
+    with cku.checkpoint_dir(tmp_path_dist_ckpt / name) as ckpt_dir:
+        with cku.mock_checkpoint_args(
+            ckpt_dir, fully_reshardable=fully_reshardable, hybrid_layer_pattern=DENSE
+        ):
+            cku.save(run["ddp"], run["optimizer"], run["full"], iteration=2)
+            fresh = _fresh_store_objects()
+            assert cku.load(fresh["ddp"], fresh["optimizer"], run["full"]) == 2
+    assert cku.mismatches(cku.logical_weights(fresh["store"], fresh["ddp"]), expected_weights) == []
+    states = cku.optimizer_states(fresh["optimizer"], fresh["ddp"])
+    assert cku.mismatches(states, expected_states) == []
+    assert cku.pad_rows_zero(fresh["store"])
+
+
+def _fresh_store_objects():
+    """A new store run's model, DDP and distributed optimizer (no step taken)."""
+    args = _args()
+    full = ProcessGroupCollection.use_mpu_process_groups()
+    hybrid = _build(setup.loop_model_pg_collection(full))
+    store = setup.install_loop_param_store([hybrid], args, full)
+    ddp = DistributedDataParallel(
+        hybrid.config,
+        DistributedDataParallelConfig(
+            overlap_grad_reduce=False,
+            use_distributed_optimizer=True,
+            grad_reduce_in_fp32=True,
+            average_in_collective=False,
+        ),
+        hybrid,
+        pg_collection=full,
+    )
+    setup.configure_loop_param_store(args, [ddp])
+    optimizer = get_megatron_optimizer(
+        OptimizerConfig(optimizer="adam", lr=1e-3, use_distributed_optimizer=True, clip_grad=1.0),
+        [ddp],
+        use_gloo_process_groups=False,
+        pg_collection=full,
+    )
+    return dict(store=store, ddp=ddp, optimizer=optimizer, full=full)

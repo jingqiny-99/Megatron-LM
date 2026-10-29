@@ -611,14 +611,29 @@ def _validate_loop_param_store(args):
     > 1): every rule of ``loop_param_store_setup.loop_param_store_problems`` (the RSBF schedule
     on a hybrid Huginn loop, z dividing the RSBF domain, no module GTP / TP / PP / CP, the
     per-token loss, fp32 gradient reduction, no FSDP / delayed wgrad / FP8 primary weights /
-    shared-expert overlap, Adam or SGD, no checkpoint save / load (M3c), the store modes
-    against ``--loop-planner apply``); the store flags need z > 1. ``args.data_parallel_size``
-    stays the full data-distribution degree (z is not folded into ``total_model_size``)."""
+    shared-expert overlap, Adam or SGD, the store modes against ``--loop-planner apply``) and the
+    checkpoint rules (``_validate_loop_checkpoint``); the store flags need z > 1.
+    ``args.data_parallel_size`` stays the full data-distribution degree (z is not folded into
+    ``total_model_size``)."""
     from megatron.training.loop_param_store_setup import loop_param_store_problems
 
     problems = loop_param_store_problems(args)
     if problems:
         raise ValueError('loop parameter store: ' + '; '.join(problems))
+    _validate_loop_checkpoint(args)
+
+
+def _validate_loop_checkpoint(args):
+    """Checkpoints with the loop parameter store (M3c,
+    ``loop_checkpoint.loop_checkpoint_problems``): save in torch_dist only (no local
+    non-persistent checkpoints), no mem-efficient fully reshardable optimizer state, no chunked
+    optimizer-state offload, no ``distributed_weight`` binding with ``--save`` / ``--load``.
+    A no-op without a store."""
+    from megatron.training.loop_checkpoint import loop_checkpoint_problems
+
+    problems = loop_checkpoint_problems(args)
+    if problems:
+        raise ValueError('loop parameter store checkpoints: ' + '; '.join(problems))
 
 
 def _validate_sbhd_document_packing(args):
@@ -3959,6 +3974,18 @@ def _add_loop_planner_args(parser):
         type=str,
         default=None,
         help='Write the plan with every evaluated option as JSON to this file (rank 0).',
+    )
+    group.add_argument(
+        '--loop-resume-changes',
+        type=str,
+        default='refuse',
+        choices=['refuse', 'allow'],
+        help='Hybrid loop models resumed from a checkpoint (megatron/training/loop_checkpoint.py): '
+        '"refuse" stops a resume whose numerics-relevant loop arguments (every --loop-* '
+        'argument except the planner inputs, the parameter store layout and paths / reports / '
+        'debug settings), roles, layer pattern or applied RSBF plan differ from the '
+        'checkpoint\'s, since the resumed loss curve would not continue the checkpoint\'s; '
+        '"allow" logs each change and resumes. Ignored for other models.',
     )
     return parser
 

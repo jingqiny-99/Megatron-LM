@@ -94,6 +94,11 @@ from megatron.core.transformer.loop.param_store_binding import (
     unbind_grad,
     unbind_weight,
 )
+from megatron.core.transformer.loop.param_store_checkpoint import (
+    install_load_hooks,
+    logical_sharded_state_dict,
+    store_checkpoint_layout,
+)
 from megatron.core.transformer.loop.param_store_comm import (
     COPY_ENGINE_EXPERIMENTAL_NOTE,
     GATHER_ENGINES,
@@ -136,10 +141,6 @@ __all__ = [
 TRAIN_OUTSIDE_RSBF = (
     "the loop parameter store trains only through loop_schedule='rsbf': a grad-enabled visit "
     "outside an RSBF sub-round would leave the shard gradients unreduced"
-)
-CHECKPOINT_M3C = (
-    "checkpointing with the loop parameter store is M3c (not implemented); run with "
-    "--loop-param-store-shard-size 1 to save or load"
 )
 
 
@@ -733,6 +734,22 @@ class LoopParamStore(nn.Module):
         self._exposure: List[Tuple[Any, Any]] = []
         self._scratch_exposure: List[Tuple[Any, Any]] = []
         self._verify_refs: Dict[int, torch.Tensor] = {}
+        # The checkpoint writer election of the canonical shards: the rank in the replicate
+        # group (None for the trivial test store: its entries keep the owners' replica ids).
+        self.replicate_rank = None if self.trivial else dist.get_rank(group=groups.replicate)
+        # Checkpoint state (``param_store_checkpoint``): the logical view's depth and root, the
+        # dict keys of each stored tensor's entry, the row-shard merge outputs (factory sources
+        # of the load pre-hook), what the last load consumed / missed, the load hooks.
+        self._ckpt_view_depth = 0
+        self._ckpt_root = None
+        self._ckpt_entry_keys: Dict[str, Tuple[str, ...]] = {}
+        # id -> merge output; entries vanish with their tensor (O(1) per merge, no id reuse).
+        self._ckpt_merged: "weakref.WeakValueDictionary[int, torch.Tensor]" = (
+            weakref.WeakValueDictionary()
+        )
+        self._ckpt_consumed: Dict[str, str] = {}
+        self._ckpt_missing: Dict[str, List[str]] = {}
+        self._ckpt_handles: List[Any] = []
 
     # -----------------------------------------------------------------------------------------
     # Construction
@@ -816,6 +833,7 @@ class LoopParamStore(nn.Module):
         hybrid.loop_param_store = store
         object.__setattr__(hybrid, "_loop_store_hook", store)
         object.__setattr__(hybrid.decoder, "_loop_store_hook", store)
+        install_load_hooks(store, hybrid)
         return store
 
     @property
@@ -2057,9 +2075,60 @@ class LoopParamStore(nn.Module):
                 out[key] = f"the parameter store cannot run it ({error})"
         return out
 
-    def sharded_state_dict(self, *args, **kwargs):  # pylint: disable=unused-argument
-        """Store checkpoints are M3c."""
-        raise NotImplementedError(CHECKPOINT_M3C)
+    # -----------------------------------------------------------------------------------------
+    # Checkpoints (M3c, ``param_store_checkpoint``)
+    # -----------------------------------------------------------------------------------------
+
+    @property
+    def in_checkpoint_view(self) -> bool:
+        """True while the owners build checkpoint entries in the logical view."""
+        return self._ckpt_view_depth > 0
+
+    def sharded_state_dict(
+        self, prefix: str = "", sharded_offsets=(), metadata=None
+    ):  # pylint: disable=unused-argument
+        """``{}`` inside the logical view: the canonical shards are saved under their owners'
+        logical keys (``HybridModel.sharded_state_dict``), never as mirror entries. Raises
+        outside it."""
+        if self.in_checkpoint_view:
+            return {}
+        raise RuntimeError(
+            "the loop parameter store's shards are saved through HybridModel.sharded_state_dict "
+            "(logical keys); do not call it on the store"
+        )
+
+    def logical_sharded_state_dict(self, root: nn.Module, produce, *, prefix: str = ""):
+        """``produce()`` (``root``'s owners' sharded state dict) in the logical view, the stored
+        tensors' entries converted to row-shard factories (``param_store_checkpoint``)."""
+        return logical_sharded_state_dict(self, root, produce, prefix=prefix)
+
+    def checkpoint_layout(self) -> Dict[str, Any]:
+        """``store_checkpoint_layout``: z, ``min_numel``, binding, dtype, the stored set."""
+        return store_checkpoint_layout(self)
+
+    def on_checkpoint_load(self) -> None:
+        """After the canonical shards were loaded (the load post-hook): every compute copy is
+        unbound (the data binding's ``.data`` back on the NaN placeholder) and marked stale, so
+        nothing reads a pre-load weight; the next ``begin_step`` (or ``refresh()`` before
+        evaluation) gathers and binds the loaded shards. Copies, slots and scratch stay
+        allocated; the copy engines' mirror is refreshed at every step begin. Raises inside a
+        step."""
+        if self._in_step or self._cursor is not None:
+            raise RuntimeError("store: checkpoint load inside a training step")
+        for unit in self.units:
+            for tensor in unit.tensors:
+                if tensor.bound is not None:
+                    unbind_weight(tensor)
+            unit.bound = False
+        self._fresh = False
+        self._verify_refs = {}
+
+    def _mark_merged(self, tensor: torch.Tensor) -> None:
+        """Record a row-shard merge output (a factory source for the load pre-hook)."""
+        self._ckpt_merged[id(tensor)] = tensor
+
+    def _is_merged(self, tensor: Any) -> bool:
+        return self._ckpt_merged.get(id(tensor)) is tensor
 
 
 _INT_OF = {1: torch.int8, 2: torch.int16, 4: torch.int32, 8: torch.int64}

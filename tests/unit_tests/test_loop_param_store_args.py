@@ -7,12 +7,12 @@
   ``_validate_loop_param_store``): the RSBF schedule on a hybrid Huginn loop, z dividing the
   domain, no module GTP / TP / PP / CP, the per-token loss, fp32 gradient reduction, no FSDP /
   delayed wgrad / FP8 primary weights / shared-expert overlap / average-in-collective, Adam or
-  SGD, ``--data-parallel-random-init`` / ``--init-model-with-meta-device``, ``--save`` /
-  ``--load`` / ``--pretrained-checkpoint`` refused (M3c), the store modes against
-  ``--loop-planner apply``; the store flags need z > 1;
+  SGD, ``--data-parallel-random-init`` / ``--init-model-with-meta-device``, the store modes
+  against ``--loop-planner apply``; the store flags need z > 1; ``--save`` / ``--load`` /
+  ``--pretrained-checkpoint`` accepted (M3c; the checkpoint rules are
+  ``test_loop_checkpoint_args.py``);
 * the grid size, the store config from the debug switches, the model's collection with the
-  gtp axes nulled, the install guard against a DDP-wrapped model, the checkpoint backstop, the
-  evaluation refresh;
+  gtp axes nulled, the install guard against a DDP-wrapped model, the evaluation refresh;
 * the planner with a store on a CPU-built dense loop model (trivial ``z = 1`` store): the
   Layer-window capability, the move steps (``E`` / ``EM`` without Adam to Grace), the shard
   axis, the store modes <-> planner option map, ``auto`` modes (core Layer window exactly when
@@ -36,12 +36,7 @@ import torch
 
 from megatron.core.process_groups_config import ProcessGroupCollection, resolve_gtp_remat_group
 from megatron.core.transformer.loop import planner as P
-from megatron.core.transformer.loop.param_store import (
-    CHECKPOINT_M3C,
-    ResidencyMode,
-    StoreModes,
-    find_param_store,
-)
+from megatron.core.transformer.loop.param_store import ResidencyMode, StoreModes, find_param_store
 from megatron.core.transformer.loop.rsbf_executor import get_loop_rsbf_schedule
 from megatron.training import loop_param_store_setup as setup
 from megatron.training import loop_rsbf_planning as planning
@@ -243,9 +238,6 @@ def test_the_valid_run_and_the_default_have_no_problems():
         (dict(use_layer_wise_distributed_optimizer=True), "layer-wise"),
         (dict(data_parallel_random_init=True), "--data-parallel-random-init"),
         (dict(init_model_with_meta_device=True), "--init-model-with-meta-device"),
-        (dict(save="/ckpt"), r"--save: checkpointing with the loop parameter store \(z = 8\)"),
-        (dict(load="/ckpt"), "--load: checkpointing .* is M3c"),
-        (dict(pretrained_checkpoint="/ckpt"), "--pretrained-checkpoint: .*shard-size 1"),
         (dict(loop_param_store_modes="core=xx"), "--loop-param-store-modes: store modes"),
         (dict(loop_param_store_modes="emb_head=lw"), "emb_head=layer_window"),
         (dict(loop_planner="apply", loop_param_store_modes="core=lw"), "planner apply sets"),
@@ -256,6 +248,21 @@ def test_argument_rules(overrides, match):
     assert problems and any(re.search(match, p) for p in problems), problems
     with pytest.raises(ValueError, match="loop parameter store: "):
         _validate_loop_param_store(_args(**overrides))
+
+
+def test_checkpoint_arguments_are_accepted():
+    # M3c: the store saves and loads torch_dist checkpoints.
+    for overrides in (
+        dict(save="/ckpt"),
+        dict(load="/ckpt"),
+        dict(pretrained_checkpoint="/ckpt"),
+        dict(save="/ckpt", load="/ckpt", ckpt_format="torch_dist"),
+    ):
+        assert setup.loop_param_store_problems(_args(**overrides)) == [], overrides
+        _validate_loop_param_store(_args(**overrides))
+    # ... and the checkpoint rules run from the same validation.
+    with pytest.raises(ValueError, match="loop parameter store checkpoints: --ckpt-format torch"):
+        _validate_loop_param_store(_args(save="/ckpt", ckpt_format="torch"))
 
 
 def test_distributed_weight_binding_needs_the_te_protocol():
@@ -398,16 +405,13 @@ def test_install_guards(_model_parallel):
     assert groups.domain is pgc.dp_gtp_remat and groups.shard_rs is None
 
 
-def test_checkpoint_backstop_and_refresh(_model_parallel):
+def test_refresh(_model_parallel):
     plain = _model()
-    setup.check_loop_param_store_checkpoint([plain], "save_checkpoint")  # no store: silent
     assert not setup.refresh_loop_param_store([plain])
     model = _model()
     store = _store(model)
-    with pytest.raises(NotImplementedError, match="save_checkpoint: " + CHECKPOINT_M3C[:40]):
-        setup.check_loop_param_store_checkpoint([model], "save_checkpoint")
-    with pytest.raises(NotImplementedError, match="M3c"):
-        store.sharded_state_dict()
+    with pytest.raises(RuntimeError, match="saved through HybridModel.sharded_state_dict"):
+        store.sharded_state_dict()  # M3c: only the logical view saves the shards
     assert not setup.refresh_loop_param_store([model])  # modes not configured: nothing to do
     store.configure_modes(StoreModes.parse("core=lw,edges=lw,emb_head=rsg"))
     store._fresh = False  # pylint: disable=protected-access
@@ -568,16 +572,43 @@ def test_training_hooks_in_order():
     assert line["_build_model_wrapper"] < line["configure_loop_param_store"]
     assert line["configure_loop_param_store"] < line["plan_loop_rsbf"]
     assert line["plan_loop_rsbf"] < line["get_megatron_optimizer"]
+    assert line["plan_loop_rsbf"] < line["check_loop_sharded_state_dict"]
+    assert line["check_loop_sharded_state_dict"] < line["get_megatron_optimizer"]
     assert "_build_loop_param_store_models" in line
     line = _first_lines(training.evaluate)
     assert line["refresh_loop_param_store"] < line["forward_backward_func"]
     assert "loop_rsbf_status_gloo_group" in _first_lines(training.loop_rsbf_status_group)
-    for function, what in (
-        (checkpointing.save_checkpoint, "save_checkpoint"),
-        (checkpointing.load_checkpoint, "load_checkpoint"),
-    ):
+    for function in (checkpointing.save_checkpoint, checkpointing.load_checkpoint):
         calls = [name for _, name in sorted(_calls_in(function))]
-        assert "check_loop_param_store_checkpoint" in calls, what
+        assert "check_loop_param_store_checkpoint" not in calls  # the M3c backstop is gone
+    # save_checkpoint: the format backstop, the coverage check on the state dict being saved,
+    # the loop_resume entry before the write.
+    line = _first_lines(checkpointing.save_checkpoint)
+    assert line["check_loop_save_format"] < line["generate_state_dict"]
+    assert line["generate_state_dict"] < line["check_loop_sharded_state_dict"]
+    assert line["check_loop_sharded_state_dict"] < line["loop_resume_state"]
+    assert line["loop_resume_state"] < line["TorchDistSaveShardedStrategy"]
+    # load_checkpoint: the bucket-layout check before the template, the coverage check on the
+    # template, the format check before the model state is loaded; message 11 (GPT-to-hybrid
+    # maps) right after the maps are set up, before they retarget the template.
+    line = _first_lines(checkpointing.load_checkpoint)
+    assert line["check_loop_optimizer_resharding"] < line["generate_state_dict"]
+    assert line["generate_state_dict"] < line["check_loop_sharded_state_dict"]
+    calls = _calls_in(checkpointing.load_checkpoint)
+    formats = sorted(n for n, name in calls if name == "check_loop_load_format")
+    assert len(formats) == 2
+    retarget = line["retarget_sharded_state_dict_to_gpt_checkpoint"]
+    assert line["_maybe_setup_gpt_to_hybrid_load"] < formats[0] < retarget
+    assert line["check_loop_sharded_state_dict"] < formats[1] < line["load_model_state_dict"]
+    assert line["check_loop_sharded_state_dict"] < line["load_state_dict"]
+    # The resume check (message 5): right after check_resume_offload on both paths (torch_dist:
+    # before the bucket check and the template; legacy: with the full state, before the
+    # consumed samples are taken over).
+    resume = sorted(n for n, name in calls if name == "check_loop_resume_state")
+    offload = sorted(n for n, name in calls if name == "check_resume_offload")
+    assert len(resume) == 2 and len(offload) == 2
+    assert offload[0] < resume[0] < line["check_loop_optimizer_resharding"]
+    assert formats[1] < offload[1] < resume[1] < line["load_model_state_dict"]
 
 
 def test_metrics_average_over_every_distinct_data_rank(_model_parallel):
