@@ -25,6 +25,7 @@ from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import (
     microbatch,
 )
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.module import FsdpModule
+from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.phase import Phase
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.placement import (
     RowAtomic,
     TensorAtomic,
@@ -76,6 +77,40 @@ class MultiChildModel(nn.Module):
         for layer in self.layers:
             x = torch.relu(layer(x))
         return x
+
+
+class TinySharedMTP(nn.Module):
+    """Two MTP depths with shifted token embeddings and one shared residual block."""
+
+    def __init__(self, width: int, vocab_size: int) -> None:
+        super().__init__()
+        self.embedding = nn.Embedding(vocab_size, width)
+        self.enorm = nn.LayerNorm(width, bias=False)
+        self.hnorm = nn.LayerNorm(width, bias=False)
+        self.eh_proj = nn.Linear(2 * width, width, bias=False)
+        self.shared_block = nn.Sequential(
+            nn.LayerNorm(width, bias=False),
+            nn.Linear(width, width, bias=False),
+            nn.GELU(),
+            nn.Linear(width, width, bias=False),
+        )
+        self.output = nn.Linear(width, vocab_size, bias=False)
+
+    def forward(self, token_ids: torch.Tensor, hidden_states: torch.Tensor) -> torch.Tensor:
+        """Condition each depth on the previous depth and sum its next-token loss."""
+        seq_length = hidden_states.size(1)
+        losses = []
+        for depth in (1, 2):
+            # At position t, depth k consumes token t+k and predicts token t+k+1.
+            embeddings = self.embedding(token_ids[:, depth : depth + seq_length])
+            hidden_states = self.eh_proj(
+                torch.cat((self.enorm(embeddings), self.hnorm(hidden_states)), dim=-1)
+            )
+            hidden_states = hidden_states + self.shared_block(hidden_states)
+            logits = self.output(hidden_states)
+            targets = token_ids[:, depth + 1 : depth + 1 + seq_length]
+            losses.append(nn.functional.cross_entropy(logits.flatten(0, 1), targets.flatten()))
+        return torch.stack(losses).sum()
 
 
 def _default_placements() -> Placements:
@@ -219,6 +254,51 @@ def test_fully_shard_sgd_losses_match_baseline(
     )
 
 
+def test_shared_mtp_backward_matches_baseline(distributed_setup):
+    """Shared-layer MTP should match unsharded training over multiple SGD steps."""
+    rank = distributed_setup.rank
+    world_size = distributed_setup.world_size
+    device = distributed_setup.device
+    width = 2 * world_size
+    vocab_size = 4 * width
+    mesh = init_device_mesh(device.type, (world_size,))
+    torch.manual_seed(5678 + rank)
+    seq_length = 4
+    token_ids = torch.randint(vocab_size, (2, seq_length + 3), device=device)
+    hidden_states = torch.randn(2, seq_length, width, device=device)
+    inputs = (token_ids, hidden_states)
+
+    def train(model, optimizer, inputs, *, reduce_wgrad: bool) -> list[torch.Tensor]:
+        losses = []
+        for _ in range(5):
+            optimizer.zero_grad()
+            loss = model(*inputs)
+            losses.append(loss.detach())
+            loss.backward()
+            if reduce_wgrad:
+                # The plain baseline has no DDP wrapper to average its gradients.
+                for parameter in model.parameters():
+                    dist.all_reduce(parameter.grad, op=dist.ReduceOp.AVG)
+            optimizer.step()
+        return losses
+
+    torch.manual_seed(1234)
+    baseline = TinySharedMTP(width, vocab_size).to(device)
+    baseline_optimizer = torch.optim.SGD(baseline.parameters(), lr=0.05)
+    baseline_losses = train(baseline, baseline_optimizer, inputs, reduce_wgrad=True)
+
+    torch.manual_seed(1234)
+    model = TinySharedMTP(width, vocab_size).to(device)
+    with fully_shard_context(device=device):
+        fully_shard(model.shared_block, mesh=mesh, placements=_default_placements())
+        fully_shard(model, mesh=mesh, placements=_default_placements())
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.05)
+    fully_shard_optimizer(optimizer)
+    losses = train(model, optimizer, inputs, reduce_wgrad=False)
+
+    torch.testing.assert_close(torch.stack(losses), torch.stack(baseline_losses))
+
+
 def test_rejects_delayed_te_weight_gradient(distributed_setup):
     """Default automatic synchronization rejects weight gradients produced after autograd."""
     world_size = distributed_setup.world_size
@@ -240,7 +320,7 @@ def test_rejects_delayed_te_weight_gradient(distributed_setup):
     x = torch.randn(4, 16, device=device, dtype=torch.bfloat16, requires_grad=True)
     model(x).float().square().mean().backward()
     assert model.weight.grad is None
-    assert model.phase is FsdpModule.Phase.BACKWARD
+    assert model.phase is Phase.BACKWARD
 
     with pytest.raises(RuntimeError, match="caller_managed_grad_sync=True"):
         model.backward_dw()
@@ -303,16 +383,16 @@ def test_fully_shard_activation_recompute_reshards_parameters(distributed_setup,
 
     # Backward completes each module before recomputing the previous one, so
     # every module-local phase must be cleared after its matching backward.
-    assert model.phase is FsdpModule.Phase.RESTING
-    assert model.fc1.phase is FsdpModule.Phase.RESTING
-    assert model.fc2.phase is FsdpModule.Phase.RESTING
+    assert model.phase is Phase.RESTING
+    assert model.fc1.phase is Phase.RESTING
+    assert model.fc2.phase is Phase.RESTING
 
     # A second forward after backward runs in the forward phase again, so
     # forward-order prefetch resumes and the module phases return to resting.
     model(x).sum().backward()
-    assert model.phase is FsdpModule.Phase.RESTING
-    assert model.fc1.phase is FsdpModule.Phase.RESTING
-    assert model.fc2.phase is FsdpModule.Phase.RESTING
+    assert model.phase is Phase.RESTING
+    assert model.fc1.phase is Phase.RESTING
+    assert model.fc2.phase is Phase.RESTING
 
 
 @pytest.mark.parametrize("set_to_none", [True, False])
@@ -609,7 +689,7 @@ def test_backward_averages_across_dp_and_accumulates_across_calls(distributed_se
     x = torch.full((1, 1), float(rank + 1), device=device)
     with microbatch(context, is_last=False):
         model(x).sum().backward()
-        model(x).sum().backward()
+    model(x).sum().backward()
 
     assert isinstance(model.weight.grad, DTensor)
     local_grad = model.weight.grad.to_local()
@@ -716,7 +796,7 @@ def test_fully_shard_preserves_parameter_attributes(distributed_setup):
     device = distributed_setup.device
     mesh = init_device_mesh(device.type, (distributed_setup.world_size,))
     model = nn.Linear(8, 8, bias=False, device=device)
-    attributes = {"use_muon": False}
+    attributes = {"use_muon": False, "is_wide_residual_retention_parameter": True}
     for name, value in attributes.items():
         setattr(model.weight, name, value)
 

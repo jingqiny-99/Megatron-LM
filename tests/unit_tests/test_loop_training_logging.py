@@ -238,23 +238,29 @@ def test_training_log_writes_the_histogram(monkeypatch, step_batch, run_config, 
     interval's histogram (two steps) and a new interval starts."""
     from megatron.training import arguments, training
     from megatron.training.config import LoggerConfig
+    from megatron.training.state import TrainState
 
     parser = ArgumentParser()
     arguments.add_megatron_arguments(parser)
     args = parser.parse_args(["--micro-batch-size", "1"])
     args.data_parallel_size = args.world_size = args.gtp_weight_remat_size = 1
-    args.consumed_train_samples = args.skipped_train_samples = 0
     args.dsa_indexer_loss_coeff = None
     args.loop_architecture = "huginn"  # the loop-FLOPs throughput path
     args.train_iters, args.seq_length = 10, 16
     step_batch.samples = 4
     run_config.logger = LoggerConfig(log_interval=2, tensorboard_log_interval=1)
+    # training_log reads the batch size and the iteration budget from the run config.
+    run_config.train.micro_batch_size = args.micro_batch_size
+    run_config.train.train_iters = args.train_iters
     _step(args, _StubSchedule(), iteration - 1, [1, 1, 1, 1])
     _step(args, _StubSchedule(), iteration, [4, 0, 0, 0], (4, 64))
     writer, wandb, lines = Mock(), Mock(), []
     timers = Mock()
     timers.return_value.elapsed.return_value = 1.0
     monkeypatch.setattr(training, "get_args", lambda: args)
+    # The sample counters live in the TrainState (consumed / skipped samples start at 0).
+    train_state = TrainState()
+    monkeypatch.setattr(training, "get_train_state", lambda: train_state)
     monkeypatch.setattr(training, "get_timers", lambda: timers)
     monkeypatch.setattr(training, "get_tensorboard_writer", lambda: writer)
     monkeypatch.setattr(training, "get_wandb_writer", lambda: wandb)

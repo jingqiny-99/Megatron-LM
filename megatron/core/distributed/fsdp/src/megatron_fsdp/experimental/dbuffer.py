@@ -26,6 +26,7 @@ from torch.distributed import DeviceMesh
 from torch.distributed.tensor import DTensor, Partial, Replicate, Shard
 from torch.distributed.tensor.placement_types import Placement
 
+from . import layout_builder
 from .layout import GlobalLayout, Shape, non_leading_numel
 from .placement import BlockAtomic, TensorAtomic
 from .range import Range, intersect_ranges
@@ -178,7 +179,7 @@ class DBuffer:
     ) -> "DBuffer":
         """Build a RowAtomic or BlockAtomic layout and allocate its local buffer.
 
-        For TensorAtomic, use ``GlobalLayout.build_for_tensor_atomic`` and pass
+        For TensorAtomic, use ``layout_builder.build_for_tensor_atomic`` and pass
         the resulting layout to the DBuffer constructor.
 
         Args:
@@ -189,7 +190,7 @@ class DBuffer:
             device: Device for the local buffer.
             block_size: Number of consecutive rows kept together on one rank.
         """
-        layout = GlobalLayout.build_for_row_atomic(
+        layout = layout_builder.build_for_row_atomic(
             tensor_shapes, dp_size=mesh.size(), block_size=block_size
         )
         return cls(mesh, placements, layout, dtype, device)
@@ -213,6 +214,15 @@ class DBuffer:
         if hasattr(symm_mem, "is_symm_mem_tensor"):
             return symm_mem.is_symm_mem_tensor(self.local_buffer)
         return self.allocated_from_symm_mem
+
+    @property
+    def is_allocated(self) -> bool:
+        """Whether the local buffer has backing storage.
+
+        ``release_storage()`` clears this and ``reallocate_storage()`` restores it.
+        Empty local buffers are always allocated.
+        """
+        return self.local_buffer.numel() == 0 or self.local_buffer.untyped_storage().nbytes() > 0
 
     def reallocate_storage(self) -> None:
         """Restore the local buffer's backing storage to its logical size."""
@@ -342,7 +352,7 @@ class DBuffer:
             mesh: Device mesh whose dimensions correspond to ``placements``.
             placements: Per-mesh-axis DBuffer placements.
             layout: Prebuilt layout matching the input tensor shapes and order. If
-                omitted, build a RowAtomic layout. Use the GlobalLayout builders
+                omitted, build a RowAtomic layout. Use the functions in ``layout_builder``
                 to supply a TensorAtomic or BlockAtomic layout.
 
         Returns:
@@ -360,7 +370,7 @@ class DBuffer:
 
         tensor_shapes = tuple(tensor.shape for tensor in tensors)
         if layout is None:
-            layout = GlobalLayout.build_for_row_atomic(tensor_shapes, dp_size=mesh.size())
+            layout = layout_builder.build_for_row_atomic(tensor_shapes, dp_size=mesh.size())
         elif layout.tensor_shapes != tensor_shapes:
             raise ValueError("Layout tensor shapes must match the input tensors in order.")
         buffer = cls(

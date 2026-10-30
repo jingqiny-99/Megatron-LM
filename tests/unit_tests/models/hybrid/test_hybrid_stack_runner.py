@@ -372,10 +372,13 @@ class _LoopRecordingStack(HybridStack):
 
 
 def test_layer_loop_is_the_eager_hook_and_full_recompute_bypasses_it(monkeypatch):
+    # checkpointed_forward checkpoints through precision_aware_checkpoint (upstream dev).
     monkeypatch.setattr(
-        recompute_module.tensor_parallel,
-        "checkpoint",
-        lambda function, _distribute_saved_activations, *args: function(*args),
+        recompute_module,
+        "precision_aware_checkpoint",
+        lambda function, _config, _tp_group, *args, distribute_saved_activations=False: function(
+            *args
+        ),
     )
     hidden = torch.zeros(4, 2, 8)
 
@@ -413,6 +416,7 @@ def test_grouped_tail_is_skipped_and_cleared(with_cp_layout_state):
         state = SimpleNamespace(
             manager=manager,
             prepare_layer=lambda _index, hidden: (hidden, None),
+            get_layer_padding_mask=lambda _index, default, _masks: default,
             finalize_layer=lambda index, hidden: finalized.append(index) or hidden,
         )
         manager.build_forward_state = lambda *_args, **_kwargs: state

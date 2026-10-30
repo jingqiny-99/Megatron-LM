@@ -115,6 +115,8 @@ class _CPBatch:
     def __init__(self, batch, packed_seq_params=None):
         self.batch = batch
         self.packed_seq_params = packed_seq_params
+        # HybridModel.forward reads the per-layout padding masks (one layout at CP = 1).
+        self.batches_by_layout = {"contiguous": batch}
 
     def get_batch(self):
         return self.batch
@@ -141,8 +143,11 @@ def hybrid(monkeypatch):
     monkeypatch.setattr(pretrain_hybrid, "get_timers", lambda: lambda *a, **k: _Timer(timer_log))
     monkeypatch.setattr(pretrain_hybrid, "get_rerun_state_machine", lambda: machine)
     monkeypatch.setattr(pretrain_hybrid, "has_nvidia_modelopt", False, raising=False)
+    # forward_step passes the model's pg_collection (upstream dev, DCP V2); loop_rsbf_batch does not.
     monkeypatch.setattr(
-        pretrain_hybrid, "get_batch", lambda data_iterator, vp_stage=None: next(data_iterator)
+        pretrain_hybrid,
+        "get_batch",
+        lambda data_iterator, vp_stage=None, pg_collection=None: next(data_iterator),
     )
     monkeypatch.setattr(pretrain_hybrid, "test_args", args, raising=False)
     monkeypatch.setattr(pretrain_hybrid, "test_machine", machine, raising=False)

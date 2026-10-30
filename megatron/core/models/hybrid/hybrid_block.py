@@ -59,6 +59,10 @@ from megatron.core.transformer.residual_recompute import (
     build_residual_stream_recompute_plan,
     residual_stream_recompute_enabled,
 )
+from megatron.core.transformer.residual_recompute_plan import (
+    build_recompute_block_end_plan,
+    finalize_recompute_block,
+)
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.transformer_layer import TransformerLayer
 from megatron.core.transformer.utils import (
@@ -250,7 +254,7 @@ class HybridStack(MegatronModule):
         self.input_tensor = None
         self.pg_collection = pg_collection
 
-        self._mhc_block_end_plan: Optional[List[bool]] = None
+        self._mhc_block_end_plan: Optional[Tuple[bool, ...]] = None
 
         self.layer_config_list = layer_config_list
         self._has_linear_layer_with_chunkwise_cp = self.cp_group.size() > 1 and any(
@@ -580,20 +584,9 @@ class HybridStack(MegatronModule):
                 return layer.self_attention.mamba_state_shapes_per_request()
         return None
 
-    def _compute_mhc_block_end_plan(self) -> List[bool]:
+    def _compute_mhc_block_end_plan(self) -> Tuple[bool, ...]:
         """Compute deterministic per-layer mHC recompute block boundaries."""
-        num_layers = len(self.layers)
-        block_ends: List[bool] = [False] * num_layers
-        if num_layers == 0:
-            return block_ends
-
-        layers_per_block = self.config.mhc_recompute_layer_num
-        for layer_idx in range(num_layers):
-            is_last_in_stack = layer_idx == num_layers - 1
-            block_ends[layer_idx] = is_last_in_stack or (
-                layers_per_block is not None and (layer_idx + 1) % layers_per_block == 0
-            )
-        return block_ends
+        return build_recompute_block_end_plan(len(self.layers), self.config.mhc_recompute_layer_num)
 
     def _build_mhc_recompute_layer_plan(
         self, use_mhc_recompute: bool
@@ -607,21 +600,23 @@ class HybridStack(MegatronModule):
             self._mhc_block_end_plan = self._compute_mhc_block_end_plan()
         block_ends = self._mhc_block_end_plan
 
+        # mHC layers bind arena slots on, and register phase-checked replay with, the
+        # manager; build_recompute_layer_managers only creates plain
+        # CheckpointWithoutOutputManager instances, which have neither.
         layer_managers: List[Optional[MHCCheckpointManager]] = [None] * num_layers
         manager = MHCCheckpointManager()
         for layer_idx in range(num_layers):
             layer_managers[layer_idx] = manager
             if block_ends[layer_idx] and layer_idx != num_layers - 1:
                 manager = MHCCheckpointManager()
-        return layer_managers, block_ends
+        return layer_managers, list(block_ends)
 
     @staticmethod
     def _finalize_mhc_recompute_layer(
         manager: Optional[MHCCheckpointManager], hidden_states: Tensor, is_block_end: bool
     ) -> None:
         """Finalize the current mHC recompute block when its last layer finishes."""
-        if manager is not None and is_block_end:
-            manager.discard_all_outputs_and_register_unified_recompute(hidden_states)
+        finalize_recompute_block(manager, hidden_states, is_block_end)
 
     def forward(
         self,
@@ -634,6 +629,7 @@ class HybridStack(MegatronModule):
         packed_seq_params: Optional[PackedSeqParams] = None,
         padding_mask=None,
         input_ids: Optional[Tensor] = None,
+        padding_mask_by_layout: dict[CPLayout, Tensor | None] | None = None,
         packed_seq_params_by_layout: dict[CPLayout, PackedSeqParams | None] | None = None,
         cp_layout_plan: THDCPLayoutPlan | None = None,
     ):
@@ -672,6 +668,7 @@ class HybridStack(MegatronModule):
             input_ids=input_ids,
             packed_seq_params_by_layout=packed_seq_params_by_layout,
             cp_layout_plan=cp_layout_plan,
+            padding_mask_by_layout=padding_mask_by_layout,
         )
 
         with ctx.outer_quant_context:
@@ -710,19 +707,17 @@ class HybridStack(MegatronModule):
         input_ids: Optional[Tensor],
         packed_seq_params_by_layout: dict[CPLayout, PackedSeqParams | None] | None,
         cp_layout_plan: THDCPLayoutPlan | None,
+        padding_mask_by_layout: dict[CPLayout, Tensor | None] | None = None,
     ) -> Tuple[Tensor, HybridStackLayerContext]:
         """Resolve the stack input and build the per-forward layer-call context.
 
         Returns the input hidden states (the pipeline input when this is not the first
         stage, unwrapped, and expanded to the residual-stream width on the first stage) and
         the ``HybridStackLayerContext`` that every layer call of this forward reads.
+        ``padding_mask_by_layout`` is HybridModel's per-layout mask of a dynamic-CP batch;
+        when None (and CP layouts are active) it is derived from ``padding_mask``.
         """
         packed_seq_params = self._stage_te_cuda_graph_route_metadata(packed_seq_params)
-
-        if self._has_linear_layer_with_chunkwise_cp and padding_mask is not None:
-            raise NotImplementedError(
-                "Hybrid chunkwise context parallelism does not support padding masks."
-            )
 
         cp_layout_state = None
         if self._cp_layout_manager is not None:
@@ -733,7 +728,6 @@ class HybridStack(MegatronModule):
             )
 
         input_ids_by_layout = None
-        padding_mask_by_layout = None
         if cp_layout_state is not None:
             layouts = set(cp_layout_state.manager.layer_layouts)
             if input_ids is not None:
@@ -741,7 +735,10 @@ class HybridStack(MegatronModule):
                     layout: cp_layout_state.convert_sequence_metadata(input_ids, layout)
                     for layout in layouts
                 }
-            if padding_mask is not None:
+            if padding_mask_by_layout is None and padding_mask is not None:
+                # HybridModel supplies per-layout masks when it has a dynamic-CP batch,
+                # where each layout can carry its own padded length. Otherwise derive
+                # them from the contiguous mask.
                 padding_mask_by_layout = {
                     layout: cp_layout_state.convert_sequence_metadata(padding_mask, layout)
                     for layout in layouts
@@ -948,6 +945,11 @@ class HybridStack(MegatronModule):
                 )
             # Keep both residuals in the layer's layout, inside the CP conversions.
             residual_accumulator = hidden_states
+            layer_padding_mask = ctx.padding_mask
+            if ctx.cp_layout_state is not None:
+                layer_padding_mask = ctx.cp_layout_state.get_layer_padding_mask(
+                    physical_layer_idx, ctx.padding_mask, ctx.padding_mask_by_layout
+                )
             # Layers have 1-indexed layer numbers attribute.
             inner_quant_context = ctx.quant_context_factory(layer_config, layer.layer_number - 1)
             with inner_quant_context:
@@ -959,13 +961,7 @@ class HybridStack(MegatronModule):
                         rotary_pos_emb=ctx.rotary_pos_emb,
                         sequence_len_offset=ctx.sequence_len_offset,
                         packed_seq_params=layer_packed_seq_params,
-                        padding_mask=(
-                            ctx.padding_mask_by_layout[
-                                ctx.cp_layout_state.manager.layer_layouts[physical_layer_idx]
-                            ]
-                            if ctx.padding_mask_by_layout is not None
-                            else ctx.padding_mask
-                        ),
+                        padding_mask=layer_padding_mask,
                     )
                     if ctx.input_ids is not None and self._uses_hash_routing(layer):
                         layer_kwargs["input_ids"] = (

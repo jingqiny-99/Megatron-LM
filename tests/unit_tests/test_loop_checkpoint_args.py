@@ -1011,12 +1011,17 @@ class _Rows(torch.utils.data.Dataset):
         return {"tokens": torch.full((4,), index)}
 
 
-def test_data_loader_leaves_the_default_generator_unchanged(monkeypatch):
+def test_data_loader_leaves_the_default_generator_unchanged(monkeypatch, run_config):
     """The eager stack's ``--loop-sample-depth`` draws use the CPU default generator, which
     ``load_checkpoint`` restores before the data iterators are built; the pretraining loader
     owns its generator, so creating its iterator draws nothing from the default one."""
     from megatron.training.datasets import data_samplers
 
+    # The loader reads the batch sizes and the signal handler from the run config.
+    run_config.train.micro_batch_size = 1
+    run_config.train.global_batch_size = 8
+    run_config.train.exit_signal_handler = False
+    run_config.validation.full_validation = False
     loader_args = Namespace(
         dataloader_type="single",
         micro_batch_size=1,

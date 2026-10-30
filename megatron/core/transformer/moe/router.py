@@ -345,7 +345,7 @@ class TopKRouter(Router):
 
         self.router_replay = None
         if self.config.moe_enable_routing_replay:
-            self.router_replay = RouterReplay()
+            self.router_replay = RouterReplay(is_mtp_layer=self.is_mtp_layer)
 
         if layer_number is not None:
             self.set_layer_number(layer_number)
@@ -455,20 +455,43 @@ class TopKRouter(Router):
         scores = logits * map
         return scores, map
 
-    def quantile_balancing(self, logits: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    def quantile_balancing(
+        self, logits: torch.Tensor, dense_output: bool = False
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         """Apply quantile-balancing (QB) routing to the logits tensor.
 
-        Selects top-k experts per token using a dual coordinate-descent update on
-        a per-expert bias ``qb_beta``. Load balance is handled entirely by the bias
-        update; auxiliary losses must be disabled when QB is active.
+        ``micro_batch`` uses the existing exact estimator and ``qb_beta`` state.
+        ``global_batch`` accumulates Kimi K3 margin histograms and updates the shared
+        router ``expert_bias`` at the global-batch boundary. Auxiliary losses must be
+        disabled for either estimator.
 
         Args:
             logits (torch.Tensor): The logits tensor, shape ``[num_tokens, num_experts]``.
+            dense_output (bool): Return selected probabilities and expert IDs as
+                ``[num_tokens, topk]`` tensors.
 
         Returns:
-            Tuple[torch.Tensor, torch.Tensor]: Sparse routing probs and boolean
-            routing map, each shaped ``[num_tokens, num_experts]``.
+            Tuple[torch.Tensor, torch.Tensor]: Routing probabilities and either a boolean
+            map or compact expert IDs, according to ``dense_output``.
         """
+        if self.use_quantile_balancing:
+            # Activation checkpointing runs the original forward under no-grad and its
+            # recompute under enable-grad, so this gate records each token exactly once.
+            accumulate_histogram = (
+                self.training and torch.is_grad_enabled() and not self.frozen_expert_bias
+            )
+            return topk_routing_with_score_function(
+                logits,
+                self.topk,
+                use_pre_softmax=self.config.moe_router_pre_softmax,
+                scaling_factor=self.config.moe_router_topk_scaling_factor,
+                score_function=self.score_function,
+                expert_bias=self.expert_bias,
+                fused=self.config.moe_router_fusion,
+                qb_histogram=self.qb_histogram if accumulate_histogram else None,
+                qb_bin_bounds=self.qb_bin_bounds if accumulate_histogram else None,
+            )
+
         assert (
             not self.config.moe_router_fusion
         ), "Quantile balancing routing does not support moe_router_fusion."
@@ -530,6 +553,7 @@ class TopKRouter(Router):
             score_function=self.score_function,
             fused=self.config.moe_router_fusion,
             precomputed_indices=indices,
+            dense_output=dense_output,
         )
 
     def get_aux_loss_coeff(self, aux_loss_type: str) -> float:
@@ -556,29 +580,32 @@ class TopKRouter(Router):
 
     def _dense_route_indices_dtype(self) -> Optional[torch.dtype]:
         """Return the route-index dtype for Flex backends that consume dense top-k indices."""
-        if not self.config.moe_router_fusion:
-            return None
-        if self.config.moe_token_dispatcher_type != "flex":
-            return None
-        if self.config.moe_expert_capacity_factor is not None:
-            return None
-        if not fused_topk_with_score_function_supports_topk_indices:
-            return None
+        config = self.config
+        fused_dense_routing = (
+            config.moe_token_dispatcher_type == "flex"
+            and config.moe_expert_capacity_factor is None
+            and config.moe_router_fusion
+            and fused_topk_with_score_function_supports_topk_indices
+            and not self.is_hash_layer
+            and self.routing_type != "sinkhorn"
+        )
+        backend = config.moe_flex_dispatcher_backend
 
-        backend = self.config.moe_flex_dispatcher_backend
-        if backend in ("deepep", "deepepv2", "ncclep"):
+        if config.moe_virtual_expert_load_balance:
+            # The MoonEP planner consumes int64 IDs for every routing mode.
             return torch.int64
-        if backend != "hybridep":
-            return None
-        if self.config.moe_hybridep_routing_map_mode != "indices":
-            return None
-        if not HAVE_HYBRIDEP_DENSE_ROUTING:
-            return None
-
-        num_experts = self.expt_tp_group.size() * self.config.num_moe_experts
-        if num_experts <= _HYBRIDEP_INT16_EXPERT_LIMIT:
+        elif fused_dense_routing and backend in ("deepep", "deepepv2", "ncclep"):
+            return torch.int64
+        elif (
+            fused_dense_routing
+            and backend == "hybridep"
+            and config.moe_hybridep_routing_map_mode == "indices"
+            and HAVE_HYBRIDEP_DENSE_ROUTING
+            and self.expt_tp_group.size() * config.num_moe_experts <= _HYBRIDEP_INT16_EXPERT_LIMIT
+        ):
             return torch.int16
-        return None
+        else:
+            return None
 
     def _apply_aux_loss(
         self,
@@ -865,8 +892,10 @@ class TopKRouter(Router):
                         device=activation.device
                     )
                 else:
-                    aux_loss_scale_num_tokens = torch.tensor(
-                        num_local_tokens, device=activation.device
+                    # torch.full is a device-side fill; torch.tensor(int, device=cuda) does a
+                    # pageable H2D copy that fails inside the moe_router CUDA graph capture.
+                    aux_loss_scale_num_tokens = torch.full(
+                        (), num_local_tokens, dtype=torch.int64, device=activation.device
                     )
                 if aux_loss_scale_reduce_groups is None:
                     assert reduce_group is not None, "reduce_group is required for aux-loss scaling"
@@ -1078,7 +1107,8 @@ class TopKRouter(Router):
                 Required when this is a hash-routing layer.
 
         Returns:
-            probs (torch.Tensor): The probabilities of token to experts assignment.
+            probs (torch.Tensor): Routing probabilities shaped [num_tokens, topk] for
+                MoonEP, or [num_tokens, num_experts] otherwise.
             routing_map (torch.Tensor): The mapping of token to experts assignment,
                 with shape [num_tokens, num_experts], or dense top-k indices with shape
                 [num_tokens, topk] for supported Flex backends.
@@ -1110,6 +1140,8 @@ class TopKRouter(Router):
         logits = self.apply_z_loss(logits, padding_mask=padding_mask)
 
         # Calculate probs and routing_map for token dispatching
+        topk_indices_dtype = self._dense_route_indices_dtype()
+        dense_output = topk_indices_dtype is not None
         if self.config.moe_num_hash_layers > 0:
             assert self.layer_number is not None, (
                 "Hash routing requires a layer number. Construct the router through MoELayer "
@@ -1120,7 +1152,7 @@ class TopKRouter(Router):
                 "input_ids is required for hash-based routing. Pass token IDs through "
                 "the model, transformer block, and transformer layer."
             )
-            probs, routing_map = self._hash_routing(logits, input_ids)
+            probs, routing_map = self._hash_routing(logits, input_ids, dense_output=dense_output)
         elif self.routing_type == "sinkhorn":
             probs, routing_map = self.sinkhorn_load_balancing(logits)
         elif self.use_micro_batch_quantile_balancing:
@@ -1128,7 +1160,7 @@ class TopKRouter(Router):
                 "Micro-batch quantile balancing does not support padding masks; "
                 "padded tokens must not enter its quantile estimator."
             )
-            probs, routing_map = self.quantile_balancing(logits)
+            probs, routing_map = self.quantile_balancing(logits, dense_output=dense_output)
         else:
             # Activation checkpointing runs the original forward under no-grad and its
             # recompute under enable-grad, so this gate records each token exactly once.
@@ -1143,12 +1175,15 @@ class TopKRouter(Router):
                     "Quantile Balancing does not yet support padding masks because the "
                     "histogram APIs do not accept a valid-token mask."
                 )
-            topk_indices_dtype = self._dense_route_indices_dtype()
+            # TE capability controls the implementation, not the requested output format.
+            fused = self.config.moe_router_fusion and (
+                not dense_output or fused_topk_with_score_function_supports_topk_indices
+            )
             topk_indices = (
                 torch.empty(
                     (logits.shape[0], self.topk), dtype=topk_indices_dtype, device=logits.device
                 )
-                if topk_indices_dtype is not None
+                if dense_output and fused
                 else None
             )
             probs, routing_map = topk_routing_with_score_function(
@@ -1160,12 +1195,16 @@ class TopKRouter(Router):
                 scaling_factor=self.config.moe_router_topk_scaling_factor,
                 score_function=self.score_function,
                 expert_bias=self.expert_bias,
-                fused=self.config.moe_router_fusion,
+                fused=fused,
                 router_replay=self.router_replay,
                 qb_histogram=self.qb_histogram if accumulate_qb_histogram else None,
                 qb_bin_bounds=self.qb_bin_bounds if accumulate_qb_histogram else None,
                 topk_indices=topk_indices,
+                dense_output=dense_output and not fused,
             )
+            if self.config.moe_virtual_expert_load_balance and fused:
+                # TE returns compact IDs but full-width probabilities; normalize the pair.
+                probs = probs.gather(1, routing_map)
 
         # Apply token dropping to probs and routing_map.
         if self.config.moe_expert_capacity_factor is not None:
@@ -1420,6 +1459,7 @@ class InferenceTopKRouter(TopKRouter):
         fused,
         router_replay,
         dense_output,
+        precomputed_indices=None,
     ):
         return topk_routing_with_score_function(
             logits,
@@ -1433,6 +1473,7 @@ class InferenceTopKRouter(TopKRouter):
             fused=fused,
             router_replay=router_replay,
             dense_output=dense_output,
+            precomputed_indices=precomputed_indices,
         )
 
     def _forward(
@@ -1454,6 +1495,8 @@ class InferenceTopKRouter(TopKRouter):
         # Preserve the compiled inference router's established single-batch layout.
         logits = logits.squeeze(1)  # [num_tokens, num_experts]
 
+        # Micro-batch QB selects on (logits - qb_beta). Global-batch QB passes its
+        # fixed additive bias through the normal score-function route.
         precomputed_indices = None
         if self.qb_beta is not None:
             precomputed_indices = (logits - self.qb_beta).topk(self.topk, dim=1).indices

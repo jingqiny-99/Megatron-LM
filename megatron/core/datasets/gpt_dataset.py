@@ -3,6 +3,7 @@
 import logging
 import os
 import time
+import warnings
 from dataclasses import dataclass, field
 from math import ceil
 from typing import Any, Dict, List, Optional, Tuple
@@ -66,11 +67,14 @@ class GPTDatasetConfig(BlendedMegatronDatasetConfig):
     """
 
     dynamic_context_parallel: bool = False
-    """Option to enable dynamic context parallelism. When setting this to True, 
+    """Option to enable dynamic context parallelism. When setting this to True,
     each sample should be divisible by the data parallel size * context parallel size * 2.
-    If sequence parallel is enabled, it should be divisible by the 
+    If sequence parallel is enabled, it should be divisible by the
     data parallel size * context parallel size * sequence parallel size * 2.
     """
+
+    hybrid_context_parallel: bool = False
+    """Deprecated alias for ``dynamic_context_parallel``."""
 
     sequences_per_dataset: Optional[Dict[str, int]] = None
     """If provided, the sequence and document counts for each dataset. 
@@ -138,6 +142,20 @@ class GPTDatasetConfig(BlendedMegatronDatasetConfig):
         assert self.reset_position_ids is not None
         assert self.reset_attention_mask is not None
         assert self.eod_mask_loss is not None
+
+        if self.hybrid_context_parallel:
+            warnings.warn(
+                "GPTDatasetConfig.hybrid_context_parallel is deprecated; use "
+                "dynamic_context_parallel instead.",
+                DeprecationWarning,
+                stacklevel=2,
+            )
+            if self.dynamic_context_parallel:
+                raise ValueError(
+                    "Cannot set both hybrid_context_parallel and dynamic_context_parallel"
+                )
+            self.dynamic_context_parallel = True
+            self.hybrid_context_parallel = False
 
         if self.varlen_sbhd_validation:
             assert not self.dynamic_context_parallel, (
@@ -371,12 +389,10 @@ class GPTDataset(MegatronDataset):
             )
             if self.masks_and_position_ids_are_cacheable:
                 self.cached_attention_mask = attention_mask
-                # Packing writes the row's padding into the loss mask below, so the cache
-                # must not alias it (the default path keeps the alias: its only in-place
-                # write is the roll's last-label pad, the same position in every sample).
-                self.cached_loss_mask = (
-                    loss_mask.clone() if self.config.sbhd_document_packing else loss_mask
-                )
+                # Cache a copy: loss_mask is masked in place below, so caching the
+                # tensor itself would bake this sample's padding into every
+                # subsequent sample served by this dataset.
+                self.cached_loss_mask = loss_mask.clone()
                 self.cached_position_ids = position_ids
                 self.masks_and_position_ids_are_cached = True
         else:
