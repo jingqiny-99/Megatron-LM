@@ -39,12 +39,15 @@ from megatron.core.transformer.loop.param_store_checkpoint import logical_view
 from megatron.core.transformer.loop.param_store_comm import StoreComm
 from megatron.core.transformer.loop.param_store_schedule import SegmentKey
 from megatron.core.transformer.loop.rsbf_plan import SubRoundType
+from tests.unit_tests.transformer.loop import hybrid_loop_utils
 from tests.unit_tests.transformer.loop import param_store_utils as psu
 from tests.unit_tests.transformer.loop.hybrid_loop_utils import (
     VOCAB,
     build_local_loop_model,
     model_parallel_once,
 )
+
+cpu_mtp = hybrid_loop_utils.cpu_mtp
 
 PATTERN = "*-*-*-*-"
 SEQ = 16
@@ -746,6 +749,52 @@ def test_tied_embedding_with_a_fused_output_layer(monkeypatch, fused):
     # Head wgrads, then lookup wgrads, in item order: the reference's accumulation order.
     for name, grad in grads.items():
         assert torch.equal(grad, ref_grads[name]), name
+
+
+@pytest.mark.parametrize(
+    "tied,fused,modes,rejected",
+    [
+        # The tied embedding read by an unfused output layer: hook class.
+        (True, False, "all=r,emb_head=rsg", "embedding.word_embeddings.weight (hook class"),
+        (True, False, "all=r,emb_head=r", None),
+        (True, True, "all=r,emb_head=rsg", None),
+        # An untied, unfused output layer: hook class.
+        (False, False, "all=rsg,emb_head=rsg", "output_layer.weight (hook class"),
+        (False, False, "all=rsg,emb_head=r", None),
+        (False, True, "all=rsg,emb_head=rsg", None),
+    ],
+)
+def test_mtp_early_backward_needs_a_bound_output_weight_target(
+    cpu_mtp, tied, fused, modes, rejected
+):
+    """mtp_loss_early_backward delivers the output weight's gradient inside the head forward: a
+    sharded-grad head unit must bind that target at the forward (a fused output layer), else the
+    modes are rejected (configure_modes, and the planner's variant terms name the reason). No
+    step runs, so the fused cases need no wgrad kernel."""
+    del cpu_mtp
+    model = build_local_loop_model(
+        PATTERN + "/*-",
+        prelude=2,
+        coda=2,
+        share_embeddings_and_output_weights=tied,
+        mtp_loss_early_backward=True,
+    )
+    model.output_layer.gradient_accumulation_fusion = fused
+    _, store = _store(model)
+    plan = psu.core_plan_of("whole_round", CORE)
+    if rejected is None:
+        store.configure_modes(StoreModes.parse(modes), core_plan=plan)
+        return
+    with pytest.raises(ValueError, match="mtp_loss_early_backward") as excinfo:
+        store.configure_modes(StoreModes.parse(modes), core_plan=plan)
+    message = str(excinfo.value)
+    assert rejected in message and "emb_head=resident_sharded_grads" in message, message
+    assert store.modes is None  # nothing changed
+    terms = store.planner_terms([(StoreModes.parse(modes), "whole_round", None)])
+    assert all("mtp_loss_early_backward" in str(v) for v in terms.values())
+    # Without MTP early backward the same modes are fine.
+    model.config.mtp_loss_early_backward = False
+    store.configure_modes(StoreModes.parse(modes), core_plan=plan)
 
 
 def test_modes_parse_and_validate():

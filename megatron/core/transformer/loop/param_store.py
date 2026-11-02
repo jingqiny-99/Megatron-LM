@@ -1240,6 +1240,7 @@ class LoopParamStore(nn.Module):
                 raise ValueError(
                     f"{self.units[uid].key}: a forward-captured target outside the head"
                 )
+        self._check_mtp_early_backward(grad_units, unit_modes)
         slot_numel = max((u.numel_padded for u in lw_units), default=0)
         pooled = lw_units or [u for u in grad_units if u.group != "emb_head"]
         scratch_numel = max((u.numel_padded for u in pooled), default=0)
@@ -1270,6 +1271,43 @@ class LoopParamStore(nn.Module):
             slot_count=max(s.slots for s in schedules.values()),
             scratch_count=max(s.scratch_entries for s in schedules.values()),
         )
+
+    def _check_mtp_early_backward(
+        self, grad_units: Sequence[StoreUnit], unit_modes: Mapping[int, ResidencyMode]
+    ) -> None:
+        """Reject modes under which ``mtp_loss_early_backward`` would deliver the output
+        weight's gradient before its target is bound.
+
+        With early backward each MTP head runs its backward inside the head forward (on a
+        detached input: only the output-projection weight gets a gradient there). A sharded-grad
+        unit binds its target at the head forward only for a ``forward``-class tensor (a fused
+        local output layer); ``hook`` / ``lazy`` targets are bound before the unit's first
+        backward op, after the early gradient has arrived. Resident units keep a whole-step
+        accumulator and are fine.
+        """
+        hybrid = self.hybrid
+        if not getattr(hybrid.config, "mtp_loss_early_backward", False):
+            return
+        if getattr(hybrid, "mtp", None) is None:
+            return
+        tied = bool(getattr(hybrid, "share_embeddings_and_output_weights", False))
+        head_key = "emb_head:embedding" if tied else "emb_head:output"
+        late = [
+            (unit, tensor)
+            for unit in grad_units
+            if unit.key == head_key
+            for tensor in unit.tensors
+            if tensor.attr == "weight" and tensor.grad_capture != "forward"
+        ]
+        if late:
+            unit, tensor = late[0]
+            raise ValueError(
+                "store modes: mtp_loss_early_backward runs the MTP heads' backward inside the "
+                f"head forward, before {unit.group}={unit_modes[unit.uid].value} binds the "
+                f"gradient target of {tensor.name} ({tensor.grad_capture} class: bound at its "
+                f"first backward op); use {unit.group}=r or a fused output layer "
+                "(gradient_accumulation_fusion)"
+            )
 
     def _set_overwrite_flags(self) -> None:
         for unit in self.units:

@@ -181,6 +181,10 @@ _CONFIG_RULES = [
     (guards.GTP_WEIGHT_REMAT, dict(gtp_weight_remat_size=2)),
     (guards.GTP_WEIGHT_REMAT, dict(expert_gtp_weight_remat_size=2)),
     (guards.WIDE_RESIDUAL, dict(wide_residual=object())),
+    (
+        guards.DSA_OVER_GQA,
+        dict(experimental_attention_variant="dsa", dsa_indexer_mode="simplified"),
+    ),
 ]
 
 
@@ -199,6 +203,8 @@ def test_config_rule_is_reported_alone(rule, fields):
 def test_valid_configs_pass_config_rules():
     validate_hybrid_loop_config(_dense_config())
     validate_hybrid_loop_config(_dsv4_config())
+    # DSA over MLA is not DSA_OVER_GQA (the pattern rule MLA_WITHOUT_DSV4 reports it).
+    validate_hybrid_loop_config(_violating(_dsv4_config(), experimental_attention_variant="dsa"))
     # Non-delayed FP8 recipes are allowed (with the weight-cache rule of __post_init__).
     validate_hybrid_loop_config(
         _violating(
@@ -861,6 +867,14 @@ _LOCKSTEP_OPTIONS = [
     ("moe_megakernel_backend", dict(moe_megakernel_backend="any")),
     ("moe_latent_size", dict(moe_latent_size=128)),
     ("log_moe_overload_factor", dict(log_moe_overload_factor=True)),
+    (
+        "moe_virtual_expert_load_balance",
+        dict(
+            moe_token_dispatcher_type="flex",
+            moe_flex_dispatcher_backend="hybridep",
+            moe_virtual_expert_load_balance=True,
+        ),
+    ),
 ]
 
 
@@ -1064,6 +1078,15 @@ _STORE_RULES = [
     (guards.STORE_TRANSPOSE_CACHE, dict(fp8="e4m3"), {}),
     (guards.STORE_TRANSPOSE_CACHE, dict(fp4="e2m1"), {}),
     (guards.STORE_MODULE_GTP, dict(gtp_weight_remat_size=2), {}),
+    (
+        guards.STORE_SHARED_EXPERT_GLU_INTERLEAVE,
+        dict(
+            gated_linear_unit=True,
+            use_grouped_gemm_for_shared_expert=True,
+            moe_shared_expert_glu_interleave_size=32,
+        ),
+        {},
+    ),
     (guards.STORE_GRAD_REDUCE_DTYPE, {}, dict(grad_reduce_in_fp32=False)),
     (guards.STORE_SHARDED_DP, {}, dict(use_megatron_fsdp=True)),
     (guards.STORE_OPTIMIZER_INSTANCES, {}, dict(num_distributed_optimizer_instances=2)),
@@ -1103,6 +1126,14 @@ def test_param_store_configs_pass_and_rules_collect():
         _violating(config, fp8="e4m3", disable_parameter_transpose_cache=True)
     )
     guards.validate_param_store_config(config, None, None)
+    # Routed-expert GLU interleave (EP-resident weights, never stored) passes, and so does a
+    # shared-expert interleave size the grouped shared expert does not use.
+    guards.validate_param_store_config(
+        _violating(config, gated_linear_unit=True, moe_mlp_glu_interleave_size=32)
+    )
+    guards.validate_param_store_config(
+        _violating(config, gated_linear_unit=True, moe_shared_expert_glu_interleave_size=32)
+    )
     violating = _violating(config, loop_schedule="standard", delay_wgrad_compute=True)
     ddp_config = _violating(DistributedDataParallelConfig(**_STORE_DDP), grad_reduce_in_fp32=False)
     with pytest.raises(ValueError) as excinfo:

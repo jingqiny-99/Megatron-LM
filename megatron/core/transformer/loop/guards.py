@@ -69,6 +69,10 @@ ACTIVATION_OFFLOAD = "activation offload"
 OTHER_RECOMPUTE = "activation recompute other than loop_recompute"
 GTP_WEIGHT_REMAT = "GTP weight remat"
 WIDE_RESIDUAL = "wide residual"
+DSA_OVER_GQA = (
+    "DSA over GQA (experimental_attention_variant='dsa' without MLA: its indexer has no "
+    "padding / exit row mask)"
+)
 UNSUPPORTED_SUBLAYERS = "Mamba / GDN / KDA / plain MLA sublayers"
 MOR_NON_DENSE_CORE = "MoR on a non-dense core"
 MASKED_MOR_ON_DSV4 = "masked MoR on DSv4 / MLA attention"
@@ -233,6 +237,11 @@ def validate_hybrid_loop_config(config: "TransformerConfig") -> None:
         or config.expert_gtp_weight_remat_size > 1,
         # A second multi-stream residual scheme; the loop adapter is defined for mHC only.
         WIDE_RESIDUAL: config.wide_residual is not None,
+        # DSGQACoreAttention takes no padding mask (padded / exited rows would train its
+        # indexer); the loop specs build plain attention for '*', so the variant would be
+        # silently dense there. DSA over MLA is MLA_WITHOUT_DSV4 (pattern rule).
+        DSA_OVER_GQA: getattr(config, "experimental_attention_variant", None) == "dsa"
+        and not config.multi_latent_attention,
     }
     _raise_if_any([name for name, value in unsupported.items() if value])
 
@@ -511,6 +520,12 @@ def _lockstep_moe_options(config: Any) -> List[str]:
         "moe_megakernel_backend": getattr(config, "moe_megakernel_backend", None) is not None,
         # The null path through the latent projections is untested.
         "moe_latent_size": bool(getattr(config, "moe_latent_size", None)),
+        # MoonEP: the null skips route() (so the dispatcher's wrap_layer_input and its
+        # grad-reduce hook never run, while postprocess still finalizes the planner) and feeds
+        # full-width probabilities to a planner that needs [tokens, topk].
+        "moe_virtual_expert_load_balance": bool(
+            getattr(config, "moe_virtual_expert_load_balance", False)
+        ),
         # Its metric divides by the local token count, 0 on a null.
         "log_moe_overload_factor": bool(getattr(config, "log_moe_overload_factor", False)),
     }
@@ -629,6 +644,10 @@ STORE_SHARDED_DP = "Megatron FSDP with the loop parameter store"
 STORE_OPTIMIZER_INSTANCES = "num_distributed_optimizer_instances > 1 with the loop parameter store"
 STORE_AVERAGE_IN_COLLECTIVE = "average_in_collective with the loop parameter store"
 STORE_MODULE_GTP = "module GTP (gtp_weight_remat_size > 1) with the loop parameter store"
+STORE_SHARED_EXPERT_GLU_INTERLEAVE = (
+    "shared-expert GLU interleave (moe_shared_expert_glu_interleave_size) with the loop "
+    "parameter store"
+)
 
 
 def validate_param_store_config(
@@ -645,7 +664,9 @@ def validate_param_store_config(
     delayed wgrad would run after the segment's reduce-scatter; the store gathers bf16 (no FP8
     primary weights) and a cached FP8 transpose would pin a quantized copy per layer; the shard
     gradients are DDP's fp32 ``main_grad``; one distributed-optimizer instance (the grid's);
-    no pre-scaling inside the collective (per-token loss); no module GTP (only the grid).
+    no pre-scaling inside the collective (per-token loss); no module GTP (only the grid); no
+    shared-expert GLU interleave (the checkpoint's GLU row conversion would permute a stored
+    row shard as if it were the whole weight).
     Collects every violation and raises one ``ValueError``.
     """
     del store_config
@@ -664,6 +685,12 @@ def validate_param_store_config(
         STORE_TRANSPOSE_CACHE: quantized
         and not getattr(config, "disable_parameter_transpose_cache", False),
         STORE_MODULE_GTP: getattr(config, "gtp_weight_remat_size", 1) > 1,
+        # The checkpoint's GLU conversion permutes a stored fc1's row shard as if it were the
+        # whole [2F, H] weight (mixing gate / up rows across shards and moving pad rows into
+        # real rows). Routed experts are EP-resident (not stored), so their interleave is fine.
+        STORE_SHARED_EXPERT_GLU_INTERLEAVE: bool(getattr(config, "gated_linear_unit", False))
+        and bool(getattr(config, "use_grouped_gemm_for_shared_expert", False))
+        and getattr(config, "moe_shared_expert_glu_interleave_size", None) is not None,
     }
     if ddp_config is not None:
         unsupported.update(
