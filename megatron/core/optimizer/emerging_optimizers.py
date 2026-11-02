@@ -867,6 +867,53 @@ class TensorParallelMuon(OrthogonalizedOptimizer):
         )
         return self._restore_local_qkv_grad(gathered_grad, tp_slice)
 
+    def _orthogonalize_row_blocks(self, p, grad, split_sizes, tp_group, partition_dim):
+        """Orthogonalize the row blocks of ``p.muon_split_sizes`` independently.
+
+        A model sets ``muon_split_sizes`` on a 2-D weight whose dim-0 rows stack matrices that
+        Muon should treat separately (one block per head, the gate and up halves of a fused
+        GLU fc1). The sizes describe this rank's rows, so the rows must not be sharded across
+        ranks: dim-0 tensor parallelism and GTP_remat are rejected. Blocks of equal size go
+        through Newton-Schulz as one batch when the weight is not tensor-parallel.
+        """
+        if grad.ndim != 2:
+            raise RuntimeError(f"Muon row-block split needs a 2-D gradient, got {grad.ndim}-D")
+        if not split_sizes or any(size <= 0 for size in split_sizes):
+            raise RuntimeError(f"muon_split_sizes must be positive: {split_sizes}")
+        if sum(split_sizes) != grad.shape[0]:
+            raise RuntimeError(
+                f"muon_split_sizes {split_sizes} do not add up to the {grad.shape[0]} rows "
+                f"of the gradient {tuple(grad.shape)}"
+            )
+        if getattr(p, "is_gtp_weight_remat", False):
+            raise RuntimeError("muon_split_sizes is not supported for GTP_remat weights")
+        if partition_dim == 0 and tp_group is not None and get_pg_size(tp_group) > 1:
+            raise RuntimeError("muon_split_sizes is not supported for weights sharded along dim 0")
+        tp_mode = "duplicated" if self.tp_mode == "auto" else self.tp_mode
+
+        def orthogonalize_fn(block):
+            return self.scaled_orthogonalize_fn(
+                block, tp_group, partition_dim, tp_mode_this_group=tp_mode
+            )
+
+        blocks = torch.split(grad, list(split_sizes), dim=0)
+        if partition_dim is not None:
+            return torch.cat([orthogonalize_fn(block) for block in blocks], dim=0)
+        if len(set(split_sizes)) == 1:
+            # A 3D input selects Emerging-Optimizers' batched Newton-Schulz path. Its output is a
+            # transposed view for tall blocks, so it is reshaped rather than viewed.
+            batch = grad.reshape(len(split_sizes), split_sizes[0], -1)
+            return orthogonalize_fn(batch).reshape_as(grad)
+        indices_by_size: Dict[int, list] = {}
+        for index, size in enumerate(split_sizes):
+            indices_by_size.setdefault(size, []).append(index)
+        out = [None] * len(blocks)
+        for indices in indices_by_size.values():
+            batch = orthogonalize_fn(torch.stack([blocks[index] for index in indices]))
+            for index, block in zip(indices, batch):
+                out[index] = block
+        return torch.cat(out, dim=0)
+
     def orthogonalize(self, p: torch.Tensor, grad: torch.Tensor, **kwargs: Any) -> torch.Tensor:
         """Orthogonalize the momentum.
 
@@ -891,6 +938,12 @@ class TensorParallelMuon(OrthogonalizedOptimizer):
         partition_dim = None if self.tp_mode == "blockwise" else getattr(p, "partition_dim", None)
         if partition_dim == -1:
             partition_dim = None
+
+        muon_split_sizes = getattr(p, "muon_split_sizes", None)
+        if muon_split_sizes is not None:
+            return self._orthogonalize_row_blocks(
+                p, grad, muon_split_sizes, tp_group, partition_dim
+            )
 
         if self.split_qkv and self.is_qkv_fn(p):  # type: ignore[misc]
             # Preserve dev's explicit split-QKV contract for every TP mode. GTP shards

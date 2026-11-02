@@ -106,6 +106,7 @@ def test_copy_tensor_model_parallel_attributes_preserves_qkv_metadata():
     source.qkv_split_shapes_global = [2] * 4
     source.qkv_split_groups_are_complete = True
     source.qkv_split_heads_are_complete = True
+    source.muon_split_sizes = [1, 3]
 
     copy_tensor_model_parallel_attributes(destination, source)
 
@@ -115,6 +116,7 @@ def test_copy_tensor_model_parallel_attributes_preserves_qkv_metadata():
     assert destination.qkv_split_shapes_global == source.qkv_split_shapes_global
     assert destination.qkv_split_groups_are_complete is True
     assert destination.qkv_split_heads_are_complete is True
+    assert destination.muon_split_sizes == [1, 3]
 
 
 def test_copy_gtp_attributes_preserves_pad_length():

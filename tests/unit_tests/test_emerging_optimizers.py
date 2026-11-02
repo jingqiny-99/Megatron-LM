@@ -1841,6 +1841,121 @@ def test_muon_optimizer_nonuniform_per_head_splits_use_unbatched_ns():
     torch.testing.assert_close(actual, expected)
 
 
+def _center_rows_recording(call_shapes):
+    def center_rows(x, tp_group=None, partition_dim=None, tp_mode_this_group=None):
+        del tp_group, partition_dim, tp_mode_this_group
+        call_shapes.append(tuple(x.shape))
+        return x - x.mean(dim=-2, keepdim=True)
+
+    return center_rows
+
+
+@pytest.mark.parametrize(
+    ("split_sizes", "expected_calls"),
+    (
+        ([2, 2, 2], [(3, 2, 4)]),
+        ([3, 1, 2], [(1, 3, 4), (1, 1, 4), (1, 2, 4)]),
+        ([2, 1, 2, 1], [(2, 2, 4), (2, 1, 4)]),
+    ),
+)
+def test_muon_optimizer_orthogonalizes_muon_split_sizes_blocks(split_sizes, expected_calls):
+    """``muon_split_sizes`` orthogonalizes each row block alone; equal blocks share a batch."""
+    grad = torch.randn(sum(split_sizes), 4, dtype=torch.float32, device='cuda')
+    param = torch.nn.Parameter(torch.zeros_like(grad))
+    param.muon_split_sizes = split_sizes
+    optimizer = TensorParallelMuon(params=[param], pg_collection=None, tp_mode="blockwise")
+    call_shapes = []
+    optimizer.scaled_orthogonalize_fn = _center_rows_recording(call_shapes)
+    actual = optimizer.orthogonalize(param, grad)
+    assert sorted(call_shapes) == sorted(expected_calls)
+    expected = torch.cat(
+        [block - block.mean(dim=-2, keepdim=True) for block in torch.split(grad, split_sizes)]
+    )
+    torch.testing.assert_close(actual, expected)
+
+
+@pytest.mark.skipif(
+    not _batched_newton_schulz_supported(),
+    reason="installed emerging-optimizers lacks batched Newton-Schulz",
+)
+@pytest.mark.parametrize(
+    ("split_sizes", "cols"),
+    (
+        ([6, 2] * 3, 16),
+        # Equal tall blocks take the single-batch path, whose Newton-Schulz output is transposed.
+        ([8] * 3, 4),
+        ([2] * 3, 8),
+    ),
+)
+def test_muon_optimizer_muon_split_sizes_match_blockwise_newton_schulz(split_sizes, cols):
+    """Each block's update is Muon's update of that block alone, scaled by its own shape."""
+    torch.manual_seed(7)
+    grad = torch.randn(sum(split_sizes), cols, dtype=torch.float32, device='cuda')
+    param = torch.nn.Parameter(torch.zeros_like(grad))
+    param.muon_split_sizes = split_sizes
+    optimizer = TensorParallelMuon(
+        params=[param],
+        fp32_matmul_prec="highest",
+        num_ns_steps=3,
+        extra_scale_factor=0.2,
+        pg_collection=None,
+        tp_mode="blockwise",
+    )
+    prev_precision = torch.get_float32_matmul_precision()
+    torch.set_float32_matmul_precision("highest")
+    try:
+        actual = optimizer.orthogonalize(param, grad)
+        expected = torch.cat(
+            [
+                optimizer.scaled_orthogonalize_fn(block, tp_group=None, partition_dim=None)
+                for block in torch.split(grad, split_sizes)
+            ]
+        )
+    finally:
+        torch.set_float32_matmul_precision(prev_precision)
+    torch.testing.assert_close(actual, expected)
+    assert not torch.allclose(
+        actual, optimizer.scaled_orthogonalize_fn(grad, tp_group=None, partition_dim=None)
+    )
+
+
+def test_muon_optimizer_muon_split_sizes_take_precedence_over_qkv_split():
+    grad = torch.randn(4, 4, dtype=torch.float32, device='cuda')
+    param = torch.nn.Parameter(torch.zeros_like(grad))
+    param.is_qkv = True
+    param.muon_split_sizes = [1, 3]
+    optimizer = TensorParallelMuon(
+        params=[param],
+        split_qkv=True,
+        is_qkv_fn=lambda p: getattr(p, 'is_qkv', False),
+        qkv_split_shapes=[2, 1, 1],
+        pg_collection=None,
+    )
+    call_shapes = []
+    optimizer.scaled_orthogonalize_fn = _center_rows_recording(call_shapes)
+    optimizer.orthogonalize(param, grad)
+    assert sorted(call_shapes) == [(1, 1, 4), (1, 3, 4)]
+
+
+@pytest.mark.parametrize(
+    ("split_sizes", "attributes", "match"),
+    (
+        ([2, 1], {}, "do not add up"),
+        ([4, 0], {}, "must be positive"),
+        ([2, 2], {"is_gtp_weight_remat": True}, "GTP_remat"),
+    ),
+)
+def test_muon_optimizer_rejects_unusable_muon_split_sizes(split_sizes, attributes, match):
+    grad = torch.randn(4, 4, dtype=torch.float32, device='cuda')
+    param = torch.nn.Parameter(torch.zeros_like(grad))
+    param.muon_split_sizes = split_sizes
+    for name, value in attributes.items():
+        setattr(param, name, value)
+    optimizer = TensorParallelMuon(params=[param], pg_collection=None)
+    with pytest.raises(RuntimeError, match=match):
+        optimizer.orthogonalize(param, grad)
+
+
 @pytest.mark.parametrize(
     ("layout", "expects_fallback"),
     (("local_projection", False), ("per_head", True), ("fragmented", True)),
