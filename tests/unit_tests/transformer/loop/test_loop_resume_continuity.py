@@ -24,7 +24,10 @@ save equal it too (the run itself is deterministic in process).
 
 Arms: the eager ``LoopHybridStack`` through the standard schedule (TINY, mHC without MTP,
 TINY-plain, TINY-plain with ``loop_sample_depth``, whose depth draws use the CPU default
-generator restored by the checkpoint's RNG state); the RSBF executor (sampled R4-uniform depths,
+generator restored by the checkpoint's RNG state; ``eager_attnres``: TINY-plain on the K3
+attention-residual carrier, ``LoopAttnResHybridStack``, the ablation's ``loop-attnres-1``;
+``eager_plain_inject``: TINY-plain with an untied core of four ``HECEHECE`` segments, the
+ablation's ``plain-inject``); the RSBF executor (sampled R4-uniform depths,
 counter-based on (seed, iteration, sample)) with the whole-round, block (stride 2) and nested
 (stride 2) items. The store arms are ``test_loop_resume_continuity_store.py``; fresh-process
 chains through ``pretrain_hybrid.py`` are the toolkit's ``scripts/loop_ckpt_chain.sh``.
@@ -66,6 +69,12 @@ VARIANTS = {
     "tiny": dict(),
     "tiny_nomtp": dict(mtp=False),
     "tiny_plain": dict(mtp=False, mhc=False, hash_layers=0),
+    # The carrier ablation's loop-attnres-1 shape (stage 9): TINY-plain with the K3
+    # attention-residual carrier (LoopAttnResHybridStack, k = 1; fp32 carrier parameters).
+    "tiny_attnres": dict(mtp=False, mhc=False, hash_layers=0, attn_res=True),
+    # The carrier ablation's plain-inject shape (stage 9): TINY-plain with the core untied
+    # into R = 4 physical segments (loop_untie_core; one adapter and norm per segment).
+    "tiny_plain_inject": dict(mtp=False, mhc=False, hash_layers=0, untie=True),
 }
 ARMS = {
     # name: (variant, schedule, config overrides)
@@ -73,6 +82,8 @@ ARMS = {
     "eager_tiny_nomtp": ("tiny_nomtp", "standard", {}),
     "eager_plain": ("tiny_plain", "standard", {}),
     "eager_plain_sampled_depth": ("tiny_plain", "standard", dict(loop_sample_depth=True)),
+    "eager_attnres": ("tiny_attnres", "standard", {}),
+    "eager_plain_inject": ("tiny_plain_inject", "standard", {}),
     "rsbf_whole_round": ("tiny", "rsbf", {}),
     "rsbf_block2": ("tiny", "rsbf", dict(loop_rsbf_item_form="block", loop_rsbf_block_stride=2)),
     "rsbf_nested2": ("tiny", "rsbf", dict(loop_rsbf_item_form="nested", loop_rsbf_block_stride=2)),
@@ -126,13 +137,21 @@ def tiny_model(variant, schedule, overrides, *, world=WORLD):
     from megatron.core.models.hybrid.hybrid_model import HybridModel
     from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
     from megatron.core.transformer.enums import AttnBackend
-    from megatron.core.transformer.loop.hybrid_specs import loop_hybrid_dsv4_stack_spec
+    from megatron.core.transformer.loop.hybrid_specs import (
+        loop_attn_res_hybrid_dsv4_stack_spec,
+        loop_hybrid_dsv4_stack_spec,
+    )
     from megatron.core.transformer.moe.moe_logging import MoEMetricsTracker, set_moe_metrics_tracker
     from megatron.core.transformer.transformer_config import MLATransformerConfig
 
     shape = VARIANTS[variant]
     mtp, mhc = shape.get("mtp", True), shape.get("mhc", True)
+    attn_res = shape.get("attn_res", False)
+    untie = shape.get("untie", False)
     main = PATTERN.split("/")[0]
+    if untie:
+        # prelude HE, the core HECEHECE once per round (4 untied segments), coda HECE.
+        main = main[:2] + main[2:10] * 4 + main[10:]
     pattern = PATTERN if mtp else main
     symbols = main + ("WE" if mtp else "")
     rsbf = schedule == "rsbf"
@@ -191,6 +210,10 @@ def tiny_model(variant, schedule, overrides, *, world=WORLD):
         fields.update(mhc_num_residual_streams=4, mhc_sinkhorn_iterations=5)
     if mtp:
         fields.update(mtp_num_layers=1, mtp_loss_scaling_factor=0.1)
+    if attn_res:
+        fields.update(loop_carrier="attn_res")
+    if untie:
+        fields.update(loop_untie_core=True)
     if rsbf:
         fields.update(
             loop_exit_criterion="sampled",
@@ -204,7 +227,11 @@ def tiny_model(variant, schedule, overrides, *, world=WORLD):
     set_moe_metrics_tracker(MoEMetricsTracker())
     return HybridModel(
         config=config,
-        hybrid_stack_spec=loop_hybrid_dsv4_stack_spec(config),
+        hybrid_stack_spec=(
+            loop_attn_res_hybrid_dsv4_stack_spec(config)
+            if attn_res
+            else loop_hybrid_dsv4_stack_spec(config)
+        ),
         vocab_size=VOCAB,
         max_sequence_length=1024,
         hybrid_layer_pattern=pattern,
@@ -411,12 +438,34 @@ def assert_continuity(expected, early, late):
         assert got["grad_norm"] == want["grad_norm"], f"iteration {iteration}: grad norm differs"
 
 
+def assert_variant_built(model, variant):
+    """The arm builds the stack its variant names (a silent fallback to the plain stack would
+    otherwise pass as an attention-residual arm)."""
+    from megatron.core.transformer.loop.attn_res_stack import LoopAttnResHybridStack
+
+    shape = VARIANTS[variant]
+    names = [name for name, _ in model.named_parameters()]
+    carrier = [name for name in names if ".loop_attn_res" in name]
+    if shape.get("attn_res", False):
+        assert isinstance(model.decoder, LoopAttnResHybridStack), type(model.decoder)
+        assert any(name.endswith("pseudo_query") for name in carrier), carrier
+        assert any(".loop_attn_res_head." in name for name in carrier), carrier
+    else:
+        assert not isinstance(model.decoder, LoopAttnResHybridStack)
+        assert not carrier, carrier
+    assert bool(model.config.loop_untie_core) == shape.get("untie", False)
+
+
 @pytest.mark.parametrize("arm", sorted(ARMS))
 def test_resume_continues_bitwise(tmp_path_dist_ckpt, arm):
     variant, schedule, overrides = ARMS[arm]
-    expected, early, late = resume_arm(
-        tmp_path_dist_ckpt, f"resume_{arm}", lambda: tiny_model(variant, schedule, overrides)
-    )
+
+    def make_model():
+        model = tiny_model(variant, schedule, overrides)
+        assert_variant_built(model, variant)
+        return model
+
+    expected, early, late = resume_arm(tmp_path_dist_ckpt, f"resume_{arm}", make_model)
     assert_continuity(expected, early, late)
 
 

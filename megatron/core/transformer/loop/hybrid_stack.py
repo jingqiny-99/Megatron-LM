@@ -10,9 +10,20 @@ layer call (``HybridStack._run_layer``). Two recurrences are supported, as on th
 
 * Huginn: ``state_0 = 0``; each round runs ``loop_norm(core(loop_adapter([state, e])))`` with
   ``e`` the prelude output. Uniform depth, or per-row depth (``set_loop_depths``): a row that
-  has exited keeps its state (self-carry) while the others continue.
+  has exited keeps its state (self-carry) while the others continue. ``loop_carrier``
+  selects what carries the state: ``'injection'`` (that adapter and norm, the default) or
+  ``'residual'`` (``state_0 = e``, each round ``core(state)`` on one continuing residual
+  stream, no adapter or norm: the ``w = 0`` reference of the attention-residual carrier, which
+  is ``attn_res_stack.LoopAttnResHybridStack``).
 * MoR (token-choice mixture of recursions, dense cores only): a router picks a depth per token;
   round ``r`` runs the core on the tokens with depth ``>= r`` (masked or compacted).
+
+Untied core (``loop_untie_core``, the carrier ablation's ``plain-inject``: a non-loop baseline
+with the same injection operator): the physical core holds ``R = loop_iterations`` equal
+segments cut on block boundaries (``UNTIED_CORE_SEGMENTS``); round ``r`` runs segment ``r``
+with its own adapter ``loop_adapters[r]`` and norm ``loop_norms[r]``, so the forward is the
+injection carrier's Huginn recurrence with untied weights. Fixed depth only (the config's
+"Untied loop baseline requires fixed-depth Huginn" rule; ``set_loop_depths`` raises).
 
 Eager only: no CUDA graphs, no pipeline / context / sequence parallelism (see the guards).
 
@@ -27,8 +38,14 @@ tensors a replicated entry through the default walk:
   streams);
 * ``decoder.loop_norm.weight``, ``[h]`` (``LoopRMSNorm``, one stream) or ``[n, h]``
   (``LoopStreamRMSNorm``, D34's per-stream norm);
+* ``decoder.loop_adapters.{r}.weight`` ``[h, 2h]`` and ``decoder.loop_norms.{r}.weight``
+  instead of the two above for an untied core (``loop_untie_core``), ``r`` over the rounds;
 * ``decoder.depth_router.0.weight`` ``[h, h]`` and ``decoder.depth_router.2.weight``
   ``[R_max, h]``: the MoR router;
+* ``decoder.loop_attn_res.{j}.pseudo_query`` / ``.key_norm_weight`` (``j`` over the core and
+  coda sublayers) and ``decoder.loop_attn_res_head.*``, ``[h]`` fp32: the attention-residual
+  carrier (``LoopAttnResHybridStack``; no ``loop_adapter`` / ``loop_norm``; the residual
+  carrier has no loop parameter at all);
 * ``decoder.<name>`` / ``decoder.<child>.<...>``: anything registered on the stack later.
 
 A parameter or persistent buffer registered on the stack (a direct ``Parameter``, a child
@@ -58,7 +75,7 @@ from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.experimental_attention_variant.dsa_masking import (
     indexer_loss_padding_mask,
 )
-from megatron.core.transformer.forward_replay import forward_statistics_round
+from megatron.core.transformer.forward_replay import forward_statistics_round, in_forward_replay
 from megatron.core.transformer.loop import flops
 from megatron.core.transformer.loop.guards import (
     LoopRoles,
@@ -66,9 +83,12 @@ from megatron.core.transformer.loop.guards import (
     resolve_hybrid_loop_roles,
     validate_hybrid_loop_config,
     validate_hybrid_loop_inputs,
+    validate_loop_carrier,
+    validate_loop_carrier_stack,
     validate_loop_mtp_pattern,
     validate_loop_stack_construction,
 )
+from megatron.core.transformer.loop.reporting import stream_mean_rms
 from megatron.core.transformer.loop_transformer_block import (
     LoopRMSNorm,
     active_causal_mask,
@@ -121,6 +141,8 @@ class LoopHybridStack(HybridStack):
     # every sublayer call of ``_run_range`` and the adapter call of ``_adapt`` run inside its
     # segment visits. None without a store (the stage-5 path, op for op).
     _loop_store_hook = None
+    # The ``loop_carrier`` values this class runs (``LoopAttnResHybridStack``: 'attn_res').
+    _LOOP_CARRIERS = ("injection", "residual")
 
     def __init__(
         self,
@@ -142,6 +164,8 @@ class LoopHybridStack(HybridStack):
         boundary_layout=None,
     ):
         validate_loop_stack_construction(config, is_mtp_layer)
+        validate_loop_carrier_stack(config, type(self)._LOOP_CARRIERS)
+        validate_loop_carrier(config)
         validate_hybrid_loop_config(config)
         super().__init__(
             config=config,
@@ -185,21 +209,35 @@ class LoopHybridStack(HybridStack):
             loop_device = "cpu"
         else:
             loop_device = torch.cuda.current_device()
+        self._loop_device = loop_device
         loop_dtype = config.params_dtype
         hidden = config.hidden_size
-        if config.loop_architecture == "huginn":
-            self.loop_adapter = nn.Linear(
-                2 * hidden, hidden, bias=False, dtype=loop_dtype, device=loop_device
-            )
-            config.init_method(self.loop_adapter.weight)
-            if self.loop_num_streams == 1:
-                self.loop_norm = LoopRMSNorm(
-                    hidden, config.layernorm_epsilon, loop_dtype, loop_device
+        if config.loop_architecture == "huginn" and config.loop_carrier != "injection":
+            pass  # the residual / attention-residual carriers have no adapter and no norm
+        elif config.loop_architecture == "huginn":
+
+            def adapter():
+                linear = nn.Linear(
+                    2 * hidden, hidden, bias=False, dtype=loop_dtype, device=loop_device
                 )
-            else:
-                self.loop_norm = LoopStreamRMSNorm(
+                config.init_method(linear.weight)
+                return linear
+
+            def norm():
+                if self.loop_num_streams == 1:
+                    return LoopRMSNorm(hidden, config.layernorm_epsilon, loop_dtype, loop_device)
+                return LoopStreamRMSNorm(
                     hidden, self.loop_num_streams, config.layernorm_epsilon, loop_dtype, loop_device
                 )
+
+            if config.loop_untie_core:
+                # One adapter and one norm per untied segment (round).
+                rounds = range(config.loop_iterations)
+                self.loop_adapters = nn.ModuleList([adapter() for _ in rounds])
+                self.loop_norms = nn.ModuleList([norm() for _ in rounds])
+            else:
+                self.loop_adapter = adapter()
+                self.loop_norm = norm()
         else:
             self.depth_router = nn.Sequential(
                 nn.Linear(hidden, hidden, bias=False, dtype=loop_dtype, device=loop_device),
@@ -216,6 +254,12 @@ class LoopHybridStack(HybridStack):
                     attention = getattr(layer, "self_attention", None)
                     if hasattr(attention, "attn_mask_type"):  # '*' sublayers only
                         attention.attn_mask_type = AttnMaskType.arbitrary
+        # Sublayers one round runs: the whole core, or one of the R untied segments.
+        self._round_core = (
+            self.loop_roles.core // config.loop_iterations
+            if config.loop_untie_core
+            else self.loop_roles.core
+        )
         self.loop_losses = {}
         self.loop_metrics = {}
         self.loop_metric_populations = {}
@@ -223,6 +267,9 @@ class LoopHybridStack(HybridStack):
         self._loop_depths: Optional[Tensor] = None
         self._loop_head = None
         self._work = [0.0, 0.0, 0.0]
+        # Carrier diagnostics (``enable_carrier_diagnostics``): off by default.
+        self._carrier_diagnostics = False
+        self._diagnostic_metrics = {}
 
     def sharded_state_dict(
         self, prefix: str = '', sharded_offsets: Optional[tuple] = None, metadata=None
@@ -282,7 +329,11 @@ class LoopHybridStack(HybridStack):
         experts. While every row of the TP x EP group is alive the round runs exactly as
         uniform depth (no padding mask is added), so equal row depths equal uniform depth
         bitwise.
+
+        Raises ``ValueError`` on an untied core (``loop_untie_core``: a fixed-depth baseline).
         """
+        if depths is not None and self.config.loop_untie_core:
+            raise ValueError("Untied loop baseline requires fixed-depth Huginn (set_loop_depths)")
         self._loop_depths = depths
 
     def set_loop_head_flops(
@@ -317,6 +368,7 @@ class LoopHybridStack(HybridStack):
         self.loop_losses = {}
         self.loop_metrics = {}
         self.loop_metric_populations = {}
+        self._diagnostic_metrics = {}
         self._work = [0.0, 0.0, 0.0]
         label = f"loop_hybrid/mb={self._microbatch_id}"
         self._microbatch_id += 1
@@ -327,19 +379,88 @@ class LoopHybridStack(HybridStack):
         with torch.profiler.record_function(label):
             self._record_range(0, roles.core_start, tokens, squared_lengths, sequence)
             embedding = self._run_range(hidden_states, 0, roles.core_start, ctx, label + "/prelude")
-            if self.config.loop_architecture == "huginn":
-                state = self._huginn(embedding, ctx, label, depths)
-            else:
-                state = self._mor(embedding, ctx, label)
-            self._record_range(roles.core_end, len(self.layers), tokens, squared_lengths, sequence)
-            self._record_head(tokens, squared_lengths, sequence)
-            state = self._run_range(state, roles.core_end, len(self.layers), ctx, label + "/coda")
+            if self._diagnostics_active():
+                self._note_state_rms("loop state rms prelude", embedding, ctx.padding_mask)
+            state = self._rounds_and_coda(
+                embedding, ctx, label, depths, tokens, squared_lengths, sequence
+            )
             for phase, value in zip(("forward", "backward", "recompute"), self._work):
                 self.loop_metrics[f"loop {phase} flops per token"] = (
                     torch.as_tensor(value, dtype=torch.float32, device=hidden_states.device)
                     / tokens
                 )
+            # Carrier diagnostics (enable_carrier_diagnostics): merged, never rebound. Every
+            # round 1..loop_iterations has its metric (the loss-dict reduction needs one key set
+            # on every microbatch and rank); a round this forward did not run has population 0.
+            if self._diagnostic_metrics:
+                zero = torch.zeros((), dtype=torch.float32, device=hidden_states.device)
+                for step in range(self.config.loop_iterations):
+                    self._diagnostic_metrics.setdefault(f"loop state rms r{step + 1}", (zero, zero))
+            for name, (value, population) in self._diagnostic_metrics.items():
+                self.loop_metrics[name] = value
+                self.loop_metric_populations[name] = population
         return state
+
+    def _rounds_and_coda(
+        self,
+        embedding: Tensor,
+        ctx: HybridStackLayerContext,
+        label: str,
+        depths: Optional[Tensor],
+        tokens: int,
+        squared_lengths: int,
+        sequence: int,
+    ) -> Tensor:
+        """The rounds (Huginn or MoR) and the coda after the prelude; returns the coda output.
+
+        Overridden by ``LoopAttnResHybridStack`` (the attention-residual carrier).
+        """
+        roles = self.loop_roles
+        if self.config.loop_architecture == "huginn":
+            state = self._huginn(embedding, ctx, label, depths)
+        else:
+            state = self._mor(embedding, ctx, label)
+        self._record_range(roles.core_end, len(self.layers), tokens, squared_lengths, sequence)
+        self._record_head(tokens, squared_lengths, sequence)
+        return self._run_range(state, roles.core_end, len(self.layers), ctx, label + "/coda")
+
+    # ---------------------------------------------------------------------------------------
+    # Carrier diagnostics
+    # ---------------------------------------------------------------------------------------
+
+    def enable_carrier_diagnostics(self, enabled: bool, sink=None, per_sublayer=False) -> None:
+        """Turn the carrier diagnostics on or off (off by default).
+
+        When on, every training forward (never an activation replay) adds to ``loop_metrics``
+        (with its population in ``loop_metric_populations``, the loop reporting rule):
+        ``loop state rms prelude`` (the prelude output) and ``loop state rms r{r}`` (the hidden
+        state at the end of round ``r``: the injection carrier's round output before the loop
+        norm, the residual carrier's stream; the RMS of the stream mean with mHC), each over the
+        non-padding tokens of the rows alive in that round. ``LoopAttnResHybridStack`` adds the
+        attention-residual weights and accepts ``sink`` (an ``attn_res.AttnResStatsSink`` that
+        also receives every call's weights) and ``per_sublayer`` (accumulate the per-sublayer
+        weight sums for ``take_carrier_diagnostics``); this class takes no sink and has no
+        per-sublayer statistics, so ``per_sublayer`` changes nothing here.
+        """
+        del per_sublayer  # No per-sublayer statistics on this carrier.
+        if sink is not None:
+            raise ValueError("Only the attention-residual carrier takes a diagnostics sink")
+        self._carrier_diagnostics = bool(enabled)
+
+    def take_carrier_diagnostics(self) -> Optional[dict]:
+        """The per-sublayer carrier statistics accumulated since the last call (None: this
+        carrier has none; see ``LoopAttnResHybridStack``)."""
+        return None
+
+    def _diagnostics_active(self) -> bool:
+        return self._carrier_diagnostics and self.training and not in_forward_replay()
+
+    def _note_state_rms(self, name, x, padding_mask) -> None:
+        """Record ``name`` = the RMS of the stream mean of ``x`` over the tokens that are not
+        ``padding_mask`` (``[B, S]``, True = padding; None: every token)."""
+        with torch.no_grad():
+            valid = None if padding_mask is None else ~padding_mask.transpose(0, 1)
+            self._diagnostic_metrics[name] = stream_mean_rms(x, self.loop_num_streams, valid)
 
     def _run_range(self, x, start, end, ctx, label):
         """Run sublayers ``[start, end)`` once, each through ``HybridStack._run_layer``.
@@ -358,27 +479,42 @@ class LoopHybridStack(HybridStack):
         segment (``SegmentKey("sub", index)``): the sublayer's weights are bound there (an
         RSBF sub-round's schedule, or an eager no-grad visit).
         """
-        hook = self._loop_store_hook
         with indexer_loss_padding_mask(ctx.padding_mask):
             for index in range(start, end):
-                layer = self.layers[index]
-                visit = nullcontext() if hook is None else hook.visit("sub", index)
-                with visit, torch.profiler.record_function(f"{label}/layer={index}"):
-                    if x.shape[0] == 0:
-                        residual_accumulator = x
-                        if getattr(layer, "is_moe_layer", False):
-                            update, _ = layer.mlp(x)
-                            x = x + update
-                        observe_layer_residuals(layer, residual_accumulator, x)
-                    else:
-                        # Observes the layer residuals itself, once per call.
-                        x = self._run_layer(index, x, ctx)
-                        # A grouped CUDA-graph replay covering the next sublayer would make
-                        # this loop skip it silently; eager only (graphs are guarded off).
-                        assert ctx.grouped_tail_to_skip is None, (
-                            f"sublayer {index} replayed a grouped CUDA graph inside the hybrid "
-                            "loop"
-                        )
+                x = self._run_sublayer(index, x, ctx, label)
+        return x
+
+    def _run_sublayer(self, index, x, ctx, label):
+        """One sublayer call of ``_run_range`` (the caller enters the indexer-loss scope).
+
+        Inside the loop parameter store's visit of the sublayer and a ``{label}/layer={index}``
+        profiler range. An empty input runs only a MoE sublayer's MLP (``_run_range``); with
+        ``ctx.return_layer_delta`` the call returns the layer's delta (the MoE update itself on
+        an empty input) instead of the residual sum.
+        """
+        hook = self._loop_store_hook
+        layer = self.layers[index]
+        visit = nullcontext() if hook is None else hook.visit("sub", index)
+        with visit, torch.profiler.record_function(f"{label}/layer={index}"):
+            if x.shape[0] == 0:
+                residual_accumulator = x
+                if ctx.return_layer_delta:
+                    if getattr(layer, "is_moe_layer", False):
+                        update, _ = layer.mlp(x)
+                        return update
+                    return torch.zeros_like(x)
+                if getattr(layer, "is_moe_layer", False):
+                    update, _ = layer.mlp(x)
+                    x = x + update
+                observe_layer_residuals(layer, residual_accumulator, x)
+            else:
+                # Observes the layer residuals itself, once per call (not for a delta).
+                x = self._run_layer(index, x, ctx)
+                # A grouped CUDA-graph replay covering the next sublayer would make
+                # this loop skip it silently; eager only (graphs are guarded off).
+                assert (
+                    ctx.grouped_tail_to_skip is None
+                ), f"sublayer {index} replayed a grouped CUDA graph inside the hybrid loop"
         return x
 
     def _layer_forward_flops(self, index, tokens, squared_lengths, sequence, arbitrary_mask):
@@ -448,7 +584,10 @@ class LoopHybridStack(HybridStack):
 
     def round_extra_forward_flops(self, tokens):
         """Forward FLOPs of one Huginn round outside the core sublayers: the adapter on every
-        mHC stream."""
+        mHC stream (none for the residual and attention-residual carriers; the aggregation is
+        not a GEMM and is not counted)."""
+        if self.config.loop_carrier != "injection":
+            return 0
         return flops.huginn_adapter_forward_flops(
             tokens, self.config.hidden_size, self.loop_num_streams
         )
@@ -522,17 +661,30 @@ class LoopHybridStack(HybridStack):
         rounds, negative_low = agreed.tolist()
         return rounds, -negative_low
 
-    def _adapt(self, state, injection):
-        """The shared ``[h, 2h]`` adapter on ``[state, injection]``, stream by stream (inside
-        the loop parameter store's adapter visit when a store is installed)."""
+    def _round_bounds(self, step):
+        """``(start, end)`` of the core sublayers round ``step`` (0-based) runs: the whole core,
+        or segment ``step`` of an untied core."""
+        start = self.loop_roles.core_start
+        if not self.config.loop_untie_core:
+            return start, self.loop_roles.core_end
+        start = start + step * self._round_core
+        return start, start + self._round_core
+
+    def _loop_norm(self, step):
+        """The loop norm of round ``step`` (its own norm on an untied core)."""
+        return self.loop_norms[step] if self.config.loop_untie_core else self.loop_norm
+
+    def _adapt(self, state, injection, step=0):
+        """The ``[h, 2h]`` adapter on ``[state, injection]``, stream by stream (inside the loop
+        parameter store's adapter visit when a store is installed): the shared adapter, or
+        round ``step``'s own on an untied core."""
         hook = self._loop_store_hook
+        adapter = self.loop_adapters[step] if self.config.loop_untie_core else self.loop_adapter
         with nullcontext() if hook is None else hook.visit("adapter"):
             if self.loop_num_streams == 1:
-                return self.loop_adapter(torch.cat((state, injection), -1))
+                return adapter(torch.cat((state, injection), -1))
             split = (*state.shape[:-1], self.loop_num_streams, self.config.hidden_size)
-            adapted = self.loop_adapter(
-                torch.cat((state.reshape(split), injection.reshape(split)), -1)
-            )
+            adapted = adapter(torch.cat((state.reshape(split), injection.reshape(split)), -1))
             return adapted.reshape(state.shape)
 
     def _huginn(self, embedding, ctx, label, depths=None):
@@ -544,10 +696,12 @@ class LoopHybridStack(HybridStack):
             depth, all_alive = self._row_rounds(depths, batch)
         differentiated = self.config.loop_bptt_iterations or depth
         first_grad = max(0, depth - differentiated)
-        core_start, core_end = self.loop_roles.core_start, self.loop_roles.core_end
         tokens = sequence * batch
-        state = torch.zeros_like(embedding)
+        residual = self.config.loop_carrier == "residual"
+        # 'residual': the core continues the prelude's residual stream.
+        state = embedding if residual else torch.zeros_like(embedding)
         for step in range(depth):
+            core_start, core_end = self._round_bounds(step)
             self._record_range(
                 core_start,
                 core_end,
@@ -578,13 +732,24 @@ class LoopHybridStack(HybridStack):
 
             # Bind the step in the checkpoint closure: backward runs after this
             # Python loop, so capturing its mutable variable would mislabel replay.
-            def recurrence(previous, injection, step=step, round_ctx=round_ctx):
+            def recurrence(
+                previous,
+                injection,
+                step=step,
+                round_ctx=round_ctx,
+                core_start=core_start,
+                core_end=core_end,
+            ):
                 with torch.profiler.record_function(f"{label}/loop={step + 1}"):
-                    adapted = self._adapt(previous, injection)
+                    adapted = previous if residual else self._adapt(previous, injection, step)
                     output = self._run_range(
                         adapted, core_start, core_end, round_ctx, f"{label}/loop={step + 1}"
                     )
-                    return self.loop_norm(output)
+                    if self._diagnostics_active():
+                        self._note_state_rms(
+                            f"loop state rms r{step + 1}", output, round_ctx.padding_mask
+                        )
+                    return output if residual else self._loop_norm(step)(output)
 
             context = torch.no_grad() if step < first_grad else nullcontext()
             # Statistics recorded in this round's forward are also binned as round step + 1
@@ -611,7 +776,7 @@ class LoopHybridStack(HybridStack):
             # Row exit: an exited row keeps its state on every stream (self-carry).
             state = updated if alive is None else torch.where(alive[None, :, None], updated, state)
         device = embedding.device
-        core = self.loop_roles.core
+        core = self._round_core
         if depths is None:
             row_rounds = float(tokens * depth)
             backward_rounds = float(tokens * min(depth, differentiated))

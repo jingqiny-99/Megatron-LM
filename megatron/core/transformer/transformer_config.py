@@ -135,7 +135,12 @@ class TransformerConfig(ModelParallelConfig):
     loop_core_layers: int = 4
     loop_iterations: int = 4
     loop_untie_core: bool = False
-    """Fixed-depth compute baseline with a separate physical core for each iteration."""
+    """Fixed-depth compute baseline with a separate physical core for each iteration.
+    GPT loop: loop_core_layers x loop_iterations physical layers. Hybrid loop (role mode,
+    the carrier ablation's 'plain-inject'): the physical core holds loop_iterations equal
+    segments cut on block boundaries; segment r runs once, after its own Huginn adapter
+    [state; prelude output] -> state, and is followed by its own loop norm (the injection
+    carrier's round body with untied weights)."""
     loop_sample_depth: bool = False
     """Sample one depth uniformly from {1, 2, 4, 8}, shared by the TP/EP domain."""
 
@@ -239,6 +244,18 @@ class TransformerConfig(ModelParallelConfig):
 
     loop_depth_seed: int = 0
     """RSBF, 'sampled' exit: seed of the counter-based depth generator."""
+
+    loop_carrier: Literal["injection", "residual", "attn_res"] = "injection"
+    """Hybrid Huginn loop: what carries the state across rounds. 'injection': the Huginn
+    adapter [state; prelude output] at every round entry plus the loop norm (default).
+    'residual': the core repeated on one continuing residual stream, no adapter and no norm
+    (the 'attn_res' w = 0 reference). 'attn_res': Kimi-K3-style attention residuals with block
+    boundaries on round boundaries (LoopAttnResHybridStack, the loop_attn_res_hybrid_*_stack_spec
+    specs; eager only)."""
+
+    loop_attn_res_blocks_per_round: int = 1
+    """loop_carrier='attn_res': depth blocks per round (k). Each round's core splits into k
+    equal blocks whose cuts lie on attention + MLP block boundaries."""
 
     mtp_num_layers: Optional[int] = None
     """Number of Multi-Token Prediction (MTP) Layers.
@@ -2341,11 +2358,11 @@ class TransformerConfig(ModelParallelConfig):
                 f"Hybrid loop roles leave an empty core: loop_prelude_sublayers ({prelude}) + "
                 f"loop_coda_sublayers ({coda}) must be less than num_layers ({self.num_layers})"
             )
-        if self.loop_untie_core:
-            raise ValueError(
-                "loop_untie_core is a GPT-loop baseline; it is not supported with "
-                "loop_prelude_sublayers / loop_coda_sublayers"
-            )
+        if self.loop_untie_core and self.loop_carrier != "injection":
+            # Imported lazily: the guards module imports model code.
+            from megatron.core.transformer.loop.guards import UNTIED_CORE_CARRIER
+
+            raise ValueError(f"Hybrid loop does not support: {UNTIED_CORE_CARRIER}")
         # Refuse the GPT layer counts rather than ignore them silently. Passing their
         # defaults explicitly cannot be told apart from not passing them, and is harmless.
         gpt_defaults = (TransformerConfig.loop_prelude_layers, TransformerConfig.loop_core_layers)
@@ -2384,8 +2401,11 @@ class TransformerConfig(ModelParallelConfig):
                     or self.loop_bptt_iterations
                 ):
                     raise ValueError("Untied loop baseline requires fixed-depth Huginn")
+                # Role mode counts segments in the hybrid pattern (UNTIED_CORE_SEGMENTS, checked
+                # when the stack is built); the GPT bank count applies to the GPT loop only.
                 if (
-                    self.loop_prelude_layers + self.loop_core_layers * self.loop_iterations
+                    not hybrid_loop_roles
+                    and self.loop_prelude_layers + self.loop_core_layers * self.loop_iterations
                     > self.num_layers
                 ):
                     raise ValueError("Untied core banks must fit in physical num_layers")
@@ -2393,6 +2413,25 @@ class TransformerConfig(ModelParallelConfig):
                 self.loop_sample_depth or self.loop_bptt_iterations
             ):
                 raise ValueError("MoR uses token-choice depth and full BPTT")
+            if self.loop_carrier != "injection" and (
+                not hybrid_loop_roles or self.loop_architecture != "huginn"
+            ):
+                raise ValueError(
+                    f"loop_carrier='{self.loop_carrier}' needs a hybrid Huginn loop "
+                    "(loop_architecture='huginn' with loop_prelude_sublayers / "
+                    "loop_coda_sublayers)"
+                )
+            if self.loop_attn_res_blocks_per_round != 1 and (
+                self.loop_carrier != "attn_res" or self.loop_attn_res_blocks_per_round < 1
+            ):
+                raise ValueError(
+                    "loop_attn_res_blocks_per_round must be >= 1 and needs "
+                    "loop_carrier='attn_res'"
+                )
+            # Imported lazily: the guards module imports model code.
+            from megatron.core.transformer.loop.guards import validate_loop_carrier
+
+            validate_loop_carrier(self)
             # Imported lazily: module.py imports this file.
             from megatron.core.transformer.module import is_first_microbatch_tracked
 
@@ -2409,6 +2448,8 @@ class TransformerConfig(ModelParallelConfig):
             raise ValueError(
                 "loop_prelude_sublayers / loop_coda_sublayers require loop_architecture"
             )
+        elif self.loop_carrier != "injection" or self.loop_attn_res_blocks_per_round != 1:
+            raise ValueError("loop_carrier / loop_attn_res_blocks_per_round require a hybrid loop")
         if self.loop_schedule == "rsbf":
             # Imported lazily: the guards module imports model code.
             from megatron.core.transformer.loop.guards import validate_rsbf_config

@@ -248,13 +248,17 @@ def hybrid_loop_config(pattern, prelude, coda, **overrides):
     return dense_config(len(pattern), **fields)
 
 
-def build_local_loop_stack(pattern, prelude, coda, *, seed=1234, **overrides):
-    """A LoopHybridStack of local layers, without the TE final norm, on the test device."""
+def build_local_loop_stack(
+    pattern, prelude, coda, *, seed=1234, module=LoopHybridStack, submodules=None, **overrides
+):
+    """A LoopHybridStack (or ``module``, e.g. ``LoopAttnResHybridStack``) of local layers
+    (``submodules``: default ``local_hybrid_submodules()``), without the TE final norm, on the
+    test device."""
     torch.manual_seed(seed)
     config = hybrid_loop_config(pattern, prelude, coda, **overrides)
-    stack = LoopHybridStack(
+    stack = module(
         config=config,
-        submodules=local_hybrid_submodules(),
+        submodules=local_hybrid_submodules() if submodules is None else submodules,
         layer_config_list=validate_segment_layers(pattern, config),
         post_layer_norm=False,
         pg_collection=ProcessGroupCollection.use_mpu_process_groups(),

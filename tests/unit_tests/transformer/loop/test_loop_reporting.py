@@ -165,3 +165,25 @@ def test_forward_steps_pass_the_decoder_populations():
         assert (
             'loop_metric_populations=getattr(decoder, "loop_metric_populations", None)' in source
         ), module.__name__
+
+
+def test_hybrid_forward_step_hands_over_the_diagnostics_decoder():
+    """``pretrain_hybrid.forward_step`` hands a loop decoder's metrics to the loss, and a
+    non-loop decoder's when ``--loop-carrier-diagnostics-segments`` installed its boundary
+    hooks (plain-mhc's ``loop state rms``); otherwise none."""
+    import inspect
+    from types import SimpleNamespace
+
+    import pretrain_hybrid
+
+    assert "_loop_metrics_decoder(model, args)" in inspect.getsource(pretrain_hybrid.forward_step)
+    decoder = object()
+    model = SimpleNamespace(decoder=decoder)
+    pick = pretrain_hybrid._loop_metrics_decoder
+    assert pick(model, SimpleNamespace(loop_architecture="huginn")) is decoder
+    segments = SimpleNamespace(
+        loop_architecture="none", loop_carrier_diagnostics_segments=[1, 4, 2]
+    )
+    assert pick(model, segments) is decoder
+    assert pick(model, SimpleNamespace(loop_architecture="none")) is None
+    assert pick(model, SimpleNamespace()) is None

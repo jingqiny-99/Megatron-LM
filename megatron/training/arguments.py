@@ -505,6 +505,53 @@ def _validate_loop_exit_histogram(args):
         )
 
 
+def _validate_loop_carrier_diagnostics(args):
+    """``--loop-carrier-diagnostics summary|full``: the eager hybrid Huginn loop (the RSBF
+    executor runs no eager layer loop in training) at a fixed round count (the summary metrics
+    are keyed by round 1..--loop-iterations, the same on every microbatch and rank), or a
+    non-loop hybrid model with ``--loop-carrier-diagnostics-segments`` (the carrier ablation's
+    ``plain-mhc``); ``--loop-carrier-diagnostics-path`` needs ``full``."""
+    mode = getattr(args, 'loop_carrier_diagnostics', 'off')
+    if getattr(args, 'loop_carrier_diagnostics_path', None) is not None and mode != 'full':
+        raise ValueError('--loop-carrier-diagnostics-path needs --loop-carrier-diagnostics full')
+    segments = getattr(args, 'loop_carrier_diagnostics_segments', None)
+    if segments is not None and mode == 'off':
+        raise ValueError(
+            '--loop-carrier-diagnostics-segments needs --loop-carrier-diagnostics summary or full'
+        )
+    if mode == 'off':
+        return
+    from megatron.core.transformer.loop.guards import is_hybrid_loop_config
+
+    if getattr(args, 'loop_architecture', 'none') == 'none' and segments is not None:
+        prelude, rounds, coda = segments
+        if getattr(args, 'hybrid_layer_pattern', None) is None:
+            raise ValueError('--loop-carrier-diagnostics-segments needs a hybrid model')
+        if prelude < 0 or rounds < 1 or coda < 0:
+            raise ValueError(
+                '--loop-carrier-diagnostics-segments PRELUDE ROUNDS CODA needs PRELUDE >= 0, '
+                f'ROUNDS >= 1 and CODA >= 0, got {segments}'
+            )
+        return
+    if segments is not None:
+        raise ValueError(
+            '--loop-carrier-diagnostics-segments is for a non-loop hybrid model (a loop takes '
+            'its rounds from --loop-prelude-sublayers / --loop-coda-sublayers)'
+        )
+    if (
+        not is_hybrid_loop_config(args)
+        or getattr(args, 'loop_architecture', 'none') != 'huginn'
+        or getattr(args, 'loop_schedule', 'standard') != 'standard'
+        or getattr(args, 'loop_sample_depth', False)
+    ):
+        raise ValueError(
+            '--loop-carrier-diagnostics needs an eager hybrid Huginn loop (--loop-architecture '
+            'huginn with --loop-prelude-sublayers / --loop-coda-sublayers, --loop-schedule '
+            'standard, no --loop-sample-depth) or a non-loop hybrid model with '
+            '--loop-carrier-diagnostics-segments'
+        )
+
+
 def _validate_loop_planner(args):
     """``--loop-planner report|apply``: a hybrid Huginn loop on the RSBF schedule; positive
     sizes; a depth source the run has; and for ``apply``: cp = 1, the four planner-owned RSBF
@@ -527,6 +574,13 @@ def _validate_loop_planner(args):
             '--loop-planner needs a hybrid Huginn loop (--loop-architecture huginn with '
             '--loop-prelude-sublayers / --loop-coda-sublayers) on --loop-schedule rsbf'
         )
+    if getattr(args, 'loop_carrier', 'injection') != 'injection':
+        # The cost model has no attention-residual history rows (and RSBF runs only the
+        # injection carrier).
+        raise ValueError("--loop-planner needs --loop-carrier injection")
+    if getattr(args, 'loop_untie_core', False):
+        # The cost model has no untied-core rows (and RSBF runs only a tied core).
+        raise ValueError("--loop-planner does not support --loop-untie-core")
     for flag in (
         'loop_planner_hbm_cap_gb',
         'loop_planner_c2c_gbps',
@@ -716,15 +770,28 @@ def _validate_sbhd_document_packing(args):
                 getattr(args, 'dsa_kernel_backend', None),
                 getattr(args, 'apply_dsa_kernel_fusion', None),
             ),
+            recompute_granularity=getattr(args, 'recompute_granularity', None),
+            mtp_num_layers=getattr(args, 'mtp_num_layers', None),
         )
 
 
-def check_sbhd_packing_indexer_loss(variant, indexer_loss_coeff, loop_architecture, backend):
+def check_sbhd_packing_indexer_loss(
+    variant,
+    indexer_loss_coeff,
+    loop_architecture,
+    backend,
+    recompute_granularity=None,
+    mtp_num_layers=None,
+):
     """The DSA indexer-loss rows of ``--sbhd-document-packing``: the row-tail padding must not
     reach an indexer loss. A plain ``dsa`` indexer loss excludes padding only through THD; a
-    DSv4 indexer loss excludes it only on a loop stack (the stage-4 row mask) and only on the
-    unfused SBHD path (``dsa_kernel_backend`` 'none'). Takes the resolved variant and backend,
-    so the argument validator and the built-config backstop share it."""
+    DSv4 indexer loss excludes it only inside an ``indexer_loss_padding_mask`` scope (a loop
+    stack's row mask, or a loop-less ``HybridStack`` with ``indexer_loss_row_mask``, which
+    ``hybrid_builder`` sets under packing) and only on the unfused SBHD path
+    (``dsa_kernel_backend`` 'none'). The loop-less scope covers ``HybridStack._layer_loop``
+    only: full recomputation (``checkpointed_forward``) and the MTP layers run outside it.
+    Takes the resolved variant and backend, so the argument validator and the built-config
+    backstop share it."""
     if not (indexer_loss_coeff or 0) > 0 or variant not in ('dsa', 'dsv4_hybrid'):
         return
 
@@ -736,10 +803,15 @@ def check_sbhd_packing_indexer_loss(variant, indexer_loss_coeff, loop_architectu
             f'a DSA indexer loss of experimental_attention_variant={variant!r}',
             'it excludes padding only through THD packed sequences',
         )
-    if loop_architecture == 'none':
+    if loop_architecture == 'none' and recompute_granularity == 'full':
         reject(
-            'a DSv4 indexer loss without --loop-architecture',
-            'only loop stacks exclude the padded rows from the SBHD indexer loss',
+            'a DSv4 indexer loss without --loop-architecture under --recompute-granularity full',
+            'full recomputation replays the HybridStack layers outside its indexer-loss row mask',
+        )
+    if loop_architecture == 'none' and mtp_num_layers:
+        reject(
+            'a DSv4 indexer loss without --loop-architecture with --mtp-num-layers',
+            'the MTP layers of a loop-less model run outside the indexer-loss row mask',
         )
     if backend != 'none':
         reject(
@@ -1031,6 +1103,7 @@ def validate_args(args, defaults={}):
     )
     _validate_loop_rsbf_waves(args)
     _validate_loop_exit_histogram(args)
+    _validate_loop_carrier_diagnostics(args)
     _validate_loop_planner(args)
     _validate_loop_param_store(args)
 
@@ -3824,8 +3897,40 @@ def _add_logging_args(parser):
 
 def _add_loop_planner_args(parser):
     """The loop RSBF planner group: the planner (megatron/training/loop_rsbf_planning.py) and
-    the measured exit-depth histogram export."""
+    the measured exit-depth histogram export; the eager loop's carrier diagnostics."""
     group = parser.add_argument_group(title='loop planner')
+    group.add_argument(
+        '--loop-carrier-diagnostics',
+        type=str,
+        default='off',
+        choices=['off', 'summary', 'full'],
+        help='Eager hybrid Huginn loops: log the residual carrier\'s state. summary: per log '
+        'interval, with the other loop metrics, the hidden-state RMS per round (loop state rms '
+        'r{r}) and, for --loop-carrier attn_res, the attention-residual weights on the prelude '
+        'output, on each earlier round and on the current round, averaged over the core / coda '
+        'sublayers and the head (loop attnres weight ...). full: also, at the TensorBoard '
+        'interval, every sublayer\'s weights (loop attnres/<segment>/sub<j>/r<r>/<source>, '
+        'summed over the data-parallel ranks; megatron/training/loop_diagnostics.py).',
+    )
+    group.add_argument(
+        '--loop-carrier-diagnostics-segments',
+        type=int,
+        nargs=3,
+        default=None,
+        metavar=('PRELUDE', 'ROUNDS', 'CODA'),
+        help='A non-loop hybrid model (the carrier ablation\'s plain-mhc): log the same '
+        'hidden-state RMS as a loop (loop state rms prelude / r{r}) at the boundaries of a '
+        'pattern read as PRELUDE sublayers, ROUNDS equal core segments and CODA sublayers '
+        '(the RMS of the mHC stream mean after the prelude and after each segment).',
+    )
+    group.add_argument(
+        '--loop-carrier-diagnostics-path',
+        type=str,
+        default=None,
+        help='With --loop-carrier-diagnostics full: append every TensorBoard-interval record of '
+        'the per-sublayer attention-residual weights to this file, one JSON object per line '
+        '(format megatron-loop-carrier-diagnostics/1), written by the last rank.',
+    )
     group.add_argument(
         '--loop-exit-histogram-path',
         type=str,

@@ -10,6 +10,7 @@ initialization for the module: gloo on CPU, NCCL on CUDA.
 
 import copy
 import os
+import re
 import socket
 
 import pytest
@@ -553,9 +554,60 @@ def test_role_fields_leave_a_core(prelude, coda):
         _dense_config(loop_prelude_sublayers=prelude, loop_coda_sublayers=coda)
 
 
-def test_untied_core_is_rejected_in_role_mode():
-    with pytest.raises(ValueError, match="loop_untie_core is a GPT-loop baseline"):
-        _dense_config(loop_untie_core=True)
+def test_untied_core_role_mode_rules():
+    """Role-mode ``loop_untie_core`` (the carrier ablation's 'plain-inject'): accepted with
+    fixed-depth Huginn and the injection carrier (no GPT bank-count check: the '*-*-*-*-'
+    pattern is shorter than the GPT defaults 2 + 4 x 4 would need); the other carriers are
+    UNTIED_CORE_CARRIER; MoR, sampled depth and truncated BPTT keep the existing untied
+    message."""
+    config = _dense_config(loop_untie_core=True, loop_iterations=2)
+    assert config.loop_untie_core and config.loop_carrier == "injection"
+    for carrier in ("attn_res", "residual"):
+        with pytest.raises(ValueError, match=re.escape(guards.UNTIED_CORE_CARRIER)):
+            _dense_config(loop_untie_core=True, loop_carrier=carrier)
+    for overrides in (
+        dict(loop_architecture="mor"),
+        dict(loop_sample_depth=True),
+        dict(loop_bptt_iterations=1),
+    ):
+        with pytest.raises(ValueError, match="Untied loop baseline requires fixed-depth Huginn"):
+            _dense_config(loop_untie_core=True, **overrides)
+
+
+@pytest.mark.parametrize(
+    "pattern,prelude,coda,rounds,ok",
+    [
+        ("*-*-*-*-", 2, 2, 2, True),  # core '*-*-': two '*-' segments
+        ("*-*-*-*-*-", 2, 2, 3, True),  # core '*-*-*-': three segments
+        ("*-*-*-*-*-", 2, 2, 2, False),  # 6 core sublayers: segments of 3 cut mid-block
+        ("*-*-*-*-*-", 2, 2, 4, False),  # 6 % 4 != 0
+        ("*-*-*-", 2, 2, 2, False),  # a 2-sublayer core cannot hold two blocks
+    ],
+)
+def test_untied_core_segments_rule(pattern, prelude, coda, rounds, ok):
+    config = _dense_config(
+        num_layers=len(pattern),
+        loop_prelude_sublayers=prelude,
+        loop_coda_sublayers=coda,
+        loop_untie_core=True,
+        loop_iterations=rounds,
+    )
+    if ok:
+        roles = resolve_hybrid_loop_roles(config, list(pattern), None)
+        assert roles.core % rounds == 0
+        return
+    with pytest.raises(ValueError, match=re.escape(guards.UNTIED_CORE_SEGMENTS)):
+        resolve_hybrid_loop_roles(config, list(pattern), None)
+
+
+def test_rsbf_refuses_the_untied_core():
+    with pytest.raises(ValueError, match=re.escape(guards.RSBF_UNTIED_CORE)):
+        _dense_config(
+            loop_untie_core=True,
+            loop_iterations=2,
+            loop_schedule="rsbf",
+            calculate_per_token_loss=True,
+        )
 
 
 @pytest.mark.parametrize("fields", [dict(loop_core_layers=3), dict(loop_prelude_layers=1)], ids=str)

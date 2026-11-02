@@ -55,6 +55,17 @@ def hybrid_builder(args, pre_process, post_process, vp_stage=None, config=None, 
         vp_stage=vp_stage,
     )
 
+    # SBHD document packing: a loop-less HybridStack masks the row-tail padding out of the DSv4
+    # indexer loss (a loop stack's _run_range does on its own; check_sbhd_packing_indexer_loss
+    # refuses the paths outside the scope).
+    if getattr(args, 'sbhd_document_packing', False) and hasattr(model, 'decoder'):
+        model.decoder.indexer_loss_row_mask = True
+
+    # --loop-carrier-diagnostics: the eager loop decoder's carrier diagnostics.
+    from megatron.training.loop_diagnostics import enable_loop_carrier_diagnostics
+
+    enable_loop_carrier_diagnostics(args, model)
+
     for l in range(model.decoder.num_layers_per_pipeline_rank):
         layer_params = count_parameters_in_layer(model, f'decoder.layers.{l}.')
         print_rank_0(f" == params layer {l}: {layer_params}")

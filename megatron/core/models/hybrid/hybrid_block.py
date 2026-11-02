@@ -141,6 +141,10 @@ class HybridStackLayerContext:
     # Reserved for a per-forward layer adapter context (cross-layer working state).
     # Always None today; nothing reads it.
     forward_adapter_context: Optional[object] = None
+    # The layer call returns the branch output without the residual add (the layer's delta;
+    # a plain TransformerLayer with exactly one of attention / MLP). Set by the loop's
+    # attention-residual carrier, which observes its own residual stream.
+    return_layer_delta: bool = False
 
 
 class HybridStack(MegatronModule):
@@ -175,6 +179,12 @@ class HybridStack(MegatronModule):
         hash_moe_layer_threshold (int, optional): global Hybrid layer-number threshold used
             to select hash-routed MoE layers.
     """
+
+    # Opt-in (SBHD document packing, set by the training builder): ``_layer_loop`` runs the
+    # layers inside ``indexer_loss_padding_mask`` of the forward's padding mask, so the
+    # row-tail padding does not train DSv4 indexers (as a loop stack's ``_run_range``). Full
+    # recomputation bypasses ``_layer_loop``; the packing validator refuses it with this.
+    indexer_loss_row_mask: bool = False
 
     def __init__(
         self,
@@ -870,20 +880,32 @@ class HybridStack(MegatronModule):
         Skips the tail layer of a grouped attention->MoE CUDA-graph replay, which the
         preceding layer call already ran. Subclasses override this method to change the
         layer schedule; full recomputation bypasses it (``checkpointed_forward``).
+
+        With ``indexer_loss_row_mask`` and a padding mask the loop runs inside
+        ``indexer_loss_padding_mask`` of it: padded rows do not train the DSv4 indexers.
         """
         ctx.grouped_tail_to_skip = None
-        for l_no, (_, _, layer) in enumerate(
-            zip(
-                self._execution_layer_indices,
-                self._execution_layer_config_list,
-                self.layers,
-                strict=True,
+        scope = nullcontext()
+        if self.indexer_loss_row_mask and ctx.padding_mask is not None:
+            # pylint: disable=import-outside-toplevel
+            from megatron.core.transformer.experimental_attention_variant.dsa_masking import (
+                indexer_loss_padding_mask,
             )
-        ):
-            if layer is ctx.grouped_tail_to_skip:
-                ctx.grouped_tail_to_skip = None
-                continue
-            hidden_states = self._run_layer(l_no, hidden_states, ctx)
+
+            scope = indexer_loss_padding_mask(ctx.padding_mask)
+        with scope:
+            for l_no, (_, _, layer) in enumerate(
+                zip(
+                    self._execution_layer_indices,
+                    self._execution_layer_config_list,
+                    self.layers,
+                    strict=True,
+                )
+            ):
+                if layer is ctx.grouped_tail_to_skip:
+                    ctx.grouped_tail_to_skip = None
+                    continue
+                hidden_states = self._run_layer(l_no, hidden_states, ctx)
         return hidden_states
 
     def _run_layer(self, l_no: int, hidden_states: Tensor, ctx: HybridStackLayerContext) -> Tensor:
@@ -920,6 +942,10 @@ class HybridStack(MegatronModule):
                     "A registered ShortcutMoEBlock is missing its MoE physical index."
                 )
             moe_recompute_context = ctx.residual_stream_recompute_plan[layer.moe_local_idx]
+            if ctx.return_layer_delta:
+                raise TypeError(
+                    "A layer delta needs a plain TransformerLayer, got ShortcutMoEBlock"
+                )
             hidden_states = layer(
                 hidden_states=hidden_states,
                 attention_mask=ctx.attention_mask,
@@ -939,6 +965,15 @@ class HybridStack(MegatronModule):
             )
             residual_stream_recompute_context = moe_recompute_context
         else:
+            if ctx.return_layer_delta and (
+                not isinstance(layer, TransformerLayer)
+                or isinstance(layer, HyperConnectionHybridLayer)
+                or residual_stream_recompute_context is not None
+            ):
+                raise TypeError(
+                    "A layer delta needs a plain TransformerLayer without residual-stream "
+                    f"recompute, got {type(layer).__name__}"
+                )
             if ctx.cp_layout_state is not None:
                 hidden_states, layer_packed_seq_params = ctx.cp_layout_state.prepare_layer(
                     physical_layer_idx, hidden_states
@@ -989,6 +1024,8 @@ class HybridStack(MegatronModule):
                         )
                     if mhc_manager is not None and isinstance(layer, HyperConnectionHybridLayer):
                         layer_kwargs["mhc_recompute_manager"] = mhc_manager
+                    if ctx.return_layer_delta:
+                        layer_kwargs["_return_layer_delta"] = True
                     # The single call site of TransformerLayer / HyperConnectionHybridLayer.
                     if ctx.observe_residuals and isinstance(layer, HyperConnectionHybridLayer):
                         # Observe each physical boundary accurately. nn.Module's
@@ -1030,7 +1067,8 @@ class HybridStack(MegatronModule):
 
             if isinstance(hidden_states, tuple):
                 hidden_states = hidden_states[0]
-            observe_layer_residuals(layer, residual_accumulator, hidden_states)
+            if not ctx.return_layer_delta:  # a delta is not a residual stream
+                observe_layer_residuals(layer, residual_accumulator, hidden_states)
             if isinstance(layer, HyperConnectionHybridLayer) and not ctx.observe_residuals:
                 ctx.grouped_tail_to_skip = layer._get_active_te_cuda_graph_group_tail()
             if ctx.cp_layout_state is not None:

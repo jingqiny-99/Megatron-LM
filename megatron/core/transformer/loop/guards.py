@@ -18,6 +18,8 @@ Where each group runs:
 * ``validate_loop_stack_construction``, ``validate_hybrid_loop_config`` and
   ``resolve_hybrid_loop_roles``: the loop stack's constructor (the stack owns the layer list
   the roles index into).
+* ``validate_loop_carrier``: ``TransformerConfig.__post_init__`` and the loop stack
+  constructors; ``validate_loop_carrier_stack``: the loop stack constructors.
 * ``validate_loop_decoder``: ``HybridModel.__init__``, after the decoder is built.
 * ``validate_hybrid_loop_inputs``: the start of the loop stack's layer loop, every forward.
 * ``validate_loop_ddp_config``: ``DistributedDataParallel.__init__``.
@@ -84,6 +86,30 @@ MTP_DS_ATTENTION = "'D' sublayer in the MTP pattern (no FLOP row; use W / C / H)
 SBHD_MASK_WITH_DSV4 = (
     "explicit attention mask with DSv4 attention on SBHD "
     "(set no_create_attention_mask_in_dataloader)"
+)
+# Residual carriers (``loop_carrier``; ``validate_loop_carrier``, the stack constructors).
+CUDA_GRAPHS_ATTN_RES = (
+    "cuda_graph_impl with loop_carrier='attn_res' (the source count grows every round; no "
+    "graph path)"
+)
+ATTN_RES_WITH_MHC = "enable_mhc_connections with loop_carrier='attn_res' (two residual carriers)"
+ATTN_RES_WITH_MTP = "MTP with loop_carrier='attn_res' (MTP trunk sources not ported)"
+ATTN_RES_TRUNCATED_BPTT = "loop_bptt_iterations with loop_carrier='attn_res'"
+ATTN_RES_FP32_RESIDUAL = (
+    "fp32_residual_connection with loop_carrier='attn_res' (MLP deltas would be fp32, "
+    "attention deltas params_dtype: the sources must share one dtype)"
+)
+ATTN_RES_BLOCKS = "loop_attn_res_blocks_per_round does not cut the core into equal blocks"
+RESIDUAL_WITH_MHC = (
+    "enable_mhc_connections with loop_carrier='residual' (the residual carrier is the "
+    "attn_res w = 0 reference only)"
+)
+# The hybrid untied core (``loop_untie_core`` in role mode, the ablation's 'plain-inject').
+UNTIED_CORE_CARRIER = "loop_untie_core with loop_carrier other than 'injection'"
+UNTIED_CORE_SEGMENTS = "loop_untie_core core not R equal segments cut on block boundaries"
+CARRIER_STACK_MISMATCH = (
+    "loop_carrier does not match the loop stack class (use "
+    "loop_attn_res_hybrid_*_stack_spec for 'attn_res', loop_hybrid_*_stack_spec otherwise)"
 )
 
 # Sublayer symbols that begin a block (a sequence mixer) or end one (an MLP / MoE). The
@@ -191,6 +217,35 @@ def validate_loop_decoder(config: "TransformerConfig", decoder: Any) -> None:
         _raise_if_any([NON_LOOP_DECODER])
 
 
+def validate_loop_carrier(config: "TransformerConfig") -> None:
+    """Reject features the non-default residual carriers do not support (``loop_carrier``).
+
+    ``'attn_res'`` (Kimi-K3-style attention residuals, ``LoopAttnResHybridStack``): no mHC (a
+    second residual carrier), no MTP (the PR's MTP trunk sources are not ported), full BPTT
+    only, no ``fp32_residual_connection`` (the layer-delta path would return fp32 MLP deltas
+    and ``params_dtype`` attention deltas; the aggregation needs one dtype). ``'residual'``
+    (the ``w = 0`` reference of ``'attn_res'``): no mHC. Called by
+    ``TransformerConfig.__post_init__`` and the loop stack constructors; the carriers' role
+    and architecture rules (hybrid Huginn only) are in the config.
+    """
+    carrier = getattr(config, "loop_carrier", "injection")
+    unsupported = {
+        ATTN_RES_WITH_MHC: carrier == "attn_res" and bool(config.enable_mhc_connections),
+        ATTN_RES_WITH_MTP: carrier == "attn_res" and bool(config.mtp_num_layers),
+        ATTN_RES_TRUNCATED_BPTT: carrier == "attn_res" and config.loop_bptt_iterations > 0,
+        ATTN_RES_FP32_RESIDUAL: carrier == "attn_res" and bool(config.fp32_residual_connection),
+        RESIDUAL_WITH_MHC: carrier == "residual" and bool(config.enable_mhc_connections),
+    }
+    _raise_if_any([name for name, value in unsupported.items() if value])
+
+
+def validate_loop_carrier_stack(config: "TransformerConfig", accepted: Sequence[str]) -> None:
+    """Reject a loop stack class built for another ``loop_carrier`` (``accepted``: the
+    carriers the class runs)."""
+    if getattr(config, "loop_carrier", "injection") not in accepted:
+        _raise_if_any([CARRIER_STACK_MISMATCH])
+
+
 def validate_hybrid_loop_config(config: "TransformerConfig") -> None:
     """Reject config features the eager hybrid loop does not support.
 
@@ -199,11 +254,13 @@ def validate_hybrid_loop_config(config: "TransformerConfig") -> None:
     """
     selective = config.recompute_granularity == "selective"
     explicit_modules = config.recompute_modules if config.recompute_modules is not None else ()
+    attn_res = getattr(config, "loop_carrier", "injection") == "attn_res"
     unsupported = {
         # Delayed scaling keeps an amax history per module call; a core module is called
         # R times per microbatch, so the history would mix rounds.
         DELAYED_FP8_SCALING: bool(config.fp8) and config.fp8_recipe == "delayed",
-        CUDA_GRAPHS: config.cuda_graph_impl != "none",
+        # The attention-residual carrier names its own reason.
+        (CUDA_GRAPHS_ATTN_RES if attn_res else CUDA_GRAPHS): config.cuda_graph_impl != "none",
         MHC_RECOMPUTE: selective and "mhc" in explicit_modules,
         MOE_EP_OVERLAP: config.overlap_moe_expert_parallel_comm,
         PAGED_STASH: config.moe_paged_stash,
@@ -273,6 +330,17 @@ def reject_pipe_in_loop_pattern(loop_architecture: str, pattern: Optional[str]) 
         _raise_if_any([PIPE_IN_PATTERN])
 
 
+def _untied_segments_valid(symbols: Sequence[str], roles: LoopRoles, rounds: int) -> bool:
+    """True if the core splits into ``rounds`` equal segments whose cuts lie on block
+    boundaries (UNTIED_CORE_SEGMENTS)."""
+    if rounds < 1 or roles.core % rounds:
+        return False
+    segment = roles.core // rounds
+    return all(
+        is_block_boundary(symbols, roles.core_start + step * segment) for step in range(1, rounds)
+    )
+
+
 def resolve_hybrid_loop_roles(
     config: "TransformerConfig",
     layer_symbols: Sequence[str],
@@ -315,6 +383,12 @@ def resolve_hybrid_loop_roles(
         # core round may run on compacted tokens without ids.
         if hash_moe_layer_threshold and hash_moe_layer_threshold > roles.prelude:
             violations.append(HASH_BEYOND_PRELUDE)
+        # An untied core holds loop_iterations physical segments, one per round; each runs
+        # as a round body, so every segment cut must separate whole blocks.
+        if getattr(config, "loop_untie_core", False) and not _untied_segments_valid(
+            symbols, roles, config.loop_iterations
+        ):
+            violations.append(UNTIED_CORE_SEGMENTS)
 
     if set(symbols) & _UNSUPPORTED_SYMBOLS:
         violations.append(UNSUPPORTED_SUBLAYERS)
@@ -436,6 +510,11 @@ RSBF_ITEM_FORM = "unknown loop_rsbf_item_form"
 RSBF_BLOCK_STRIDE_MISMATCH = "loop_rsbf_block_stride mismatch"
 RSBF_BLOCK_STRIDE_BEYOND_CORE = "loop_rsbf_block_stride beyond the core"
 RSBF_CODA_RECOMPUTE_WITHOUT_DSV4 = "coda mla_up_proj recompute without DSv4 attention"
+RSBF_UNTIED_CORE = "loop_untie_core (a non-loop baseline; eager only)"
+RSBF_CARRIER = (
+    "loop_carrier other than 'injection' (the K3 attention-residual and residual carriers run "
+    "in the eager LoopHybridStack only; RSBF would have to move the history with samples)"
+)
 
 # The CORE item forms: the whole round as one block (stage 3), the block-checkpoint item with
 # stride ``loop_rsbf_block_stride`` (block inputs stashed by the sweep) and the nested item
@@ -564,6 +643,10 @@ def validate_rsbf_config(config: "TransformerConfig") -> None:
         RSBF_WITHOUT_HYBRID_ROLES: not is_hybrid_loop_config(config),
         # MoR (token-level exit) stays on the eager path.
         RSBF_MOR: config.loop_architecture == "mor",
+        # The cells carry the injection state only.
+        RSBF_CARRIER: getattr(config, "loop_carrier", "injection") != "injection",
+        # The cells run one tied core with one adapter.
+        RSBF_UNTIED_CORE: bool(getattr(config, "loop_untie_core", False)),
         # Per-sample backward seeds are loss sums; finalize divides by the token count.
         RSBF_SUM_LOSS: not config.calculate_per_token_loss,
         RSBF_TRUNCATED_BPTT: config.loop_bptt_iterations > 0,

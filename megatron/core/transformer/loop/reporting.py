@@ -18,7 +18,7 @@ is a mean over its population and is multiplied by the population size. Loop **l
 router losses) are loss terms, not metrics: they stay weighted by the loss-token count.
 """
 
-from typing import Mapping, Optional, Union
+from typing import Mapping, Optional, Tuple, Union
 
 import torch
 from torch import Tensor
@@ -62,3 +62,34 @@ def loop_metric_report(
         name: loop_metric_entry(name, metric, population=populations.get(name, issued_tokens))
         for name, metric in (loop_metrics or {}).items()
     }
+
+
+def stream_mean_rms(
+    x: Tensor, num_streams: int, valid: Optional[Tensor] = None
+) -> Tuple[Tensor, Tensor]:
+    """The carrier diagnostics' hidden-state norm: ``(rms, tokens)``.
+
+    ``rms`` is the root mean square, over the ``valid`` tokens and the hidden dimension, of the
+    **stream mean** ``(1 / N) sum_s x_s`` of ``x`` (``[S, B, N * h]``, the streams as contiguous
+    ``h`` chunks as ``HyperConnectionModule.input_expand`` lays them out; ``N = 1`` is the plain
+    residual stream). ``valid``: ``[S, B]`` bool (None: every token). ``tokens`` is the valid
+    token count (a device scalar), the metric's population for ``loop_metric_report``; with no
+    valid token ``rms`` is 0. FP32, no host sync.
+
+    The logged ``loop state rms ...`` value is ``loop_metric_report``'s population-weighted mean
+    of these per-microbatch RMS values over the microbatches, data-parallel ranks and log
+    interval, not the RMS over all their tokens (at most that, by Jensen; equal when the
+    microbatch values agree). Every variant logs the same quantity, so the variants compare.
+    """
+    x = x.detach().float()
+    if num_streams > 1:
+        x = x.reshape(*x.shape[:-1], num_streams, x.shape[-1] // num_streams).mean(-2)
+    mean_square = x.square().mean(-1)  # [S, B]
+    if valid is None:
+        tokens = torch.tensor(float(mean_square.numel()), device=x.device)
+        total = mean_square.sum()
+    else:
+        weight = valid.to(torch.float32)
+        tokens = weight.sum()
+        total = (mean_square * weight).sum()
+    return (total / tokens.clamp_min(1.0)).sqrt(), tokens

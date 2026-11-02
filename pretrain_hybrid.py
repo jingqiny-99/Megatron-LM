@@ -471,11 +471,7 @@ def forward_step(data_iterator, model: HybridModel):
         )
 
     # [ModelOpt]: model is needed to access ModelOpt distillation losses
-    decoder = (
-        get_attr_wrapped_model(model, "decoder")
-        if getattr(args, "loop_architecture", "none") != "none"
-        else None
-    )
+    decoder = _loop_metrics_decoder(model, args)
     return output_tensor, partial(
         loss_func,
         loss_mask,
@@ -484,6 +480,19 @@ def forward_step(data_iterator, model: HybridModel):
         loop_metrics=getattr(decoder, "loop_metrics", None),
         loop_metric_populations=getattr(decoder, "loop_metric_populations", None),
     )
+
+
+def _loop_metrics_decoder(model, args):
+    """The decoder whose ``loop_losses`` / ``loop_metrics`` / ``loop_metric_populations`` the
+    loss function reads: a loop decoder, or a non-loop decoder with
+    ``--loop-carrier-diagnostics-segments`` (its boundary hooks fill ``loop_metrics``,
+    megatron/training/loop_diagnostics.py); None otherwise."""
+    if (
+        getattr(args, "loop_architecture", "none") != "none"
+        or getattr(args, "loop_carrier_diagnostics_segments", None) is not None
+    ):
+        return get_attr_wrapped_model(model, "decoder")
+    return None
 
 
 def loop_rsbf_batch(data_iterator, model: HybridModel) -> LoopMicrobatch:
@@ -621,9 +630,10 @@ def core_gpt_dataset_config_from_args(args: Any) -> GPTDatasetConfig:
 
 def _check_sbhd_packing_model_config(args: Any) -> None:
     """Backstop of the argument-time packing checks on the built model config (its resolved
-    attention variant, loop architecture and DSA kernel backend): with SBHD document packing
-    no indexer loss may see the row-tail padding (a plain DSA indexer loss, a loop-less DSv4
-    one, or one on the fused kernels, which have no row mask)."""
+    attention variant, loop architecture, DSA kernel backend, recomputation and MTP depth):
+    with SBHD document packing no indexer loss may see the row-tail padding (a plain DSA
+    indexer loss, a loop-less DSv4 one outside the HybridStack row mask, or one on the fused
+    kernels, which have no row mask)."""
     if not getattr(args, "sbhd_document_packing", False):
         return
     config = core_transformer_config_from_args(args)
@@ -632,6 +642,8 @@ def _check_sbhd_packing_model_config(args: Any) -> None:
         config.dsa_indexer_loss_coeff,
         config.loop_architecture,
         config.dsa_kernel_backend,
+        recompute_granularity=config.recompute_granularity,
+        mtp_num_layers=config.mtp_num_layers,
     )
 
 

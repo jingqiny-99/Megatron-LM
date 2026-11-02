@@ -502,7 +502,12 @@ def test_resume_check_layout_neutral_arguments(session):
 # is added here, so every loop argument gets an explicit resume decision.
 LOOP_ARGUMENT_RESUME_CLASSES = {
     "loop_architecture": "refused",
+    "loop_attn_res_blocks_per_round": "refused",
     "loop_bptt_iterations": "refused",
+    "loop_carrier": "refused",
+    "loop_carrier_diagnostics": "silent",
+    "loop_carrier_diagnostics_path": "silent",
+    "loop_carrier_diagnostics_segments": "silent",
     "loop_coda_sublayers": "refused",
     "loop_core_layers": "refused",
     "loop_depth_probs": "refused",

@@ -246,6 +246,57 @@ def test_training_log_asks_for_round_bins_of_hybrid_loops_only():
         assert keywords["loop_rounds"] == "loop_metric_rounds(args)"
 
 
+def test_untied_core_metric_normalizers_count_the_core_once():
+    """An untied core (plain-inject) holds R physical core segments; its MoE and indexer-loss
+    normalizers count the prelude, one segment and the coda, as the tied loop of the same shape
+    (loop-entry) does, so ``"{name}"`` and ``"{name} round {r}"`` read the same for the same
+    per-execution values (stage-9 deviation 36). A tied loop and a non-loop stack count every
+    main layer, as before. The patterns are the h1024_c8 ablation configs (P 2, C 16, Cd 4)."""
+    from megatron.training import training
+    from megatron.training.models.deepseek_v4 import normalize_dsv4_hybrid_csa_compress_ratios
+
+    prelude, core, coda = "HE", "HECE" * 4, "HECE"
+    roles = dict(loop_architecture="huginn", loop_prelude_sublayers=2, loop_coda_sublayers=4)
+
+    def args(pattern, **fields):
+        namespace = SimpleNamespace(
+            hybrid_layer_pattern=pattern,
+            num_layers=len(pattern),
+            mtp_num_layers=None,
+            mtp_use_repeated_layer=False,
+            csa_compress_ratios=None,
+            csa_dense_mode=False,
+            **fields,
+        )
+        normalize_dsv4_hybrid_csa_compress_ratios(
+            namespace, {"experimental_attention_variant": "dsv4_hybrid"}, pattern
+        )
+        return namespace
+
+    def counts(namespace):
+        moe = training._hybrid_metric_moe_layers(namespace, namespace.hybrid_layer_pattern)
+        _, indexers = training._get_indexer_logging_layer_counts(namespace)
+        dsa = training._num_hybrid_dsa_indexer_layers(
+            namespace.hybrid_layer_pattern.replace("C", "D"),
+            namespace.num_layers,
+            0,
+            1,
+            main_layer_numbers=training.loop_metric_layer_numbers(namespace),
+        )
+        return moe, indexers, dsa
+
+    tied = args(prelude + core + coda, loop_iterations=4, loop_untie_core=False, **roles)
+    untied = args(prelude + core * 4 + coda, loop_iterations=4, loop_untie_core=True, **roles)
+    plain = args(prelude + core * 4 + coda, loop_architecture="none")
+    assert training.loop_metric_layer_numbers(tied) is None
+    assert training.loop_metric_layer_numbers(plain) is None
+    numbers = training.loop_metric_layer_numbers(untied)
+    assert numbers == list(range(1, 2 + 16 + 1)) + list(range(2 + 64 + 1, 2 + 64 + 4 + 1))
+    # MoE layers: 1 + 8 + 2 = 11; CSA (indexer) layers: 0 + 4 + 1 = 5.
+    assert counts(tied) == counts(untied) == (11, 5, 5)
+    assert counts(plain) == (1 + 32 + 2, 16 + 1, 16 + 1)
+
+
 # ---------------------------------------------------------------------------
 # The eager loop stack and the RSBF sweep bin alike
 # ---------------------------------------------------------------------------

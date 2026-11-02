@@ -1222,8 +1222,11 @@ def consume_vision_model_flops_stats(
     return (total_patches / dedup, attention_seqlen_squared_sum / dedup, merged_tokens / dedup)
 
 
-def _num_hybrid_dsa_indexer_layers(hybrid_layer_pattern, num_layers, skip_topk_offset, topk_freq):
-    """Count DSA indexer executions at actual main and nested-MTP layer numbers."""
+def _num_hybrid_dsa_indexer_layers(
+    hybrid_layer_pattern, num_layers, skip_topk_offset, topk_freq, main_layer_numbers=None
+):
+    """Count DSA indexer executions at actual main and nested-MTP layer numbers (the main
+    layers restricted to ``main_layer_numbers`` when given: ``loop_metric_layer_numbers``)."""
     from megatron.core.models.hybrid.hybrid_layer_allocation import Symbols, parse_hybrid_pattern
 
     parsed = parse_hybrid_pattern(hybrid_layer_pattern)
@@ -1237,6 +1240,7 @@ def _num_hybrid_dsa_indexer_layers(hybrid_layer_pattern, num_layers, skip_topk_o
     count = sum(
         is_indexer(layer_type, layer_number)
         for layer_number, layer_type in enumerate(main_pattern, start=1)
+        if main_layer_numbers is None or layer_number in main_layer_numbers
     )
     if parsed.mtp_pattern is not None:
         indexers_per_mtp_depth = sum(
@@ -5224,7 +5228,12 @@ def _get_indexer_logging_layer_counts(args) -> tuple[int, int | None]:
         parsed_pattern = parse_hybrid_pattern(args.hybrid_layer_pattern)
         mtp_pattern_layers = len(parsed_pattern.mtp_pattern or "")
         tracker_layers = args.num_layers + mtp_pattern_layers
-        main_indexers = sum(ratio == 4 for ratio in ratios[: args.num_layers])
+        metric_layers = loop_metric_layer_numbers(args)
+        if metric_layers is None:
+            main_indexers = sum(ratio == 4 for ratio in ratios[: args.num_layers])
+        else:
+            # An untied core counts the core once (loop_metric_layer_numbers).
+            main_indexers = sum(ratios[n - 1] == 4 for n in metric_layers)
         mtp_indexers_per_depth = sum(
             ratio == 4 for ratio in ratios[args.num_layers : tracker_layers]
         )
@@ -5449,6 +5458,10 @@ def training_log(
             from megatron.training.loop_rsbf_planning import log_loop_exit_histogram
 
             log_loop_exit_histogram(args, iteration, writer, wandb_writer)
+        if getattr(args, "_loop_carrier_diagnostics", None):
+            from megatron.training.loop_diagnostics import log_loop_carrier_diagnostics
+
+            log_loop_carrier_diagnostics(args, iteration, writer, wandb_writer)
         model_config = (
             get_model_config(model[0]) if model else getattr(cfg.model, 'transformer', None)
         )
@@ -5483,7 +5496,7 @@ def training_log(
             parsed_pattern = parse_hybrid_pattern(args.hybrid_layer_pattern)
             main_pattern = parsed_pattern.main_pattern or ""
             mtp_pattern = parsed_pattern.mtp_pattern or ""
-            main_moe_layers = main_pattern.count(Symbols.MOE)
+            main_moe_layers = _hybrid_metric_moe_layers(args, main_pattern)
             # Hybrid hash counts select leading MoE positions, excluding MTP.
             num_hash_layers = min(main_moe_layers, max(args.moe_num_hash_layers, 0))
             mtp_moe_layers_per_depth = mtp_pattern.count(Symbols.MOE)
@@ -5602,6 +5615,7 @@ def training_log(
                 args.num_layers,
                 args.dsa_indexer_skip_topk_offset,
                 args.dsa_indexer_topk_freq,
+                main_layer_numbers=loop_metric_layer_numbers(args),
             )
         else:
             num_indexer_layers = _num_dsa_indexer_layers(
@@ -6365,6 +6379,42 @@ def loop_metric_rounds(args) -> Optional[int]:
     if is_hybrid_loop_config(args) and args.loop_architecture == "huginn":
         return args.loop_iterations
     return None
+
+
+def _hybrid_metric_moe_layers(args, main_pattern: str) -> int:
+    """MoE layers of a hybrid main pattern that the MoE tracker's ``num_moe_layers`` counts:
+    every ``E``, or those at ``loop_metric_layer_numbers`` (an untied core counts its core
+    once)."""
+    from megatron.core.models.hybrid.hybrid_layer_allocation import Symbols
+
+    metric_layers = loop_metric_layer_numbers(args)
+    if metric_layers is None:
+        return main_pattern.count(Symbols.MOE)
+    return sum(main_pattern[n - 1] == Symbols.MOE for n in metric_layers)
+
+
+def loop_metric_layer_numbers(args) -> Optional[list[int]]:
+    """The main-stack layer numbers (1-based) whose layers the loss-metric normalizers count
+    (``num_moe_layers`` of the MoE tracker, ``num_indexer_layers`` of the indexer-loss
+    tracker), or None for every main layer.
+
+    An untied core (``loop_untie_core``, the carrier ablation's plain-inject) holds its R rounds
+    as R physical core segments. Its counts take the prelude, the first segment and the coda:
+    the layers a tied loop of the same shape counts, so every tracker key (``"{name}"`` and
+    ``"{name} round {r}"``) reads the same as the tied loop's for the same per-execution
+    values. Counting all R segments would scale them by (P + C + Cd) / (P + R C + Cd). The
+    argument guards (UNTIED_CORE_SEGMENTS, no ``|`` in a loop pattern) hold already."""
+    from megatron.core.models.hybrid.hybrid_layer_allocation import Symbols, parse_hybrid_pattern
+    from megatron.core.transformer.loop.guards import is_hybrid_loop_config
+
+    if not (getattr(args, "loop_untie_core", False) and is_hybrid_loop_config(args)):
+        return None
+    main = (parse_hybrid_pattern(args.hybrid_layer_pattern).main_pattern or "").replace(
+        Symbols.PIPE, ""
+    )
+    prelude, coda = args.loop_prelude_sublayers, args.loop_coda_sublayers
+    segment = (len(main) - prelude - coda) // args.loop_iterations
+    return list(range(1, prelude + segment + 1)) + list(range(len(main) - coda + 1, len(main) + 1))
 
 
 def get_loop_rsbf_forward_backward_func(config, args):
@@ -7269,6 +7319,11 @@ def train(
             from megatron.training.loop_rsbf_planning import record_loop_exit_histogram
 
             record_loop_exit_histogram(args, loop_rsbf_schedule, model, iteration)
+        if getattr(args, "loop_carrier_diagnostics", "off") == "full":
+            # Every rank, every step; collects at the TensorBoard interval (a DP collective).
+            from megatron.training.loop_diagnostics import record_loop_carrier_diagnostics
+
+            record_loop_carrier_diagnostics(args, model, iteration)
         num_floating_point_operations_in_batch = num_floating_point_operations(
             args,
             batch_size,

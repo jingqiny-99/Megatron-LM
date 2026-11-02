@@ -101,8 +101,13 @@ DSV4 = dict(experimental_attention_variant="dsv4_hybrid", dsa_indexer_loss_coeff
         (dict(loop_architecture="huginn", apply_dsa_kernel_fusion=True), "resolves to 'cudnn'"),
         (dict(loop_architecture="huginn", dsa_kernel_backend="cudnn"), "resolves to 'cudnn'"),
         (dict(loop_architecture="huginn", dsa_kernel_backend="tilelang"), "resolves to 'tilelang'"),
-        (dict(dsa_kernel_backend="none"), "without --loop-architecture"),
-        (dict(loop_architecture="none", dsa_kernel_backend="none"), "without --loop-architecture"),
+        # Loop-less: the HybridStack row mask covers its layer loop only.
+        (dict(loop_architecture="none"), "resolves to 'cudnn'"),
+        (
+            dict(dsa_kernel_backend="none", recompute_granularity="full"),
+            "without --loop-architecture under --recompute-granularity full",
+        ),
+        (dict(dsa_kernel_backend="none", mtp_num_layers=1), "with --mtp-num-layers"),
     ],
 )
 def test_dsv4_indexer_loss_rows(overrides, match):
@@ -119,6 +124,23 @@ def test_dsv4_indexer_loss_rows(overrides, match):
     ],
 )
 def test_dsv4_indexer_loss_on_the_unfused_loop_path_passes(overrides):
+    _validate_sbhd_document_packing(_args(**DSV4, **overrides))
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        dict(dsa_kernel_backend="none"),
+        dict(loop_architecture="none", dsa_kernel_backend="none", mtp_num_layers=None),
+        dict(dsa_kernel_backend="none", recompute_granularity="selective"),
+        # A loop stack enters its own scope inside every replay and around the MTP head.
+        dict(loop_architecture="huginn", dsa_kernel_backend="none", recompute_granularity="full"),
+        dict(loop_architecture="huginn", dsa_kernel_backend="none", mtp_num_layers=1),
+    ],
+)
+def test_dsv4_indexer_loss_on_the_unfused_hybrid_stack_passes(overrides):
+    """A loop-less HybridStack masks the padded rows in ``_layer_loop``
+    (``indexer_loss_row_mask``, set by ``hybrid_builder`` under packing)."""
     _validate_sbhd_document_packing(_args(**DSV4, **overrides))
 
 
@@ -232,7 +254,13 @@ def test_pretrain_hybrid_padding_mask_switch_and_dataset_config(monkeypatch):
     )
     assert not pretrain_hybrid._needs_padding_mask(Namespace(use_varlen_dataset=True))
 
-    monkeypatch.setattr(pretrain_hybrid, "get_run_config", lambda: Namespace(rng=Namespace(seed=7)))
+    # core_gpt_dataset_config_from_args reads cfg.rng.seed and cfg.validation.{multiple_validation_sets,
+    # full_validation} from the run config (upstream dev c4220af3a moved the validation fields there).
+    run_config = Namespace(
+        rng=Namespace(seed=7),
+        validation=Namespace(multiple_validation_sets=False, full_validation=False),
+    )
+    monkeypatch.setattr(pretrain_hybrid, "get_run_config", lambda: run_config)
     from megatron.core.tokenizers import MegatronTokenizer
 
     tokenizer = MegatronTokenizer.from_pretrained(
@@ -253,7 +281,8 @@ def test_pretrain_hybrid_padding_mask_switch_and_dataset_config(monkeypatch):
     "variant, loop_architecture, backend, match",
     [
         ("dsv4_hybrid", "huginn", "cudnn", "resolves to 'cudnn'"),
-        ("dsv4_hybrid", "none", "none", "without --loop-architecture"),
+        ("dsv4_hybrid", "none", "none", None),
+        ("dsv4_hybrid", "none", "cudnn", "resolves to 'cudnn'"),
         ("dsa", "huginn", "none", "experimental_attention_variant='dsa'"),
         ("dsa", "none", "none", "experimental_attention_variant='dsa'"),
         ("dsv4_hybrid", "huginn", "none", None),
@@ -270,6 +299,8 @@ def test_model_config_backstop(monkeypatch, variant, loop_architecture, backend,
         dsa_indexer_loss_coeff=0.01,
         loop_architecture=loop_architecture,
         dsa_kernel_backend=backend,
+        recompute_granularity=None,
+        mtp_num_layers=None,
     )
     monkeypatch.setattr(pretrain_hybrid, "core_transformer_config_from_args", lambda args: built)
     pretrain_hybrid._check_sbhd_packing_model_config(Namespace(sbhd_document_packing=False))
@@ -278,6 +309,18 @@ def test_model_config_backstop(monkeypatch, variant, loop_architecture, backend,
     else:
         with pytest.raises(ValueError, match=match):
             pretrain_hybrid._check_sbhd_packing_model_config(Namespace(sbhd_document_packing=True))
+    if match is None and variant == "dsv4_hybrid" and loop_architecture == "none":
+        # The loop-less row mask does not reach full-recompute replays or the MTP layers.
+        for name, value, text in (
+            ("recompute_granularity", "full", "--recompute-granularity full"),
+            ("mtp_num_layers", 1, "--mtp-num-layers"),
+        ):
+            setattr(built, name, value)
+            with pytest.raises(ValueError, match=text):
+                pretrain_hybrid._check_sbhd_packing_model_config(
+                    Namespace(sbhd_document_packing=True)
+                )
+            setattr(built, name, None)
     built.dsa_indexer_loss_coeff = 0.0
     pretrain_hybrid._check_sbhd_packing_model_config(Namespace(sbhd_document_packing=True))
 
@@ -286,10 +329,10 @@ def test_model_config_backstop(monkeypatch, variant, loop_architecture, backend,
     "pattern, overrides, match",
     [
         # DSv4 C/H/W symbols imply dsv4_hybrid; an unset backend resolves to cudnn.
-        ("WCHE", dict(loop_architecture="none"), "without --loop-architecture"),
+        ("WCHE", dict(loop_architecture="none"), "resolves to 'cudnn'"),
         ("WCHE", dict(loop_architecture="huginn"), "resolves to 'cudnn'"),
         ("WE", dict(loop_architecture="huginn", dsa_kernel_backend="cudnn"), "resolves to 'cudnn'"),
-        ("CE", dict(dsa_kernel_backend="none"), "without --loop-architecture"),
+        ("CE", dict(dsa_kernel_backend="none", mtp_num_layers=2), "with --mtp-num-layers"),
         # A D symbol implies plain dsa.
         ("DE", dict(), "experimental_attention_variant='dsa'"),
         ("DE", dict(loop_architecture="huginn"), "experimental_attention_variant='dsa'"),

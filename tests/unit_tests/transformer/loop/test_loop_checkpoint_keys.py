@@ -12,7 +12,12 @@ Local-layer loop models (CPU on gloo with one rank, or CUDA): the Huginn dense m
   recorded at ``cfb14081d`` (stage 7) before any M3c change; replica ids are compared on a
   one-rank world only (they carry the data-parallel rank). After a deliberate key change, re-record
   with ``LOOP_CHECKPOINT_KEYS_RECORD=1`` (the cases then skip).
-* Coverage: no state tensor without an entry (sharded and legacy state dicts, tied embeddings).
+  The ``attn_res`` case (stage 9: the K3 attention-residual carrier, ``LoopAttnResHybridStack``,
+  k = 1, R = 2) was recorded at stage 9 with ``-k attn_res``, the ``plain_inject`` case (the
+  untied core, ``loop_untie_core``: ``*-`` + ``*-*-`` x 2 + ``*-``, R = 2) with
+  ``-k plain_inject``; the other cases are unchanged.
+* Coverage: no state tensor without an entry (sharded and legacy state dicts, tied embeddings,
+  the attention-residual carrier's fp32 parameters).
 * Later loop parameters: a ``LoopHybridStack`` subclass registering a direct ``Parameter``, a
   child ``nn.Linear``, an ``nn.ParameterList``, a persistent and a non-persistent buffer and a
   parameter inside a layer gets an entry for each (the non-persistent buffer none) under its
@@ -42,6 +47,7 @@ from megatron.core.dist_checkpointing.mapping import (
 )
 from megatron.core.models.hybrid.hybrid_block import HybridStack
 from megatron.core.models.hybrid.hybrid_model import HybridModel
+from megatron.core.transformer.loop.attn_res_stack import LoopAttnResHybridStack
 from megatron.core.transformer.loop.hybrid_stack import LoopHybridStack
 from megatron.core.transformer.loop.param_store_checkpoint import (
     RowShard,
@@ -83,7 +89,8 @@ def _model_parallel():
 
 
 def _model(name, request, module=LoopHybridStack, **overrides):
-    """The model a case name asks for (``dense``, ``mhc_mtp``, ``mor``, ``tied``)."""
+    """The model a case name asks for (``dense``, ``mhc_mtp``, ``mor``, ``tied``,
+    ``attn_res``, ``plain_inject``)."""
     pattern = DENSE
     if name == "mhc_mtp":
         request.getfixturevalue("mhc_on_this_device")
@@ -94,6 +101,14 @@ def _model(name, request, module=LoopHybridStack, **overrides):
         overrides.update(loop_architecture="mor", loop_token_execution="masked")
     elif name == "tied":
         overrides.update(share_embeddings_and_output_weights=True)
+    elif name == "attn_res":
+        # The K3 attention-residual carrier (stage 9): k = 1, R = 2.
+        module = LoopAttnResHybridStack
+        overrides.update(loop_carrier="attn_res")
+    elif name == "plain_inject":
+        # The untied core (stage 9, the ablation's plain-inject): two '*-*-' segments, R = 2.
+        pattern = "*-" + "*-*-" * 2 + "*-"
+        overrides.update(loop_untie_core=True, loop_iterations=2)
     return build_local_loop_model(pattern, module, **overrides)
 
 
@@ -159,7 +174,7 @@ def _state(module):
 # ---------------------------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("name", ["dense", "mhc_mtp", "mor"])
+@pytest.mark.parametrize("name", ["dense", "mhc_mtp", "mor", "attn_res", "plain_inject"])
 def test_golden_keys(request, name):
     observed = _describe(_model(name, request).sharded_state_dict())
     if RECORD:
@@ -179,7 +194,7 @@ def test_golden_keys(request, name):
             assert actual[:-1] == entry[:-1], key
 
 
-@pytest.mark.parametrize("name", ["dense", "mhc_mtp", "mor", "tied"])
+@pytest.mark.parametrize("name", ["dense", "mhc_mtp", "mor", "tied", "attn_res", "plain_inject"])
 def test_every_state_tensor_has_an_entry(request, name):
     model = _model(name, request)
     sharded = model.sharded_state_dict()
@@ -197,12 +212,29 @@ def test_every_state_tensor_has_an_entry(request, name):
     check_loop_sharded_state_dict(model, when="setup")
     # Dropping any loop parameter's entry is caught, by name.
     loop_keys = [key for key in sharded if key.startswith(("decoder.loop_", "decoder.depth_"))]
-    assert len(loop_keys) == 2
+    roles = model.decoder.loop_roles
+    # attn_res: a pseudo-query and a key-norm weight per core / coda sublayer, and the head;
+    # plain_inject: an adapter and a norm per round.
+    rounds = model.config.loop_iterations
+    expected_loop_keys = {"attn_res": 2 * (roles.core + roles.coda + 1), "plain_inject": 2 * rounds}
+    assert len(loop_keys) == expected_loop_keys.get(name, 2)
     for key in loop_keys:
         partial = {k: v for k, v in sharded.items() if k != key}
         assert uncovered_state_names(model, partial) == [key]
     hidden = model.config.hidden_size
-    if name == "mor":
+    if name == "attn_res":
+        for key in loop_keys:
+            assert tuple(sharded[key].global_shape) == (hidden,), key
+            assert sharded[key].dtype == torch.float32, key
+        assert "decoder.loop_attn_res_head.pseudo_query" in sharded
+        assert f"decoder.loop_attn_res.{roles.core + roles.coda - 1}.key_norm_weight" in sharded
+    elif name == "plain_inject":
+        for step in range(rounds):
+            adapter = sharded[f"decoder.loop_adapters.{step}.weight"]
+            assert tuple(adapter.global_shape) == (hidden, 2 * hidden)
+            assert tuple(sharded[f"decoder.loop_norms.{step}.weight"].global_shape) == (hidden,)
+        assert "decoder.loop_adapter.weight" not in sharded
+    elif name == "mor":
         assert tuple(sharded["decoder.depth_router.0.weight"].global_shape) == (hidden, hidden)
         assert tuple(sharded["decoder.depth_router.2.weight"].global_shape) == (
             model.config.loop_iterations,

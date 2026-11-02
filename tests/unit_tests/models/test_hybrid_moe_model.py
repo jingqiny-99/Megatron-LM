@@ -474,6 +474,8 @@ GOLDEN_CONFIG: Dict[str, Any] = {
     "loop_depth_probs": None,
     "loop_min_rounds": 1,
     "loop_depth_seed": 0,
+    "loop_carrier": "injection",
+    "loop_attn_res_blocks_per_round": 1,
 }
 # Fields to ignore entirely (ephemeral, environment-specific, very large).
 SKIP_FIELDS = set()
