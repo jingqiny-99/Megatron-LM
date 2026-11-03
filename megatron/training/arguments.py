@@ -692,8 +692,10 @@ def _validate_loop_fsdp(args):
     """A loop model with FSDP: the hybrid loop trains with Megatron-FSDP v1 under every rule of
     ``guards.validate_loop_fsdp_config`` (``--megatron-fsdp-accumulate-main-grad``, fp32 main
     and communication gradients, no persistent buffers / fine-grained gather / TE op fuser /
-    delayed wgrad / sampled depths / MoR / attention-residual carrier / HSDP / checkpointing);
-    torch FSDP2, Megatron-FSDP v2 and the GPT loop are refused. A no-op without a loop."""
+    delayed wgrad / sampled depths / MoR / attention-residual carrier / HSDP / checkpointing
+    other than a model-only ``--load --finetune --no-load-optim``, which training runs before
+    the Megatron-FSDP wrap); torch FSDP2, Megatron-FSDP v2 and the GPT loop are refused. A no-op
+    without a loop."""
     if getattr(args, 'loop_architecture', 'none') == 'none':
         return
     if getattr(args, 'use_torch_fsdp2', False):

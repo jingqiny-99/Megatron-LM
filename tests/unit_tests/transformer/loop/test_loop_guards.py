@@ -1390,6 +1390,32 @@ def test_fsdp_refuses_checkpointing_at_argument_validation(flag):
     assert _fsdp_reported(excinfo) == [guards.FSDP_CHECKPOINTING]
 
 
+_MODEL_ONLY = dict(load="/checkpoints", finetune=True, no_load_optim=True)
+
+
+def test_fsdp_admits_a_model_only_load():
+    """``--load`` with ``--finetune --no-load-optim`` (the experiment's G2 / G4 load of a
+    torch_dist initial checkpoint) passes: training loads the weights before the Megatron-FSDP
+    wrap. A resume, an optimizer load, a meta-device model (no weights to load into before the
+    wrap), a save and a pretrained checkpoint stay refused, with or without the model-only flags."""
+    config = _dense_config()
+    for fields in (_MODEL_ONLY, dict(_MODEL_ONLY, no_load_rng=True)):
+        args = _args_namespace(config, _fsdp_ddp_config(), **fields)
+        guards.validate_loop_fsdp_config(args, args)
+    for fields in (
+        dict(load="/checkpoints"),
+        dict(load="/checkpoints", finetune=True),
+        dict(load="/checkpoints", no_load_optim=True),
+        dict(_MODEL_ONLY, init_model_with_meta_device=True),
+        dict(_MODEL_ONLY, save="/checkpoints/out"),
+        dict(_MODEL_ONLY, pretrained_checkpoint="/checkpoints/pre"),
+    ):
+        args = _args_namespace(config, _fsdp_ddp_config(), **fields)
+        with pytest.raises(ValueError) as excinfo:
+            guards.validate_loop_fsdp_config(args, args)
+        assert _fsdp_reported(excinfo) == [guards.FSDP_CHECKPOINTING], fields
+
+
 def test_fsdp_configs_pass_and_rules_collect():
     for strategy in ("optim_grads", "optim_grads_params"):
         ddp_config = _fsdp_ddp_config(data_parallel_sharding_strategy=strategy)

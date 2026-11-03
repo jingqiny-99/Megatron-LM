@@ -592,8 +592,9 @@ FSDP_MOR = "MoR (loop_architecture='mor')"
 FSDP_ATTN_RES = "loop_carrier='attn_res'"
 FSDP_HSDP = "HSDP (num_distributed_optimizer_instances > 1)"
 FSDP_CHECKPOINTING = (
-    "checkpoint save / load (--save / --load / --pretrained-checkpoint; the fsdp_dtensor format "
-    "is untested with the loop)"
+    "checkpoint save or resume (--save / --pretrained-checkpoint / --load without --finetune "
+    "--no-load-optim or with init_model_with_meta_device; only a model-only torch_dist load is "
+    "supported: it loads the built model before the Megatron-FSDP wrap)"
 )
 
 
@@ -614,7 +615,8 @@ def validate_loop_fsdp_config(config: Any, ddp_config: Any) -> None:
 
     Called by the Megatron-FSDP v1 wrapper (``FullyShardedDataParallel``) with the model and
     DDP configs, and by argument validation with the argument namespace as both (duck-typed;
-    the checkpoint rule needs the namespace's ``save`` / ``load`` / ``pretrained_checkpoint``).
+    the checkpoint rule needs the namespace's ``save`` / ``load`` / ``pretrained_checkpoint`` /
+    ``finetune`` / ``no_load_optim`` / ``init_model_with_meta_device``).
 
     The loop runs every core weight several times per microbatch. Megatron-FSDP reduce-scatters
     a sharded gradient once per microbatch, after the parameter's last backward use, from an
@@ -627,9 +629,12 @@ def validate_loop_fsdp_config(config: Any, ddp_config: Any) -> None:
     could run different numbers of rounds, i.e. different gather sequences, while the round
     count is agreed over TP x EP only; per-row depths are refused at runtime by
     ``validate_loop_row_depths``), MoR and the attention-residual carrier, HSDP, and
-    checkpointing (Megatron-FSDP saves and loads ``fsdp_dtensor``, untested with the loop). The
-    GPT loop and Megatron-FSDP v2 are not supported. Collects every violation and raises one
-    ``ValueError`` (``FSDP_PREFIX``).
+    checkpointing except a model-only load (Megatron-FSDP saves and loads ``fsdp_dtensor``,
+    untested with the loop; a ``--load`` with ``--finetune --no-load-optim`` loads a torch_dist
+    checkpoint's weights into the built model before the Megatron-FSDP wrap, in training's
+    ``_build_loop_megatron_fsdp_models``, which needs materialized weights: no
+    ``init_model_with_meta_device``). The GPT loop and Megatron-FSDP v2 are not supported.
+    Collects every violation and raises one ``ValueError`` (``FSDP_PREFIX``).
     """
     architecture = getattr(config, "loop_architecture", "none")
     if architecture == "none":
@@ -666,7 +671,15 @@ def validate_loop_fsdp_config(config: Any, ddp_config: Any) -> None:
         FSDP_ATTN_RES: getattr(config, "loop_carrier", "injection") == "attn_res",
         FSDP_HSDP: getattr(ddp_config, "num_distributed_optimizer_instances", 1) > 1,
         FSDP_CHECKPOINTING: any(
-            getattr(ddp_config, name, None) for name in ("save", "load", "pretrained_checkpoint")
+            getattr(ddp_config, name, None) for name in ("save", "pretrained_checkpoint")
+        )
+        or (
+            bool(getattr(ddp_config, "load", None))
+            and not (
+                getattr(ddp_config, "finetune", False)
+                and getattr(ddp_config, "no_load_optim", False)
+                and not getattr(ddp_config, "init_model_with_meta_device", False)
+            )
         ),
     }
     _raise_fsdp_if_any([name for name, value in unsupported.items() if value])

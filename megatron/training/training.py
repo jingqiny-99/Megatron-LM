@@ -4218,6 +4218,145 @@ def _build_loop_param_store_models(builder, cfg, args, pg_collection, wrap_with_
     )
 
 
+def _loads_loop_model_before_megatron_fsdp_wrap(args) -> bool:
+    """A loop model on Megatron-FSDP with ``--load``: the checkpoint's weights are loaded into
+    the built chunks before the Megatron-FSDP wrap (``_build_loop_megatron_fsdp_models``)."""
+    return (
+        getattr(args, "loop_architecture", "none") != "none"
+        and bool(getattr(args, "use_megatron_fsdp", False))
+        and args.load is not None
+        and not args.moe_use_upcycling
+    )
+
+
+def _load_loop_model_before_megatron_fsdp_wrap(model, args, checkpointing_context=None):
+    """Load a torch_dist checkpoint's weights into the built chunks of a loop model that trains
+    on Megatron-FSDP, before the Megatron-FSDP wrap. Returns ``load_checkpoint``'s (iteration,
+    floating-point operations so far).
+
+    Megatron-FSDP saves and loads ``fsdp_dtensor`` checkpoints (``--ckpt-format fsdp_dtensor`` is
+    required with it), whose model state is the wrapper's sharded parameters; a torch_dist
+    checkpoint cannot be loaded into the wrapped model. The loop's Megatron-FSDP rules admit a
+    model-only load (``--finetune --no-load-optim``, ``guards.FSDP_CHECKPOINTING``), so the weights
+    are loaded here into the chunks as built and wrapped for mixed precision, through
+    ``load_checkpoint``'s torch_dist path with the run's arguments (``ckpt_format`` set to
+    torch_dist for the call): the sharded state dict, ``--dist-ckpt-strictness``, the
+    sharding-integrity validation and the log lines of a DDP run's load. The Megatron-FSDP wrap
+    then copies the loaded weights into its buffers, its fp32 main weights from the loaded bf16
+    weights (what ``reload_model_params`` gives the distributed optimizer after a model-only
+    load; under Megatron-FSDP that call is a no-op). Training's own load after the wrap is
+    skipped (``setup_model_and_optimizer``).
+    """
+    # pylint: disable=import-outside-toplevel
+    from megatron.training.checkpointing import CheckpointType, _load_base_checkpoint
+
+    run_format = args.ckpt_format
+    args.ckpt_format = "torch_dist"
+    try:
+        _, checkpoint_name, _, ckpt_type = _load_base_checkpoint(args.load, args, rank0=True)
+        if ckpt_type not in (None, CheckpointType.GLOBAL):
+            raise RuntimeError(
+                f"A loop model on Megatron-FSDP loads model weights from a torch_dist checkpoint "
+                f"only (before the Megatron-FSDP wrap); {checkpoint_name} is {ckpt_type}"
+            )
+        print_rank_0(
+            " > loop model on Megatron-FSDP: loading the model weights of a torch_dist "
+            "checkpoint before the Megatron-FSDP wrap"
+        )
+        pgc = getattr(unwrap_model(model)[0], "pg_collection", None)
+        return load_checkpoint(
+            model,
+            None,
+            None,
+            checkpointing_context=checkpointing_context,
+            restore_training_state=True,
+            tp_group=pgc.tp if pgc is not None else None,
+            pp_group=pgc.pp if pgc is not None else None,
+            dp_cp_group=getattr(pgc, "dp_cp_gtp_remat", None),
+            dp_group=pgc.dp if pgc is not None else None,
+            expt_dp_group=pgc.expt_dp if pgc is not None else None,
+            rng_state_key_prefix=getattr(unwrap_model(model)[0], "rng_state_key_prefix", ""),
+        )
+    finally:
+        args.ckpt_format = run_format
+
+
+def _build_loop_megatron_fsdp_models(
+    builder, cfg, args, pg_collection, wrap_with_ddp, checkpointing_context
+):
+    """The config-container model build of a loop model on Megatron-FSDP with ``--load``: the
+    builder's chunks built and wrapped for mixed precision (no data-parallel wrapper), the
+    checkpoint's weights loaded into them (``_load_loop_model_before_megatron_fsdp_wrap``), then
+    the Megatron-FSDP wrap. Returns the chunks and the load's (iteration, floating-point
+    operations so far)."""
+    from megatron.training.models.dist_utils import _ddp_wrap
+
+    if pg_collection is None:
+        pg_collection = ProcessGroupCollection.use_mpu_process_groups()
+    model = builder.build_distributed_models(
+        pg_collection=pg_collection,
+        ddp_config=cfg.ddp,
+        overlap_param_gather_with_optimizer_step=cfg.optimizer.overlap_param_gather_with_optimizer_step,
+        use_megatron_fsdp=cfg.ddp.use_megatron_fsdp,
+        use_torch_fsdp2=cfg.dist.use_torch_fsdp2,
+        wrap_with_ddp=False,
+        data_parallel_random_init=cfg.rng.data_parallel_random_init,
+        use_layer_wise_distributed_optimizer=cfg.optimizer.use_layer_wise_distributed_optimizer,
+    )
+    loaded = _load_loop_model_before_megatron_fsdp_wrap(model, args, checkpointing_context)
+    if wrap_with_ddp:
+        model = _ddp_wrap(
+            model,
+            cfg.rng.data_parallel_random_init,
+            cfg.ddp,
+            cfg.optimizer.overlap_param_gather_with_optimizer_step,
+            use_megatron_fsdp=cfg.ddp.use_megatron_fsdp,
+            use_torch_fsdp2=cfg.dist.use_torch_fsdp2,
+            pg_collection=pg_collection,
+            use_layer_wise_distributed_optimizer=cfg.optimizer.use_layer_wise_distributed_optimizer,
+        )
+    return model, loaded
+
+
+def loop_optimizer_param_group_lines(model, config, config_overrides):
+    """The optimizer's parameter groups of ``model`` (chunks) as log lines: per group its
+    weight-decay and LR multipliers, the expert flag, the numbers of parameters and elements,
+    a digest of the member names and the names themselves, wrapper prefixes (``module.``)
+    stripped, so runs under different data-parallel wrappers (DDP, Megatron-FSDP) can be diffed
+    (the DSv4 Flash loop experiment's G2 checks the optimizer's parameter-group membership).
+
+    The groups are recomputed by the optimizer's own grouping (``_get_param_groups`` over every
+    chunk, ``config_overrides`` as given to ``get_megatron_optimizer``; None: its standard
+    overrides), which gathers the group keys over the default process group: every rank calls
+    this. Element counts are global for Megatron-FSDP's sharded (DTensor) parameters.
+    """
+    # pylint: disable=import-outside-toplevel
+    import hashlib
+    import re
+
+    from megatron.core.optimizer import _get_param_groups, get_standard_config_overrides
+
+    if config_overrides is None:
+        config_overrides = get_standard_config_overrides(config)
+    groups = _get_param_groups(model, config, config_overrides)
+    names = {}
+    for chunk in model:
+        for name, param in chunk.named_parameters():
+            names.setdefault(id(param), re.sub(r"^(module\.)+", "", name))
+    lines = []
+    for index, group in enumerate(groups):
+        members = sorted(names[id(param)] for param in group["params"])
+        digest = hashlib.sha256("\n".join(members).encode()).hexdigest()[:16]
+        lines.append(
+            f" > optimizer parameter group {index}: wd_mult {group['wd_mult']}, "
+            f"lr_mult {group['lr_mult']}, is_expert_parallel {group['is_expert_parallel']}, "
+            f"parameters {len(members)}, elements {sum(p.numel() for p in group['params'])}, "
+            f"names sha256 {digest}"
+        )
+        lines.append(f" > optimizer parameter group {index} names: {' '.join(members)}")
+    return lines
+
+
 def setup_model_and_optimizer(
     model_type,
     model_provider_func=None,
@@ -4249,6 +4388,10 @@ def setup_model_and_optimizer(
     if has_nvidia_modelopt:
         maybe_enable_modelopt(args)
 
+    # A loop model on Megatron-FSDP loads its weights before the wrap (the load's iteration and
+    # floating-point operations, set by _build_model_wrapper); training's load below is skipped.
+    loaded_before_wrap = []
+
     def _build_model_wrapper(wrap_with_ddp: bool):
         if cfg_container is not None and getattr(cfg_container, "model", None) is not None:
             from megatron.training.utils import start_memory_history_recording
@@ -4272,6 +4415,13 @@ def setup_model_and_optimizer(
                     builder, cfg, args, pg_collection, wrap_with_ddp
                 )
 
+            if _loads_loop_model_before_megatron_fsdp_wrap(args):
+                model, loaded = _build_loop_megatron_fsdp_models(
+                    builder, cfg, args, pg_collection, wrap_with_ddp, checkpointing_context
+                )
+                loaded_before_wrap.append(loaded)
+                return model
+
             return builder.build_distributed_models(
                 pg_collection=pg_collection,
                 ddp_config=cfg.ddp,
@@ -4286,6 +4436,11 @@ def setup_model_and_optimizer(
             assert (
                 model_provider_func is not None
             ), "Must provide a model config via config_container or a model_provider_func."
+            if _loads_loop_model_before_megatron_fsdp_wrap(args):
+                raise NotImplementedError(
+                    "A loop model on Megatron-FSDP loads a checkpoint only on the config-container "
+                    "build path (its weights are loaded before the Megatron-FSDP wrap)"
+                )
             return get_model(
                 model_provider_func,
                 model_type,
@@ -4409,6 +4564,10 @@ def setup_model_and_optimizer(
             dump_param_to_param_group_map=args.dump_param_to_param_group_map,
         )
         opt_param_scheduler = get_optimizer_param_scheduler(optimizer)
+        if getattr(args, "loop_architecture", "none") != "none":
+            # Loop models: the optimizer's parameter groups, comparable across wrappers.
+            for line in loop_optimizer_param_group_lines(model, config, config_overrides):
+                print_rank_0(line)
 
     one_logger and one_logger.log_metrics(
         {"app_build_optimzer_finish_time": one_logger_utils.get_timestamp_in_ms()}
@@ -4473,7 +4632,18 @@ def setup_model_and_optimizer(
             optimizer.reload_model_params()
         print_rank_0(f'Upcycled checkpoint saved to {args.save}')
 
-    if (
+    if loaded_before_wrap:
+        # A loop model on Megatron-FSDP: its weights were loaded before the wrap
+        # (_load_loop_model_before_megatron_fsdp_wrap, model only); no second load.
+        train_state.iteration, train_state.num_floating_point_operations_so_far = (
+            loaded_before_wrap[0]
+        )
+        train_state.resume_iteration = train_state.iteration
+        train_state.resume_num_floating_point_operations = (
+            train_state.num_floating_point_operations_so_far
+        )
+        update_num_microbatches(consumed_samples=train_state.consumed_train_samples, verbose=True)
+    elif (
         args.load is not None or args.pretrained_checkpoint is not None
     ) and not args.moe_use_upcycling:
         one_logger and one_logger.log_metrics(
