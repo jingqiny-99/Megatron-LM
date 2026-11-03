@@ -3974,6 +3974,17 @@ def _add_loop_planner_args(parser):
         '(measured_depth.py) re-run on it.',
     )
     group.add_argument(
+        '--loop-param-checksums',
+        action='store_true',
+        default=False,
+        help='Hybrid loop models: after the model is built and the checkpoint (if any) loaded, '
+        'print one checksum line per parameter and persistent buffer, keyed by its PP = 1 name '
+        '(a loop ring chunk\'s layer indices and the routed experts\' local indices made '
+        'global): element count, dtype, the exact integer sum of the raw element bits, and the '
+        'float64 sum and sum of squares (megatron/training/loop_ring_report.py). Runs of '
+        'different layouts loaded from one checkpoint print equal lines.',
+    )
+    group.add_argument(
         '--loop-planner',
         type=str,
         default='off',

@@ -68,6 +68,7 @@ from megatron.training.loop_checkpoint import (
     check_loop_resume_state,
     check_loop_save_format,
     check_loop_sharded_state_dict,
+    loop_model_state_dicts,
     loop_resume_state,
 )
 from megatron.training.utils.checkpoint_utils import (
@@ -906,7 +907,7 @@ def save_checkpoint(
         check_loop_sharded_state_dict(
             model,
             when="save",
-            sharded_state_dict=state_dict.get('model'),
+            sharded_state_dict=loop_model_state_dicts(state_dict, model),
             context=checkpointing_context,
         )
 
@@ -3145,7 +3146,9 @@ def load_checkpoint(
         # Hybrid loop models: a template entry missing here would be hidden by the strict=False
         # retry of the model load below (a no-op for other models).
         check_loop_sharded_state_dict(
-            model, when="load", sharded_state_dict=load_kwargs['sharded_state_dict'].get('model')
+            model,
+            when="load",
+            sharded_state_dict=loop_model_state_dicts(load_kwargs['sharded_state_dict'], model),
         )
 
         if gpt_compat_layer_maps is not None:

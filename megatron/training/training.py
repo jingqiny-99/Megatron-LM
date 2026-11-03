@@ -4341,6 +4341,13 @@ def setup_model_and_optimizer(
 
         check_loop_sharded_state_dict(model, when="setup")
 
+    # Hybrid loop models: the unique-parameter census (every chunk of every pipeline rank counted
+    # once; a pipeline all-reduce on every rank), printed by rank 0 (a no-op for other models).
+    if getattr(args, "loop_architecture", "none") != "none":
+        from megatron.training.loop_ring_report import log_loop_param_census
+
+        log_loop_param_census(model, args)
+
     # Classify each GTP param's prefetch chain after model build + DDP wrap, before the
     # first forward. Placed here (not in get_model) so it also covers the config-container
     # builder path.
@@ -4591,6 +4598,13 @@ def setup_model_and_optimizer(
     # per step. Establish its PP-agreed capacity before the first forward/capture.
     if (getattr(args, "dsa_indexer_loss_coeff", None) or 0.0) > 0:
         initialize_dsa_metric_tracker(unwrapped_model, pg_collection)
+
+    # --loop-param-checksums: the loaded (or initial) weights of a hybrid loop model, one line per
+    # tensor keyed by its PP = 1 name (a collective on every rank; printed by rank 0).
+    if getattr(args, "loop_param_checksums", False):
+        from megatron.training.loop_ring_report import log_loop_param_checksums
+
+        log_loop_param_checksums(model)
 
     return model, optimizer, opt_param_scheduler
 
@@ -6459,6 +6473,54 @@ def get_loop_rsbf_forward_backward_func(config, args):
     return get_loop_rsbf_schedule()
 
 
+def get_loop_ring_forward_backward_func(config, args):
+    """The loop ring schedule when the model config opts in (``loop_schedule='ring'``), else
+    None.
+
+    The ring schedule (``megatron/core/transformer/loop/ring_pp.py``, ``LoopRingSchedule``) runs
+    Megatron's interleaved schedule over the R x k round views of the stage's physical chunks;
+    ``train()`` and ``evaluate()`` both use it (evaluation runs it forward-only). Rejected here:
+
+    * the full-iteration CUDA graph wrapper of ``train()`` (the loop guards reject CUDA graphs);
+    * sharded data parallelism (Megatron FSDP, torch FSDP2): the schedule's chunks are the
+      parameterless round views, and a sharded wrapper would gather and reduce once per round;
+    * the debug-save hooks of ``train_step`` (activations, dgrads, tokens per expert): they
+      would also record every round view's call and every recompute replay;
+    * ``defer_embedding_wgrad_compute`` (also a config rule): the deferred output-layer wgrad is
+      finished on the schedule's model chunks, the round views.
+
+    The iteration wgrad dump (``--save-wgrads-interval``, the main grads after finalize) stays:
+    ``force_all_reduce`` passes through to the finalize of the physical chunks.
+    """
+    if getattr(config, "loop_schedule", "standard") != "ring":
+        return None
+    debug_saves = (
+        "save_activations_interval",
+        "save_dgrads_interval",
+        "save_tokens_per_expert_interval",
+    )
+    unsupported = [
+        name
+        for name, applies in (
+            ("cuda_graph_impl=full_iteration", args.cuda_graph_impl == "full_iteration"),
+            ("use_megatron_fsdp", getattr(args, "use_megatron_fsdp", False)),
+            ("use_torch_fsdp2", getattr(args, "use_torch_fsdp2", False)),
+            *((name, getattr(args, name, None) is not None) for name in debug_saves),
+            (
+                "defer_embedding_wgrad_compute",
+                bool(getattr(config, "defer_embedding_wgrad_compute", False))
+                or bool(getattr(args, "defer_embedding_wgrad_compute", False)),
+            ),
+        )
+        if applies
+    ]
+    if unsupported:
+        raise ValueError(f"loop_schedule='ring' does not support {', '.join(unsupported)}")
+    from megatron.core.transformer.loop.ring_pp import get_loop_ring_schedule
+
+    return get_loop_ring_schedule()
+
+
 def loop_rsbf_status_group(args):
     """The Gloo data-parallel group for the multi-EU RSBF status exchange, or None without
     data parallelism or without Gloo process groups (known-depth criteria, the only ones the
@@ -6785,6 +6847,11 @@ def train(
         # Data-parallel ranks are the executor's EUs; online exit criteria and plan checks
         # exchange over a Gloo group of the same ranks.
         loop_rsbf_schedule.configure(status_group=loop_rsbf_status_group(args))
+    # Hybrid loop over pipeline stages: the interleaved schedule over the round views (the
+    # wrappers below cannot apply; the helper and the ring config rules check).
+    loop_ring_schedule = get_loop_ring_forward_backward_func(config, args)
+    if loop_ring_schedule is not None:
+        forward_backward_func = loop_ring_schedule
     if args.cuda_graph_impl == "full_iteration":
         forward_backward_func = FullCudaGraphWrapper(
             forward_backward_func,
@@ -7319,6 +7386,12 @@ def train(
             from megatron.training.loop_rsbf_planning import record_loop_exit_histogram
 
             record_loop_exit_histogram(args, loop_rsbf_schedule, model, iteration)
+        if loop_ring_schedule is not None:
+            # G1 every step (the step's own round counters, reduced by the schedule) and, at
+            # log steps, the max-over-ranks memory line (a collective on every rank).
+            from megatron.training.loop_ring_report import log_loop_ring_step
+
+            log_loop_ring_step(args, loop_ring_schedule, iteration)
         if getattr(args, "loop_carrier_diagnostics", "off") == "full":
             # Every rank, every step; collects at the TensorBoard interval (a DP collective).
             from megatron.training.loop_diagnostics import record_loop_carrier_diagnostics
@@ -7686,6 +7759,10 @@ def evaluate(
     # average a 1/gtp_remat subsample of the eval batch (768 sequences read, 12 averaged at
     # dp=6/gtp_remat=64) while consumed_valid_samples still books the full eval_batch_size.
     eval_dp_cp_group = getattr(eval_pgc, 'dp_cp_gtp_remat', None) or eval_pgc.dp_cp
+    # Hybrid loop over pipeline stages: the ring schedule, forward-only.
+    loop_ring_schedule = get_loop_ring_forward_backward_func(config, args)
+    if loop_ring_schedule is not None:
+        forward_backward_func = loop_ring_schedule
     if args.cuda_graph_impl == "full_iteration":
         forward_backward_func = FullCudaGraphWrapper(
             forward_backward_func,

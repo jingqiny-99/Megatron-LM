@@ -2,9 +2,10 @@
 """Training side of hybrid loop checkpoints (M3c).
 
 **Coverage backstop.** ``check_loop_sharded_state_dict`` raises when a state tensor of a hybrid
-loop model (a ``HybridModel`` with a ``LoopHybridStack`` decoder) has no entry in its sharded
-state dict, by the rule of ``megatron/core/transformer/loop/param_store_checkpoint.py``. A
-missing entry would otherwise be silently re-initialized on resume (and, on the load template,
+loop model (a ``HybridModel`` with a ``LoopHybridStack`` decoder; every chunk of a multi-chunk
+model, ``loop_hybrid_models``: the loop ring's virtual-pipeline chunks) has no entry in its
+sharded state dict, by the rule of ``megatron/core/transformer/loop/param_store_checkpoint.py``.
+A missing entry would otherwise be silently re-initialized on resume (and, on the load template,
 hidden by ``load_checkpoint``'s ``strict=False`` retry). It runs
 
 * at setup (``setup_model_and_optimizer``, after the store and the planner, when ``--save`` or
@@ -64,7 +65,7 @@ For any non-loop model every call here is a silent no-op.
 
 import argparse
 import functools
-from typing import Any, Callable, Dict, FrozenSet, List, Mapping, Optional, Set
+from typing import Any, Callable, Dict, FrozenSet, List, Mapping, Optional, Sequence, Set
 
 import torch
 
@@ -85,6 +86,8 @@ __all__ = [
     "is_loop_model",
     "loop_checkpoint_problems",
     "loop_hybrid_model",
+    "loop_hybrid_models",
+    "loop_model_state_dicts",
     "loop_resume_state",
 ]
 
@@ -98,13 +101,10 @@ CHUNKED_OFFLOAD_EVIDENCE = "S8.0 chunked-offload arm: not run (no GPU phase of s
 COVERAGE_CHECKED_KEY = "loop_sharded_state_dict_checked"
 
 
-def loop_hybrid_model(model: Any) -> Optional[torch.nn.Module]:
-    """The ``HybridModel`` with a ``LoopHybridStack`` decoder inside ``model`` (DDP /
-    ``Float16Module`` wrappers, a one-chunk list), or None for any other model."""
-    chunks = model if isinstance(model, (list, tuple)) else [model]
-    if len(chunks) != 1:
-        return None
-    unwrapped = unwrap_model(chunks[0])
+def _loop_hybrid_chunk(chunk: Any) -> Optional[torch.nn.Module]:
+    """The ``HybridModel`` with a ``LoopHybridStack`` decoder inside one model chunk (DDP /
+    ``Float16Module`` wrappers), or None."""
+    unwrapped = unwrap_model(chunk)
     if not isinstance(unwrapped, torch.nn.Module):
         return None
     decoder = unwrapped._modules.get("decoder")  # pylint: disable=protected-access
@@ -116,9 +116,44 @@ def loop_hybrid_model(model: Any) -> Optional[torch.nn.Module]:
     return unwrapped if isinstance(decoder, LoopHybridStack) else None
 
 
+def loop_hybrid_models(model: Any) -> List[torch.nn.Module]:
+    """Every chunk's ``HybridModel`` with a ``LoopHybridStack`` decoder (DDP / ``Float16Module``
+    wrappers; one chunk or a list of chunks, e.g. the loop ring's virtual-pipeline chunks), in
+    chunk order; empty for any other model. Raises ``ValueError`` for a list mixing loop and
+    non-loop chunks."""
+    chunks = model if isinstance(model, (list, tuple)) else [model]
+    found = [_loop_hybrid_chunk(chunk) for chunk in chunks]
+    if all(hybrid is None for hybrid in found):
+        return []
+    if any(hybrid is None for hybrid in found):
+        raise ValueError(
+            "a model chunk list mixes hybrid loop chunks and other chunks "
+            f"({[type(unwrap_model(chunk)).__name__ for chunk in chunks]})"
+        )
+    return found
+
+
+def loop_hybrid_model(model: Any) -> Optional[torch.nn.Module]:
+    """The ``HybridModel`` with a ``LoopHybridStack`` decoder inside ``model`` (DDP /
+    ``Float16Module`` wrappers, a one-chunk list), or None for any other model and for several
+    chunks (``loop_hybrid_models`` returns those)."""
+    hybrids = loop_hybrid_models(model)
+    return hybrids[0] if len(hybrids) == 1 else None
+
+
 def is_loop_model(model: Any) -> bool:
-    """True for a hybrid loop model (``loop_hybrid_model``)."""
+    """True for a one-chunk hybrid loop model (``loop_hybrid_model``)."""
     return loop_hybrid_model(model) is not None
+
+
+def loop_model_state_dicts(state_dict: Mapping[str, Any], model: Sequence[Any]) -> Any:
+    """The model entries of a checkpoint state dict (``generate_state_dict``: ``'model'`` for one
+    chunk, ``'model<i>'`` for several), in the form ``check_loop_sharded_state_dict`` takes: the
+    one entry, or the list of the chunks' entries."""
+    chunks = len(model) if isinstance(model, (list, tuple)) else 1
+    if chunks == 1:
+        return state_dict.get("model")
+    return [state_dict.get(f"model{index}") for index in range(chunks)]
 
 
 def check_loop_sharded_state_dict(
@@ -131,32 +166,56 @@ def check_loop_sharded_state_dict(
 ) -> None:
     """Raise when a state tensor of a hybrid loop model has no checkpoint entry.
 
+    Every chunk of the model is checked (``loop_hybrid_models``: one chunk, or the loop ring's
+    virtual-pipeline chunks).
+
     Args:
-        model: the model (wrapped or not, a one-chunk list accepted); no-op for non-loop models.
+        model: the model (wrapped or not, one chunk or a list of chunks); no-op for non-loop
+            models.
         when: ``"setup"``, ``"save"`` or ``"load"`` (named in the message).
         sharded_state_dict: the model's (sharded) state dict as built for the save or the load
-            template; built with ``metadata`` when None.
-        metadata: ``sharded_state_dict`` metadata when the dict is built here.
+            template (``loop_model_state_dicts``: the one chunk's dict, or a list with each
+            chunk's); a chunk whose dict is None (or all of them, when this is None) is built
+            here with ``metadata``.
+        metadata: ``sharded_state_dict`` metadata when a dict is built here.
         context: the ``checkpointing_context``: the check runs once per context (first save).
     """
-    hybrid = loop_hybrid_model(model)
-    if hybrid is None:
+    hybrids = loop_hybrid_models(model)
+    if not hybrids:
         return
     if context is not None and context.get(COVERAGE_CHECKED_KEY):
         return
     # pylint: disable=import-outside-toplevel
     from megatron.core.transformer.loop.param_store_checkpoint import uncovered_state_names
 
-    if sharded_state_dict is None:
-        sharded_state_dict = hybrid.sharded_state_dict(metadata=metadata)
-    names = uncovered_state_names(hybrid, sharded_state_dict)
-    if names:
-        raise RuntimeError(
-            f"loop checkpoint ({when}): the sharded state dict has no entry for "
-            f"{', '.join(names)} (a parameter or persistent buffer without an entry would be "
-            "silently re-initialized on resume); give its module a sharded_state_dict or "
-            "register it on a module the default walk reaches"
+    if isinstance(sharded_state_dict, (list, tuple)):
+        dicts = list(sharded_state_dict)
+    elif len(hybrids) == 1:
+        dicts = [sharded_state_dict]
+    elif sharded_state_dict is None:
+        dicts = [None] * len(hybrids)
+    else:
+        raise ValueError(
+            f"loop checkpoint ({when}): one sharded state dict for {len(hybrids)} model chunks "
+            "(pass loop_model_state_dicts: one per chunk)"
         )
+    if len(dicts) != len(hybrids):
+        raise ValueError(
+            f"loop checkpoint ({when}): {len(dicts)} sharded state dicts for {len(hybrids)} "
+            "model chunks"
+        )
+    for index, (hybrid, chunk_dict) in enumerate(zip(hybrids, dicts)):
+        if chunk_dict is None:
+            chunk_dict = hybrid.sharded_state_dict(metadata=metadata)
+        names = uncovered_state_names(hybrid, chunk_dict)
+        if names:
+            where = f" chunk {index}" if len(hybrids) > 1 else ""
+            raise RuntimeError(
+                f"loop checkpoint ({when}){where}: the sharded state dict has no entry for "
+                f"{', '.join(names)} (a parameter or persistent buffer without an entry would be "
+                "silently re-initialized on resume); give its module a sharded_state_dict or "
+                "register it on a module the default walk reaches"
+            )
     if context is not None:
         context[COVERAGE_CHECKED_KEY] = True
 
@@ -338,12 +397,13 @@ def loop_resume_state(args, model: Any, optimizer: Any) -> Optional[Dict[str, An
     over the world, a collective; ``save_checkpoint`` calls it on every rank of a torch_dist
     save, the only format a store saves), the applied RSBF plan
     (``loop_rsbf_planning.loop_plan_record``; None without ``--loop-planner apply``), the
-    expert-parallel and world sizes."""
-    hybrid = loop_hybrid_model(model)
-    if hybrid is None:
+    expert-parallel and world sizes. With several chunks (the loop ring) the roles are the first
+    chunk's: every ring chunk carries the model's roles."""
+    hybrids = loop_hybrid_models(model)
+    if not hybrids:
         return None
     store = _store_of(model)
-    roles = getattr(hybrid.decoder, "loop_roles", None)
+    roles = getattr(hybrids[0].decoder, "loop_roles", None)
     return {
         "version": LOOP_RESUME_VERSION,
         "roles": (
@@ -475,6 +535,7 @@ LAYOUT_NEUTRAL_LOOP_ARGS: FrozenSet[str] = frozenset(
         "loop_carrier_diagnostics",
         "loop_carrier_diagnostics_path",
         "loop_carrier_diagnostics_segments",
+        "loop_param_checksums",
     }
 )
 LAYOUT_NEUTRAL_PREFIXES = ("loop_planner_", "loop_param_store_")
@@ -627,10 +688,12 @@ def check_loop_resume_state(
     numerics-relevant change unless ``--loop-resume-changes allow`` (then every change is a
     note). Returns the notes, printed on rank 0. A no-op returning [] (nothing logged) for a
     non-loop model, without ``restore_training_state``, or when finetuning; every argument is
-    read with ``getattr``."""
-    hybrid = loop_hybrid_model(model)
-    if hybrid is None or not restore_training_state or getattr(args, "finetune", False):
+    read with ``getattr``. With several chunks (the loop ring) the roles are the first chunk's:
+    every ring chunk carries the model's roles."""
+    hybrids = loop_hybrid_models(model)
+    if not hybrids or not restore_training_state or getattr(args, "finetune", False):
         return []
+    hybrid = hybrids[0]
     # pylint: disable=import-outside-toplevel
     from megatron.training.loop_rsbf_planning import check_resume_plan, get_loop_planner_session
     from megatron.training.utils import print_rank_0

@@ -33,7 +33,7 @@ import torch
 from megatron.core import parallel_state
 from megatron.core.transformer.forward_replay import in_forward_replay
 from megatron.core.transformer.loop.reporting import stream_mean_rms
-from megatron.training.loop_checkpoint import loop_hybrid_model
+from megatron.training.loop_checkpoint import loop_hybrid_model, loop_hybrid_models
 
 FORMAT = "megatron-loop-carrier-diagnostics/1"
 
@@ -127,6 +127,11 @@ def record_loop_carrier_diagnostics(args, model, iteration: int, group=None) -> 
     (not a record iteration, or a carrier without per-sublayer statistics)."""
     if not _is_record_iteration(args, iteration):
         return None
+    if len(loop_hybrid_models(model)) > 1:
+        raise ValueError(
+            "--loop-carrier-diagnostics full needs a one-chunk loop model (the loop ring's "
+            "virtual-pipeline chunks each hold one segment of the rounds)"
+        )
     hybrid = loop_hybrid_model(model)
     if hybrid is None:
         return None
