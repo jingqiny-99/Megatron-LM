@@ -21,15 +21,19 @@ same state. ``per_microbatch_mean_aux_scaling`` is the mutation the invariance t
 auxiliary and indexer loss gradients scaled by ``1 / micro_batch_size``, i.e. averaged over the
 rows of a microbatch instead of summed like the per-token LM loss.
 
-Comparisons. ``compare_gradients`` gives per parameter the cosine and the relative norm
-difference ``|g - g_ref| / |g_ref|``. A bf16 comparison of two different GEMM shapes differs by
-rounding that the network amplifies, so its per-parameter gate is relative to a measured floor
-of the same parameter (``floor_gate``): ``rel <= max(min_relative, factor * floor_rel)``.
+Comparisons. ``compare_gradients`` gives per parameter the cosine, the relative norm
+difference ``|g - g_ref| / |g_ref|`` and the absolute one; ``global_comparison`` the same for the
+whole gradient. ``resolution_gate`` gates every parameter against a measured noise floor of the
+same parameter: a resolved gradient by the strict (fp32) or floor-relative (bf16) relative gate,
+an unresolved one (zero up to rounding) absolutely, against the global gradient norm.
 """
 
 import contextlib
 import functools
+import json
 import math
+import os
+import re
 from typing import Dict, List, Optional, Sequence
 
 import torch
@@ -224,8 +228,9 @@ def compare_gradients(
     min_cosine: float,
     max_relative: float,
 ) -> Dict[str, dict]:
-    """Per parameter: cosine and relative norm difference ``|g - g_ref| / |g_ref|`` against the
-    reference, and whether both gates hold (two all-zero gradients pass)."""
+    """Per parameter: cosine, relative norm difference ``|g - g_ref| / |g_ref|`` and absolute
+    difference ``|g - g_ref|`` against the reference, and whether the cosine and relative gates
+    hold (two all-zero gradients pass)."""
     assert grads.keys() == reference.keys()
     report = {}
     for name, expected in reference.items():
@@ -233,21 +238,24 @@ def compare_gradients(
         expected = expected.double().flatten()
         expected_norm = expected.norm().item()
         actual_norm = actual.norm().item()
+        diff = (actual - expected).norm().item()
         if expected_norm == 0.0 or actual_norm == 0.0:
             both_zero = expected_norm == 0.0 and actual_norm == 0.0
             report[name] = dict(
                 cosine=1.0 if both_zero else 0.0,
                 relative=0.0 if both_zero else math.inf,
+                diff=diff,
                 norm=expected_norm,
                 numel=expected.numel(),
                 ok=both_zero,
             )
             continue
         cosine = torch.dot(actual, expected).item() / (actual_norm * expected_norm)
-        relative = (actual - expected).norm().item() / expected_norm
+        relative = diff / expected_norm
         report[name] = dict(
             cosine=cosine,
             relative=relative,
+            diff=diff,
             norm=expected_norm,
             numel=expected.numel(),
             ok=cosine >= min_cosine and relative <= max_relative,
@@ -255,17 +263,70 @@ def compare_gradients(
     return report
 
 
-def floor_gate(
-    report: Dict[str, dict], floor: Dict[str, dict], *, min_relative: float, factor: float
+def global_comparison(grads: Dict[str, torch.Tensor], reference: Dict[str, torch.Tensor]):
+    """Cosine and relative difference of the whole gradient (every parameter concatenated),
+    and the reference's global norm."""
+    dot = diff2 = norm2 = ref2 = 0.0
+    for name, expected in reference.items():
+        actual = grads[name].double().flatten()
+        expected = expected.double().flatten()
+        dot += torch.dot(actual, expected).item()
+        diff2 += (actual - expected).pow(2).sum().item()
+        norm2 += actual.pow(2).sum().item()
+        ref2 += expected.pow(2).sum().item()
+    return dict(
+        cosine=dot / math.sqrt(norm2 * ref2), relative=math.sqrt(diff2 / ref2), norm=ref2**0.5
+    )
+
+
+def resolution_gate(
+    report: Dict[str, dict],
+    floor: Dict[str, dict],
+    *,
+    global_norm: float,
+    strict: bool,
+    min_cosine: float = 0.9999,
+    min_relative: float = 1e-3,
+    factor: float = 3.0,
+    unresolved_floor: float = 0.5,
+    absolute_fraction: float = 1e-4,
 ) -> Dict[str, dict]:
-    """``report`` re-gated per parameter against a measured floor of the same parameter:
-    ``relative <= max(min_relative, factor * floor relative)`` (cosine reported, not gated)."""
+    """``report`` re-gated per parameter by whether the floor resolves its gradient.
+
+    ``floor`` gives each parameter's measured noise (the relative difference of two computations
+    of the same gradient). A parameter is *resolved* when that noise is at most
+    ``unresolved_floor`` of its gradient; then ``strict`` gates cosine >= ``min_cosine`` and
+    relative <= ``min_relative``, and the non-strict gate is relative <= max(``min_relative``,
+    ``factor`` x floor). An *unresolved* gradient (zero up to rounding, such as the mHC
+    stream-symmetry parameters at initialization) has no meaningful relative difference; it is
+    gated absolutely: ``|g - g_ref| <= absolute_fraction x global_norm``."""
     out = {}
     for name, entry in report.items():
-        bound = max(min_relative, factor * floor[name]["relative"])
-        out[name] = dict(entry, floor=floor[name]["relative"], bound=bound)
-        out[name]["ok"] = entry["relative"] <= bound
+        noise = floor[name]["relative"]
+        resolved = noise <= unresolved_floor
+        if not resolved:
+            bound = absolute_fraction * global_norm
+            ok = entry["diff"] <= bound
+        elif strict:
+            bound = min_relative
+            ok = entry["cosine"] >= min_cosine and entry["relative"] <= min_relative
+        else:
+            bound = max(min_relative, factor * noise)
+            ok = entry["relative"] <= bound
+        out[name] = dict(entry, floor=noise, bound=bound, resolved=resolved, ok=ok)
     return out
+
+
+def dump_report(tag: str, report: dict) -> None:
+    """With ``MBS_REPORT_DIR`` set: the comparison as JSON, one file per tag and rank."""
+    directory = os.environ.get("MBS_REPORT_DIR")
+    if not directory:
+        return
+    os.makedirs(directory, exist_ok=True)
+    name = re.sub(r"[^A-Za-z0-9_.-]+", "_", tag)
+    path = os.path.join(directory, f"{name}.rank{torch.distributed.get_rank()}.json")
+    with open(path, "w", encoding="utf-8") as handle:
+        json.dump(report, handle, indent=1, default=float)
 
 
 def relative_loss_differences(losses: dict, reference: dict) -> Dict[str, float]:
@@ -293,6 +354,7 @@ def worst(report: Dict[str, dict], names: Optional[Sequence[str]] = None, count:
     return "; ".join(
         f"{name}: cos {r['cosine']:.6f} rel {r['relative']:.2e} |g| {r['norm']:.2e}"
         + (f" floor {r['floor']:.2e}" if "floor" in r else "")
+        + ("" if r.get("resolved", True) else f" unresolved |dg| {r['diff']:.2e}")
         for name, r in items[:count]
     )
 
@@ -314,9 +376,14 @@ def print_report(tag: str, report: Dict[str, dict], focus: Sequence[str] = ()) -
         flush=True,
     )
     print(f"[{tag}] worst: {worst(report, count=8)}", flush=True)
+    unresolved = [name for name, r in report.items() if not r.get("resolved", True)]
+    if unresolved:
+        print(f"[{tag}] unresolved (gated absolutely): {len(unresolved)}", flush=True)
     for name in focus:
         r = report[name]
         extra = f" floor {r['floor']:.2e} bound {r['bound']:.2e}" if "floor" in r else ""
+        if not r.get("resolved", True):
+            extra += f" unresolved |dg| {r['diff']:.2e}"
         print(
             f"[{tag}]   {name}: cos {r['cosine']:.8f} rel {r['relative']:.2e} "
             f"|g| {r['norm']:.2e}{extra} {'ok' if r['ok'] else 'FAIL'}",

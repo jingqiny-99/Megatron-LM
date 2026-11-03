@@ -39,6 +39,7 @@ is skipped with that error as the reason.
 """
 
 import collections
+import math
 import os
 import warnings
 
@@ -270,7 +271,10 @@ def test_fused_kernels_batch_equals_single_rows(runner, monkeypatch, batch):
         flush=True,
     )
     floor = mbs.compare_gradients(
-        arms[("training", "1 again")][2], arms[("training", 1)][2], min_cosine=0.0, max_relative=1.0
+        arms[("training", "1 again")][2],
+        arms[("training", 1)][2],
+        min_cosine=0.0,
+        max_relative=math.inf,
     )
     checked = [name for names in _checked_weight_names(runner.model).values() for name in names]
     mbs.print_report(f"T7 b={batch} floor (training, 1-row arm twice)", floor, checked[:6])
@@ -290,15 +294,18 @@ def test_fused_kernels_batch_equals_single_rows(runner, monkeypatch, batch):
         losses, rows_b, grads = arms[(mode, batch)]
         loss_rel = mbs.relative_loss_differences(losses, ref_losses)
         row_rel = mbs.max_row_difference(rows_b, ref_rows)
-        report = mbs.floor_gate(
-            mbs.compare_gradients(grads, ref_grads, min_cosine=0.0, max_relative=1.0),
+        report = mbs.resolution_gate(
+            mbs.compare_gradients(grads, ref_grads, min_cosine=0.0, max_relative=math.inf),
             floor,
+            global_norm=mbs.global_comparison(ref_grads, ref_grads)["norm"],
+            strict=False,
             min_relative=MAX_RELATIVE,
             factor=FLOOR_FACTOR,
         )
         tag = f"T7 b={batch} {mode} {batch} x 1 vs 1 x {batch}"
         print(f"[{tag}] loss rel {loss_rel}; max row rel {row_rel:.2e}", flush=True)
         mbs.print_report(tag, report, checked[:6])
+        mbs.dump_report(tag, dict(per_param=report, total=mbs.global_comparison(grads, ref_grads)))
         if any(value > 1e-3 for value in loss_rel.values()) or row_rel > 1e-3:
             failures.append(f"{mode}: loss rel {loss_rel}, max row rel {row_rel:.2e}")
         failing = [name for name, r in report.items() if not r["ok"]]

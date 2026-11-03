@@ -23,18 +23,24 @@ every arm, so the fp32 and bf16 models compute the same function.
   sequence aux loss. The indexer weights get gradients only from the indexer loss (the indexer
   reads detached activations, ``csa.py`` unfused path).
 * fp32 (the math): every attached loss sum and every row's LM loss within 1e-3 relative of
-  MBS 1; every parameter gradient cosine >= 0.9999 and relative norm difference <= 1e-3.
+  MBS 1; the whole gradient cosine >= 0.9999 and relative difference <= 1e-3; every resolved
+  parameter gradient the same (below).
 * bf16 (the precision the arms train in): different micro-batch sizes run different GEMM shapes,
-  whose rounding the network amplifies, so a per-parameter gate at 1e-3 measures bf16 noise, not
-  the math (FSDP-arm deviations D6). Each parameter's floor is its own precision error, bf16 MBS
-  1 against the fp32 model with the same weights; gate: relative difference to bf16 MBS 1 at most
-  max(1e-3, 3 x floor); losses and rows within 1e-3 as in fp32.
+  whose rounding the network amplifies (FSDP-arm deviations D6). Each parameter's noise floor
+  is bf16's own error on it: bf16 MBS 1 against the fp32 model with the same weights.
+* Per parameter (``mbs_invariance_utils.resolution_gate``): a gradient the floor resolves (floor
+  <= 0.5) must match in fp32 (cosine >= 0.9999, relative <= 1e-3) and in bf16 (relative <=
+  max(1e-3, 3 x floor)). An unresolved gradient is zero up to rounding (at initialization the
+  4 mHC streams are copies, so the gradients of the stream-mixing scalars vanish); it is gated
+  absolutely, |g - g_ref| <= 1e-4 x the whole-gradient norm. The learned routers and every indexer
+  weight must be resolved.
 * Teeth: ``per_microbatch_mean_aux_scaling`` (aux and indexer gradients x 1 / micro-batch size,
   the per-microbatch mean the ``loop_schedule`` docstring describes) must fail the fp32 gate and
-  the bf16 floor gate on every learned router weight and every indexer weight.
+  the bf16 gate on every learned router weight and every indexer weight.
 """
 
 import contextlib
+import math
 import os
 
 import pytest
@@ -243,102 +249,113 @@ def results():
 
 
 def _precision_floor(out):
-    """Per parameter: bf16 MBS 1 against fp32 MBS 1 (same weights): bf16's own error."""
-    return mbs.compare_gradients(
-        out[("bf16", False)][1][2], out[("fp32", False)][1][2], min_cosine=0.0, max_relative=1.0
-    )
+    """Per parameter and globally: bf16 MBS 1 against fp32 MBS 1 (same weights), bf16's own
+    error on that gradient."""
+    bf16, fp32 = out[("bf16", False)][1][2], out[("fp32", False)][1][2]
+    floor = mbs.compare_gradients(bf16, fp32, min_cosine=0.0, max_relative=math.inf)
+    return floor, mbs.global_comparison(bf16, fp32)
 
 
 def _tag(text):
     return f"T3 W{WORLD} rank{torch.distributed.get_rank()} {text}"
 
 
-def test_fp32_step_is_invariant_to_micro_batch_size(results):
+def _gate(grads, ref_grads, floor, strict):
+    """Per-parameter resolution gate (fp32: strict; bf16: floor-relative) and the global gate."""
+    report = mbs.resolution_gate(
+        mbs.compare_gradients(grads, ref_grads, min_cosine=0.0, max_relative=math.inf),
+        floor,
+        global_norm=mbs.global_comparison(ref_grads, ref_grads)["norm"],
+        strict=strict,
+        min_cosine=MIN_COSINE,
+        min_relative=MAX_RELATIVE,
+        factor=FLOOR_FACTOR,
+    )
+    return report, mbs.global_comparison(grads, ref_grads)
+
+
+def test_routers_and_indexers_are_resolved(results):
+    """The checked weights train and bf16 resolves their gradients (the gates below are then
+    strict on them, and the mutation test has teeth)."""
     out, routers, indexers = results
-    arms = out[("fp32", False)]
-    ref_losses, ref_rows, ref_grads = arms[1]
-    # The gate must not be vacuous: every loss is on and the checked weights train.
+    floor, global_floor = _precision_floor(out)
+    ref_losses, _, ref_grads = out[("fp32", False)][1]
+    mbs.print_report(
+        _tag("bf16 precision floor (bf16 MBS 1 vs fp32 MBS 1)"), floor, routers[:2] + indexers[:2]
+    )
+    mbs.dump_report(_tag("floor bf16 vs fp32 MBS 1"), dict(per_param=floor, total=global_floor))
+    print(f"[{_tag('global floor')}] {global_floor}", flush=True)
     assert all(ref_losses[key] != 0.0 for key in mbs.LOSS_KEYS), ref_losses
     assert routers and indexers
     for name in routers + indexers:
         assert ref_grads[name].norm() > 0, name
+        assert floor[name]["relative"] <= 0.5, (name, floor[name])
+
+
+def test_fp32_step_is_invariant_to_micro_batch_size(results):
+    out, routers, indexers = results
+    floor, _ = _precision_floor(out)
+    arms = out[("fp32", False)]
+    ref_losses, ref_rows, ref_grads = arms[1]
     for micro_batch_size in MBS[1:]:
         losses, rows, grads = arms[micro_batch_size]
         loss_rel = mbs.relative_loss_differences(losses, ref_losses)
         row_rel = mbs.max_row_difference(rows, ref_rows)
-        report = mbs.compare_gradients(
-            grads, ref_grads, min_cosine=MIN_COSINE, max_relative=MAX_RELATIVE
-        )
+        report, total = _gate(grads, ref_grads, floor, strict=True)
+        tag = _tag(f"fp32 MBS {micro_batch_size} vs 1")
         print(
-            f"[{_tag(f'fp32 MBS {micro_batch_size} vs 1')}] loss rel {loss_rel}; "
-            f"max row rel {row_rel:.2e}",
+            f"[{tag}] loss rel {loss_rel}; max row rel {row_rel:.2e}; whole gradient {total}",
             flush=True,
         )
-        mbs.print_report(
-            _tag(f"fp32 MBS {micro_batch_size} vs 1"), report, routers[:2] + indexers[:2]
-        )
+        mbs.print_report(tag, report, routers[:2] + indexers[:2])
+        mbs.dump_report(tag, dict(per_param=report, total=total, loss_rel=loss_rel))
         assert all(value <= 1e-3 for value in loss_rel.values()), loss_rel
         assert row_rel <= 1e-3, row_rel
+        assert total["cosine"] >= MIN_COSINE and total["relative"] <= MAX_RELATIVE, total
         failing = [name for name, r in report.items() if not r["ok"]]
         assert not failing, mbs.worst(report, failing)
 
 
 def test_bf16_step_is_invariant_within_bf16_precision(results):
     out, routers, indexers = results
+    floor, global_floor = _precision_floor(out)
     arms = out[("bf16", False)]
     ref_losses, ref_rows, ref_grads = arms[1]
-    floor = _precision_floor(out)
-    mbs.print_report(
-        _tag("bf16 precision floor (bf16 MBS 1 vs fp32 MBS 1)"), floor, routers[:2] + indexers[:2]
-    )
     for micro_batch_size in MBS[1:]:
         losses, rows, grads = arms[micro_batch_size]
         loss_rel = mbs.relative_loss_differences(losses, ref_losses)
         row_rel = mbs.max_row_difference(rows, ref_rows)
-        report = mbs.floor_gate(
-            mbs.compare_gradients(grads, ref_grads, min_cosine=0.0, max_relative=1.0),
-            floor,
-            min_relative=MAX_RELATIVE,
-            factor=FLOOR_FACTOR,
-        )
+        report, total = _gate(grads, ref_grads, floor, strict=False)
+        tag = _tag(f"bf16 MBS {micro_batch_size} vs 1")
         print(
-            f"[{_tag(f'bf16 MBS {micro_batch_size} vs 1')}] loss rel {loss_rel}; "
-            f"max row rel {row_rel:.2e}",
+            f"[{tag}] loss rel {loss_rel}; max row rel {row_rel:.2e}; whole gradient {total}",
             flush=True,
         )
-        mbs.print_report(
-            _tag(f"bf16 MBS {micro_batch_size} vs 1"), report, routers[:2] + indexers[:2]
-        )
+        mbs.print_report(tag, report, routers[:2] + indexers[:2])
+        mbs.dump_report(tag, dict(per_param=report, total=total, loss_rel=loss_rel))
         assert all(value <= 1e-3 for value in loss_rel.values()), loss_rel
         assert row_rel <= 1e-3, row_rel
+        assert total["relative"] <= max(MAX_RELATIVE, FLOOR_FACTOR * global_floor["relative"]), (
+            total,
+            global_floor,
+        )
         failing = [name for name, r in report.items() if not r["ok"]]
         assert not failing, mbs.worst(report, failing)
 
 
 def test_per_microbatch_mean_aux_scaling_is_caught(results):
-    """The 1 / b mutation fails the fp32 gate and the bf16 floor gate on every learned router
-    weight and every indexer weight."""
+    """The 1 / b mutation fails the fp32 gate and the bf16 gate on every learned router weight
+    and every indexer weight."""
     out, routers, indexers = results
-    floor = _precision_floor(out)
+    floor, _ = _precision_floor(out)
     for precision in ("fp32", "bf16"):
         _, _, ref_grads = out[(precision, False)][1]
         for micro_batch_size in MBS[1:]:
             _, _, grads = out[(precision, True)][micro_batch_size]
-            if precision == "fp32":
-                report = mbs.compare_gradients(
-                    grads, ref_grads, min_cosine=MIN_COSINE, max_relative=MAX_RELATIVE
-                )
-            else:
-                report = mbs.floor_gate(
-                    mbs.compare_gradients(grads, ref_grads, min_cosine=0.0, max_relative=1.0),
-                    floor,
-                    min_relative=MAX_RELATIVE,
-                    factor=FLOOR_FACTOR,
-                )
-            mbs.print_report(
-                _tag(f"mutant {precision} MBS {micro_batch_size} vs 1"),
-                report,
-                routers[:2] + indexers[:2],
-            )
+            report, total = _gate(grads, ref_grads, floor, strict=precision == "fp32")
+            tag = _tag(f"mutant {precision} MBS {micro_batch_size} vs 1")
+            print(f"[{tag}] whole gradient {total}", flush=True)
+            mbs.print_report(tag, report, routers[:2] + indexers[:2])
+            mbs.dump_report(tag, dict(per_param=report, total=total))
             passing = [name for name in routers + indexers if report[name]["ok"]]
             assert not passing, mbs.worst(report, passing)
