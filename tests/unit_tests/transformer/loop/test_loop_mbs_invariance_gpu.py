@@ -13,18 +13,25 @@ and the CSA indexer's sparse KL loss.
 Model: pattern ``'WEWECEHECEHECE/WE'`` (prelude ``WEWECE`` with three hash-routed MoE layers,
 core ``HECE`` run exactly 4 times, coda ``HECE``, MTP ``WE``), DSv4 W / C / H attention
 (unfused, ``dsa_kernel_backend='none'``, the parity reference's path), 8 experts top-2 with
-sqrtsoftplus scores, top-k scaling 1.5, expert bias and one shared expert, mHC with 4 streams,
-bf16, deterministic kernels. Runs under torchrun at W in {1, 2, 4, 8} (EP = W; each rank its
-own 4 rows).
+sqrtsoftplus scores, top-k scaling 1.5, expert bias and one shared expert, SwiGLU with the
+activation clamp, RMSNorm, mHC with 4 streams, deterministic kernels, full-precision GEMMs
+(no TF32). Runs under torchrun at W in {1, 2, 4, 8} (EP = W; each rank its own 4 rows). The
+DSv4 Hadamard rotation (``csa.rotate_activation``, bf16-only) is the same scaled identity in
+every arm, so the fp32 and bf16 models compute the same function.
 
 * ``moe_aux_loss_coeff = 1.0``: the learned routers' weight gradients are dominated by the
   sequence aux loss. The indexer weights get gradients only from the indexer loss (the indexer
   reads detached activations, ``csa.py`` unfused path).
-* Gate (bf16, deterministic): every attached loss sum within 1e-3 relative of MBS 1; every
-  parameter gradient cosine >= 0.9999 and relative norm difference <= 1e-3.
+* fp32 (the math): every attached loss sum and every row's LM loss within 1e-3 relative of
+  MBS 1; every parameter gradient cosine >= 0.9999 and relative norm difference <= 1e-3.
+* bf16 (the precision the arms train in): different micro-batch sizes run different GEMM shapes,
+  whose rounding the network amplifies, so a per-parameter gate at 1e-3 measures bf16 noise, not
+  the math (FSDP-arm deviations D6). Each parameter's floor is its own precision error, bf16 MBS
+  1 against the fp32 model with the same weights; gate: relative difference to bf16 MBS 1 at most
+  max(1e-3, 3 x floor); losses and rows within 1e-3 as in fp32.
 * Teeth: ``per_microbatch_mean_aux_scaling`` (aux and indexer gradients x 1 / micro-batch size,
-  the per-microbatch mean the ``loop_schedule`` docstring describes) must fail the gate on every
-  learned router weight and every indexer weight.
+  the per-microbatch mean the ``loop_schedule`` docstring describes) must fail the fp32 gate and
+  the bf16 floor gate on every learned router weight and every indexer weight.
 """
 
 import contextlib
@@ -50,42 +57,52 @@ _RATIOS = {"W": 0, "C": 4, "H": 128, "E": 0}
 SEQ = 256
 VOCAB = 512
 ROWS = 4  # per rank
+MBS = (1, 2, 4)
 MIN_COSINE = 0.9999
 MAX_RELATIVE = 1e-3
+FLOOR_FACTOR = 3.0
 
 
 @pytest.fixture(scope="module", autouse=True)
 def _model_parallel():
+    """Deterministic kernels and full-precision fp32 GEMMs for the module: set before model
+    parallelism and the first GEMM (NCCL, cuBLAS and TE read these once per process)."""
     if not CUDA:
         yield
         return
-    with determinism_env(), model_parallel_once(expert_model_parallel_size=WORLD):
-        torch.use_deterministic_algorithms(True, warn_only=True)
-        try:
-            yield
-        finally:
-            torch.use_deterministic_algorithms(False)
+    previous = os.environ.get("NVIDIA_TF32_OVERRIDE")
+    os.environ["NVIDIA_TF32_OVERRIDE"] = "0"
+    tf32 = (torch.backends.cuda.matmul.allow_tf32, torch.backends.cudnn.allow_tf32)
+    torch.backends.cuda.matmul.allow_tf32 = False
+    torch.backends.cudnn.allow_tf32 = False
+    try:
+        with determinism_env(), model_parallel_once(expert_model_parallel_size=WORLD):
+            torch.use_deterministic_algorithms(True, warn_only=True)
+            try:
+                yield
+            finally:
+                torch.use_deterministic_algorithms(False)
+    finally:
+        torch.backends.cuda.matmul.allow_tf32, torch.backends.cudnn.allow_tf32 = tf32
+        if previous is None:
+            os.environ.pop("NVIDIA_TF32_OVERRIDE", None)
+        else:
+            os.environ["NVIDIA_TF32_OVERRIDE"] = previous
 
 
 @contextlib.contextmanager
-def _hadamard():
-    """``rotate_activation`` (``dsa.py``) needs ``fast_hadamard_transform``; without it every
-    arm uses the same scaled identity."""
+def _scaled_identity_rotation():
+    """``csa.rotate_activation`` -> ``x / sqrt(d)`` (the Hadamard transform is bf16-only)."""
     from unittest.mock import patch
 
-    try:
-        from fast_hadamard_transform import hadamard_transform  # noqa: F401
-
+    with patch(
+        "megatron.core.transformer.experimental_attention_variant.csa.rotate_activation",
+        lambda x: x * (x.size(-1) ** -0.5),
+    ):
         yield
-    except ImportError:
-        with patch(
-            "megatron.core.transformer.experimental_attention_variant.csa.rotate_activation",
-            lambda x: x * (x.size(-1) ** -0.5),
-        ):
-            yield
 
 
-def _model():
+def _model(dtype):
     from megatron.core.models.hybrid.hybrid_model import HybridModel
     from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
     from megatron.core.transformer.enums import AttnBackend
@@ -147,8 +164,8 @@ def _model():
         add_bias_linear=False,
         hidden_dropout=0.0,
         attention_dropout=0.0,
-        bf16=True,
-        params_dtype=torch.bfloat16,
+        bf16=dtype == torch.bfloat16,
+        params_dtype=dtype,
         use_cpu_initialization=True,
         gradient_accumulation_fusion=True,
         loop_architecture="huginn",
@@ -190,68 +207,138 @@ def learned_router_and_indexer_names(model):
 
 
 @pytest.fixture(scope="module")
-def runner():
-    with _hadamard():
-        model = _model()
-    return mbs.StepRunner(model)
-
-
-def _arms(runner, mutant=False):
+def results():
+    """Every arm of the module, run once: {(precision, mutant): {mbs: (losses, rows, grads)}}
+    and the model names. The fp32 model starts from the bf16 model's weights."""
+    bf16_model = _model(torch.bfloat16)
+    fp32_model = _model(torch.float32)
+    state = {
+        name: value.float() if torch.is_tensor(value) and value.is_floating_point() else value
+        for name, value in bf16_model.state_dict().items()
+    }
+    fp32_model.load_state_dict(state, strict=True)
+    runners = {"bf16": mbs.StepRunner(bf16_model), "fp32": mbs.StepRunner(fp32_model)}
     rows = mbs.make_rows(ROWS, SEQ, VOCAB, seed=4242 + torch.distributed.get_rank())
-    results = {}
-    for micro_batch_size in (1, 2, 4):
-        mutation = (
-            mbs.per_microbatch_mean_aux_scaling(micro_batch_size)
-            if mutant
-            else contextlib.nullcontext()
-        )
-        with _hadamard(), mutation:
-            results[micro_batch_size] = runner.run(rows, micro_batch_size, seq=SEQ)
-    return results
+    out = {}
+    with _scaled_identity_rotation():
+        for precision in ("fp32", "bf16"):
+            for mutant in (False, True):
+                arms = {}
+                for micro_batch_size in MBS:
+                    if mutant and micro_batch_size == 1:
+                        arms[1] = out[(precision, False)][1]  # x 1 / 1: the same step
+                        continue
+                    mutation = (
+                        mbs.per_microbatch_mean_aux_scaling(micro_batch_size)
+                        if mutant
+                        else contextlib.nullcontext()
+                    )
+                    with mutation:
+                        arms[micro_batch_size] = runners[precision].run(
+                            rows, micro_batch_size, seq=SEQ
+                        )
+                out[(precision, mutant)] = arms
+    routers, indexers = learned_router_and_indexer_names(bf16_model)
+    return out, routers, indexers
 
 
-def _print_report(tag, micro_batch_size, loss_rel, report):
-    print(
-        f"[T3 rank {torch.distributed.get_rank()} W {WORLD}] {tag} MBS {micro_batch_size} vs 1: "
-        f"loss rel {loss_rel}; params {len(report)}, "
-        f"failing {sum(not r['ok'] for r in report.values())}, "
-        f"min cosine {min(r['cosine'] for r in report.values()):.8f}, "
-        f"max rel {max(r['relative'] for r in report.values()):.3e}",
-        flush=True,
+def _precision_floor(out):
+    """Per parameter: bf16 MBS 1 against fp32 MBS 1 (same weights): bf16's own error."""
+    return mbs.compare_gradients(
+        out[("bf16", False)][1][2], out[("fp32", False)][1][2], min_cosine=0.0, max_relative=1.0
     )
 
 
-def test_step_is_invariant_to_micro_batch_size(runner):
-    results = _arms(runner)
-    ref_losses, ref_grads = results[1]
-    routers, indexers = learned_router_and_indexer_names(runner.model)
+def _tag(text):
+    return f"T3 W{WORLD} rank{torch.distributed.get_rank()} {text}"
+
+
+def test_fp32_step_is_invariant_to_micro_batch_size(results):
+    out, routers, indexers = results
+    arms = out[("fp32", False)]
+    ref_losses, ref_rows, ref_grads = arms[1]
     # The gate must not be vacuous: every loss is on and the checked weights train.
     assert all(ref_losses[key] != 0.0 for key in mbs.LOSS_KEYS), ref_losses
     assert routers and indexers
     for name in routers + indexers:
         assert ref_grads[name].norm() > 0, name
-    for micro_batch_size in (2, 4):
-        losses, grads = results[micro_batch_size]
+    for micro_batch_size in MBS[1:]:
+        losses, rows, grads = arms[micro_batch_size]
         loss_rel = mbs.relative_loss_differences(losses, ref_losses)
+        row_rel = mbs.max_row_difference(rows, ref_rows)
         report = mbs.compare_gradients(
             grads, ref_grads, min_cosine=MIN_COSINE, max_relative=MAX_RELATIVE
         )
-        _print_report("invariance", micro_batch_size, loss_rel, report)
+        print(
+            f"[{_tag(f'fp32 MBS {micro_batch_size} vs 1')}] loss rel {loss_rel}; "
+            f"max row rel {row_rel:.2e}",
+            flush=True,
+        )
+        mbs.print_report(
+            _tag(f"fp32 MBS {micro_batch_size} vs 1"), report, routers[:2] + indexers[:2]
+        )
         assert all(value <= 1e-3 for value in loss_rel.values()), loss_rel
+        assert row_rel <= 1e-3, row_rel
         failing = [name for name, r in report.items() if not r["ok"]]
         assert not failing, mbs.worst(report, failing)
 
 
-def test_per_microbatch_mean_aux_scaling_is_caught(runner):
-    """The 1 / b mutation fails on every learned router weight and every indexer weight."""
-    results = _arms(runner, mutant=True)
-    _, ref_grads = results[1]
-    routers, indexers = learned_router_and_indexer_names(runner.model)
-    for micro_batch_size in (2, 4):
-        _, grads = results[micro_batch_size]
-        report = mbs.compare_gradients(
-            grads, ref_grads, min_cosine=MIN_COSINE, max_relative=MAX_RELATIVE
+def test_bf16_step_is_invariant_within_bf16_precision(results):
+    out, routers, indexers = results
+    arms = out[("bf16", False)]
+    ref_losses, ref_rows, ref_grads = arms[1]
+    floor = _precision_floor(out)
+    mbs.print_report(
+        _tag("bf16 precision floor (bf16 MBS 1 vs fp32 MBS 1)"), floor, routers[:2] + indexers[:2]
+    )
+    for micro_batch_size in MBS[1:]:
+        losses, rows, grads = arms[micro_batch_size]
+        loss_rel = mbs.relative_loss_differences(losses, ref_losses)
+        row_rel = mbs.max_row_difference(rows, ref_rows)
+        report = mbs.floor_gate(
+            mbs.compare_gradients(grads, ref_grads, min_cosine=0.0, max_relative=1.0),
+            floor,
+            min_relative=MAX_RELATIVE,
+            factor=FLOOR_FACTOR,
         )
-        _print_report("mutant", micro_batch_size, {}, report)
-        passing = [name for name in routers + indexers if report[name]["ok"]]
-        assert not passing, mbs.worst(report, passing)
+        print(
+            f"[{_tag(f'bf16 MBS {micro_batch_size} vs 1')}] loss rel {loss_rel}; "
+            f"max row rel {row_rel:.2e}",
+            flush=True,
+        )
+        mbs.print_report(
+            _tag(f"bf16 MBS {micro_batch_size} vs 1"), report, routers[:2] + indexers[:2]
+        )
+        assert all(value <= 1e-3 for value in loss_rel.values()), loss_rel
+        assert row_rel <= 1e-3, row_rel
+        failing = [name for name, r in report.items() if not r["ok"]]
+        assert not failing, mbs.worst(report, failing)
+
+
+def test_per_microbatch_mean_aux_scaling_is_caught(results):
+    """The 1 / b mutation fails the fp32 gate and the bf16 floor gate on every learned router
+    weight and every indexer weight."""
+    out, routers, indexers = results
+    floor = _precision_floor(out)
+    for precision in ("fp32", "bf16"):
+        _, _, ref_grads = out[(precision, False)][1]
+        for micro_batch_size in MBS[1:]:
+            _, _, grads = out[(precision, True)][micro_batch_size]
+            if precision == "fp32":
+                report = mbs.compare_gradients(
+                    grads, ref_grads, min_cosine=MIN_COSINE, max_relative=MAX_RELATIVE
+                )
+            else:
+                report = mbs.floor_gate(
+                    mbs.compare_gradients(grads, ref_grads, min_cosine=0.0, max_relative=1.0),
+                    floor,
+                    min_relative=MAX_RELATIVE,
+                    factor=FLOOR_FACTOR,
+                )
+            mbs.print_report(
+                _tag(f"mutant {precision} MBS {micro_batch_size} vs 1"),
+                report,
+                routers[:2] + indexers[:2],
+            )
+            passing = [name for name in routers + indexers if report[name]["ok"]]
+            assert not passing, mbs.worst(report, passing)

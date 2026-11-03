@@ -8,7 +8,7 @@ layers, the fused mHC kernels) at the micro-batch size the arms choose. This tes
 b-row microbatch gives the step of b one-row microbatches over the same rows: one training step
 of a Flash-width loop slice through the real no-pipelining schedule, DDP (fp32 gradient
 reduction) and ``finalize_model_grads`` under ``calculate_per_token_loss``
-(``mbs_invariance_utils``), b = 4 (4 x 1 vs 1 x 4) and b = 8 (8 x 1 vs 1 x 8; 32,768 query rows
+(``mbs_invariance_utils``), b = 4 (1 x 4 vs 4 x 1) and b = 8 (1 x 8 vs 8 x 1; 32,768 query rows
 per fused indexer call, the fused indexer's verified-safe row limit).
 
 Slice (one GPU, EP 1; ``loop_hybrid_dsv4_stack_spec``): DSv4 Flash widths (hidden 4096, 64
@@ -16,21 +16,26 @@ heads, q LoRA 1024, v head 512, rope head 64, output groups 8 x LoRA 1024, qk la
 window 128; indexer 64 x 128, top-512, sparse loss 1e-2), pattern ``'WEWECEHECEHECE'``: prelude
 ``WEWECE`` (three hash-routed MoE layers), core ``HECE`` run exactly 4 times, coda ``HECE``; no
 MTP. MoE 16 experts (FFN 2048) + one shared expert, top-6 sqrtsoftplus, top-k scaling 1.5,
-expert bias, sequence aux loss 1e-4, clamp 10; mHC 4 streams (Sinkhorn 20, fused); bf16;
-``loop_recompute`` (round checkpoints) so b = 8 fits one GB200; sequence 4096; vocabulary 4096
-(the heads are not under test).
+expert bias, sequence aux loss 1e-4, SwiGLU with the clamp; mHC 4 streams (Sinkhorn 20, fused);
+bf16; ``loop_recompute`` (round checkpoints) so b = 8 fits one GB200; sequence 4096; vocabulary
+4096 (the heads are not under test).
 
-Gate (bf16): every attached loss sum (LM, aux, indexer) within 1e-3 relative; every parameter
-gradient cosine >= 0.9999 and relative norm difference <= 1e-3, including the indexer
-(``linear_wq_b``, ``linear_weights_proj``, its compressor) and the attention compressors
-(``linear_wkv``, ``linear_wgate``, ``ape``, ``norm``). Both with deterministic kernels and with
-training's non-deterministic ones (``deterministic_mode`` False, as the recipes run); the latter
-also reports the noise floor (the 1-row arm against itself).
+The fused kernels are bf16-only, so the comparison is bf16 with a measured floor per parameter
+(FSDP-arm deviations D6): the floor is the fused path's own run-to-run difference (the 1-row arm
+twice with training's non-deterministic kernels). Gates, with deterministic kernels and with
+training's: every attached loss sum (LM, aux, indexer) and every row's LM loss within 1e-3
+relative; every parameter gradient (the indexer's ``linear_wq_b``, ``linear_weights_proj`` and
+compressor, the attention compressors' ``linear_wkv``, ``linear_wgate``, ``ape`` and ``norm``
+included) within max(1e-3, 3 x floor) of the 1-row arm.
 
 Recorded (printed, not gated): the batch sizes the fused CSA indexer + sparse attention ran at,
-that the unfused CSA path never ran, and whether the DSA cuDNN sparse indexer loss path
+that the unfused CSA path never ran, and whether the DSA cuDNN sparse indexer-loss path
 (``dsa_cudnn_kernels._compute_sparse_indexer_loss_and_grads``, whose b > 1 top-k offset site
 is the known 'D'-path issue) was reached; Flash builds only W / C / H, so it should not be.
+
+The fused path needs a cuDNN Frontend whose compact DSA indexer wrapper takes ``deterministic``
+(``TransformerConfig`` refuses ``dsa_kernel_backend='cudnn'`` otherwise); without one the module
+is skipped with that error as the reason.
 """
 
 import collections
@@ -52,8 +57,8 @@ PATTERN = "WEWECEHECEHECE"
 _RATIOS = {"W": 0, "C": 4, "H": 128, "E": 0}
 SEQ = 4096
 VOCAB = 4096
-MIN_COSINE = 0.9999
 MAX_RELATIVE = 1e-3
+FLOOR_FACTOR = 3.0
 
 
 @pytest.fixture(scope="module", autouse=True)
@@ -65,15 +70,11 @@ def _model_parallel():
         yield
 
 
-def _model():
-    from megatron.core.models.hybrid.hybrid_model import HybridModel
-    from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
+def _config():
     from megatron.core.transformer.enums import AttnBackend
-    from megatron.core.transformer.loop.hybrid_specs import loop_hybrid_dsv4_stack_spec
-    from megatron.core.transformer.moe.moe_logging import MoEMetricsTracker, set_moe_metrics_tracker
     from megatron.core.transformer.transformer_config import MLATransformerConfig
 
-    config = MLATransformerConfig(
+    return MLATransformerConfig(
         num_layers=len(PATTERN),
         hidden_size=4096,
         num_attention_heads=64,
@@ -145,6 +146,14 @@ def _model():
         deterministic_mode=False,
         attention_backend=AttnBackend.auto,
     )
+
+
+def _model(config):
+    from megatron.core.models.hybrid.hybrid_model import HybridModel
+    from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
+    from megatron.core.transformer.loop.hybrid_specs import loop_hybrid_dsv4_stack_spec
+    from megatron.core.transformer.moe.moe_logging import MoEMetricsTracker, set_moe_metrics_tracker
+
     torch.manual_seed(1234)
     model_parallel_cuda_manual_seed(1234)
     set_moe_metrics_tracker(MoEMetricsTracker())
@@ -160,9 +169,20 @@ def _model():
 
 @pytest.fixture(scope="module")
 def runner():
-    # Per-arm gradients go to host memory: three fp32 copies of a 3.8 B-parameter slice do not
-    # fit next to the b = 8 activations.
-    return mbs.StepRunner(_model(), grads_device="cpu")
+    try:
+        config = _config()
+    except ValueError as exc:
+        if "cuDNN Frontend" not in str(exc):
+            raise
+        import cudnn
+
+        pytest.skip(
+            f"fused DSv4 path unavailable in this environment (cudnn-frontend "
+            f"{getattr(cudnn, '__version__', '?')}): {exc}"
+        )
+    # Per-arm gradients go to host memory: several fp32 copies of a 3.8 B-parameter slice do
+    # not fit next to the b = 8 activations.
+    return mbs.StepRunner(_model(config), grads_device="cpu")
 
 
 class _KernelLog:
@@ -211,9 +231,7 @@ def _checked_weight_names(model):
     return {key: [name for name in names if key in name] for key in wanted}
 
 
-@pytest.mark.parametrize("deterministic", [True, False], ids=["deterministic", "training"])
-@pytest.mark.parametrize("batch", [4, 8])
-def test_fused_kernels_batch_equals_single_rows(runner, monkeypatch, batch, deterministic):
+def _set_kernels(monkeypatch, runner, deterministic):
     from megatron.training.determinism import DETERMINISM_ENV_VAR_DEFAULTS
 
     if deterministic:
@@ -222,61 +240,68 @@ def test_fused_kernels_batch_equals_single_rows(runner, monkeypatch, batch, dete
     else:
         monkeypatch.setenv("NVTE_ALLOW_NONDETERMINISTIC_ALGO", "1")
     monkeypatch.setattr(runner.model.config, "deterministic_mode", deterministic)
-    previous = torch.are_deterministic_algorithms_enabled()
     torch.use_deterministic_algorithms(deterministic, warn_only=True)
+
+
+@pytest.mark.parametrize("batch", [4, 8])
+def test_fused_kernels_batch_equals_single_rows(runner, monkeypatch, batch):
     log = _KernelLog(monkeypatch)
     rows = mbs.make_rows(batch, SEQ, VOCAB, seed=777)
+    previous = torch.are_deterministic_algorithms_enabled()
+    arms = {}
     try:
         with warnings.catch_warnings(record=True) as caught:
             warnings.simplefilter("always")
-            singles = runner.run(rows, 1, seq=SEQ)
-            batched = runner.run(rows, batch, seq=SEQ)
-            floor = None if deterministic else runner.run(rows, 1, seq=SEQ)
+            for deterministic in (False, True):
+                _set_kernels(monkeypatch, runner, deterministic)
+                mode = "deterministic" if deterministic else "training"
+                arms[(mode, 1)] = runner.run(rows, 1, seq=SEQ)
+                arms[(mode, batch)] = runner.run(rows, batch, seq=SEQ)
+                if not deterministic:
+                    arms[(mode, "1 again")] = runner.run(rows, 1, seq=SEQ)
     finally:
         torch.use_deterministic_algorithms(previous)
-    ref_losses, ref_grads = singles
-    losses, grads = batched
-    loss_rel = mbs.relative_loss_differences(losses, ref_losses)
-    report = mbs.compare_gradients(
-        grads, ref_grads, min_cosine=MIN_COSINE, max_relative=MAX_RELATIVE
-    )
-    fallbacks = [str(w.message) for w in caught if "falling back" in str(w.message)]
-    tag = f"b={batch} {'deterministic' if deterministic else 'training'}"
+    fallbacks = sorted({str(w.message)[:160] for w in caught if "falling back" in str(w.message)})
     print(
-        f"[T7] {tag}: fused CSA indexer calls by batch {dict(log.fused_indexer_batches)}; "
-        f"unfused CSA calls {log.unfused_csa}; DSA cuDNN sparse indexer-loss calls "
-        f"(the 'D' path with the b > 1 offset site) {log.dsa_sparse_indexer_loss}; "
-        f"fallback warnings {fallbacks}",
+        f"[T7 b={batch}] fused CSA indexer calls by batch {dict(log.fused_indexer_batches)}; "
+        f"unfused CSA calls {log.unfused_csa}; DSA cuDNN sparse indexer-loss calls (the 'D' "
+        f"path with the b > 1 offset site) {log.dsa_sparse_indexer_loss}; fallback warnings "
+        f"{fallbacks}",
         flush=True,
     )
-    print(
-        f"[T7] {tag}: loss rel {loss_rel}; params {len(report)}, failing "
-        f"{sum(not r['ok'] for r in report.values())}, min cosine "
-        f"{min(r['cosine'] for r in report.values()):.8f}, max rel "
-        f"{max(r['relative'] for r in report.values()):.3e}; worst: {mbs.worst(report)}",
-        flush=True,
+    floor = mbs.compare_gradients(
+        arms[("training", "1 again")][2], arms[("training", 1)][2], min_cosine=0.0, max_relative=1.0
     )
-    if floor is not None:
-        floor_report = mbs.compare_gradients(
-            floor[1], ref_grads, min_cosine=MIN_COSINE, max_relative=MAX_RELATIVE
-        )
-        print(
-            f"[T7] {tag}: noise floor (1-row arm twice): loss rel "
-            f"{mbs.relative_loss_differences(floor[0], ref_losses)}; min cosine "
-            f"{min(r['cosine'] for r in floor_report.values()):.8f}, max rel "
-            f"{max(r['relative'] for r in floor_report.values()):.3e}; worst: "
-            f"{mbs.worst(floor_report)}",
-            flush=True,
-        )
+    checked = [name for names in _checked_weight_names(runner.model).values() for name in names]
+    mbs.print_report(f"T7 b={batch} floor (training, 1-row arm twice)", floor, checked[:6])
     # The fused path ran at both batch sizes and the unfused CSA path never did.
     assert log.fused_indexer_batches[1] > 0 and log.fused_indexer_batches[batch] > 0
     assert log.unfused_csa == 0
     # The gate covers the indexer and compressor weights, and they train.
+    ref_losses, _, ref_grads = arms[("training", 1)]
     for key, names in _checked_weight_names(runner.model).items():
         assert names, key
         for name in names:
             assert ref_grads[name].norm() > 0, name
-    assert ref_losses["lm"] != 0.0 and ref_losses["aux"] != 0.0 and ref_losses["indexer"] != 0.0
-    assert all(value <= 1e-3 for value in loss_rel.values()), loss_rel
-    failing = [name for name, r in report.items() if not r["ok"]]
-    assert not failing, mbs.worst(report, failing)
+    assert all(ref_losses[key] != 0.0 for key in ("lm", "aux", "indexer")), ref_losses
+    failures = []
+    for mode in ("deterministic", "training"):
+        ref_losses, ref_rows, ref_grads = arms[(mode, 1)]
+        losses, rows_b, grads = arms[(mode, batch)]
+        loss_rel = mbs.relative_loss_differences(losses, ref_losses)
+        row_rel = mbs.max_row_difference(rows_b, ref_rows)
+        report = mbs.floor_gate(
+            mbs.compare_gradients(grads, ref_grads, min_cosine=0.0, max_relative=1.0),
+            floor,
+            min_relative=MAX_RELATIVE,
+            factor=FLOOR_FACTOR,
+        )
+        tag = f"T7 b={batch} {mode} {batch} x 1 vs 1 x {batch}"
+        print(f"[{tag}] loss rel {loss_rel}; max row rel {row_rel:.2e}", flush=True)
+        mbs.print_report(tag, report, checked[:6])
+        if any(value > 1e-3 for value in loss_rel.values()) or row_rel > 1e-3:
+            failures.append(f"{mode}: loss rel {loss_rel}, max row rel {row_rel:.2e}")
+        failing = [name for name, r in report.items() if not r["ok"]]
+        if failing:
+            failures.append(f"{mode}: {len(failing)} params: {mbs.worst(report, failing)}")
+    assert not failures, failures

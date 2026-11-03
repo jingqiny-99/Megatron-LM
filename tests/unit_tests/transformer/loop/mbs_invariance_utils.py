@@ -12,6 +12,7 @@ count under ``calculate_per_token_loss``). Per arm it returns:
   and the auxiliary losses as attached to the graph by ``MoEAuxLossAutoScaler`` (sequence aux),
   ``MTPLossAutoScaler`` (MTP) and ``DSAIndexerLossAutoScaler`` (DSA / CSA indexer); activation
   replays (``forward_replay``) are not counted, they rebuild what the forward attached;
+* every row's LM loss (masked token sum), in row order;
 * every parameter's final fp32 gradient (``main_grad`` after ``finalize_model_grads``).
 
 Arms run on one model object: its buffers (router expert biases and token counts, which
@@ -19,12 +20,17 @@ Arms run on one model object: its buffers (router expert biases and token counts
 same state. ``per_microbatch_mean_aux_scaling`` is the mutation the invariance tests must catch:
 auxiliary and indexer loss gradients scaled by ``1 / micro_batch_size``, i.e. averaged over the
 rows of a microbatch instead of summed like the per-token LM loss.
+
+Comparisons. ``compare_gradients`` gives per parameter the cosine and the relative norm
+difference ``|g - g_ref| / |g_ref|``. A bf16 comparison of two different GEMM shapes differs by
+rounding that the network amplifies, so its per-parameter gate is relative to a measured floor
+of the same parameter (``floor_gate``): ``rel <= max(min_relative, factor * floor_rel)``.
 """
 
 import contextlib
 import functools
 import math
-from typing import Dict, List, Sequence
+from typing import Dict, List, Optional, Sequence
 
 import torch
 
@@ -56,12 +62,15 @@ def _microbatches(rows, micro_batch_size: int) -> List[dict]:
 class _Recorder:
     def __init__(self):
         self.sums = {key: 0.0 for key in LOSS_KEYS}
+        self.rows: List[float] = []
 
     def add(self, key, value):
         self.sums[key] += float(value.detach().double().sum())
 
 
 def _loss_func(recorder, loss_mask, output):
+    masked = output.float() * loss_mask.float()
+    recorder.rows.extend(masked.detach().double().sum(dim=1).tolist())
     losses = output.view(-1).float()
     mask = loss_mask.view(-1).float()
     loss = torch.sum(losses * mask)
@@ -180,7 +189,7 @@ class StepRunner:
         self._buffers = {name: buf.detach().clone() for name, buf in model.named_buffers()}
 
     def run(self, rows, micro_batch_size: int, *, seq: int):
-        """``(attached loss sums, {name: final fp32 gradient})`` of one step."""
+        """``(attached loss sums, per-row LM losses, {name: final fp32 gradient})``."""
         from megatron.core.pipeline_parallel import get_forward_backward_func
 
         with torch.no_grad():
@@ -205,7 +214,7 @@ class StepRunner:
             for name, param in self.model.named_parameters()
             if param.requires_grad
         }
-        return recorder.sums, grads
+        return recorder.sums, recorder.rows, grads
 
 
 def compare_gradients(
@@ -230,6 +239,7 @@ def compare_gradients(
                 cosine=1.0 if both_zero else 0.0,
                 relative=0.0 if both_zero else math.inf,
                 norm=expected_norm,
+                numel=expected.numel(),
                 ok=both_zero,
             )
             continue
@@ -239,9 +249,23 @@ def compare_gradients(
             cosine=cosine,
             relative=relative,
             norm=expected_norm,
+            numel=expected.numel(),
             ok=cosine >= min_cosine and relative <= max_relative,
         )
     return report
+
+
+def floor_gate(
+    report: Dict[str, dict], floor: Dict[str, dict], *, min_relative: float, factor: float
+) -> Dict[str, dict]:
+    """``report`` re-gated per parameter against a measured floor of the same parameter:
+    ``relative <= max(min_relative, factor * floor relative)`` (cosine reported, not gated)."""
+    out = {}
+    for name, entry in report.items():
+        bound = max(min_relative, factor * floor[name]["relative"])
+        out[name] = dict(entry, floor=floor[name]["relative"], bound=bound)
+        out[name]["ok"] = entry["relative"] <= bound
+    return out
 
 
 def relative_loss_differences(losses: dict, reference: dict) -> Dict[str, float]:
@@ -256,11 +280,45 @@ def relative_loss_differences(losses: dict, reference: dict) -> Dict[str, float]
     return out
 
 
-def worst(report: Dict[str, dict], names: Sequence[str] = None) -> str:
+def max_row_difference(rows: Sequence[float], reference: Sequence[float]) -> float:
+    """The largest relative difference between per-row LM losses (same row order)."""
+    assert len(rows) == len(reference), (len(rows), len(reference))
+    return max(abs(a - b) / abs(b) for a, b in zip(rows, reference))
+
+
+def worst(report: Dict[str, dict], names: Optional[Sequence[str]] = None, count: int = 5) -> str:
     """A one-line summary of the worst parameters of ``report`` (for assertion messages)."""
     items = [(name, report[name]) for name in (names or report)]
     items.sort(key=lambda item: (item[1]["ok"], -item[1]["relative"]))
     return "; ".join(
         f"{name}: cos {r['cosine']:.6f} rel {r['relative']:.2e} |g| {r['norm']:.2e}"
-        for name, r in items[:5]
+        + (f" floor {r['floor']:.2e}" if "floor" in r else "")
+        for name, r in items[:count]
     )
+
+
+def print_report(tag: str, report: Dict[str, dict], focus: Sequence[str] = ()) -> None:
+    """Rank 0: the distribution of ``relative`` over parameters, the 8 worst parameters and
+    every ``focus`` parameter (diagnostics for the per-rank logs)."""
+    if torch.distributed.get_rank() != 0:
+        return
+    rels = sorted(r["relative"] for r in report.values())
+
+    def quantile(q):
+        return rels[min(len(rels) - 1, int(q * (len(rels) - 1)))]
+
+    print(
+        f"[{tag}] params {len(report)}, failing {sum(not r['ok'] for r in report.values())}; "
+        f"relative p50 {quantile(0.5):.2e} p90 {quantile(0.9):.2e} max {rels[-1]:.2e}; "
+        f"min cosine {min(r['cosine'] for r in report.values()):.8f}",
+        flush=True,
+    )
+    print(f"[{tag}] worst: {worst(report, count=8)}", flush=True)
+    for name in focus:
+        r = report[name]
+        extra = f" floor {r['floor']:.2e} bound {r['bound']:.2e}" if "floor" in r else ""
+        print(
+            f"[{tag}]   {name}: cos {r['cosine']:.8f} rel {r['relative']:.2e} "
+            f"|g| {r['norm']:.2e}{extra} {'ok' if r['ok'] else 'FAIL'}",
+            flush=True,
+        )
