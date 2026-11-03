@@ -380,6 +380,11 @@ class LoggerConfig:
     log_device_memory_used: bool = False
     """Log device memory used (as reported by nvidia-smi)."""
 
+    log_memory_max_over_ranks: bool = False
+    """With every memory report, also print on rank 0 its values maximized over all ranks, with
+    the rank that holds each maximum. A memory report otherwise prints the values of
+    data-parallel rank 0 only. Costs one all-gather of a few integers per report, on every rank."""
+
     log_l2_norm_grad_to_tensorboard: bool = False
     """Enable gradients logging to tensorboard."""
 

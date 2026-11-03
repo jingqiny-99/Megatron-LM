@@ -420,6 +420,53 @@ def report_memory(name, process_group=None):
     )
     if is_dp_rank_0:
         print("[Rank {}] {}".format(torch.distributed.get_rank(), string), flush=True)
+    if cfg.logger.log_memory_max_over_ranks:
+        _report_memory_max_over_ranks(name, cfg.logger.log_device_memory_used)
+
+
+_MEMORY_REPORT_FIELDS = (
+    "allocated",
+    "max allocated",
+    "reserved",
+    "max reserved",
+    "total device memory used",
+)
+
+
+def _report_memory_max_over_ranks(name, log_device_memory_used):
+    """Print on global rank 0 one memory report's values maximized over all ranks.
+
+    Every rank's allocated / max allocated / reserved / max reserved bytes (and the device
+    memory used, when logged) are all-gathered, so every rank must call this at the same point.
+    ``report_memory``'s training call sites do: their conditions depend only on the iteration
+    and on values that are equal on every rank. The printed line has the per-rank report's
+    fields, prefixed ``[Max over <world size> ranks]``, and then the rank of each maximum.
+    """
+    if not (torch.distributed.is_available() and torch.distributed.is_initialized()):
+        return
+    values = [
+        torch.cuda.memory_allocated(),
+        torch.cuda.max_memory_allocated(),
+        torch.cuda.memory_reserved(),
+        torch.cuda.max_memory_reserved(),
+    ]
+    if log_device_memory_used:
+        values.append(torch.cuda.device_memory_used())
+    device = torch.cuda.current_device() if torch.cuda.is_available() else "cpu"
+    local = torch.tensor(values, dtype=torch.int64, device=device)
+    gathered = [torch.empty_like(local) for _ in range(torch.distributed.get_world_size())]
+    torch.distributed.all_gather(gathered, local)
+    if torch.distributed.get_rank() != 0:
+        return
+    peaks, ranks = torch.stack(gathered).cpu().max(dim=0)
+    mega_bytes = 1024.0 * 1024.0
+    string = f"[Max over {len(gathered)} ranks] {name} memory (MB)"
+    for field, peak in zip(_MEMORY_REPORT_FIELDS, peaks.tolist()):
+        string += f" | {field}: {peak / mega_bytes:.2f}"
+    string += " | rank of each maximum: " + ", ".join(
+        f"{field} {rank}" for field, rank in zip(_MEMORY_REPORT_FIELDS, ranks.tolist())
+    )
+    print_rank_0(string)
 
 
 def print_params_min_max_norm(optimizer, iteration):
