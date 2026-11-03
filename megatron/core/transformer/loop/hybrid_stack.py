@@ -67,7 +67,7 @@ sharded_state_dict`` build in the store's logical view), so the keys do not depe
 """
 
 import dataclasses
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 from typing import Optional
 
 import torch
@@ -105,6 +105,33 @@ from megatron.core.transformer.loop_transformer_block import (
     loop_checkpoint_context_fn,
     token_depth_distribution,
 )
+from megatron.core.utils import nvtx_profiling_enabled
+
+
+@contextmanager
+def loop_range(name: str):
+    """``torch.profiler.record_function(name)`` that is also the NVTX range ``name`` while
+    Megatron's NVTX ranges are on (``--nvtx-ranges``: the nsys-profiled steps only;
+    ``configure_nvtx_profiling``), and nothing more otherwise. No tensor op.
+
+    The hybrid loop names its ranges ``loop_hybrid/mb={m}`` (one forward of a microbatch),
+    ``.../prelude`` and ``.../coda`` (block = the edge checkpoints), ``.../loop={r}`` (round r),
+    ``.../block={k}`` (one block checkpoint; inside the checkpointed function, so its recompute
+    in the backward opens it again on the autograd thread) and ``.../layer={i}`` (sublayer i).
+
+    The NVTX range is a start / end range, not a push / pop range: a non-reentrant checkpoint's
+    recompute stops early by raising through the checkpointed function
+    (``torch.utils.checkpoint`` early stop), which skips the pops of Megatron's push / pop ranges
+    inside it (``nvtx_range_push``; their stack keeps the stale entries). A start / end range
+    ends where it was opened whatever is left on that stack, and touches neither stack.
+    """
+    handle = torch.cuda.nvtx.range_start(name) if nvtx_profiling_enabled() else None
+    try:
+        with torch.profiler.record_function(name):
+            yield
+    finally:
+        if handle is not None:
+            torch.cuda.nvtx.range_end(handle)
 
 
 class LoopStreamRMSNorm(nn.Module):
@@ -385,7 +412,7 @@ class LoopHybridStack(HybridStack):
         sequence = hidden_states.shape[0]
         tokens = sequence * hidden_states.shape[1]
         squared_lengths = tokens * sequence
-        with torch.profiler.record_function(label):
+        with loop_range(label):
             self._record_range(
                 0,
                 roles.core_start,
@@ -518,7 +545,7 @@ class LoopHybridStack(HybridStack):
         hook = self._loop_store_hook
         layer = self.layers[index]
         visit = nullcontext() if hook is None else hook.visit("sub", index)
-        with visit, torch.profiler.record_function(f"{label}/layer={index}"):
+        with visit, loop_range(f"{label}/layer={index}"):
             if x.shape[0] == 0:
                 residual_accumulator = x
                 if ctx.return_layer_delta:
@@ -542,14 +569,16 @@ class LoopHybridStack(HybridStack):
 
     def _run_edge(self, x, start, end, ctx, label):
         """The prelude or the coda (sublayers ``[start, end)``): block checkpoints with
-        ``loop_recompute_edges`` in grad mode (``_checkpointed_blocks``), else ``_run_range``."""
-        if (
-            self.config.loop_recompute
-            and self.config.loop_recompute_edges
-            and torch.is_grad_enabled()
-        ):
-            return self._checkpointed_blocks(x, None, start, end, ctx, label)
-        return self._run_range(x, start, end, ctx, label)
+        ``loop_recompute_edges`` in grad mode (``_checkpointed_blocks``), else ``_run_range``.
+        Inside the profiler / NVTX range ``label`` (``loop_range``)."""
+        with loop_range(label):
+            if (
+                self.config.loop_recompute
+                and self.config.loop_recompute_edges
+                and torch.is_grad_enabled()
+            ):
+                return self._checkpointed_blocks(x, None, start, end, ctx, label)
+            return self._run_range(x, start, end, ctx, label)
 
     def _checkpointed_blocks(self, x, injection, start, end, ctx, label, step=None):
         """Run sublayers ``[start, end)`` as non-reentrant activation checkpoints of
@@ -571,6 +600,10 @@ class LoopHybridStack(HybridStack):
         replay, ``_diagnostics_active``) and then applies the loop norm (none on the residual
         carrier). One block (stride = the round's sublayers) is the round checkpoint under a
         block label. Without ``step`` (the prelude and coda edges) blocks run sublayers only.
+
+        The checkpointed function opens the profiler / NVTX range ``{label}/block={k}``
+        (``loop_range``), so the range appears in the forward and again in the block's
+        recompute during the backward.
         """
         stride = self.config.loop_recompute_block_stride
         cuts = list(range(start, end, stride))
@@ -583,15 +616,24 @@ class LoopHybridStack(HybridStack):
             tail = step is not None and k == len(bounds)
 
             # Bind the block's bounds in the closure: its replay runs in the backward.
-            def block(h, *injected, first=first, last=last, adapter=adapter, tail=tail):
-                if adapter:
-                    h = self._adapt(h, injected[0], step)
-                h = self._run_range(h, first, last, ctx, label)
-                if tail:
-                    if self._diagnostics_active():
-                        self._note_state_rms(f"loop state rms r{step + 1}", h, ctx.padding_mask)
-                    if not residual:
-                        h = self._loop_norm(step)(h)
+            def block(
+                h,
+                *injected,
+                first=first,
+                last=last,
+                adapter=adapter,
+                tail=tail,
+                name=f"{label}/block={k}",
+            ):
+                with loop_range(name):
+                    if adapter:
+                        h = self._adapt(h, injected[0], step)
+                    h = self._run_range(h, first, last, ctx, label)
+                    if tail:
+                        if self._diagnostics_active():
+                            self._note_state_rms(f"loop state rms r{step + 1}", h, ctx.padding_mask)
+                        if not residual:
+                            h = self._loop_norm(step)(h)
                 return h
 
             x = checkpoint(
@@ -825,7 +867,7 @@ class LoopHybridStack(HybridStack):
                 core_start=core_start,
                 core_end=core_end,
             ):
-                with torch.profiler.record_function(f"{label}/loop={step + 1}"):
+                with loop_range(f"{label}/loop={step + 1}"):
                     adapted = previous if residual else self._adapt(previous, injection, step)
                     output = self._run_range(
                         adapted, core_start, core_end, round_ctx, f"{label}/loop={step + 1}"
@@ -850,7 +892,7 @@ class LoopHybridStack(HybridStack):
                 ):
                     # Block checkpoints: the round body cut into blocks of the stride.
                     round_label = f"{label}/loop={step + 1}"
-                    with torch.profiler.record_function(round_label):
+                    with loop_range(round_label):
                         updated = self._checkpointed_blocks(
                             state, embedding, core_start, core_end, round_ctx, round_label, step
                         )
