@@ -419,15 +419,18 @@ def test_local_linear_fused_wgrad_follows_overwrite_main_grad(overwrite):
     """Megatron's own fused-wgrad linear (``tensor_parallel.layers``) treats a Megatron-FSDP
     weight as TE does: it writes over the bucket only under ``overwrite_main_grad`` (unset:
     the legacy overwrite). The weight has no ``grad_added_to_main_grad`` so that the backward
-    returns no dummy gradient (that branch allocates on the current CUDA device)."""
+    returns no dummy gradient (that branch allocates on the current CUDA device). On the test
+    device (with TE on CUDA the wgrad GEMM is TE's); integer-valued inputs keep every GEMM path
+    exact (TF32 included)."""
     from megatron.core.tensor_parallel.layers import (
         linear_with_grad_accumulation_and_async_allreduce,
     )
 
+    device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
     generator = torch.Generator().manual_seed(7)
-    weight = torch.nn.Parameter(torch.randn(4, 3, generator=generator))
-    inputs = torch.randn(5, 2, 3, generator=generator)
-    bucket = torch.full((4, 3), 5.0)
+    weight = torch.nn.Parameter(torch.randn(4, 3, generator=generator).to(device))
+    inputs = torch.randint(-4, 5, (5, 2, 3), generator=generator).float().to(device)
+    bucket = torch.full((4, 3), 5.0, device=device)
     weight.__fsdp_param__ = True
     weight.get_main_grad = lambda: bucket
     if overwrite is not None:
@@ -442,9 +445,9 @@ def test_local_linear_fused_wgrad_follows_overwrite_main_grad(overwrite):
         tp_group=object(),
     )
     out.sum().backward()
-    wgrad = torch.ones(5 * 2, 4).t() @ inputs.reshape(-1, 3)
+    wgrad = inputs.reshape(-1, 3).sum(dim=0).expand(4, 3)  # ones^T @ inputs: integer sums
     expected = wgrad if overwrite in (True, None) else 5.0 + wgrad
-    assert torch.allclose(bucket, expected, rtol=1e-6, atol=1e-6)
+    assert torch.equal(bucket, expected), (bucket, expected)
     assert weight.grad is None
 
 
