@@ -35,8 +35,9 @@ weight's gradient, orders of magnitude above the gate.
   bound. Every parameter's comparison is printed (rank 0: distribution and worst) and dumped.
 * The noise floor (``ref`` vs ``ref`` in reverse microbatch order) is reported and passes the gate.
 * The attached losses (LM, MTP, sequence aux, indexer) and every row's LM loss equal ``ref``'s
-  within 1e-6 relative (the forward is the same function of the same weights in every arm), and
-  every round 1..4 records MoE statistics.
+  within 1e-6 relative (the forward is the same function of the same weights in every arm but the
+  ``loop_bptt_iterations`` mutants, whose round 1 runs under ``no_grad`` and attaches no aux or
+  indexer loss), and every round 1..4 records MoE statistics.
 * Teeth, both must fail: (a) ``loop_bptt_iterations = 3`` (round 1 under ``no_grad``) on ``f1``
   and ``z3``: every resolved core parameter fails; (b) the legacy overwrite (Megatron-FSDP
   without accumulate mode, the loop guard bypassed) on ``z2`` and ``z3``: every core weight that
@@ -496,11 +497,12 @@ def test_noise_floor_reverse_microbatch_order(results):
     assert not failing, mbs.worst(report, failing)
 
 
-@pytest.mark.parametrize(
-    "arm", ["ref_reversed", "f1", "z2", "z3", "f1_bptt3", "z3_bptt3", "z2_legacy", "z3_legacy"]
-)
+@pytest.mark.parametrize("arm", ["ref_reversed", "f1", "z2", "z3", "z2_legacy", "z3_legacy"])
 def test_losses_and_rows_match_the_reference(results, arm):
-    """Every arm computes the same forward: the attached loss sums and every row's LM loss."""
+    """Every arm computes the same forward: the attached loss sums and every row's LM loss.
+    The ``loop_bptt_iterations = 3`` mutants are not compared: their round 1 runs under
+    ``no_grad``, which attaches no sequence aux or indexer loss (round 1's share is missing from
+    those sums) and may run other kernels (inference-mode compiled graphs)."""
     reference, _ = results["ref"]
     step, _ = results[arm]
     rows = step.rows[::-1] if arm == "ref_reversed" else step.rows
@@ -597,7 +599,11 @@ def test_model_only_load_before_the_megatron_fsdp_wrap(results, tmp_path_dist_ck
         saved = _model(results["reference_state"])
         saved_ddp = _ddp(saved)
         with cku.mock_checkpoint_args(
-            ckpt_dir, loop_config=saved.config, no_save_optim=True, no_save_rng=True
+            ckpt_dir,
+            loop_config=saved.config,
+            no_save_optim=True,
+            no_save_rng=True,
+            hybrid_layer_pattern=PATTERN,
         ):
             cku.save(saved_ddp, None, full, iteration=1)
         _release(saved_ddp)
@@ -615,6 +621,7 @@ def test_model_only_load_before_the_megatron_fsdp_wrap(results, tmp_path_dist_ck
             dist_ckpt_strictness="raise_unexpected",
             ckpt_format="fsdp_dtensor",
             use_megatron_fsdp=True,
+            hybrid_layer_pattern=PATTERN,
         ) as args:
             iteration, _ = _load_loop_model_before_megatron_fsdp_wrap([model], args)
             assert args.ckpt_format == "fsdp_dtensor"
