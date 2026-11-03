@@ -4600,11 +4600,16 @@ def setup_model_and_optimizer(
         initialize_dsa_metric_tracker(unwrapped_model, pg_collection)
 
     # --loop-param-checksums: the loaded (or initial) weights of a hybrid loop model, one line per
-    # tensor keyed by its PP = 1 name (a collective on every rank; printed by rank 0).
+    # tensor keyed by its PP = 1 name, and with an optimizer every parameter's optimizer group
+    # (collectives on every rank; printed by rank 0).
     if getattr(args, "loop_param_checksums", False):
-        from megatron.training.loop_ring_report import log_loop_param_checksums
+        from megatron.training.loop_ring_report import (
+            log_loop_optimizer_groups,
+            log_loop_param_checksums,
+        )
 
         log_loop_param_checksums(model)
+        log_loop_optimizer_groups(model, optimizer)
 
     return model, optimizer, opt_param_scheduler
 

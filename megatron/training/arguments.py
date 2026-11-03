@@ -3982,7 +3982,10 @@ def _add_loop_planner_args(parser):
         '(a loop ring chunk\'s layer indices and the routed experts\' local indices made '
         'global): element count, dtype, the exact integer sum of the raw element bits, and the '
         'float64 sum and sum of squares (megatron/training/loop_ring_report.py). Runs of '
-        'different layouts loaded from one checkpoint print equal lines.',
+        'different layouts loaded from one checkpoint print equal lines. With an optimizer it '
+        'also prints every parameter\'s optimizer group (weight-decay and LR multipliers, '
+        'expert-parallel flag, decoupled LR, LR bounds) and the decay / no-decay tensor and '
+        'element counts.',
     )
     group.add_argument(
         '--loop-planner',

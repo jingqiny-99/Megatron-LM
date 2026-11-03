@@ -24,8 +24,16 @@ unique-parameter census and the per-tensor parameter checksums.
   (data-parallel ranks, the MTP stage's embedding copy) must agree; a key whose holders disagree
   prints once per distinct value with ``MISMATCH``. Two runs of different layouts loaded from one
   checkpoint print the same lines.
+* ``log_loop_optimizer_groups`` (``--loop-param-checksums`` with an optimizer, after the
+  checksums): every parameter's optimizer parameter group, keyed by the same global names
+  (``loop param group <name>: numel N, wd_mult ..., lr_mult ..., is_expert_parallel ...,
+  is_decoupled_lr ..., max_lr ..., min_lr ...``), after a summary (decay and no-decay tensors and
+  elements, each name once) and one line per distinct group. Two layouts' lines differ only where
+  the layout itself changes a group (``is_expert_parallel``: Megatron reduces routed experts with
+  the dense parameters at expert-parallel size 1).
 
-For any model that is not a hybrid loop model the census and the checksums print nothing.
+For any model that is not a hybrid loop model the census, the checksums and the group lines print
+nothing.
 """
 
 import re
@@ -38,9 +46,12 @@ from megatron.training.loop_checkpoint import loop_hybrid_models
 from megatron.training.utils import print_rank_0, print_rank_last
 
 __all__ = [
+    "log_loop_optimizer_groups",
     "log_loop_param_census",
     "log_loop_param_checksums",
     "log_loop_ring_step",
+    "loop_optimizer_group_lines",
+    "loop_optimizer_groups",
     "loop_param_census",
     "loop_param_checksum_lines",
     "loop_param_checksums",
@@ -206,10 +217,14 @@ def _global_name(name: str, offset: int, routed: List[Tuple[str, int, int]]) -> 
     if entry is not None:
         prefix, start, rank = entry
         rest = name[len(prefix) + 1 :]
-        mapped = _SEQUENTIAL_EXPERT.sub(lambda m: f"local_experts.{start + int(m.group(1))}.", rest)
-        if mapped == rest:
+        # Matched, not compared: EP rank 0's shift is 0, so its names map onto themselves.
+        if _SEQUENTIAL_EXPERT.match(rest):
+            mapped = _SEQUENTIAL_EXPERT.sub(
+                lambda m: f"local_experts.{start + int(m.group(1))}.", rest
+            )
+        elif _GROUPED_EXPERT.match(rest):
             mapped = _GROUPED_EXPERT.sub(lambda m: f"{m.group(1)}{start + int(m.group(2))}", rest)
-        if mapped == rest:
+        else:
             mapped = f"{rest}@ep{rank}"
         name = f"{prefix}.{mapped}"
     if offset:
@@ -294,6 +309,126 @@ def log_loop_param_checksums(model) -> List[str]:
         return []
     lines = loop_param_checksum_lines(gathered)
     print_rank_0(f"loop param checksums: {len(lines)} lines follow")
+    for line in lines:
+        print_rank_0(line)
+    return lines
+
+
+# ---------------------------------------------------------------------------------------------
+# Optimizer parameter groups keyed by global name
+# ---------------------------------------------------------------------------------------------
+
+_GROUP_FIELDS = ("wd_mult", "lr_mult", "is_expert_parallel", "is_decoupled_lr", "max_lr", "min_lr")
+
+
+def _optimizer_param_groups(optimizer) -> Dict[int, dict]:
+    """``{id(model parameter): its param group}`` of a Megatron optimizer (each leaf of a
+    ``ChainedOptimizer``): the distributed optimizer through ``model_param_group_index_map`` (the
+    parameters of this rank's shard of each group), the mixed-precision optimizer through its
+    ``float16_groups`` / ``fp32_from_fp32_groups`` (index-aligned with the torch groups), any
+    other one through the torch groups' own parameters (the model's)."""
+    groups: Dict[int, dict] = {}
+    for leaf in getattr(optimizer, "chained_optimizers", None) or [optimizer]:
+        torch_groups = getattr(getattr(leaf, "optimizer", None), "param_groups", None) or []
+        index_map = getattr(leaf, "model_param_group_index_map", None)
+        if index_map is not None:
+            for param, (group_index, _) in index_map.items():
+                groups[id(param)] = torch_groups[group_index]
+        elif hasattr(leaf, "float16_groups"):
+            for group_index, (half, full) in enumerate(
+                zip(leaf.float16_groups, leaf.fp32_from_fp32_groups)
+            ):
+                for param in (*half, *full):
+                    groups[id(param)] = torch_groups[group_index]
+        else:
+            for group in torch_groups:
+                for param in group["params"]:
+                    groups[id(param)] = group
+    return groups
+
+
+def loop_optimizer_groups(model, optimizer) -> Dict[str, Tuple]:
+    """This rank's optimizer parameter-group membership of a hybrid loop model's parameters,
+    keyed by global name (as ``loop_param_checksums``): ``(numel, wd_mult, lr_mult,
+    is_expert_parallel, is_decoupled_lr, max_lr, min_lr)``. A parameter in no group of this rank
+    (the distributed optimizer's other shards) is left out; empty for any other model or without
+    an optimizer."""
+    if optimizer is None:
+        return {}
+    groups = _optimizer_param_groups(optimizer)
+    membership: Dict[str, Tuple] = {}
+    for hybrid in loop_hybrid_models(model):
+        ring = getattr(hybrid.decoder, "loop_ring", None)
+        offset = ring.offset if ring is not None else 0
+        routed = _routed_experts(hybrid)
+        for name, param in hybrid.named_parameters():
+            group = groups.get(id(param))
+            if group is not None:
+                membership.setdefault(
+                    _global_name(name, offset, routed),
+                    (param.numel(),) + tuple(group.get(field) for field in _GROUP_FIELDS),
+                )
+    return membership
+
+
+def _group_text(settings) -> str:
+    return ", ".join(f"{field} {value}" for field, value in zip(_GROUP_FIELDS, settings))
+
+
+def loop_optimizer_group_lines(gathered: List[Dict[str, Tuple]]) -> List[str]:
+    """The lines of every rank's ``loop_optimizer_groups``: a summary (decay: ``wd_mult > 0``, no
+    decay: ``wd_mult == 0``; tensors and elements, each name once), one line per distinct group
+    (its settings, tensors, elements) and one per name, sorted (a name whose holders disagree
+    prints once per value with ``MISMATCH ranks [...]``)."""
+    holders: Dict[str, Dict[Tuple, List[int]]] = {}
+    for rank, membership in enumerate(gathered):
+        for name, value in (membership or {}).items():
+            holders.setdefault(name, {}).setdefault(tuple(value), []).append(rank)
+    totals: Dict[Tuple, List[int]] = {}
+    lines = []
+    for name in sorted(holders):
+        values = holders[name]
+        for value, ranks in values.items():
+            line = f"loop param group {name}: numel {value[0]}, {_group_text(value[1:])}"
+            if len(values) > 1:
+                line += f" MISMATCH ranks {sorted(set(ranks))}"
+            lines.append(line)
+        numel, *settings = next(iter(values))
+        total = totals.setdefault(tuple(settings), [0, 0])
+        total[0] += 1
+        total[1] += numel
+    decay = [total for settings, total in totals.items() if (settings[0] or 0) > 0]
+    no_decay = [total for settings, total in totals.items() if not (settings[0] or 0) > 0]
+    header = [
+        f"loop optimizer groups: {len(holders)} tensors in {len(totals)} groups; decay "
+        f"{sum(t[0] for t in decay)} tensors {sum(t[1] for t in decay)} elements; no decay "
+        f"{sum(t[0] for t in no_decay)} tensors {sum(t[1] for t in no_decay)} elements"
+    ]
+    for index, settings in enumerate(sorted(totals, key=str)):
+        tensors, elements = totals[settings]
+        header.append(
+            f"loop optimizer group {index} ({_group_text(settings)}): {tensors} tensors, "
+            f"{elements} elements"
+        )
+    return header + lines
+
+
+def log_loop_optimizer_groups(model, optimizer) -> List[str]:
+    """Gather every rank's ``loop_optimizer_groups`` (a collective over the default group: every
+    rank calls it) and print the lines (``loop_optimizer_group_lines``) on rank 0; returns them on
+    rank 0 (empty elsewhere, for a non-loop model and without an optimizer)."""
+    local = loop_optimizer_groups(model, optimizer)
+    if torch.distributed.is_initialized() and torch.distributed.get_world_size() > 1:
+        gathered: List[Any] = [None] * torch.distributed.get_world_size()
+        torch.distributed.all_gather_object(gathered, local)
+    else:
+        gathered = [local]
+    if not any(gathered):
+        return []
+    if torch.distributed.is_initialized() and torch.distributed.get_rank() != 0:
+        return []
+    lines = loop_optimizer_group_lines(gathered)
+    print_rank_0(f"loop optimizer group lines: {len(lines)} lines follow")
     for line in lines:
         print_rank_0(line)
     return lines

@@ -12,8 +12,12 @@
   parameters without the MTP stage's embedding copy plus EP x their routed experts equals the
   PP = 1 model's parameter count, and the raw stage sum exceeds it by the copy (V x h).
 * The per-tensor checksums keyed by global name: the ring stages' lines equal the PP = 1
-  model's (layer offsets, the embedding copy merged); routed experts get their global index; a
-  disagreement prints ``MISMATCH``.
+  model's (layer offsets, the embedding copy merged); routed experts get their global index (EP
+  rank 0's included, without a suffix); a disagreement prints ``MISMATCH``.
+* The optimizer parameter-group lines keyed by global name: Megatron's parameter groups of the
+  ring stages give the PP = 1 model's lines (decay / no-decay sets and element counts), read
+  through the distributed, mixed-precision, plain and chained optimizer structures; a name whose
+  holders sit in different groups prints ``MISMATCH``.
 * ``get_loop_ring_forward_backward_func``: the ring schedule for ``loop_schedule='ring'`` and its
   refusals.
 """
@@ -296,6 +300,142 @@ def test_global_names_of_routed_experts_and_layers():
             assert names["decoder.layers.0.mlp.experts.linear_fc1.weight3"] == (
                 "decoder.layers.10.mlp.experts.linear_fc1.weight7"
             )
+
+
+def test_global_names_of_ep_rank_zero_experts():
+    """EP rank 0's routed experts keep their local index as the global one, without a suffix
+    (the mapping used to read "unchanged by a shift of 0" as "not an expert name")."""
+    for sequential in (False, True):
+        layer = nn.Module()
+        layer.mlp = nn.Module()
+        layer.mlp.num_local_experts, layer.mlp.ep_group = 4, StageGroup(0, 2)
+        layer.mlp.experts = _Experts(0, 2, 4, sequential)
+        root = nn.Module()
+        root.decoder = nn.Module()
+        root.decoder.layers = nn.ModuleList([layer])
+        routed = report._routed_experts(root)
+        assert routed == [("decoder.layers.0.mlp.experts", 0, 0)]
+        names = sorted(report._global_name(name, 0, routed) for name, _ in root.named_parameters())
+        if sequential:
+            assert names == [
+                f"decoder.layers.0.mlp.experts.local_experts.{index}.linear_fc1.weight"
+                for index in range(4)
+            ]
+        else:
+            assert names == [
+                f"decoder.layers.0.mlp.experts.linear_fc1.weight{index}" for index in range(4)
+            ]
+        # An entry of the experts module in neither form keeps its rank as a suffix.
+        assert report._global_name("decoder.layers.0.mlp.experts.other", 0, routed) == (
+            "decoder.layers.0.mlp.experts.other@ep0"
+        )
+
+
+# ---------------------------------------------------------------------------------------------
+# Optimizer parameter groups
+# ---------------------------------------------------------------------------------------------
+
+
+def _param_groups(chunks):
+    """Megatron's optimizer parameter groups of ``chunks`` (Adam, weight decay 0.1, the standard
+    no-decay overrides: biases and 1-D parameters)."""
+    from megatron.core.optimizer import (
+        OptimizerConfig,
+        _get_param_groups,
+        get_standard_config_overrides,
+    )
+
+    config = OptimizerConfig(lr=3.9e-6, min_lr=0.0, weight_decay=0.1)
+    return _get_param_groups(list(chunks), config, get_standard_config_overrides(config))
+
+
+def _optimizer(form, groups):
+    """A stand-in for a Megatron optimizer over ``groups`` with the structure ``form`` names:
+    ``distributed`` (``model_param_group_index_map``, the torch groups holding shard copies),
+    ``mixed`` (``float16_groups`` / ``fp32_from_fp32_groups`` index-aligned with the torch
+    groups), ``plain`` (the torch groups hold the model parameters); ``chained`` wraps a
+    ``distributed`` and a ``plain`` leaf, each with half of the groups."""
+
+    def torch_groups(source):
+        return [
+            dict(group, params=[p.detach().clone() for p in group["params"]]) for group in source
+        ]
+
+    if form == "distributed":
+        index_map = {
+            param: (group_index, order)
+            for group_index, group in enumerate(groups)
+            for order, param in enumerate(group["params"])
+        }
+        return SimpleNamespace(
+            model_param_group_index_map=index_map,
+            optimizer=SimpleNamespace(param_groups=torch_groups(groups)),
+        )
+    if form == "mixed":
+        return SimpleNamespace(
+            float16_groups=[list(group["params"]) for group in groups],
+            fp32_from_fp32_groups=[[] for _ in groups],
+            optimizer=SimpleNamespace(param_groups=torch_groups(groups)),
+        )
+    if form == "plain":
+        return SimpleNamespace(optimizer=SimpleNamespace(param_groups=list(groups)))
+    half = len(groups) // 2
+    return SimpleNamespace(
+        chained_optimizers=[
+            _optimizer("distributed", groups[:half]),
+            _optimizer("plain", groups[half:]),
+        ]
+    )
+
+
+@pytest.mark.parametrize("form", ["distributed", "mixed", "plain", "chained"])
+@pytest.mark.parametrize("kind,stages,chunks", [("dense", 2, 2), ("moe", 2, 1), ("moe", 4, 2)])
+def test_optimizer_groups_of_the_ring_stages_equal_pp1(cpu_ring, kind, stages, chunks, form):
+    del cpu_ring
+    reference, ring = _reference_and_ring(kind, stages, chunks)
+    pp1 = report.loop_optimizer_group_lines(
+        [report.loop_optimizer_groups([reference], _optimizer(form, _param_groups([reference])))]
+    )
+    per_stage = []
+    for stage in range(stages):
+        models = [ring.chunk_model(stage, chunk) for chunk in range(chunks)]
+        per_stage.append(
+            report.loop_optimizer_groups(
+                _stage(ring, stage), _optimizer(form, _param_groups(models))
+            )
+        )
+    assert report.loop_optimizer_group_lines(per_stage) == pp1
+    assert not any("MISMATCH" in line for line in pp1)
+    summary = re.match(
+        r"loop optimizer groups: (\d+) tensors in (\d+) groups; decay (\d+) tensors (\d+) "
+        r"elements; no decay (\d+) tensors (\d+) elements",
+        pp1[0],
+    )
+    tensors, _, decay, decay_elements, no_decay, no_decay_elements = map(int, summary.groups())
+    params = dict(reference.named_parameters())
+    assert tensors == len(params) == decay + no_decay
+    assert decay_elements + no_decay_elements == sum(p.numel() for p in params.values())
+    assert no_decay == sum(
+        1 for name, p in params.items() if p.dim() == 1 or name.endswith(".bias")
+    )
+    names = {
+        line.split(":")[0][len("loop param group ") :]
+        for line in pp1
+        if line.startswith("loop param group ")
+    }
+    assert names == set(params)
+    assert report.loop_optimizer_groups([reference], None) == {}
+    assert report.loop_optimizer_groups([nn.Linear(2, 2)], _optimizer(form, [])) == {}
+
+
+def test_optimizer_groups_name_a_disagreement():
+    """A name whose holders sit in different groups (the MTP stage's embedding copy moved to the
+    no-decay group) prints once per group with MISMATCH."""
+    first = {"embedding.word_embeddings.weight": (8, 1.0, 1.0, False, False, 1e-3, 0.0)}
+    last = {"embedding.word_embeddings.weight": (8, 0.0, 1.0, False, False, 1e-3, 0.0)}
+    lines = report.loop_optimizer_group_lines([first, last])
+    mismatched = [line for line in lines if "MISMATCH" in line]
+    assert len(mismatched) == 2 and "ranks [0]" in mismatched[0] + mismatched[1]
 
 
 # ---------------------------------------------------------------------------------------------
