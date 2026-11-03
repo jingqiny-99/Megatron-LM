@@ -284,6 +284,15 @@ def _pad(number_to_be_padded: int, divisor: int) -> int:
     return int(math.ceil(number_to_be_padded / divisor) * divisor)
 
 
+# Every tensor item of a buffer index starts at a multiple of this many elements, and every
+# bucket (so every shard) is a multiple of it long: at least 16 bytes for every buffer dtype
+# (1-byte FP8 to 4-byte fp32), the 64-element alignment of DDP's buffers. Parameters and
+# gradients are views of buckets, and kernels such as TE GEMMs and the Triton kernels
+# torch.compile generates assume 16-byte aligned pointers; small parameters packed one after
+# another would otherwise start at arbitrary offsets (CUDA "misaligned address").
+_ITEM_ALIGNMENT = 64
+
+
 def build_data_parallel_buffer_index(
     elements: List[torch.Size],
     data_parallel_rank: int,
@@ -309,15 +318,23 @@ def build_data_parallel_buffer_index(
     Returns:
         Tuple[Dict[int, TensorItemIndex], BucketIndex, ShardBucketIndex]: The index
             range of every tensor, every bucket and every in bucket local buffer.
+
+    Every item starts at a multiple of ``_ITEM_ALIGNMENT`` elements (an item of at least
+    ``chunk_size_factor`` elements at a multiple of both), and the bucket size is a multiple
+    of ``_ITEM_ALIGNMENT`` (sharded: of ``data_parallel_world_size`` times both), so views of
+    a bucket and of a shard are aligned. A layout that already satisfies this is unchanged.
     """
+    # Regular items start on the common multiple of their row size and the item alignment.
+    item_alignment = math.lcm(chunk_size_factor, _ITEM_ALIGNMENT)
 
     def _pad_if_needed(data_index: int) -> int:
         # Padded whenever any parameter class is sharded. Over-padding an unsharded
         # buffer only costs a few elements, and this index is built before the
         # buffer knows which parameter class it holds.
         if not all_sharding_strategies_in(ddp_config, ["no_shard"]):
-            return _pad(data_index, data_parallel_world_size * chunk_size_factor)
-        return data_index
+            return _pad(data_index, data_parallel_world_size * item_alignment)
+        # Buckets of one buffer are allocated back to back: keep the next one aligned.
+        return _pad(data_index, _ITEM_ALIGNMENT)
 
     def add_item(item_id, item, offset, item_index_map):
         # The item index map contains information on where each parameter item will
@@ -355,6 +372,7 @@ def build_data_parallel_buffer_index(
     data_index = 0
     while len(regular_items) > 0:
         item_id, item = regular_items.pop(0)
+        data_index = _pad(data_index, item_alignment)
         add_item(item_id, item, data_index, item_index_map)
         if item.numel() % chunk_size_factor == 0:
             data_index += item.numel()
@@ -370,7 +388,10 @@ def build_data_parallel_buffer_index(
             if rhs.numel() % chunk_size_factor == 0:
                 continue
             rhs_remain = rhs.numel() % chunk_size_factor
-            if remain + rhs_remain <= chunk_size_factor:
+            if (
+                remain + rhs_remain <= chunk_size_factor
+                and (data_index - rhs_remain) % _ITEM_ALIGNMENT == 0
+            ):
                 found_rhs = True
                 regular_items.remove(id_rhs)
                 break
@@ -382,17 +403,19 @@ def build_data_parallel_buffer_index(
             space -= rhs_remain
             data_index += rhs.numel() // chunk_size_factor * chunk_size_factor
 
-        # Try adding the fragments into the gaps
+        # Try adding the fragments into the gaps, each at an aligned offset.
+        gap_end = gap_offset + space
         for id_frag in fragment_items[:]:
             frag_id, frag = id_frag
-            if frag.numel() > space:
+            frag_offset = _pad(gap_offset, _ITEM_ALIGNMENT)
+            if frag_offset + frag.numel() > gap_end:
                 continue
-            add_item(frag_id, frag, gap_offset, item_index_map)
-            space -= frag.numel()
-            gap_offset += frag.numel()
+            add_item(frag_id, frag, frag_offset, item_index_map)
+            gap_offset = frag_offset + frag.numel()
             fragment_items.remove(id_frag)
 
     for frag_id, frag in fragment_items:
+        data_index = _pad(data_index, _ITEM_ALIGNMENT)
         add_item(frag_id, frag, data_index, item_index_map)
         data_index += frag.numel()
 
