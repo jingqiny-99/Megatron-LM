@@ -3960,6 +3960,11 @@ def get_model(
             ),
             flush=True,
         )
+        from megatron.training.models.dist_utils import logical_num_params_message
+
+        logical_message = logical_num_params_message(model, model_pg_collection)
+        if logical_message is not None:
+            print(logical_message, flush=True)
 
     # GPU allocation.
     # For FSDP2, we don't allocate GPU memory here. We allocate GPU memory

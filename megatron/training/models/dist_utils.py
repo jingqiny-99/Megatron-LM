@@ -31,7 +31,12 @@ from megatron.core.enums import ModelType
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer import MegatronModule, TransformerConfig
 from megatron.core.transformer.module import Float16Module
-from megatron.core.utils import get_model_config, get_pg_rank
+from megatron.core.utils import (
+    get_logical_num_parameters,
+    get_model_config,
+    get_pg_rank,
+    get_pg_size,
+)
 
 try:
     from megatron.core.fp8_utils import correct_amax_history_if_needed
@@ -263,6 +268,40 @@ def _print_num_params(model: list[MegatronModule], pg_collection: ProcessGroupCo
             ),
             flush=True,
         )
+        message = logical_num_params_message(model, pg_collection)
+        if message is not None:
+            print(message, flush=True)
+
+
+def logical_num_params_message(
+    model: list[MegatronModule], pg_collection: ProcessGroupCollection
+) -> str | None:
+    """The rank-0 line with the whole model's parameter count, or None where it is undefined.
+
+    The count is ``get_logical_num_parameters`` of the chunks as built: dense parameters once,
+    routed experts times the EP size. Only expert parallelism may split the parameters (TP, PP
+    and expert TP of size 1, no GTP-sharded parameter); the line then equals the EP-1 per-rank
+    count at any EP size.
+
+    Args:
+        model: The model chunks as built (before any DDP / FSDP wrapper).
+        pg_collection: The process groups the chunks were built with.
+    """
+    ep_group = getattr(pg_collection, "ep", None)
+    ep_size = None if ep_group is None else get_pg_size(ep_group)
+    logical = get_logical_num_parameters(
+        model,
+        expert_model_parallel_size=ep_size,
+        tensor_model_parallel_size=get_pg_size(getattr(pg_collection, "tp", None)),
+        pipeline_model_parallel_size=get_pg_size(getattr(pg_collection, "pp", None)),
+        expert_tensor_parallel_size=get_pg_size(getattr(pg_collection, "expt_tp", None)),
+    )
+    if logical is None:
+        return None
+    return (
+        f" > logical number of parameters (dense once, routed experts x EP {ep_size or 1}): "
+        f"{logical}"
+    )
 
 
 def _wrap_with_mp_wrapper(

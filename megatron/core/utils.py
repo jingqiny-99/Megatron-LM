@@ -844,6 +844,61 @@ def get_model_config(model):
     return get_attr_wrapped_model(model, "config", allow_none=False)
 
 
+def get_logical_num_parameters(
+    model: Union[torch.nn.Module, Iterable[torch.nn.Module]],
+    *,
+    expert_model_parallel_size: Optional[int],
+    tensor_model_parallel_size: int = 1,
+    pipeline_model_parallel_size: int = 1,
+    expert_tensor_parallel_size: int = 1,
+) -> Optional[int]:
+    """The parameter count of the whole model, from this rank's built model chunks.
+
+    Defined when expert parallelism is the only axis that splits parameters: tensor, pipeline
+    and expert-tensor parallel sizes 1 and no GTP-sharded parameter. Every parameter object is
+    counted once over all chunks, and a routed-expert parameter (``allreduce == False``: this
+    rank holds ``1 / expert_model_parallel_size`` of the routed experts) counts
+    ``expert_model_parallel_size`` times. Data and context parallelism replicate parameters and
+    change nothing. Count the chunks as built, before a DDP / FSDP wrapper or a parameter store
+    replaces their parameters.
+
+    Args:
+        model (torch.nn.Module or iterable of torch.nn.Module): The model chunks as built.
+        expert_model_parallel_size (int, optional): The EP size the chunks were built with;
+            None when unknown (a model with routed experts then has no logical count).
+        tensor_model_parallel_size (int): The TP size the chunks were built with.
+        pipeline_model_parallel_size (int): The PP size the chunks were built with.
+        expert_tensor_parallel_size (int): The expert TP size the chunks were built with.
+
+    Returns:
+        Optional[int]: The logical count, or None when it is not defined for this layout.
+    """
+    splitting_sizes = (
+        tensor_model_parallel_size,
+        pipeline_model_parallel_size,
+        expert_tensor_parallel_size,
+    )
+    if any(size != 1 for size in splitting_sizes):
+        return None
+    chunks = [model] if isinstance(model, torch.nn.Module) else list(model)
+    seen = set()
+    total = 0
+    for chunk in chunks:
+        for param in chunk.parameters():
+            if id(param) in seen:
+                continue
+            seen.add(id(param))
+            if getattr(param, "is_gtp_weight_remat", False):
+                return None
+            if getattr(param, "allreduce", True):
+                total += param.nelement()
+            elif expert_model_parallel_size is None:
+                return None
+            else:
+                total += param.nelement() * expert_model_parallel_size
+    return total
+
+
 def move_host_tensor_to_device(
     values: torch.Tensor, device: torch.device, pin_memory: bool = True
 ) -> torch.Tensor:
