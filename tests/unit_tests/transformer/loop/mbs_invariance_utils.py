@@ -291,6 +291,7 @@ def resolution_gate(
     unresolved_floor: float = 0.5,
     absolute_fraction: float = 1e-4,
     strict_floor_fraction: float = 0.0,
+    zero_fraction: float = 0.0,
 ) -> Dict[str, dict]:
     """``report`` re-gated per parameter by whether the floor resolves its gradient.
 
@@ -301,11 +302,13 @@ def resolution_gate(
     below the floor), and the non-strict gate is relative <= max(``min_relative``, ``factor`` x
     floor). An *unresolved* gradient (zero up to rounding, such as the mHC
     stream-symmetry parameters at initialization) has no meaningful relative difference; it is
-    gated absolutely: ``|g - g_ref| <= absolute_fraction x global_norm``."""
+    gated absolutely: ``|g - g_ref| <= absolute_fraction x global_norm``. A reference gradient
+    at most ``zero_fraction x global_norm`` is unresolved whatever its floor (the floor of a
+    1-element parameter that is zero up to rounding can agree by chance)."""
     out = {}
     for name, entry in report.items():
         noise = floor[name]["relative"]
-        resolved = noise <= unresolved_floor
+        resolved = noise <= unresolved_floor and entry["norm"] > zero_fraction * global_norm
         if not resolved:
             bound = absolute_fraction * global_norm
             ok = entry["diff"] <= bound

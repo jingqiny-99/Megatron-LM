@@ -32,7 +32,8 @@ every arm, so the fp32 and bf16 models compute the same function.
   <= 0.5) must match with cosine >= 0.9999 and relative difference <= max(1e-3, 0.1 x floor),
   i.e. 10x below bf16's own resolution of it; an unresolved gradient is zero up to rounding (at
   initialization the 4 mHC streams are copies, so the gradients of the stream-mixing scalars vanish)
-  and is gated absolutely, |g - g_ref| <= 1e-4 x the whole-gradient norm. The learned routers and
+  and is gated absolutely, |g - g_ref| <= 1e-4 x the whole-gradient norm, as is any gradient at
+  most 1e-10 of that norm (zero to fp32 precision). The learned routers and
   every indexer weight must be resolved. bf16: losses, rows and the whole gradient (relative
   difference <= max(1e-3, 3 x the whole gradient's floor)) are gated; per parameter the bf16
   difference is bounded by bf16's own error at both sizes, so it is reported.
@@ -72,6 +73,9 @@ FLOOR_FACTOR = 3.0
 # fp32 per parameter: the MBS difference must also sit this far below bf16's own error on
 # the gradient (a discrete top-k near-tie flip moves a poorly resolved gradient a little).
 STRICT_FLOOR_FRACTION = 0.1
+# A gradient at most this fraction of the whole-gradient norm is zero to fp32 precision
+# (fp32 resolves about 1e-7 of the scale it accumulates at).
+ZERO_FRACTION = 1e-10
 
 
 @pytest.fixture(scope="module", autouse=True)
@@ -276,6 +280,7 @@ def _gate(grads, ref_grads, floor, strict):
         min_relative=MAX_RELATIVE,
         factor=FLOOR_FACTOR,
         strict_floor_fraction=STRICT_FLOOR_FRACTION,
+        zero_fraction=ZERO_FRACTION,
     )
     return report, mbs.global_comparison(grads, ref_grads)
 
@@ -293,8 +298,9 @@ def test_routers_and_indexers_are_resolved(results):
     print(f"[{_tag('global floor')}] {global_floor}", flush=True)
     assert all(ref_losses[key] != 0.0 for key in mbs.LOSS_KEYS), ref_losses
     assert routers and indexers
+    global_norm = mbs.global_comparison(ref_grads, ref_grads)["norm"]
     for name in routers + indexers:
-        assert ref_grads[name].norm() > 0, name
+        assert ref_grads[name].norm() > ZERO_FRACTION * global_norm, name
         assert floor[name]["relative"] <= 0.5, (name, floor[name])
 
 
