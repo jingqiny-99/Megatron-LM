@@ -507,3 +507,15 @@ def test_mini_pattern_layouts_are_valid():
         assert piped == expected
         config = dsv4_loop_config(MINI_MAIN, **ring_fields(stages, chunks))
         guards.validate_ring_layout(config, piped, 6)
+
+
+def test_ring_rule_names_never_contain_the_separator():
+    """A ring refusal joins its rule names with ", " (and the ring tests split on it): no ring
+    rule name holds it."""
+    rules = {
+        name: value
+        for name, value in vars(guards).items()
+        if name.startswith("RING_") and isinstance(value, str)
+    }
+    assert {"RING_EAGER_CALL", "RING_CALL_ROLES", "RING_WITHOUT_PP"} <= set(rules)
+    assert [name for name, value in rules.items() if ", " in value] == []

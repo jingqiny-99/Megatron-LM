@@ -195,9 +195,12 @@ def make_stack(layers, **config_overrides):
 
 
 def bind_hybrid_model_stages(model):
-    """Bind the HybridModel stages that forward calls onto a namespace model stub."""
+    """Bind the HybridModel stages that forward calls onto a namespace model stub, and the
+    per-call roles they read (the stub sets none: its built flags)."""
     for name in ("embed", "rope_ctx", "head_loss"):
         setattr(model, name, MethodType(getattr(HybridModel, name), model))
+    for name in ("call_pre_process", "call_post_process", "call_mtp_process"):
+        setattr(model, name, getattr(HybridModel, name).fget(model))
     return model
 
 

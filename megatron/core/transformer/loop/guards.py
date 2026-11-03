@@ -927,8 +927,14 @@ RING_CODA_SPLIT = "coda outside the last '|' segment"
 RING_SEGMENT_WITHOUT_CORE = "a '|' segment without a core block"
 RING_CHUNK_RANGE = "a ring chunk outside the main pattern"
 # Runtime rules (the loop stack).
+# (Rule names never contain ", ": the error message joins them with it.)
 RING_EAGER_CALL = (
-    "a ring chunk run as an eager loop (its rounds run only as the ring schedule's round views)"
+    "a ring chunk called without the ring's call roles (it runs only as the ring schedule's "
+    "round views: ring_pp.LoopRingRoundView)"
+)
+RING_CALL_ROLES = (
+    "ring call roles that do not fit the chunk and round (the embedding only in round 1 of the "
+    "round-start chunk; the head only in round R of the round-end chunk)"
 )
 RING_ROW_DEPTHS = "per-row loop depths (set_loop_depths) under the ring schedule"
 RING_CARRIER_DIAGNOSTICS = "carrier diagnostics under the ring schedule"

@@ -5328,9 +5328,12 @@ class TestMultiTokenPredictionHybrid:
             tp_group=None,
             _scale_logits=lambda logits: logits,
         )
-        # HybridModel.forward calls its stages through self; bind them onto the stub.
+        # HybridModel.forward calls its stages through self; bind them onto the stub, and the
+        # per-call roles they read (the stub sets none: its built flags).
         for name in ("embed", "rope_ctx", "head_loss"):
             setattr(model, name, types.MethodType(getattr(HybridModel, name), model))
+        for name in ("call_pre_process", "call_post_process", "call_mtp_process"):
+            setattr(model, name, getattr(HybridModel, name).fget(model))
         return model, hidden_states, call_counts, metric_avg_group
 
     @pytest.mark.parametrize(

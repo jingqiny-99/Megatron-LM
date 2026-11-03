@@ -102,6 +102,22 @@ class HybridStackSubmodules:
     mtp_stack_submodules: Optional["HybridStackSubmodules"] = None
 
 
+@dataclass(frozen=True)
+class HybridStackCallRoles:
+    """The pipeline roles of one call of a built stage module.
+
+    A schedule that runs one built stage module in several roles (e.g. the loop ring's round
+    views, ``megatron/core/transformer/loop/ring_pp.py``) sets ``HybridStack.call_roles`` around
+    each call. The roles can only switch the built processing off: ``HybridStack.
+    call_pre_process`` is ``pre_process and roles.pre_process``, and so on. ``mtp_process`` is
+    read by ``HybridModel.call_mtp_process`` only. The built flags themselves never change.
+    """
+
+    pre_process: bool
+    post_process: bool
+    mtp_process: bool
+
+
 @dataclass
 class HybridStackLayerContext:
     """Per-forward layer-call inputs, built once by ``HybridStack._prepare_forward``.
@@ -185,6 +201,9 @@ class HybridStack(MegatronModule):
     # row-tail padding does not train DSv4 indexers (as a loop stack's ``_run_range``). Full
     # recomputation bypasses ``_layer_loop``; the packing validator refuses it with this.
     indexer_loss_row_mask: bool = False
+    # Per-call roles (``HybridStackCallRoles``), set around a call by a schedule that runs this
+    # built stage in several roles; None: the built roles (see ``call_pre_process``).
+    call_roles: Optional[HybridStackCallRoles] = None
 
     def __init__(
         self,
@@ -236,6 +255,7 @@ class HybridStack(MegatronModule):
         self.pre_process = pre_process
         self.post_layer_norm = post_layer_norm
         self.post_process = post_process
+        self.call_roles = None
         self.is_mtp_layer = is_mtp_layer
         self.mtp_layer_number = mtp_layer_number
         uses_stack_cp_layout = getattr(self.config, "_linear_cp_layout_explicit", True)
@@ -563,6 +583,21 @@ class HybridStack(MegatronModule):
         forward_step_func"""
         self.input_tensor = input_tensor
 
+    @property
+    def call_pre_process(self) -> bool:
+        """``pre_process`` of the current call: the built flag, switched off by the call roles
+        (``call_roles``) when set. The forward path reads this (the pipeline input, the mHC and
+        wide-residual stream expansion); construction and checkpointing read the built flag."""
+        roles = self.call_roles
+        return self.pre_process and (roles is None or roles.pre_process)
+
+    @property
+    def call_post_process(self) -> bool:
+        """``post_process`` of the current call (see ``call_pre_process``): the stream readouts
+        and the final norm."""
+        roles = self.call_roles
+        return self.post_process and (roles is None or roles.post_process)
+
     def physical_layers(self) -> tuple[nn.Module, ...]:
         """Return one layer per layer_type_list entry, in execution order.
 
@@ -764,7 +799,9 @@ class HybridStack(MegatronModule):
                 cp_size=self.cp_group.size(),
             )
 
-        if not self.pre_process:
+        # The roles of this call (the built ones unless a schedule set call_roles).
+        pre_process = self.call_pre_process
+        if not pre_process:
             # See set_input_tensor()
             hidden_states = self.input_tensor
 
@@ -772,11 +809,11 @@ class HybridStack(MegatronModule):
         if isinstance(hidden_states, WrappedTensor):
             hidden_states = hidden_states.unwrap()
 
-        if self.config.enable_mhc_connections and self.pre_process and not self.is_mtp_layer:
+        if self.config.enable_mhc_connections and pre_process and not self.is_mtp_layer:
             hidden_states = HyperConnectionModule.input_expand(
                 hidden_states, self.config.mhc_num_residual_streams
             )
-        elif self.uses_wide_residual_stream and self.pre_process:
+        elif self.uses_wide_residual_stream and pre_process:
             hidden_states = expand_wide_residual_stream(
                 hidden_states, self.config.wide_residual.num_streams
             )
@@ -1093,13 +1130,15 @@ class HybridStack(MegatronModule):
 
         Runs the wide-residual readout, the mHC output contraction (also returning the
         multistream tensor when MTP consumes it), the final norm, and the viewless
-        pipeline-output guarantees.
+        pipeline-output guarantees. The readouts and the final norm follow the call's
+        ``call_post_process``.
         """
-        if self.residual_stream_readout is not None:
+        post_process = self.call_post_process
+        if self.residual_stream_readout is not None and post_process:
             hidden_states = apply_module(self.residual_stream_readout)(hidden_states)
 
         mhc_multistream = None
-        if self.config.enable_mhc_connections and self.post_process and not self.is_mtp_layer:
+        if self.config.enable_mhc_connections and post_process and not self.is_mtp_layer:
             if (self.config.mtp_num_layers or 0) > 0:
                 mhc_multistream = hidden_states
             hidden_states = learned_output_contract(
@@ -1112,7 +1151,7 @@ class HybridStack(MegatronModule):
             )
 
         # Final layer norm.
-        if self.post_process and self.post_layer_norm:
+        if post_process and self.post_layer_norm:
             hidden_states = self.final_norm(hidden_states)
 
         # Ensure that the tensor passed between pipeline parallel stages is
@@ -1121,7 +1160,7 @@ class HybridStack(MegatronModule):
             inp=hidden_states, requires_grad=hidden_states.requires_grad, keep_graph=True
         )
 
-        if not self.pre_process and not self.post_process and len(self.layers) == 0:
+        if not self.call_pre_process and not post_process and len(self.layers) == 0:
             # The schedule may pseudo-deallocate our output after sending it. An
             # empty stage must not return the input object itself: its shape and
             # storage are still needed to receive and propagate the gradient.

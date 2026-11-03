@@ -211,9 +211,12 @@ def test_hybrid_padding_mask_sp_scatter_uses_model_tp_group(monkeypatch, input_p
         mtp_process=mtp_enabled,
         mtp=FakeMTP(),
     )
-    # HybridModel.forward calls its stages through self; bind them onto the stub.
+    # HybridModel.forward calls its stages through self; bind them onto the stub, and the
+    # per-call roles they read (the stub sets none: its built flags).
     for name in ("embed", "rope_ctx", "head_loss"):
         setattr(model, name, MethodType(getattr(hybrid_model.HybridModel, name), model))
+    for name in ("call_pre_process", "call_post_process", "call_mtp_process"):
+        setattr(model, name, getattr(hybrid_model.HybridModel, name).fget(model))
     output = hybrid_model.HybridModel.forward(
         model,
         input_ids=input_ids,

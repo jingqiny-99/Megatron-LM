@@ -148,9 +148,12 @@ def test_packed_schedule_pipeline_cp_and_hybrid_sp(dynamic_cp, cp_size, hybrid):
                 mtp_process=False,
                 pg_collection=pg,
             )
-            # forward calls the HybridModel stages (embed / rope_ctx / head_loss) on self.
+            # forward calls the HybridModel stages (embed / rope_ctx / head_loss) on self; they
+            # read the per-call roles (the stub sets none: its built flags).
             for name in ("embed", "rope_ctx", "head_loss"):
                 setattr(model, name, MethodType(getattr(HybridModel, name), model))
+            for name in ("call_pre_process", "call_post_process", "call_mtp_process"):
+                setattr(model, name, getattr(HybridModel, name).fget(model))
             boundary = result.get_batch('contiguous')
             decoder.input_tensor = torch.zeros(
                 boundary['padding_mask'].shape[1] // pg.tp.size(), 1, 8, device='cuda'

@@ -562,6 +562,30 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
         assert len(input_tensor) == 1, 'input_tensor should only be length 1 for gpt/bert'
         self.decoder.set_input_tensor(input_tensor[0])
 
+    # Per-call roles. A schedule that runs this built stage in several roles (the loop ring's
+    # round views) sets ``self.decoder.call_roles`` (``HybridStackCallRoles``) around a call; the
+    # roles can only switch built processing off. The forward path (``embed``, ``head_loss``)
+    # reads these; construction, checkpointing and the embedding / output-weight bookkeeping read
+    # the built flags, which never change.
+
+    @property
+    def call_pre_process(self) -> bool:
+        """``pre_process`` of the current call: the embedding."""
+        roles = getattr(self.decoder, "call_roles", None)
+        return self.pre_process and (roles is None or roles.pre_process)
+
+    @property
+    def call_post_process(self) -> bool:
+        """``post_process`` of the current call: the output layer and the loss."""
+        roles = getattr(self.decoder, "call_roles", None)
+        return self.post_process and (roles is None or roles.post_process)
+
+    @property
+    def call_mtp_process(self) -> bool:
+        """``mtp_process`` of the current call: the MTP block and its loss."""
+        roles = getattr(self.decoder, "call_roles", None)
+        return self.mtp_process and (roles is None or roles.mtp_process)
+
     def sharded_state_dict(
         self, prefix: str = '', sharded_offsets: tuple = (), metadata: Optional[dict] = None
     ):
@@ -820,8 +844,8 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
         """Embed the input tokens for the decoder (the first stage of ``forward``).
 
         A given ``decoder_input`` is returned untouched (``input_ids`` then only feed hash
-        routing). On a non-first pipeline stage the decoder reads its input from
-        ``set_input_tensor`` and the returned ``decoder_input`` is None.
+        routing). On a non-first pipeline stage (``call_pre_process`` off) the decoder reads its
+        input from ``set_input_tensor`` and the returned ``decoder_input`` is None.
 
         Returns:
             ``(decoder_input, decoder_padding_mask, hash_input_ids)``: the decoder input
@@ -837,7 +861,7 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
         decoder_padding_mask = padding_mask
         if decoder_input is not None:
             pass
-        elif self.pre_process:
+        elif self.call_pre_process:
             if padding_mask is not None:
                 assert padding_mask.shape == input_ids.shape, (
                     f"padding_mask shape {padding_mask.shape} does not match "
@@ -1032,10 +1056,15 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
         With a loop parameter store the whole head runs inside the store's head visit (the
         output layer, the MTP block and its embedding lookup).
 
+        The MTP block and the output layer run as this call's roles say (``call_mtp_process``,
+        ``call_post_process``: the built flags unless a schedule set per-call roles).
+
         Returns:
             The loss when ``labels`` are given on a post-process stage, the ``[b, s, v]``
             logits without labels, and the hidden states on other stages.
         """
+        post_process = self.call_post_process
+        mtp_process = self.call_mtp_process
         in_inference_mode = InferenceMode.is_active()
         packed_seq_params_by_layout = (
             cp_batch.packed_seq_params_by_layout if cp_batch is not None else None
@@ -1058,7 +1087,7 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
         mtp_cp_group = None
         sequence_roll_context = None
         mtp_forward_ran = (
-            self.mtp_process and not (in_inference_mode or is_spec_decode) and compute_mtp_loss
+            mtp_process and not (in_inference_mode or is_spec_decode) and compute_mtp_loss
         )
         mtp_hidden_states = hidden_states
         mtp_inputs = None
@@ -1109,8 +1138,8 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
                     width=self.config.mtp_num_layers + 1,
                     input_ids=mtp_inputs.input_ids,
                     position_ids=mtp_inputs.position_ids if roll_position_ids else None,
-                    labels=mtp_inputs.labels if self.post_process else None,
-                    loss_mask=mtp_inputs.loss_mask if self.post_process else None,
+                    labels=mtp_inputs.labels if post_process else None,
+                    loss_mask=mtp_inputs.loss_mask if post_process else None,
                     padding_mask=roll_padding_mask,
                     mtp_input_mask=mtp_inputs.mtp_input_mask,
                 )
@@ -1132,10 +1161,10 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
                 cp_layout_plan=cp_layout_plan,
             )
 
-        if not self.post_process:
+        if not post_process:
             return mtp_hidden_states if mtp_forward_ran else hidden_states
 
-        if self.config.mtp_num_layers is not None and self.mtp_process:
+        if self.config.mtp_num_layers is not None and mtp_process:
             assert self.config.mtp_num_layers > 0
             if is_spec_decode:
                 assert inference_context is not None

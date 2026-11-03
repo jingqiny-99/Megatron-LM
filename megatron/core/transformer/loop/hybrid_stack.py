@@ -35,8 +35,11 @@ the chunk's offset, its own prelude / core / coda sublayers and whether it start
 holds the prelude and builds ``loop_adapter``) or ends one (it holds the coda and builds
 ``loop_norm``); the other chunks set those two to None. Core sublayer modules that track
 ``is_first_microbatch`` are marked ``is_repeated_layer`` (a core runs once per round). A ring chunk
-runs only through the ring schedule's round views: as an eager loop (``_layer_loop``), with
-per-row depths or with carrier diagnostics it raises.
+runs only through the ring schedule's round views (``ring_pp.LoopRingRoundView``): each call
+carries a ``ring_pp.LoopRingCall`` (``HybridStack.call_roles``) and runs the chunk's slice of one
+round of one microbatch (``_ring_layer_loop``: the prelude and the injection store in round 1 on
+the round-start chunk, the round body, the coda in round R on the round-end chunk). Called
+without those roles, with per-row depths or with carrier diagnostics it raises.
 
 Checkpoint keys (M3c). At PP = 1 (guarded) a sharded key equals the module path; on a ring chunk
 the sublayer keys carry the global sublayer index (``HybridStack``'s ``layer_number``), so the
@@ -74,7 +77,7 @@ sharded_state_dict`` build in the store's logical view), so the keys do not depe
 
 import dataclasses
 from contextlib import nullcontext
-from typing import Optional
+from typing import Optional, Tuple
 
 import torch
 import torch.distributed as dist
@@ -91,8 +94,10 @@ from megatron.core.transformer.experimental_attention_variant.dsa_masking import
 from megatron.core.transformer.forward_replay import forward_statistics_round, in_forward_replay
 from megatron.core.transformer.loop import flops
 from megatron.core.transformer.loop.guards import (
+    RING_CALL_ROLES,
     RING_CARRIER_DIAGNOSTICS,
     RING_EAGER_CALL,
+    RING_RECOMPUTE_CODES,
     RING_ROW_DEPTHS,
     LoopRingChunk,
     LoopRoles,
@@ -110,6 +115,12 @@ from megatron.core.transformer.loop.guards import (
     validate_loop_stack_construction,
 )
 from megatron.core.transformer.loop.reporting import stream_mean_rms
+from megatron.core.transformer.loop.ring_pp import (
+    LoopRingCall,
+    RingInjection,
+    ring_injection_source,
+    ring_injection_use,
+)
 from megatron.core.transformer.loop_transformer_block import (
     LoopRMSNorm,
     active_causal_mask,
@@ -316,6 +327,16 @@ class LoopHybridStack(HybridStack):
         # Carrier diagnostics (``enable_carrier_diagnostics``): off by default.
         self._carrier_diagnostics = False
         self._diagnostic_metrics = {}
+        # Ring chunk state (``_ring_layer_loop``): the injection store of the round-start chunk
+        # (microbatch -> ring_pp.RingInjection), the G1 counters (microbatch -> [core slice runs,
+        # prelude runs, coda runs, MTP runs]), the FLOPs the calls recorded (forward, backward,
+        # recompute) and the whole model's per-microbatch FLOPs by (sequence, batch), which the
+        # head call reports.
+        self._ring_injections = {}
+        self._ring_counts = {}
+        self._ring_work = [0.0, 0.0, 0.0]
+        self._ring_model_work = {}
+        self._ring_mtp_hook = None
 
     def sharded_state_dict(
         self, prefix: str = '', sharded_offsets: Optional[tuple] = None, metadata=None
@@ -403,11 +424,11 @@ class LoopHybridStack(HybridStack):
     def _layer_loop(self, hidden_states: Tensor, ctx: HybridStackLayerContext) -> Tensor:
         """Prelude once, core per round (Huginn or MoR), coda once.
 
-        A ring chunk holds one '|' segment, not the whole loop: run as this eager loop it would
-        train one partial round, so it raises (``RING_EAGER_CALL``).
+        A ring chunk holds one '|' segment, not the whole loop: each call runs its slice of one
+        round (``_ring_layer_loop``), and only with the ring's call roles (``RING_EAGER_CALL``).
         """
         if self.loop_ring is not None:
-            refuse_ring(RING_EAGER_CALL)
+            return self._ring_layer_loop(hidden_states, ctx)
         validate_hybrid_loop_inputs(
             packed_seq_params=ctx.packed_seq_params,
             inference_context=ctx.inference_context,
@@ -478,6 +499,331 @@ class LoopHybridStack(HybridStack):
         self._record_range(roles.core_end, len(self.layers), tokens, squared_lengths, sequence)
         self._record_head(tokens, squared_lengths, sequence)
         return self._run_range(state, roles.core_end, len(self.layers), ctx, label + "/coda")
+
+    # ---------------------------------------------------------------------------------------
+    # Ring chunk calls (loop_schedule='ring'; ring_pp.py)
+    # ---------------------------------------------------------------------------------------
+
+    def _ring_layer_loop(self, hidden_states: Tensor, ctx: HybridStackLayerContext) -> Tensor:
+        """One ring call: this chunk's slice of round ``r`` of one microbatch (``LoopRingCall``).
+
+        The ops are those of ``_huginn`` followed by the coda, cut at the chunk's ends, in the
+        same order:
+
+        * round 1 on the round-start chunk: the prelude on the (stream-expanded) embedding, once
+          per microbatch (its own activation checkpoint when the call's code is 'C'); its output
+          ``e`` goes to the injection store; then the round body on ``(zeros, e)``;
+        * a later round on the round-start chunk: the round body on ``(received state, e)``;
+        * any other chunk: the round body on the received state;
+        * round R on the round-end chunk: after the round body the coda (never checkpointed),
+          then the loop metrics (``_ring_head_metrics``).
+
+        The round body is the Huginn round ``loop_norm(core(adapter([state, e])))`` cut to this
+        chunk: the adapter on the round-start chunk, the core slice, the loop norm on the
+        round-end chunk. It runs inside ``forward_statistics_round(r + 1, R)``, as one activation
+        checkpoint over its tensors (state, injection) when the call's code is 'C'. Everything
+        else it uses (round, label, core range, adapter / norm presence, the layer context) is
+        bound when the call runs (``_ring_round_function``): its recompute runs inside the
+        backward, after other calls (other microbatches and rounds) and after the call roles
+        were cleared, and must repeat this call's forward. The routing tape of each checkpoint
+        call replays its MoE choices.
+
+        Records the FLOPs the call runs (``take_ring_work``) and the G1 counters
+        (``take_ring_counts``).
+        """
+        call = self.call_roles
+        if not isinstance(call, LoopRingCall):
+            refuse_ring(RING_EAGER_CALL)
+        chunk = self.loop_ring
+        rounds = self.config.loop_iterations
+        step = call.round
+        embeds = chunk.round_start and step == 0
+        heads = chunk.round_end and step == rounds - 1
+        if (
+            not 0 <= step < rounds
+            or bool(call.pre_process) != embeds
+            or bool(call.post_process) != heads
+            or (call.mtp_process and not heads)
+        ):
+            refuse_ring(RING_CALL_ROLES)
+        validate_hybrid_loop_inputs(
+            packed_seq_params=ctx.packed_seq_params,
+            inference_context=ctx.inference_context,
+            attention_mask=ctx.attention_mask,
+            has_dsv4_attention=self._has_dsv4_attention,
+        )
+        depths, self._loop_depths = self._loop_depths, None
+        if depths is not None:
+            refuse_ring(RING_ROW_DEPTHS)
+        ctx.grouped_tail_to_skip = None
+        # Fresh dicts every call: the training loss closure of the head call captures them.
+        self.loop_losses = {}
+        self.loop_metrics = {}
+        self.loop_metric_populations = {}
+        self._diagnostic_metrics = {}
+        local = chunk.local
+        label = f"loop_hybrid/mb={call.microbatch}"
+        sequence, batch = hidden_states.shape[:2]
+        tokens = sequence * batch
+        squared_lengths = tokens * sequence
+        counts = self._ring_counts.setdefault(call.microbatch, [0, 0, 0, 0])
+        with torch.profiler.record_function(f"{label}/ring_chunk={chunk.offset}"):
+            if embeds:
+                embedding = self._ring_prelude(
+                    hidden_states, ctx, call, label, tokens, squared_lengths, sequence
+                )
+                counts[1] += 1
+                state = torch.zeros_like(embedding)
+                entry = RingInjection(
+                    self._ring_injections, self._ring_injection_key(call), embedding
+                )
+                injection = ring_injection_source(embedding, entry)
+                if not entry.grad_mode and rounds == 1:
+                    entry.release()
+            else:
+                state = hidden_states
+                injection = self._ring_injection(call) if chunk.round_start else None
+            extra = self.round_extra_forward_flops(tokens) if chunk.round_start else 0
+            self._ring_add_work(
+                self.range_forward_flops(
+                    local.core_start, local.core_end, tokens, squared_lengths, sequence, extra=extra
+                ),
+                recompute=call.checkpoint,
+            )
+            body = self._ring_round_function(
+                step, ctx, label, adapt=chunk.round_start, norm=chunk.round_end
+            )
+            with forward_statistics_round(step + 1, rounds):
+                if call.checkpoint and torch.is_grad_enabled():
+                    state = checkpoint(
+                        body,
+                        state,
+                        injection,
+                        use_reentrant=False,
+                        context_fn=loop_checkpoint_context_fn(f"{label}/loop={step + 1}"),
+                    )
+                else:
+                    state = body(state, injection)
+            counts[0] += 1
+            if heads:
+                state = self._ring_coda(state, ctx, label, tokens, squared_lengths, sequence)
+                counts[2] += 1
+                self._ring_head_metrics(state.device, sequence, batch, depth=counts[0])
+        return state
+
+    def _ring_injection_key(self, call: LoopRingCall) -> int:
+        """The injection store's key of a call: its microbatch."""
+        return call.microbatch
+
+    def _ring_injection(self, call: LoopRingCall) -> Tensor:
+        """The injection of a later round on the round-start chunk (``ring_pp``): through
+        ``_RingInjectionUse`` in training; without autograd the round-R call releases the
+        entry."""
+        entry = self._ring_injections.get(self._ring_injection_key(call))
+        if entry is None:
+            raise RuntimeError(
+                f"Ring round {call.round + 1} of microbatch {call.microbatch} has no injection: "
+                "the microbatch's round-1 call did not run on this chunk"
+            )
+        injection = ring_injection_use(entry)
+        if not entry.grad_mode and call.round == self.config.loop_iterations - 1:
+            entry.release()
+        return injection
+
+    def _ring_prelude(self, hidden_states, ctx, call, label, tokens, squared_lengths, sequence):
+        """The prelude of one microbatch (round 1 on the round-start chunk): one activation
+        checkpoint when the call's code is 'C' (its context bound like a round body's)."""
+        end = self.loop_ring.local.core_start
+        self._ring_add_work(
+            self.range_forward_flops(0, end, tokens, squared_lengths, sequence),
+            recompute=call.checkpoint,
+        )
+
+        def prelude(x, ctx=ctx, end=end, label=label):
+            return self._run_range(x, 0, end, ctx, f"{label}/prelude")
+
+        if call.checkpoint and torch.is_grad_enabled():
+            return checkpoint(
+                prelude,
+                hidden_states,
+                use_reentrant=False,
+                context_fn=loop_checkpoint_context_fn(f"{label}/prelude"),
+            )
+        return prelude(hidden_states)
+
+    def _ring_round_function(self, step, ctx, label, *, adapt, norm):
+        """The round body of one ring call as a function of its tensors ``(previous,
+        injection)``: the adapter (``adapt``), the chunk's core slice, the loop norm (``norm``).
+
+        Every other value is bound now as a default argument (the round ``step``, the layer
+        context ``ctx``, the core range, ``adapt`` / ``norm``, the profiler ``label``), as
+        ``_huginn`` binds its round: the function never reads the call roles, the injection
+        store or the round view, so a recompute inside the backward repeats this call."""
+        local = self.loop_ring.local
+
+        def round_body(
+            previous,
+            injection,
+            step=step,
+            ctx=ctx,
+            start=local.core_start,
+            end=local.core_end,
+            adapt=adapt,
+            norm=norm,
+            label=label,
+        ):
+            name = f"{label}/loop={step + 1}"
+            with torch.profiler.record_function(name):
+                x = self._adapt(previous, injection, step) if adapt else previous
+                x = self._run_range(x, start, end, ctx, name)
+                return self._loop_norm(step)(x) if norm else x
+
+        return round_body
+
+    def _ring_coda(self, state, ctx, label, tokens, squared_lengths, sequence):
+        """The coda after round R on the round-end chunk (never checkpointed: the head's backward
+        follows its forward on the last stage), with the coda and head FLOPs."""
+        local = self.loop_ring.local
+        self._ring_add_work(
+            self.range_forward_flops(
+                local.core_end, len(self.layers), tokens, squared_lengths, sequence
+            ),
+            recompute=False,
+        )
+        for work, backward_factor in self.head_work_terms(tokens, squared_lengths, sequence):
+            self._ring_add_work(work, recompute=False, backward_factor=backward_factor)
+        return self._run_range(state, local.core_end, len(self.layers), ctx, f"{label}/coda")
+
+    def _ring_head_metrics(self, device, sequence, batch, *, depth):
+        """The loop metrics of the head call, for the whole model (as ``_layer_loop`` reports
+        them at PP = 1): ``loop depth`` = this chunk's core slice runs of the microbatch (R),
+        the token-layer counts over the model's core, and the model's FLOPs per token
+        (``set_ring_model_work``; backward and recompute 0 without autograd)."""
+        work = self._ring_model_work.get((sequence, batch))
+        if work is None:
+            raise RuntimeError(
+                f"The ring's model FLOPs for [sequence {sequence}, batch {batch}] are not set "
+                "(LoopHybridStack.set_ring_model_work; the ring schedule sets them)"
+            )
+        forward, backward, recompute = work
+        grad = torch.is_grad_enabled()
+        if not grad:
+            backward = recompute = 0.0
+        tokens = sequence * batch
+        rows = float(tokens * depth)
+        core = self.loop_roles.core
+        self.loop_metrics = {
+            "loop depth": torch.tensor(float(depth), device=device),
+            "loop active token layers": torch.as_tensor(rows * core, device=device),
+            "loop backward token layers": torch.as_tensor(
+                rows * core if grad else 0.0, device=device
+            ),
+        }
+        for phase, value in zip(
+            ("forward", "backward", "recompute"), (forward, backward, recompute)
+        ):
+            self.loop_metrics[f"loop {phase} flops per token"] = (
+                torch.as_tensor(value, dtype=torch.float32, device=device) / tokens
+            )
+
+    def _ring_add_work(self, work, *, recompute, backward_factor=2):
+        """Add one pass to the ring's recorded FLOPs, as ``_add_work`` does: backward only with
+        autograd on, recompute only for a checkpointed pass."""
+        self._ring_work[0] = self._ring_work[0] + work
+        if torch.is_grad_enabled():
+            self._ring_work[1] = self._ring_work[1] + backward_factor * work
+            if recompute:
+                self._ring_work[2] = self._ring_work[2] + work
+
+    def ring_microbatch_work(self, sequence: int, batch: int, codes) -> Tuple[float, float, float]:
+        """The ``(forward, backward, recompute)`` FLOPs one training microbatch of
+        ``[sequence, batch]`` costs this ring chunk, as its calls record them: the prelude once
+        (round-start chunk), R round bodies (with the adapter on the round-start chunk), the coda
+        and the head once (round-end chunk). ``codes``: the chunk's recompute code per round
+        ('C' / 'n'; ``codes[0]`` also covers the prelude). The model's FLOPs are the sum over
+        every chunk of every stage (``set_ring_model_work``); a step of M microbatches records
+        M times this (``take_ring_work``)."""
+        chunk = self.loop_ring
+        if chunk is None:
+            raise ValueError("ring_microbatch_work needs a ring chunk (loop_schedule='ring')")
+        codes = tuple(codes)
+        if len(codes) != self.config.loop_iterations or not set(codes) <= set(RING_RECOMPUTE_CODES):
+            raise ValueError(
+                f"Ring chunk recompute codes must be {self.config.loop_iterations} of "
+                f"{RING_RECOMPUTE_CODES}, got {codes}"
+            )
+        local = chunk.local
+        tokens = sequence * batch
+        squared_lengths = tokens * sequence
+        work = [0.0, 0.0, 0.0]
+
+        def add(value, recompute, backward_factor=2):
+            work[0] = work[0] + value
+            work[1] = work[1] + backward_factor * value
+            if recompute:
+                work[2] = work[2] + value
+
+        if chunk.round_start:
+            add(
+                self.range_forward_flops(0, local.core_start, tokens, squared_lengths, sequence),
+                codes[0] == "C",
+            )
+        extra = self.round_extra_forward_flops(tokens) if chunk.round_start else 0
+        for code in codes:
+            add(
+                self.range_forward_flops(
+                    local.core_start, local.core_end, tokens, squared_lengths, sequence, extra=extra
+                ),
+                code == "C",
+            )
+        if chunk.round_end:
+            add(
+                self.range_forward_flops(
+                    local.core_end, len(self.layers), tokens, squared_lengths, sequence
+                ),
+                False,
+            )
+            for value, backward_factor in self.head_work_terms(tokens, squared_lengths, sequence):
+                add(value, False, backward_factor)
+        return tuple(work)
+
+    def set_ring_model_work(self, sequence: int, batch: int, work) -> None:
+        """Set the whole model's ``(forward, backward, recompute)`` FLOPs of one training
+        microbatch of ``[sequence, batch]`` (the sum of ``ring_microbatch_work`` over every chunk
+        of every stage), which this chunk's head call reports per token."""
+        self._ring_model_work[(int(sequence), int(batch))] = tuple(float(w) for w in work)
+
+    def take_ring_work(self) -> Tuple[float, float, float]:
+        """The ``(forward, backward, recompute)`` FLOPs the ring calls recorded since the last
+        call; resets them."""
+        work, self._ring_work = tuple(self._ring_work), [0.0, 0.0, 0.0]
+        return work
+
+    def take_ring_counts(self) -> dict:
+        """The G1 counters since the last call, per microbatch: ``[core slice runs, prelude
+        runs, coda runs, MTP runs]`` of this chunk; resets them."""
+        counts, self._ring_counts = self._ring_counts, {}
+        return counts
+
+    def ring_injection_keys(self) -> Tuple[int, ...]:
+        """The microbatches the injection store holds (empty after a complete step)."""
+        return tuple(sorted(self._ring_injections))
+
+    def watch_ring_mtp(self, mtp: nn.Module) -> None:
+        """Count the runs of ``mtp`` (the model's MTP block, on the round-end chunk) in the G1
+        counters of the running call's microbatch (a forward hook, registered once)."""
+        if self._ring_mtp_hook is None:
+            self._ring_mtp_hook = mtp.register_forward_hook(self._count_ring_mtp_run)
+
+    def _count_ring_mtp_run(self, *_):
+        """The MTP block's forward hook (``watch_ring_mtp``): one run of the call's microbatch
+        (an activation replay is not a run)."""
+        call = self.call_roles
+        if in_forward_replay():
+            return
+        if not isinstance(call, LoopRingCall):
+            raise RuntimeError("The MTP block of a ring chunk ran outside a ring call")
+        self._ring_counts.setdefault(call.microbatch, [0, 0, 0, 0])[3] += 1
 
     # ---------------------------------------------------------------------------------------
     # Carrier diagnostics
