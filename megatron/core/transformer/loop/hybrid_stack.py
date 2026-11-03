@@ -25,10 +25,23 @@ with its own adapter ``loop_adapters[r]`` and norm ``loop_norms[r]``, so the for
 injection carrier's Huginn recurrence with untied weights. Fixed depth only (the config's
 "Untied loop baseline requires fixed-depth Huginn" rule; ``set_loop_depths`` raises).
 
-Eager only: no CUDA graphs, no pipeline / context / sequence parallelism (see the guards).
+Eager only: no CUDA graphs, no context / sequence parallelism, and pipeline parallelism only as
+the ring (see the guards).
 
-Checkpoint keys (M3c). At PP = 1 (guarded) a sharded key equals the module path. The loop adds
-no key code of its own: ``HybridStack.sharded_state_dict`` writes sublayer ``i`` as
+Ring (``loop_schedule='ring'``, PP > 1; ``guards.validate_ring_layout``): the main pattern carries
+P x k ``'|'`` segments and each stack is one of them (a chunk). ``loop_roles`` stay the model's
+roles (from ``num_layers`` and the role fields); ``loop_ring`` (``guards.LoopRingChunk``) holds
+the chunk's offset, its own prelude / core / coda sublayers and whether it starts a round (it
+holds the prelude and builds ``loop_adapter``) or ends one (it holds the coda and builds
+``loop_norm``); the other chunks set those two to None. Core sublayer modules that track
+``is_first_microbatch`` are marked ``is_repeated_layer`` (a core runs once per round). A ring chunk
+runs only through the ring schedule's round views: as an eager loop (``_layer_loop``), with
+per-row depths or with carrier diagnostics it raises.
+
+Checkpoint keys (M3c). At PP = 1 (guarded) a sharded key equals the module path; on a ring chunk
+the sublayer keys carry the global sublayer index (``HybridStack``'s ``layer_number``), so the
+chunks' keys together are the PP = 1 keys, ``loop_adapter`` and ``loop_norm`` once each. The
+loop adds no key code of its own: ``HybridStack.sharded_state_dict`` writes sublayer ``i`` as
 ``decoder.layers.i`` (mHC-wrapped sublayers nest their layer under ``inner_layer.`` next to
 ``hyper_connection.*``; attention and MoE are separate sublayer indices; prelude / core / coda
 are roles in the config, not part of any key) and gives every other child and the stack's own
@@ -78,14 +91,22 @@ from megatron.core.transformer.experimental_attention_variant.dsa_masking import
 from megatron.core.transformer.forward_replay import forward_statistics_round, in_forward_replay
 from megatron.core.transformer.loop import flops
 from megatron.core.transformer.loop.guards import (
+    RING_CARRIER_DIAGNOSTICS,
+    RING_EAGER_CALL,
+    RING_ROW_DEPTHS,
+    LoopRingChunk,
     LoopRoles,
     has_dsv4_attention,
+    is_ring_loop_config,
+    refuse_ring,
+    resolve_hybrid_loop_ring_roles,
     resolve_hybrid_loop_roles,
     validate_hybrid_loop_config,
     validate_hybrid_loop_inputs,
     validate_loop_carrier,
     validate_loop_carrier_stack,
     validate_loop_mtp_pattern,
+    validate_loop_ring_config,
     validate_loop_stack_construction,
 )
 from megatron.core.transformer.loop.reporting import stream_mean_rms
@@ -167,6 +188,9 @@ class LoopHybridStack(HybridStack):
         validate_loop_carrier_stack(config, type(self)._LOOP_CARRIERS)
         validate_loop_carrier(config)
         validate_hybrid_loop_config(config)
+        ring = is_ring_loop_config(config)
+        if ring:
+            validate_loop_ring_config(config)
         super().__init__(
             config=config,
             submodules=submodules,
@@ -185,12 +209,21 @@ class LoopHybridStack(HybridStack):
             layer_config_list=layer_config_list,
             boundary_layout=boundary_layout,
         )
-        # PP = 1 (guarded): the stack holds the whole main pattern, layer numbers are i + 1, and
-        # without Shortcut MoE (guarded) self.layers is indexed by the physical sublayer.
+        # Without Shortcut MoE (guarded) self.layers is indexed by the physical sublayer.
         assert self._execution_layer_indices == list(range(len(self.layers)))
-        self.loop_roles: LoopRoles = resolve_hybrid_loop_roles(
-            config, self.layer_type_list, hash_moe_layer_threshold
-        )
+        # PP = 1 (guarded outside the ring): the stack holds the whole main pattern, layer numbers
+        # are i + 1. The ring (loop_schedule='ring', PP > 1): the stack is one '|' segment, layer
+        # numbers i + 1 + pp_layer_offset; loop_roles are the model's (from the global counts)
+        # and loop_ring this chunk's own prelude / core / coda and round flags.
+        self.loop_ring: Optional[LoopRingChunk] = None
+        if ring:
+            self.loop_roles, self.loop_ring = resolve_hybrid_loop_ring_roles(
+                config, self.layer_type_list, pp_layer_offset, hash_moe_layer_threshold
+            )
+        else:
+            self.loop_roles: LoopRoles = resolve_hybrid_loop_roles(
+                config, self.layer_type_list, hash_moe_layer_threshold
+            )
         self._loop_symbols = tuple(self.layer_type_list)
         self._has_dsv4_attention = has_dsv4_attention(self._loop_symbols)
         self._loop_flop_rows = [
@@ -236,8 +269,12 @@ class LoopHybridStack(HybridStack):
                 self.loop_adapters = nn.ModuleList([adapter() for _ in rounds])
                 self.loop_norms = nn.ModuleList([norm() for _ in rounds])
             else:
-                self.loop_adapter = adapter()
-                self.loop_norm = norm()
+                # Ring: the adapter opens every round, on the round-start chunk only; the norm
+                # closes it, on the round-end chunk only (one copy of each in the model; None on
+                # the other chunks).
+                chunk = self.loop_ring
+                self.loop_adapter = adapter() if chunk is None or chunk.round_start else None
+                self.loop_norm = norm() if chunk is None or chunk.round_end else None
         else:
             self.depth_router = nn.Sequential(
                 nn.Linear(hidden, hidden, bias=False, dtype=loop_dtype, device=loop_device),
@@ -254,6 +291,15 @@ class LoopHybridStack(HybridStack):
                     attention = getattr(layer, "self_attention", None)
                     if hasattr(attention, "attn_mask_type"):  # '*' sublayers only
                         attention.attn_mask_type = AttnMaskType.arbitrary
+        if self.loop_ring is not None:
+            # A ring core sublayer runs once per round: R calls per microbatch, each from its own
+            # round view and with its own backward. TE must add every call's weight gradient into
+            # main_grad, never overwrite it (the repeated-layer precedent of the MTP block).
+            local = self.loop_ring.local
+            for layer in self.layers[local.core_start : local.core_end]:
+                for module in layer.modules():
+                    if hasattr(module, "is_first_microbatch"):
+                        module.is_repeated_layer = True
         # Sublayers one round runs: the whole core, or one of the R untied segments.
         self._round_core = (
             self.loop_roles.core // config.loop_iterations
@@ -330,10 +376,13 @@ class LoopHybridStack(HybridStack):
         uniform depth (no padding mask is added), so equal row depths equal uniform depth
         bitwise.
 
-        Raises ``ValueError`` on an untied core (``loop_untie_core``: a fixed-depth baseline).
+        Raises ``ValueError`` on an untied core (``loop_untie_core``: a fixed-depth baseline) and
+        on a ring chunk (``RING_ROW_DEPTHS``: every ring microbatch runs every round).
         """
         if depths is not None and self.config.loop_untie_core:
             raise ValueError("Untied loop baseline requires fixed-depth Huginn (set_loop_depths)")
+        if depths is not None and self.loop_ring is not None:
+            refuse_ring(RING_ROW_DEPTHS)
         self._loop_depths = depths
 
     def set_loop_head_flops(
@@ -352,7 +401,13 @@ class LoopHybridStack(HybridStack):
         )
 
     def _layer_loop(self, hidden_states: Tensor, ctx: HybridStackLayerContext) -> Tensor:
-        """Prelude once, core per round (Huginn or MoR), coda once."""
+        """Prelude once, core per round (Huginn or MoR), coda once.
+
+        A ring chunk holds one '|' segment, not the whole loop: run as this eager loop it would
+        train one partial round, so it raises (``RING_EAGER_CALL``).
+        """
+        if self.loop_ring is not None:
+            refuse_ring(RING_EAGER_CALL)
         validate_hybrid_loop_inputs(
             packed_seq_params=ctx.packed_seq_params,
             inference_context=ctx.inference_context,
@@ -440,11 +495,14 @@ class LoopHybridStack(HybridStack):
         attention-residual weights and accepts ``sink`` (an ``attn_res.AttnResStatsSink`` that
         also receives every call's weights) and ``per_sublayer`` (accumulate the per-sublayer
         weight sums for ``take_carrier_diagnostics``); this class takes no sink and has no
-        per-sublayer statistics, so ``per_sublayer`` changes nothing here.
+        per-sublayer statistics, so ``per_sublayer`` changes nothing here. A ring chunk refuses
+        them (``RING_CARRIER_DIAGNOSTICS``: a round's state is spread over the stages).
         """
         del per_sublayer  # No per-sublayer statistics on this carrier.
         if sink is not None:
             raise ValueError("Only the attention-residual carrier takes a diagnostics sink")
+        if enabled and self.loop_ring is not None:
+            refuse_ring(RING_CARRIER_DIAGNOSTICS)
         self._carrier_diagnostics = bool(enabled)
 
     def take_carrier_diagnostics(self) -> Optional[dict]:

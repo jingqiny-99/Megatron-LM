@@ -26,6 +26,12 @@ Where each group runs:
 * ``validate_rsbf_config`` (``"Loop RSBF does not support: ..."``):
   ``TransformerConfig.__post_init__`` with ``loop_schedule='rsbf'``, and the RSBF schedule.
 * ``validate_rsbf_data_parallel``: the RSBF executor, every step, on the model it runs.
+* The ring (``loop_schedule='ring'``: the loop over pipeline stages, ``"Loop ring does not
+  support: ..."``): ``validate_loop_ring_config`` in ``TransformerConfig.__post_init__`` and the
+  loop stack's constructor; ``validate_ring_layout`` (the ``'|'`` layout) in
+  ``HybridModel.__init__``; ``resolve_hybrid_loop_ring_roles`` (one chunk's roles) in the loop
+  stack's constructor. Under the ring, ``'|'`` and pipeline / virtual-pipeline parallelism are
+  allowed (``PIPE_IN_PATTERN`` and ``PIPELINE_PARALLELISM`` apply to every other loop).
 
 The role-field checks themselves (both set or neither, nonnegative, non-empty core) and the
 quantized-loop weight-cache rule are in ``TransformerConfig.__post_init__``.
@@ -34,7 +40,7 @@ This module is imported lazily by its callers; keep its imports light.
 """
 
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, List, Optional, Sequence
+from typing import TYPE_CHECKING, Any, List, Optional, Sequence, Tuple
 
 from megatron.core.models.hybrid.layers.utils import Symbols
 
@@ -183,6 +189,15 @@ def is_hybrid_loop_config(config: Any) -> bool:
     )
 
 
+def is_ring_loop_config(config: Any) -> bool:
+    """True for a loop config on the ring schedule (``loop_schedule='ring'``: the hybrid loop over
+    pipeline stages)."""
+    return (
+        getattr(config, "loop_architecture", "none") != "none"
+        and getattr(config, "loop_schedule", "standard") == "ring"
+    )
+
+
 def has_dsv4_attention(layer_symbols: Sequence[str]) -> bool:
     """True if any sublayer is built with a DSv4 attention (CSA / HCA / window / DSA)."""
     return any(symbol in _DSV4_ATTENTION_SYMBOLS for symbol in layer_symbols)
@@ -295,8 +310,13 @@ def validate_hybrid_loop_config(config: "TransformerConfig") -> None:
         or config.moe_hybridep_pad_uneven_dispatch_inputs,
         SHORTCUT_MOE: config.moe_shortcut_connection,
         RESIDUAL_STREAM_RECOMPUTE: selective and "residual_stream" in explicit_modules,
-        PIPELINE_PARALLELISM: config.pipeline_model_parallel_size != 1
-        or bool(config.virtual_pipeline_model_parallel_size),
+        # The ring schedule runs the loop over pipeline stages (validate_loop_ring_config,
+        # validate_ring_layout); every other loop holds the whole main pattern on one stage.
+        PIPELINE_PARALLELISM: (
+            config.pipeline_model_parallel_size != 1
+            or bool(config.virtual_pipeline_model_parallel_size)
+        )
+        and not is_ring_loop_config(config),
         CONTEXT_PARALLELISM: config.context_parallel_size != 1 or config.dynamic_context_parallel,
         SEQUENCE_PARALLELISM: config.sequence_parallel,
         # Rounds must see the same function; per-call randomness breaks the recurrence and
@@ -344,8 +364,9 @@ def validate_hybrid_loop_pattern(
     """
     symbols = set(main_pattern) | set(mtp_pattern or "")
     unsupported = {
-        # Roles are counted over the whole main pattern; pipeline stages are not supported.
-        PIPE_IN_PATTERN: Symbols.PIPE in main_pattern,
+        # Roles are counted over the whole main pattern; only the ring schedule runs them over
+        # pipeline stages (its layout: validate_ring_layout).
+        PIPE_IN_PATTERN: Symbols.PIPE in main_pattern and not is_ring_loop_config(config),
         # The loop runs MLA-family attention only as the DSv4 hybrid attention.
         MLA_WITHOUT_DSV4: (config.multi_latent_attention or bool(symbols & Symbols.MLA_ATTENTION))
         and config.experimental_attention_variant != "dsv4_hybrid",
@@ -353,9 +374,16 @@ def validate_hybrid_loop_pattern(
     _raise_if_any([name for name, value in unsupported.items() if value])
 
 
-def reject_pipe_in_loop_pattern(loop_architecture: str, pattern: Optional[str]) -> None:
-    """Reject ``|`` in the main pattern of a loop model (argument-validation time)."""
-    if loop_architecture != "none" and Symbols.PIPE in _main_pattern(pattern):
+def reject_pipe_in_loop_pattern(
+    loop_architecture: str, pattern: Optional[str], loop_schedule: str = "standard"
+) -> None:
+    """Reject ``|`` in the main pattern of a loop model (argument-validation time), unless the
+    ring schedule (``loop_schedule='ring'``) runs the loop over those pipeline stages."""
+    if (
+        loop_architecture != "none"
+        and loop_schedule != "ring"
+        and Symbols.PIPE in _main_pattern(pattern)
+    ):
         _raise_if_any([PIPE_IN_PATTERN])
 
 
@@ -853,3 +881,282 @@ def validate_rsbf_data_parallel(model: Any) -> None:
         if sharded or (fsdp_module is not None and isinstance(module, fsdp_module)):
             raise ValueError("Loop RSBF does not support: " + RSBF_SHARDED_DP)
         module = getattr(module, "module", None)
+
+
+# ---------------------------------------------------------------------------------------------
+# The ring schedule (loop_schedule='ring'): the hybrid Huginn loop over pipeline stages
+# ---------------------------------------------------------------------------------------------
+#
+# The main pattern carries P x k '|' segments of the unchanged layer sequence (P pipeline stages,
+# k core slices per stage: k = 1 one chunk per rank, k > 1 Megatron's standard virtual-pipeline
+# chunks). Segment s is the physical chunk (p, j) = (s % P, s // P), as select_pipeline_segment
+# indexes it. The first segment holds the prelude before its core slice (the round-start chunk:
+# the embedding and the loop adapter), the last one the coda after its core slice (the
+# round-end chunk: the loop norm, MTP and the heads). Every microbatch passes the stage ring once
+# per round; the shared core weights live once, on the chunk that holds them.
+
+# Ring rule names, as they appear in the error message ("Loop ring does not support: <name>").
+# Config rules (validate_loop_ring_config).
+RING_WITHOUT_HYBRID_ROLES = "the ring schedule without hybrid loop roles"
+RING_WITHOUT_PP = "loop_schedule='ring' without pipeline parallelism"
+RING_MOR = "MoR under the ring schedule"
+RING_CARRIER = "loop_carrier other than 'injection' under the ring schedule"
+RING_SAMPLE_DEPTH = "loop_sample_depth under the ring schedule"
+RING_TRUNCATED_BPTT = "truncated BPTT under the ring schedule"
+RING_UNTIED_CORE = "loop_untie_core under the ring schedule"
+RING_TP = "tensor parallelism under the ring schedule"
+RING_STATIC_BUDGET_MOE = (
+    "a static MoE rank budget (moe_expert_rank_capacity_factor) under the ring schedule"
+)
+RING_DEFER_EMBEDDING_WGRAD = "defer_embedding_wgrad_compute under the ring schedule"
+RING_PIPELINE_LAYOUT = (
+    "pipeline_model_parallel_layout under the ring schedule (the '|' segments are the layout)"
+)
+RING_P2_WITHOUT_OVERLAP = "the ring at pipeline_model_parallel_size 2 without overlap_p2p_comm"
+RING_RECOMPUTE_PLAN = (
+    "loop_ring_recompute_plan other than P '/'-separated groups of R x k codes 'C' / 'n'"
+)
+RING_PLAN_WITHOUT_RECOMPUTE = "'C' in loop_ring_recompute_plan without loop_recompute"
+# Layout rules (validate_ring_layout on the main pattern; resolve_hybrid_loop_ring_roles on one
+# chunk).
+RING_SEGMENTS = "'|' segments other than pipeline_model_parallel_size x the virtual pipeline size"
+RING_NUM_LAYERS = "num_layers other than the main pattern's sublayer count"
+RING_CUT_NOT_ON_BLOCK = "'|' cut not on a block boundary"
+RING_PRELUDE_SPLIT = "prelude outside the first '|' segment"
+RING_CODA_SPLIT = "coda outside the last '|' segment"
+RING_SEGMENT_WITHOUT_CORE = "a '|' segment without a core block"
+RING_CHUNK_RANGE = "a ring chunk outside the main pattern"
+# Runtime rules (the loop stack).
+RING_EAGER_CALL = (
+    "a ring chunk run as an eager loop (its rounds run only as the ring schedule's round views)"
+)
+RING_ROW_DEPTHS = "per-row loop depths (set_loop_depths) under the ring schedule"
+RING_CARRIER_DIAGNOSTICS = "carrier diagnostics under the ring schedule"
+
+# The recompute plan's codes, one per (stage, round view): 'C' checkpoints the round body (keeps
+# only its inputs), 'n' keeps its activations.
+RING_RECOMPUTE_CODES = ("C", "n")
+
+
+def refuse_ring(*rules: str) -> None:
+    """Raise ``ValueError("Loop ring does not support: <rule>, ...")`` for ``rules`` (if any)."""
+    if rules:
+        raise ValueError("Loop ring does not support: " + ", ".join(rules))
+
+
+@dataclass(frozen=True)
+class LoopRingChunk:
+    """One chunk of a ring loop: the ``'|'`` segment a pipeline rank builds as one module (one of
+    its k virtual-pipeline modules at k > 1).
+
+    ``offset`` is the global index of the chunk's first sublayer (the stack's
+    ``pp_layer_offset``). ``local`` counts the chunk's own prelude, core and coda sublayers, which
+    lie in that order, so ``local.core_start`` / ``local.core_end`` index the chunk's layer list.
+    ``round_start``: the chunk holds global sublayer 0 (the prelude and the loop adapter: every
+    round starts here); ``round_end``: it holds the last sublayer (the coda and the loop norm:
+    every round ends here).
+    """
+
+    offset: int
+    local: LoopRoles
+    round_start: bool
+    round_end: bool
+
+
+def ring_virtual_pipeline_size(config: Any) -> int:
+    """k: the core slices per pipeline stage of a ring loop (the virtual pipeline size, 1
+    without one)."""
+    return getattr(config, "virtual_pipeline_model_parallel_size", None) or 1
+
+
+def _ring_views(config: Any) -> int:
+    """V = R x k: the round views per stage (round view v = r * k + j runs chunk j in round r)."""
+    return config.loop_iterations * ring_virtual_pipeline_size(config)
+
+
+def ring_recompute_plan_violations(config: Any) -> List[str]:
+    """The ``loop_ring_recompute_plan`` rules ``config`` breaks (empty without a plan)."""
+    plan = getattr(config, "loop_ring_recompute_plan", None)
+    if plan is None:
+        return []
+    groups = plan.split("/")
+    views = _ring_views(config)
+    violations = []
+    if len(groups) != config.pipeline_model_parallel_size or any(
+        len(group) != views or not set(group) <= set(RING_RECOMPUTE_CODES) for group in groups
+    ):
+        violations.append(RING_RECOMPUTE_PLAN)
+    if "C" in plan and not config.loop_recompute:
+        violations.append(RING_PLAN_WITHOUT_RECOMPUTE)
+    return violations
+
+
+def resolve_loop_ring_recompute_plan(config: Any) -> Tuple[str, ...]:
+    """The recompute codes of a ring config, one string of R x k codes per stage (stage 0
+    first; view v = r * k + j): ``loop_ring_recompute_plan`` when set, else every view 'C' with
+    ``loop_recompute`` and 'n' without."""
+    refuse_ring(*ring_recompute_plan_violations(config))
+    plan = getattr(config, "loop_ring_recompute_plan", None)
+    if plan is not None:
+        return tuple(plan.split("/"))
+    code = "C" if config.loop_recompute else "n"
+    return tuple(code * _ring_views(config) for _ in range(config.pipeline_model_parallel_size))
+
+
+def validate_loop_ring_config(config: "TransformerConfig") -> None:
+    """Reject configs the ring schedule (``loop_schedule='ring'``) cannot run.
+
+    Called by ``TransformerConfig.__post_init__`` with ``loop_schedule='ring'`` and by the loop
+    stack's constructor. Collects every violation and raises one ``ValueError`` (``"Loop ring
+    does not support: <name>, <name>"``). The ring runs a fixed-depth Huginn loop with the
+    injection carrier over P >= 2 pipeline stages; each microbatch runs exactly
+    ``loop_iterations`` rounds, the shared core once per round on every stage. The eager
+    hybrid-loop guards still apply (``validate_hybrid_loop_config`` except its pipeline rule, the
+    DDP guards): context / sequence parallelism, CUDA graphs, EP overlap, activation offload and
+    paged stash, recompute other than ``loop_recompute`` and overlapped grad reduce / param gather
+    stay refused there; the RSBF-only fields by ``TransformerConfig`` ("require
+    loop_schedule='rsbf'") and the loop parameter store by ``validate_param_store_config``. The
+    ``'|'`` layout is ``validate_ring_layout``'s.
+    """
+    stages = config.pipeline_model_parallel_size
+    unsupported = {
+        RING_WITHOUT_HYBRID_ROLES: not is_hybrid_loop_config(config),
+        RING_WITHOUT_PP: stages < 2,
+        # The round views run Huginn rounds of one tied core with one adapter and one norm.
+        RING_MOR: config.loop_architecture == "mor",
+        RING_CARRIER: getattr(config, "loop_carrier", "injection") != "injection",
+        RING_UNTIED_CORE: bool(getattr(config, "loop_untie_core", False)),
+        # Every microbatch runs exactly loop_iterations rounds (the schedule's views), each with
+        # its full backward.
+        RING_SAMPLE_DEPTH: config.loop_sample_depth,
+        RING_TRUNCATED_BPTT: config.loop_bptt_iterations > 0,
+        # Untested: TP collectives inside every round view.
+        RING_TP: config.tensor_model_parallel_size > 1,
+        # Dropless routing: a static per-rank budget drops the tokens that overflow it.
+        RING_STATIC_BUDGET_MOE: getattr(config, "moe_expert_rank_capacity_factor", None)
+        is not None,
+        # The deferred output-layer wgrad is finished on the schedule's model chunks, which are
+        # the parameterless round views.
+        RING_DEFER_EMBEDDING_WGRAD: bool(config.defer_embedding_wgrad_compute),
+        RING_PIPELINE_LAYOUT: getattr(config, "pipeline_model_parallel_layout", None) is not None,
+        # The ring always runs the interleaved schedule; at PP 2 both directions use one peer
+        # pair, which batched P2P cannot post in one batch (the virtual-pipeline rule).
+        RING_P2_WITHOUT_OVERLAP: stages == 2 and not config.overlap_p2p_comm,
+        **{rule: True for rule in ring_recompute_plan_violations(config)},
+    }
+    refuse_ring(*[name for name, value in unsupported.items() if value])
+
+
+def _ring_chunk(
+    roles: LoopRoles, offset: int, length: int
+) -> Tuple[Optional[LoopRingChunk], List[str]]:
+    """The chunk holding sublayers ``[offset, offset + length)`` of a ring loop with the model
+    roles ``roles`` (None when it breaks a rule) and the ring rules it breaks."""
+    total = roles.prelude + roles.core + roles.coda
+    end = offset + length
+    if length < 1:
+        return None, [RING_SEGMENT_WITHOUT_CORE]
+    if offset < 0 or end > total:
+        return None, [RING_CHUNK_RANGE]
+    prelude = max(0, min(end, roles.core_start) - offset)
+    core = max(0, min(end, roles.core_end) - max(offset, roles.core_start))
+    coda = max(0, end - max(offset, roles.core_end))
+    violations = []
+    # The prelude and the coda run once per microbatch: each lies whole in one chunk.
+    if 0 < prelude < roles.prelude:
+        violations.append(RING_PRELUDE_SPLIT)
+    if 0 < coda < roles.coda:
+        violations.append(RING_CODA_SPLIT)
+    # Every chunk runs a slice of every round.
+    if core == 0:
+        violations.append(RING_SEGMENT_WITHOUT_CORE)
+    if violations:
+        return None, violations
+    local = LoopRoles(prelude=prelude, core=core, coda=coda)
+    return LoopRingChunk(offset, local, round_start=offset == 0, round_end=end == total), []
+
+
+def validate_ring_layout(
+    config: "TransformerConfig", main_pattern: str, hash_moe_layer_threshold: Optional[int]
+) -> List[LoopRingChunk]:
+    """Check the ``'|'`` layout of a ring loop's main pattern; return its chunks in segment order.
+
+    The pipe-free pattern must pass the hybrid loop's role rules (``resolve_hybrid_loop_roles``:
+    role cuts on block boundaries, the hash-routed MoE layers inside the prelude, supported
+    sublayers; raised as "Hybrid loop does not support: ..."). Then the ring rules, collected
+    into one "Loop ring does not support: ..." error: P x k segments (``RING_SEGMENTS``; k, the
+    virtual pipeline size, exists only as ring sub-chunks), ``num_layers`` equal to the pipe-free
+    sublayer count (the stacks derive the model roles from it), every cut on a block boundary,
+    the prelude inside the first segment and the coda inside the last one, and a core block in
+    every segment. With the prelude in the first segment, the hash-routed layers lie on the stage
+    that owns the token ids. Called by ``HybridModel.__init__`` with ``loop_schedule='ring'``
+    on every rank, before any layer is built.
+    """
+    segments = main_pattern.split(Symbols.PIPE)
+    symbols = list(main_pattern.replace(Symbols.PIPE, ""))
+    roles = resolve_hybrid_loop_roles(config, symbols, hash_moe_layer_threshold)
+    violations = []
+    if len(segments) != config.pipeline_model_parallel_size * ring_virtual_pipeline_size(config):
+        violations.append(RING_SEGMENTS)
+    if config.num_layers != len(symbols):
+        violations.append(RING_NUM_LAYERS)
+    chunks = []
+    offset = 0
+    for segment in segments:
+        if offset and not is_block_boundary(symbols, offset):
+            violations.append(RING_CUT_NOT_ON_BLOCK)
+        chunk, broken = _ring_chunk(roles, offset, len(segment))
+        violations += broken
+        chunks.append(chunk)
+        offset += len(segment)
+    refuse_ring(*dict.fromkeys(violations))
+    return chunks
+
+
+def resolve_hybrid_loop_ring_roles(
+    config: "TransformerConfig",
+    layer_symbols: Sequence[str],
+    pp_layer_offset: int,
+    hash_moe_layer_threshold: Optional[int],
+) -> Tuple[LoopRoles, LoopRingChunk]:
+    """The model roles and this chunk's roles of a ring loop stack (``loop_schedule='ring'``).
+
+    The stack holds sublayers ``[pp_layer_offset, pp_layer_offset + len(layer_symbols))`` of the
+    main pattern. The model roles come from the global counts (``num_layers`` sublayers in the
+    main pattern, ``loop_prelude_sublayers``, ``loop_coda_sublayers``) and the chunk's roles from
+    its offset: no pipeline rank is read, so the same code builds every chunk, on its rank or all
+    in one process. Checks what one chunk can: its sublayer kinds (``UNSUPPORTED_SUBLAYERS``),
+    the hash-routed layers inside the prelude (``HASH_BEYOND_PRELUDE``), its role cuts on block
+    boundaries (``CUT_NOT_ON_BLOCK``), then the ring rules (its ends on block boundaries, the
+    prelude / coda not split, a core block, inside the pattern). The whole layout is
+    ``validate_ring_layout``'s.
+    """
+    symbols = list(layer_symbols)
+    num_layers = config.num_layers
+    prelude, coda = config.loop_prelude_sublayers, config.loop_coda_sublayers
+    violations = []
+    roles = None
+    if prelude is None or coda is None or prelude < 0 or coda < 0 or prelude + coda >= num_layers:
+        violations.append(ROLES_DO_NOT_MATCH)
+    else:
+        roles = LoopRoles(prelude=prelude, core=num_layers - prelude - coda, coda=coda)
+    if set(symbols) & _UNSUPPORTED_SYMBOLS:
+        violations.append(UNSUPPORTED_SUBLAYERS)
+    if roles is not None and hash_moe_layer_threshold and hash_moe_layer_threshold > roles.prelude:
+        violations.append(HASH_BEYOND_PRELUDE)
+    chunk, ring = (None, []) if roles is None else _ring_chunk(roles, pp_layer_offset, len(symbols))
+    if chunk is not None:
+        local = chunk.local
+        if not (
+            is_block_boundary(symbols, local.core_start)
+            and is_block_boundary(symbols, local.core_end)
+        ):
+            violations.append(CUT_NOT_ON_BLOCK)
+        # The chunk's own ends are '|' cuts (except at the ends of the main pattern).
+        if (not chunk.round_start and symbols[0] not in _BLOCK_START) or (
+            not chunk.round_end and symbols[-1] not in _BLOCK_END
+        ):
+            ring.append(RING_CUT_NOT_ON_BLOCK)
+    _raise_if_any(violations)
+    refuse_ring(*ring)
+    return roles, chunk

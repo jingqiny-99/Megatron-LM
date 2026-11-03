@@ -164,7 +164,7 @@ class TransformerConfig(ModelParallelConfig):
     """Hybrid loop: number of sublayers of the main hybrid layer pattern that run once after
     the shared core. Set together with loop_prelude_sublayers."""
 
-    loop_schedule: Literal["standard", "rsbf"] = "standard"
+    loop_schedule: Literal["standard", "rsbf", "ring"] = "standard"
     """Training schedule of a hybrid Huginn loop. 'rsbf' runs training steps through the
     round-synchronous breadth-first executor (forward_backward_loop_rsbf: per-sample exit,
     round-input checkpoints, per-round backward items); evaluation keeps the standard
@@ -173,7 +173,21 @@ class TransformerConfig(ModelParallelConfig):
     indexer loss gradients are the standard schedule's at micro_batch_size 1 whatever the
     micro_batch_size (at MBS b the standard schedule averages them over the b rows of a
     microbatch, a 1/b smaller coefficient); their logged values match the standard schedule's
-    logs at the same micro_batch_size."""
+    logs at the same micro_batch_size. 'ring' runs the loop over pipeline stages (PP > 1): the
+    main pattern carries P x k '|' segments of the unchanged layer sequence (k = 1 one chunk per
+    rank, k > 1 the standard virtual-pipeline chunks), the first one holding the prelude and the
+    last one the coda, and every round of every microbatch passes the stage ring once, so the
+    shared core weights live once, on the chunk that holds them. A ring chunk runs only through
+    the ring schedule's round views; the supported features are listed by
+    loop/guards.py (validate_loop_ring_config, validate_ring_layout)."""
+
+    loop_ring_recompute_plan: Optional[str] = None
+    """loop_schedule='ring': the recompute plan, one code per (pipeline stage, round view): P
+    '/'-separated groups (stage 0 first) of R x k codes, R = loop_iterations and k the virtual
+    pipeline size (round view v = r * k + j runs chunk j in round r). 'C' checkpoints the round
+    body (keeps only its inputs; needs loop_recompute), 'n' keeps its activations; e.g.
+    'CCCCCCCC/CCCCCCCn' for P = 2, k = 2, R = 4. None: every view 'C' with loop_recompute and 'n'
+    without."""
 
     loop_rsbf_waves: int = 1
     """RSBF: passes (waves) per optimizer step; gradients accumulate across waves. Must divide
@@ -2479,6 +2493,13 @@ class TransformerConfig(ModelParallelConfig):
             ]
             if rsbf_only:
                 raise ValueError(f"{', '.join(rsbf_only)} require loop_schedule='rsbf'")
+        if self.loop_schedule == "ring":
+            # Imported lazily: the guards module imports model code.
+            from megatron.core.transformer.loop.guards import validate_loop_ring_config
+
+            validate_loop_ring_config(self)
+        elif self.loop_ring_recompute_plan is not None:
+            raise ValueError("loop_ring_recompute_plan requires loop_schedule='ring'")
         # Dynamic CP can assign a multi-rank group even when configured CP is one.
         has_context_parallelism = self.context_parallel_size > 1 or self.dynamic_context_parallel
 

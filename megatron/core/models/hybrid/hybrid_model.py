@@ -299,6 +299,18 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
         hash_moe_layer_threshold = _get_hash_moe_layer_threshold(
             parsed.main_pattern, self.config.moe_num_hash_layers
         )
+        if self.config.loop_architecture != "none":
+            from megatron.core.transformer.loop.guards import (
+                is_ring_loop_config,
+                validate_ring_layout,
+            )
+
+            if is_ring_loop_config(self.config):
+                # The loop over pipeline stages: its '|' layout, on every rank before any layer
+                # is built (each loop stack then resolves its own chunk's roles).
+                validate_ring_layout(
+                    self.config, parsed.main_pattern or '', hash_moe_layer_threshold
+                )
         if self.mtp_num_depths > 0:
             if self.config.mtp_num_layers is None:
                 self.config.mtp_num_layers = self.mtp_num_depths

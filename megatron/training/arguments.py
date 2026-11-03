@@ -1183,11 +1183,14 @@ def validate_args(args, defaults={}):
 
     if args.hybrid_layer_pattern is not None:
         # A loop model counts its roles over the whole main pattern; reject '|' stages before
-        # they set the pipeline layout and VPP below.
+        # they set the pipeline layout and VPP below, unless the ring schedule runs the loop
+        # over them (--loop-schedule ring).
         from megatron.core.transformer.loop.guards import reject_pipe_in_loop_pattern
 
         reject_pipe_in_loop_pattern(
-            getattr(args, 'loop_architecture', 'none'), args.hybrid_layer_pattern
+            getattr(args, 'loop_architecture', 'none'),
+            args.hybrid_layer_pattern,
+            getattr(args, 'loop_schedule', 'standard'),
         )
 
         # Derive num_layers from pattern; hybrid_layer_pattern always overrides --num-layers when
@@ -1427,6 +1430,12 @@ def validate_args(args, defaults={}):
                 'pipeline-model-parallel size should be greater than 2 to avoid having multiple '
                 'p2p sends and recvs between same 2 ranks per communication batch'
             )
+    elif getattr(args, 'loop_schedule', 'standard') == 'ring':
+        # The loop ring runs the interleaved schedule over its round views at every virtual
+        # pipeline size, also at one chunk per rank: keep the user's overlap_p2p_comm (required
+        # at PP 2, the loop guard RING_P2_WITHOUT_OVERLAP). Aligned param AG stays off (the loop
+        # refuses overlapped param gather).
+        args.align_param_gather = False
     else:
         # Overlap P2P communication is disabled if not using the interleaved schedule.
         args.overlap_p2p_comm = False

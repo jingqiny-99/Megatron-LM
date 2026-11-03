@@ -461,6 +461,7 @@ GOLDEN_CONFIG: Dict[str, Any] = {
     "loop_prelude_sublayers": None,
     "loop_coda_sublayers": None,
     "loop_schedule": "standard",
+    "loop_ring_recompute_plan": None,
     "loop_rsbf_waves": 1,
     "loop_rsbf_fill": "drain",
     "loop_rsbf_rebalance": True,
