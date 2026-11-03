@@ -545,6 +545,8 @@ LOOP_ARGUMENT_RESUME_CLASSES = {
     "loop_prelude_layers": "refused",
     "loop_prelude_sublayers": "refused",
     "loop_recompute": "refused",
+    "loop_recompute_block_stride": "refused",
+    "loop_recompute_edges": "refused",
     "loop_resume_changes": "silent",
     "loop_router_balance_coeff": "refused",
     "loop_router_z_loss_coeff": "refused",

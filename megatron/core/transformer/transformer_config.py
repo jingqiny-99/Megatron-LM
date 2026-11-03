@@ -150,6 +150,21 @@ class TransformerConfig(ModelParallelConfig):
     loop_recompute: bool = False
     """Checkpoint individual recurrences with non-reentrant autograd."""
 
+    loop_recompute_block_stride: Optional[int] = None
+    """Hybrid Huginn loop with loop_recompute: checkpoint every loop_recompute_block_stride core
+    sublayers of a round instead of the whole round (block checkpoints). Sublayers are counted
+    as for loop_rsbf_block_stride (symbols of the hybrid pattern, so one attention + MLP layer
+    is 2); 1 <= stride <= the sublayers one round runs (the core, or one untied segment). It
+    need not divide them (the last block is then shorter); equal to them is one block per round,
+    bitwise the same as None. The first block of a round also runs the Huginn adapter and the
+    last one the loop norm. None keeps one checkpoint per round. Math-neutral: only the saved
+    activations and the recompute granularity change."""
+
+    loop_recompute_edges: bool = False
+    """Hybrid Huginn loop with loop_recompute_block_stride: also checkpoint the prelude and the
+    coda, in blocks of the same stride. The MTP depths and the output layer keep their
+    activations."""
+
     loop_token_execution: Literal["masked", "compact"] = "compact"
     loop_router_balance_coeff: float = 0.01
     loop_router_z_loss_coeff: float = 0.001
@@ -2450,6 +2465,14 @@ class TransformerConfig(ModelParallelConfig):
             )
         elif self.loop_carrier != "injection" or self.loop_attn_res_blocks_per_round != 1:
             raise ValueError("loop_carrier / loop_attn_res_blocks_per_round require a hybrid loop")
+        if (self.loop_recompute_block_stride is not None or self.loop_recompute_edges) and not (
+            self.loop_architecture != "none" and hybrid_loop_roles
+        ):
+            # Only the hybrid loop stack runs block checkpoints; elsewhere the fields would be
+            # ignored silently. Imported lazily: the guards module imports model code.
+            from megatron.core.transformer.loop.guards import RECOMPUTE_BLOCKS_WITHOUT_HYBRID_LOOP
+
+            raise ValueError(f"Loop does not support: {RECOMPUTE_BLOCKS_WITHOUT_HYBRID_LOOP}")
         if self.loop_schedule == "rsbf":
             # Imported lazily: the guards module imports model code.
             from megatron.core.transformer.loop.guards import validate_rsbf_config

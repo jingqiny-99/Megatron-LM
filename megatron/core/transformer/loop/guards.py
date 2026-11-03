@@ -30,6 +30,13 @@ Where each group runs:
 The role-field checks themselves (both set or neither, nonnegative, non-empty core) and the
 quantized-loop weight-cache rule are in ``TransformerConfig.__post_init__``.
 
+Block and edge ``loop_recompute`` (``loop_recompute_block_stride`` / ``loop_recompute_edges``):
+the prerequisites and the MoR / ``attn_res`` refusals are config rules
+(``validate_hybrid_loop_config``), the stride's range is a role rule
+(``resolve_hybrid_loop_roles``: it needs the round's sublayer count), and
+``RECOMPUTE_BLOCKS_WITHOUT_HYBRID_LOOP`` (the fields on a GPT loop or without a loop) is raised
+by ``TransformerConfig.__post_init__``.
+
 This module is imported lazily by its callers; keep its imports light.
 """
 
@@ -114,6 +121,29 @@ UNTIED_CORE_SEGMENTS = "loop_untie_core core not R equal segments cut on block b
 CARRIER_STACK_MISMATCH = (
     "loop_carrier does not match the loop stack class (use "
     "loop_attn_res_hybrid_*_stack_spec for 'attn_res', loop_hybrid_*_stack_spec otherwise)"
+)
+# Block and edge checkpoints of loop_recompute (``loop_recompute_block_stride`` /
+# ``loop_recompute_edges``; ``LoopHybridStack._checkpointed_blocks``).
+RECOMPUTE_BLOCKS_WITHOUT_RECOMPUTE = (
+    "loop_recompute_block_stride / loop_recompute_edges without loop_recompute"
+)
+RECOMPUTE_EDGES_WITHOUT_STRIDE = "loop_recompute_edges without loop_recompute_block_stride"
+RECOMPUTE_STRIDE_RANGE = (
+    "loop_recompute_block_stride outside 1..the sublayers of one round (the core or one untied "
+    "segment)"
+)
+RECOMPUTE_BLOCKS_MOR = (
+    "loop_recompute_block_stride with MoR (its recurrence keeps one checkpoint per round)"
+)
+RECOMPUTE_BLOCKS_ATTN_RES = (
+    "loop_recompute_block_stride with loop_carrier='attn_res' (LoopAttnResHybridStack "
+    "checkpoints whole rounds)"
+)
+# Raised by TransformerConfig.__post_init__ ("Loop does not support: ..."): the fields would be
+# ignored silently by a GPT loop or a model without a loop.
+RECOMPUTE_BLOCKS_WITHOUT_HYBRID_LOOP = (
+    "loop_recompute_block_stride / loop_recompute_edges without a hybrid loop "
+    "(loop_architecture with loop_prelude_sublayers / loop_coda_sublayers)"
 )
 
 # Sublayer symbols that begin a block (a sequence mixer) or end one (an MLP / MoE). The
@@ -282,6 +312,8 @@ def validate_hybrid_loop_config(config: "TransformerConfig") -> None:
     selective = config.recompute_granularity == "selective"
     explicit_modules = config.recompute_modules if config.recompute_modules is not None else ()
     attn_res = getattr(config, "loop_carrier", "injection") == "attn_res"
+    blocks = getattr(config, "loop_recompute_block_stride", None) is not None
+    edges = bool(getattr(config, "loop_recompute_edges", False))
     unsupported = {
         # Delayed scaling keeps an amax history per module call; a core module is called
         # R times per microbatch, so the history would mix rounds.
@@ -328,6 +360,14 @@ def validate_hybrid_loop_config(config: "TransformerConfig") -> None:
         # silently dense there. DSA over MLA is MLA_WITHOUT_DSV4 (pattern rule).
         DSA_OVER_GQA: getattr(config, "experimental_attention_variant", None) == "dsa"
         and not config.multi_latent_attention,
+        # Block / edge checkpoints refine loop_recompute; without it nothing is checkpointed,
+        # and edges reuse the block stride. The stride's range needs the pattern
+        # (resolve_hybrid_loop_roles).
+        RECOMPUTE_BLOCKS_WITHOUT_RECOMPUTE: (blocks or edges) and not config.loop_recompute,
+        RECOMPUTE_EDGES_WITHOUT_STRIDE: edges and not blocks,
+        # Only the Huginn rounds of LoopHybridStack run block checkpoints.
+        RECOMPUTE_BLOCKS_MOR: blocks and config.loop_architecture == "mor",
+        RECOMPUTE_BLOCKS_ATTN_RES: blocks and attn_res,
     }
     _raise_if_any([name for name, value in unsupported.items() if value])
 
@@ -357,6 +397,14 @@ def reject_pipe_in_loop_pattern(loop_architecture: str, pattern: Optional[str]) 
     """Reject ``|`` in the main pattern of a loop model (argument-validation time)."""
     if loop_architecture != "none" and Symbols.PIPE in _main_pattern(pattern):
         _raise_if_any([PIPE_IN_PATTERN])
+
+
+def round_sublayers(config: Any, roles: LoopRoles) -> int:
+    """The core sublayers one round runs: the whole core, or one of the ``loop_iterations``
+    segments of an untied core (``loop_untie_core``)."""
+    if getattr(config, "loop_untie_core", False):
+        return roles.core // config.loop_iterations
+    return roles.core
 
 
 def _untied_segments_valid(symbols: Sequence[str], roles: LoopRoles, rounds: int) -> bool:
@@ -418,6 +466,10 @@ def resolve_hybrid_loop_roles(
             symbols, roles, config.loop_iterations
         ):
             violations.append(UNTIED_CORE_SEGMENTS)
+        # Block checkpoints cut the sublayers one round runs: the core, or one untied segment.
+        stride = getattr(config, "loop_recompute_block_stride", None)
+        if stride is not None and not 1 <= stride <= round_sublayers(config, roles):
+            violations.append(RECOMPUTE_STRIDE_RANGE)
 
     if set(symbols) & _UNSUPPORTED_SYMBOLS:
         violations.append(UNSUPPORTED_SUBLAYERS)

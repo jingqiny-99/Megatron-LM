@@ -27,6 +27,13 @@ injection carrier's Huginn recurrence with untied weights. Fixed depth only (the
 
 Eager only: no CUDA graphs, no pipeline / context / sequence parallelism (see the guards).
 
+Activation recompute (``loop_recompute``): one non-reentrant checkpoint per round (Huginn) or
+recurrence (MoR) by default. With ``loop_recompute_block_stride`` a Huginn round is cut into
+checkpointed blocks of that many core sublayers (the adapter in the first block, the loop norm
+in the last), and with ``loop_recompute_edges`` the prelude and the coda are checkpointed in
+blocks of the same stride (``_checkpointed_blocks``). Each checkpoint keeps only its inputs and
+has its own routing tape; the math is unchanged (bitwise with deterministic kernels).
+
 Checkpoint keys (M3c). At PP = 1 (guarded) a sharded key equals the module path. The loop adds
 no key code of its own: ``HybridStack.sharded_state_dict`` writes sublayer ``i`` as
 ``decoder.layers.i`` (mHC-wrapped sublayers nest their layer under ``inner_layer.`` next to
@@ -81,6 +88,7 @@ from megatron.core.transformer.loop.guards import (
     LoopRoles,
     has_dsv4_attention,
     resolve_hybrid_loop_roles,
+    round_sublayers,
     validate_hybrid_loop_config,
     validate_hybrid_loop_inputs,
     validate_loop_carrier,
@@ -255,11 +263,7 @@ class LoopHybridStack(HybridStack):
                     if hasattr(attention, "attn_mask_type"):  # '*' sublayers only
                         attention.attn_mask_type = AttnMaskType.arbitrary
         # Sublayers one round runs: the whole core, or one of the R untied segments.
-        self._round_core = (
-            self.loop_roles.core // config.loop_iterations
-            if config.loop_untie_core
-            else self.loop_roles.core
-        )
+        self._round_core = round_sublayers(config, self.loop_roles)
         self.loop_losses = {}
         self.loop_metrics = {}
         self.loop_metric_populations = {}
@@ -377,8 +381,15 @@ class LoopHybridStack(HybridStack):
         tokens = sequence * hidden_states.shape[1]
         squared_lengths = tokens * sequence
         with torch.profiler.record_function(label):
-            self._record_range(0, roles.core_start, tokens, squared_lengths, sequence)
-            embedding = self._run_range(hidden_states, 0, roles.core_start, ctx, label + "/prelude")
+            self._record_range(
+                0,
+                roles.core_start,
+                tokens,
+                squared_lengths,
+                sequence,
+                recompute=self.config.loop_recompute_edges,
+            )
+            embedding = self._run_edge(hidden_states, 0, roles.core_start, ctx, label + "/prelude")
             if self._diagnostics_active():
                 self._note_state_rms("loop state rms prelude", embedding, ctx.padding_mask)
             state = self._rounds_and_coda(
@@ -420,9 +431,16 @@ class LoopHybridStack(HybridStack):
             state = self._huginn(embedding, ctx, label, depths)
         else:
             state = self._mor(embedding, ctx, label)
-        self._record_range(roles.core_end, len(self.layers), tokens, squared_lengths, sequence)
+        self._record_range(
+            roles.core_end,
+            len(self.layers),
+            tokens,
+            squared_lengths,
+            sequence,
+            recompute=self.config.loop_recompute_edges,
+        )
         self._record_head(tokens, squared_lengths, sequence)
-        return self._run_range(state, roles.core_end, len(self.layers), ctx, label + "/coda")
+        return self._run_edge(state, roles.core_end, len(self.layers), ctx, label + "/coda")
 
     # ---------------------------------------------------------------------------------------
     # Carrier diagnostics
@@ -515,6 +533,68 @@ class LoopHybridStack(HybridStack):
                 assert (
                     ctx.grouped_tail_to_skip is None
                 ), f"sublayer {index} replayed a grouped CUDA graph inside the hybrid loop"
+        return x
+
+    def _run_edge(self, x, start, end, ctx, label):
+        """The prelude or the coda (sublayers ``[start, end)``): block checkpoints with
+        ``loop_recompute_edges`` in grad mode (``_checkpointed_blocks``), else ``_run_range``."""
+        if (
+            self.config.loop_recompute
+            and self.config.loop_recompute_edges
+            and torch.is_grad_enabled()
+        ):
+            return self._checkpointed_blocks(x, None, start, end, ctx, label)
+        return self._run_range(x, start, end, ctx, label)
+
+    def _checkpointed_blocks(self, x, injection, start, end, ctx, label, step=None):
+        """Run sublayers ``[start, end)`` as non-reentrant activation checkpoints of
+        ``loop_recompute_block_stride`` sublayers each (block and edge ``loop_recompute``).
+
+        Block ``k`` (1-based, the last one possibly shorter) is one ``torch.utils.checkpoint``
+        whose ``context_fn`` is ``loop_checkpoint_context_fn(f"{label}/block={k}")``: its own
+        routing tape (the MoE choices of its forward, replayed by its recompute) and a replay
+        marked as a forward replay (statistics count each forward once). A block keeps only
+        its inputs for the backward. Every block runs its sublayers through ``_run_range`` with
+        ``ctx`` captured by the closure, so each replay enters ``ctx``'s indexer-loss padding
+        scope and gives hash-routed sublayers their token ids again. ``label`` is the range's
+        ``_run_range`` label, so the sublayer profiler ranges keep their names.
+
+        With ``step`` (a Huginn round, 0-based) the blocks form the round body, in the round
+        checkpoint's op order: block 1 takes ``(x, injection)`` (the previous state and the
+        prelude output) and runs the adapter first (the residual carrier has no adapter and
+        takes ``x`` only); the last block records the round's carrier diagnostics (never in a
+        replay, ``_diagnostics_active``) and then applies the loop norm (none on the residual
+        carrier). One block (stride = the round's sublayers) is the round checkpoint under a
+        block label. Without ``step`` (the prelude and coda edges) blocks run sublayers only.
+        """
+        stride = self.config.loop_recompute_block_stride
+        cuts = list(range(start, end, stride))
+        if not cuts:  # an empty prelude or coda
+            return self._run_range(x, start, end, ctx, label)
+        bounds = list(zip(cuts, cuts[1:] + [end]))
+        residual = self.config.loop_carrier == "residual"
+        for k, (first, last) in enumerate(bounds, start=1):
+            adapter = step is not None and k == 1 and not residual
+            tail = step is not None and k == len(bounds)
+
+            # Bind the block's bounds in the closure: its replay runs in the backward.
+            def block(h, *injected, first=first, last=last, adapter=adapter, tail=tail):
+                if adapter:
+                    h = self._adapt(h, injected[0], step)
+                h = self._run_range(h, first, last, ctx, label)
+                if tail:
+                    if self._diagnostics_active():
+                        self._note_state_rms(f"loop state rms r{step + 1}", h, ctx.padding_mask)
+                    if not residual:
+                        h = self._loop_norm(step)(h)
+                return h
+
+            x = checkpoint(
+                block,
+                *((x, injection) if adapter else (x,)),
+                use_reentrant=False,
+                context_fn=loop_checkpoint_context_fn(f"{label}/block={k}"),
+            )
         return x
 
     def _layer_forward_flops(self, index, tokens, squared_lengths, sequence, arbitrary_mask):
@@ -758,7 +838,18 @@ class LoopHybridStack(HybridStack):
             rounds = self.config.loop_iterations
             binned = forward_statistics_round(step + 1, rounds) if step < rounds else nullcontext()
             with context, binned:
-                if self.config.loop_recompute and torch.is_grad_enabled():
+                if (
+                    self.config.loop_recompute
+                    and torch.is_grad_enabled()
+                    and self.config.loop_recompute_block_stride is not None
+                ):
+                    # Block checkpoints: the round body cut into blocks of the stride.
+                    round_label = f"{label}/loop={step + 1}"
+                    with torch.profiler.record_function(round_label):
+                        updated = self._checkpointed_blocks(
+                            state, embedding, core_start, core_end, round_ctx, round_label, step
+                        )
+                elif self.config.loop_recompute and torch.is_grad_enabled():
                     updated = checkpoint(
                         recurrence,
                         state,

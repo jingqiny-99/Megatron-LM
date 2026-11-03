@@ -455,6 +455,8 @@ GOLDEN_CONFIG: Dict[str, Any] = {
     "loop_sample_depth": False,
     "loop_bptt_iterations": 0,
     "loop_recompute": False,
+    "loop_recompute_block_stride": None,
+    "loop_recompute_edges": False,
     "loop_token_execution": "compact",
     "loop_router_balance_coeff": 0.01,
     "loop_router_z_loss_coeff": 0.001,
