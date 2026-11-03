@@ -94,6 +94,7 @@ from megatron.core.transformer.loop.guards import (
     validate_loop_carrier,
     validate_loop_carrier_stack,
     validate_loop_mtp_pattern,
+    validate_loop_row_depths,
     validate_loop_stack_construction,
 )
 from megatron.core.transformer.loop.reporting import stream_mean_rms
@@ -334,10 +335,14 @@ class LoopHybridStack(HybridStack):
         uniform depth (no padding mask is added), so equal row depths equal uniform depth
         bitwise.
 
-        Raises ``ValueError`` on an untied core (``loop_untie_core``: a fixed-depth baseline).
+        Raises ``ValueError`` on an untied core (``loop_untie_core``: a fixed-depth baseline)
+        and on a stack wrapped by Megatron-FSDP (``guards.FSDP_ROW_DEPTHS``: data-parallel
+        ranks would issue different parameter gathers).
         """
         if depths is not None and self.config.loop_untie_core:
             raise ValueError("Untied loop baseline requires fixed-depth Huginn (set_loop_depths)")
+        if depths is not None:
+            validate_loop_row_depths(self)
         self._loop_depths = depths
 
     def set_loop_head_flops(

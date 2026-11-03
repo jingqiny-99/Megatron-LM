@@ -5,13 +5,17 @@ role fields of TransformerConfig.
 
 Config, pattern, role and input rules run without process groups. The wiring tests at the end
 (DistributedDataParallel and HybridModel raise through the guards) share one model-parallel
-initialization for the module: gloo on CPU, NCCL on CUDA.
+initialization for the module: gloo on CPU, NCCL on CUDA. The Megatron-FSDP rules
+(validate_loop_fsdp_config, validate_loop_row_depths) close the file, with their wiring: the
+Megatron-FSDP wrapper refuses a loop config before it builds anything, and set_loop_depths
+refuses per-row depths on a stack whose parameters Megatron-FSDP manages.
 """
 
 import copy
 import os
 import re
 import socket
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -1276,3 +1280,193 @@ def test_param_store_configs_pass_and_rules_collect():
         guards.STORE_DELAYED_WGRAD,
         guards.STORE_GRAD_REDUCE_DTYPE,
     ]
+
+
+# ---------------------------------------------------------------------------------------------
+# Megatron-FSDP rules (validate_loop_fsdp_config, validate_loop_row_depths)
+# ---------------------------------------------------------------------------------------------
+
+# The DDP config of a loop with Megatron-FSDP v1 that passes: accumulate mode, fp32 gradient
+# buckets and gradient communication (ZeRO-3 here; the rules do not depend on the strategy).
+_FSDP_DDP = dict(
+    use_megatron_fsdp=True,
+    use_distributed_optimizer=True,
+    data_parallel_sharding_strategy="optim_grads_params",
+    megatron_fsdp_accumulate_main_grad=True,
+    megatron_fsdp_main_grads_dtype=torch.float32,
+    megatron_fsdp_grad_comm_dtype=torch.float32,
+)
+
+# (rule, model config fields, DDP config fields): each on a copy of a passing pair.
+_FSDP_RULES = [
+    (guards.FSDP_VERSION, {}, dict(megatron_fsdp_version=2)),
+    (guards.FSDP_OVERWRITE_MAIN_GRAD, {}, dict(megatron_fsdp_accumulate_main_grad=False)),
+    (guards.FSDP_GRAD_DTYPE, {}, dict(megatron_fsdp_main_grads_dtype=None)),
+    (guards.FSDP_GRAD_DTYPE, {}, dict(megatron_fsdp_main_grads_dtype=torch.bfloat16)),
+    (guards.FSDP_GRAD_DTYPE, {}, dict(megatron_fsdp_grad_comm_dtype=None)),
+    (guards.FSDP_GRAD_DTYPE, {}, dict(megatron_fsdp_grad_comm_dtype=torch.bfloat16)),
+    (guards.FSDP_PERSISTENT_BUFFERS, {}, dict(fsdp_double_buffer=True)),
+    (guards.FSDP_PERSISTENT_BUFFERS, {}, dict(nccl_ub=True)),
+    (guards.FSDP_PERSISTENT_BUFFERS, {}, dict(megatron_fsdp_max_pool_double_buffer=True)),
+    (
+        guards.FSDP_FINE_GRAINED_GATHER,
+        {},
+        dict(megatron_fsdp_enable_fine_grained_param_gather=True),
+    ),
+    (guards.FSDP_FINE_GRAINED_GATHER, dict(fp8_recipe="mxfp8"), dict(fp8_param_gather=True)),
+    (guards.FSDP_TE_OP_FUSER, dict(use_transformer_engine_op_fuser=True), {}),
+    (guards.FSDP_DELAYED_WGRAD, dict(delay_wgrad_compute=True), {}),
+    (guards.FSDP_DELAYED_WGRAD, {}, dict(delay_wgrad_compute=True)),
+    (guards.FSDP_SAMPLED_DEPTHS, dict(loop_sample_depth=True), {}),
+    (guards.FSDP_SAMPLED_DEPTHS, dict(loop_exit_criterion="sampled"), {}),
+    (guards.FSDP_MOR, dict(loop_architecture="mor"), {}),
+    (guards.FSDP_ATTN_RES, dict(loop_carrier="attn_res"), {}),
+    (guards.FSDP_HSDP, {}, dict(num_distributed_optimizer_instances=2)),
+]
+_FSDP_RULE_NAMES = [
+    guards.FSDP_GPT_LOOP,
+    guards.FSDP_VERSION,
+    guards.FSDP_OVERWRITE_MAIN_GRAD,
+    guards.FSDP_GRAD_DTYPE,
+    guards.FSDP_PERSISTENT_BUFFERS,
+    guards.FSDP_FINE_GRAINED_GATHER,
+    guards.FSDP_TE_OP_FUSER,
+    guards.FSDP_DELAYED_WGRAD,
+    guards.FSDP_SAMPLED_DEPTHS,
+    guards.FSDP_ROW_DEPTHS,
+    guards.FSDP_MOR,
+    guards.FSDP_ATTN_RES,
+    guards.FSDP_HSDP,
+    guards.FSDP_CHECKPOINTING,
+]
+
+
+def _fsdp_reported(excinfo):
+    message = str(excinfo.value)
+    assert message.startswith(guards.FSDP_PREFIX), message
+    return message[len(guards.FSDP_PREFIX) :].split(", ")
+
+
+def _fsdp_ddp_config(**fields):
+    return _violating(DistributedDataParallelConfig(**_FSDP_DDP), **fields)
+
+
+def _args_namespace(config, ddp_config, **fields):
+    """The argument namespace validate_loop_fsdp_config sees in argument validation: the model
+    and DDP fields side by side (duck-typed), plus ``fields``."""
+    args = SimpleNamespace(**vars(ddp_config))
+    args.__dict__.update(vars(config))
+    args.__dict__.update(save=None, load=None, pretrained_checkpoint=None)
+    args.__dict__.update(fields)
+    return args
+
+
+@pytest.mark.parametrize(
+    "rule,fields,ddp_fields",
+    _FSDP_RULES,
+    ids=[f"{rule[:32]}-{'-'.join(list(f) + list(d))}" for rule, f, d in _FSDP_RULES],
+)
+def test_fsdp_rule_is_reported_alone(rule, fields, ddp_fields):
+    """Each Megatron-FSDP rule on a copy of a passing model config and DDP config that differs
+    in that rule's fields only (the real config classes: the field names must exist)."""
+    config = _violating(_dense_config(), **fields)
+    with pytest.raises(ValueError) as excinfo:
+        guards.validate_loop_fsdp_config(config, _fsdp_ddp_config(**ddp_fields))
+    assert _fsdp_reported(excinfo) == [rule]
+
+
+def test_fsdp_refuses_the_gpt_loop():
+    with pytest.raises(ValueError) as excinfo:
+        guards.validate_loop_fsdp_config(_gpt_loop_config(), _fsdp_ddp_config())
+    assert _fsdp_reported(excinfo) == [guards.FSDP_GPT_LOOP]
+
+
+@pytest.mark.parametrize("flag", ["save", "load", "pretrained_checkpoint"])
+def test_fsdp_refuses_checkpointing_at_argument_validation(flag):
+    """The checkpoint rule reads the argument namespace (the wrapper's configs have no paths)."""
+    args = _args_namespace(_dense_config(), _fsdp_ddp_config(), **{flag: "/checkpoints"})
+    with pytest.raises(ValueError) as excinfo:
+        guards.validate_loop_fsdp_config(args, args)
+    assert _fsdp_reported(excinfo) == [guards.FSDP_CHECKPOINTING]
+
+
+def test_fsdp_configs_pass_and_rules_collect():
+    for strategy in ("optim_grads", "optim_grads_params"):
+        ddp_config = _fsdp_ddp_config(data_parallel_sharding_strategy=strategy)
+        guards.validate_loop_fsdp_config(_dense_config(), ddp_config)
+        guards.validate_loop_fsdp_config(_dsv4_config(), ddp_config)
+        guards.validate_loop_fsdp_config(
+            _dense_config(loop_recompute=True, loop_recompute_block_stride=2), ddp_config
+        )
+    # The residual carrier, and the argument namespace's dtype strings (before the mapping).
+    guards.validate_loop_fsdp_config(
+        _violating(_dense_config(), loop_carrier="residual"), _fsdp_ddp_config()
+    )
+    args = _args_namespace(
+        _dense_config(),
+        _fsdp_ddp_config(),
+        megatron_fsdp_main_grads_dtype="fp32",
+        megatron_fsdp_grad_comm_dtype="fp32",
+    )
+    guards.validate_loop_fsdp_config(args, args)
+    # A config without a loop is not checked (Megatron-FSDP's defaults apply).
+    guards.validate_loop_fsdp_config(
+        TransformerConfig(num_layers=2, hidden_size=64, num_attention_heads=4),
+        DistributedDataParallelConfig(use_megatron_fsdp=True),
+    )
+    # Every violation is listed, in rule order.
+    violating = _violating(_dense_config(), loop_sample_depth=True)
+    ddp_config = _fsdp_ddp_config(megatron_fsdp_accumulate_main_grad=False, nccl_ub=True)
+    with pytest.raises(ValueError) as excinfo:
+        guards.validate_loop_fsdp_config(violating, ddp_config)
+    assert _fsdp_reported(excinfo) == [
+        guards.FSDP_OVERWRITE_MAIN_GRAD,
+        guards.FSDP_PERSISTENT_BUFFERS,
+        guards.FSDP_SAMPLED_DEPTHS,
+    ]
+
+
+def test_fsdp_rule_names_survive_the_message_list():
+    assert len(set(_FSDP_RULE_NAMES)) == len(_FSDP_RULE_NAMES)
+    assert not any(", " in name for name in _FSDP_RULE_NAMES)  # joined with ", "
+    covered = {rule for rule, _, _ in _FSDP_RULES}
+    covered |= {guards.FSDP_GPT_LOOP, guards.FSDP_CHECKPOINTING, guards.FSDP_ROW_DEPTHS}
+    assert covered == set(_FSDP_RULE_NAMES)
+
+
+def test_fsdp_wrapper_checks_the_loop_rules():
+    """FullyShardedDataParallel (Megatron-FSDP v1) refuses a loop config before it builds
+    anything (no process group or device is needed for the refusal)."""
+    from megatron.core.distributed.fsdp.mcore_fsdp_adapter import FullyShardedDataParallel
+
+    ddp_config = DistributedDataParallelConfig(
+        use_megatron_fsdp=True, data_parallel_sharding_strategy="optim_grads_params"
+    )
+    with pytest.raises(ValueError) as excinfo:
+        FullyShardedDataParallel(_dense_config(), ddp_config, torch.nn.Linear(8, 8, bias=False))
+    assert _fsdp_reported(excinfo) == [guards.FSDP_OVERWRITE_MAIN_GRAD, guards.FSDP_GRAD_DTYPE]
+
+
+def test_accumulate_flag_requires_megatron_fsdp_v1():
+    DistributedDataParallelConfig(use_megatron_fsdp=True, megatron_fsdp_accumulate_main_grad=True)
+    for fields in (dict(), dict(use_megatron_fsdp=True, megatron_fsdp_version=2)):
+        with pytest.raises(ValueError, match="megatron_fsdp_accumulate_main_grad requires"):
+            DistributedDataParallelConfig(megatron_fsdp_accumulate_main_grad=True, **fields)
+
+
+def test_row_depths_are_refused_on_a_megatron_fsdp_stack(model_parallel):
+    """set_loop_depths raises once Megatron-FSDP manages the stack's parameters (it marks each
+    one ``__fsdp_param__``); uniform depth (None) and unwrapped stacks are unaffected."""
+    from tests.unit_tests.transformer.loop.hybrid_loop_utils import build_local_loop_stack
+
+    stack = build_local_loop_stack(_DENSE, 2, 2)
+    depths = torch.tensor([1, 2], device=next(stack.parameters()).device)
+    stack.set_loop_depths(depths)
+    stack.set_loop_depths(None)
+    guards.validate_loop_row_depths(stack)
+    for param in stack.parameters():
+        param.__fsdp_param__ = True
+    stack.set_loop_depths(None)
+    with pytest.raises(ValueError) as excinfo:
+        stack.set_loop_depths(depths)
+    assert _fsdp_reported(excinfo) == [guards.FSDP_ROW_DEPTHS]

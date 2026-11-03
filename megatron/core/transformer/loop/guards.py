@@ -23,6 +23,9 @@ Where each group runs:
 * ``validate_loop_decoder``: ``HybridModel.__init__``, after the decoder is built.
 * ``validate_hybrid_loop_inputs``: the start of the loop stack's layer loop, every forward.
 * ``validate_loop_ddp_config``: ``DistributedDataParallel.__init__``.
+* ``validate_loop_fsdp_config`` (``"Loop with Megatron-FSDP does not support: ..."``): the
+  Megatron-FSDP v1 wrapper's constructor (``FullyShardedDataParallel``) and argument validation;
+  ``validate_loop_row_depths``: ``LoopHybridStack.set_loop_depths``.
 * ``validate_rsbf_config`` (``"Loop RSBF does not support: ..."``):
   ``TransformerConfig.__post_init__`` with ``loop_schedule='rsbf'``, and the RSBF schedule.
 * ``validate_rsbf_data_parallel``: the RSBF executor, every step, on the model it runs.
@@ -558,6 +561,126 @@ def validate_loop_ddp_config(
         OVERLAP_PARAM_GATHER: ddp_config.overlap_param_gather,
     }
     _raise_if_any([name for name, value in unsupported.items() if value])
+
+
+# Megatron-FSDP rule names (``validate_loop_fsdp_config``, ``validate_loop_row_depths``), as
+# they appear in the error message ("Loop with Megatron-FSDP does not support: <name>, <name>").
+FSDP_PREFIX = "Loop with Megatron-FSDP does not support: "
+FSDP_GPT_LOOP = "the GPT loop (no loop_prelude_sublayers / loop_coda_sublayers)"
+FSDP_VERSION = "megatron_fsdp_version other than 1"
+FSDP_OVERWRITE_MAIN_GRAD = (
+    "megatron_fsdp_accumulate_main_grad off (each backward use of a core weight would overwrite "
+    "the gradients of its earlier uses)"
+)
+FSDP_GRAD_DTYPE = (
+    "megatron_fsdp_main_grads_dtype or megatron_fsdp_grad_comm_dtype other than fp32 (the "
+    "rounds accumulate in the gradient bucket's dtype)"
+)
+FSDP_PERSISTENT_BUFFERS = (
+    "persistent communication buffers (fsdp_double_buffer / nccl_ub / "
+    "megatron_fsdp_max_pool_double_buffer)"
+)
+FSDP_FINE_GRAINED_GATHER = (
+    "fine-grained parameter gather (megatron_fsdp_enable_fine_grained_param_gather or MXFP8 "
+    "fp8_param_gather)"
+)
+FSDP_TE_OP_FUSER = "use_transformer_engine_op_fuser (its expert path forces overwrite_main_grad)"
+FSDP_DELAYED_WGRAD = "delay_wgrad_compute"
+FSDP_SAMPLED_DEPTHS = "sampled loop depths (loop_sample_depth / loop_exit_criterion='sampled')"
+FSDP_ROW_DEPTHS = "per-row loop depths (set_loop_depths)"
+FSDP_MOR = "MoR (loop_architecture='mor')"
+FSDP_ATTN_RES = "loop_carrier='attn_res'"
+FSDP_HSDP = "HSDP (num_distributed_optimizer_instances > 1)"
+FSDP_CHECKPOINTING = (
+    "checkpoint save / load (--save / --load / --pretrained-checkpoint; the fsdp_dtensor format "
+    "is untested with the loop)"
+)
+
+
+def _raise_fsdp_if_any(violations: List[str]) -> None:
+    if violations:
+        raise ValueError(FSDP_PREFIX + ", ".join(violations))
+
+
+def _is_fp32(dtype: Any) -> bool:
+    """True for fp32 as a ``torch.dtype`` or as the CLI string (before argument mapping)."""
+    import torch
+
+    return dtype is torch.float32 or dtype == "fp32"
+
+
+def validate_loop_fsdp_config(config: Any, ddp_config: Any) -> None:
+    """Reject Megatron-FSDP settings a loop cannot train with (no-op without a loop).
+
+    Called by the Megatron-FSDP v1 wrapper (``FullyShardedDataParallel``) with the model and
+    DDP configs, and by argument validation with the argument namespace as both (duck-typed;
+    the checkpoint rule needs the namespace's ``save`` / ``load`` / ``pretrained_checkpoint``).
+
+    The loop runs every core weight several times per microbatch. Megatron-FSDP reduce-scatters
+    a sharded gradient once per microbatch, after the parameter's last backward use, from an
+    unsharded bucket allocated for that microbatch; the uses must therefore add into the
+    bucket (accumulate mode, ``megatron_fsdp_accumulate_main_grad``), in fp32 (the bucket takes
+    the gradient communication dtype). Refused besides: persistent communication buffers (every
+    core unit's bucket stays alive across the rounds, more than a fixed pool holds),
+    fine-grained gather, the TE op fuser and delayed weight gradients (untested with repeated
+    module calls; the op fuser forces overwrites), sampled depths and per-row depths (ranks
+    could run different numbers of rounds, i.e. different gather sequences, while the round
+    count is agreed over TP x EP only; per-row depths are refused at runtime by
+    ``validate_loop_row_depths``), MoR and the attention-residual carrier, HSDP, and
+    checkpointing (Megatron-FSDP saves and loads ``fsdp_dtensor``, untested with the loop). The
+    GPT loop and Megatron-FSDP v2 are not supported. Collects every violation and raises one
+    ``ValueError`` (``FSDP_PREFIX``).
+    """
+    architecture = getattr(config, "loop_architecture", "none")
+    if architecture == "none":
+        return
+    double_buffer = (
+        bool(getattr(ddp_config, "fsdp_double_buffer", False))
+        or bool(getattr(ddp_config, "nccl_ub", False))
+        or bool(getattr(ddp_config, "megatron_fsdp_max_pool_double_buffer", False))
+    )
+    fine_grained_gather = bool(
+        getattr(ddp_config, "megatron_fsdp_enable_fine_grained_param_gather", False)
+    ) or (
+        getattr(config, "fp8_recipe", None) == "mxfp8"
+        and bool(getattr(ddp_config, "fp8_param_gather", False))
+    )
+    unsupported = {
+        FSDP_GPT_LOOP: not is_hybrid_loop_config(config),
+        FSDP_VERSION: getattr(ddp_config, "megatron_fsdp_version", 1) != 1,
+        FSDP_OVERWRITE_MAIN_GRAD: not getattr(
+            ddp_config, "megatron_fsdp_accumulate_main_grad", False
+        ),
+        FSDP_GRAD_DTYPE: not (
+            _is_fp32(getattr(ddp_config, "megatron_fsdp_main_grads_dtype", None))
+            and _is_fp32(getattr(ddp_config, "megatron_fsdp_grad_comm_dtype", None))
+        ),
+        FSDP_PERSISTENT_BUFFERS: double_buffer,
+        FSDP_FINE_GRAINED_GATHER: fine_grained_gather,
+        FSDP_TE_OP_FUSER: bool(getattr(config, "use_transformer_engine_op_fuser", False)),
+        FSDP_DELAYED_WGRAD: bool(getattr(config, "delay_wgrad_compute", False))
+        or bool(getattr(ddp_config, "delay_wgrad_compute", False)),
+        FSDP_SAMPLED_DEPTHS: bool(getattr(config, "loop_sample_depth", False))
+        or getattr(config, "loop_exit_criterion", "fixed") == "sampled",
+        FSDP_MOR: architecture == "mor",
+        FSDP_ATTN_RES: getattr(config, "loop_carrier", "injection") == "attn_res",
+        FSDP_HSDP: getattr(ddp_config, "num_distributed_optimizer_instances", 1) > 1,
+        FSDP_CHECKPOINTING: any(
+            getattr(ddp_config, name, None) for name in ("save", "load", "pretrained_checkpoint")
+        ),
+    }
+    _raise_fsdp_if_any([name for name, value in unsupported.items() if value])
+
+
+def validate_loop_row_depths(stack: Any) -> None:
+    """Reject per-row loop depths (``LoopHybridStack.set_loop_depths``) on a stack whose
+    parameters Megatron-FSDP manages (``FSDP_ROW_DEPTHS``): the round count is agreed over
+    TP x EP only, so data-parallel ranks could run different numbers of rounds and issue
+    different parameter gathers. Megatron-FSDP marks every parameter it wraps
+    ``__fsdp_param__``."""
+    param = next(stack.parameters(), None)
+    if param is not None and getattr(param, "__fsdp_param__", False):
+        _raise_fsdp_if_any([FSDP_ROW_DEPTHS])
 
 
 # RSBF rule names (``validate_rsbf_config``), as they appear in the error message.

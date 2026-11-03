@@ -484,7 +484,20 @@ def core_transformer_config_from_args(args, config_class=None):
     if getattr(args, 'loop_architecture', 'none') != 'none' and (
         args.use_megatron_fsdp or args.use_torch_fsdp2
     ):
-        raise ValueError("Loop decoder currently supports DDP/distributed optimizer, not FSDP")
+        from megatron.core.transformer.loop.guards import is_hybrid_loop_config
+
+        # The hybrid loop trains with Megatron-FSDP v1 (accumulate mode and the other rules of
+        # guards.validate_loop_fsdp_config, checked in argument validation and by the wrapper).
+        if (
+            args.use_torch_fsdp2
+            or getattr(args, 'megatron_fsdp_version', 1) != 1
+            or not is_hybrid_loop_config(args)
+        ):
+            raise ValueError(
+                "Loop decoder supports DDP / distributed optimizer, or Megatron-FSDP v1 with a "
+                "hybrid loop (loop_prelude_sublayers / loop_coda_sublayers); not torch FSDP2, "
+                "Megatron-FSDP v2 or the GPT loop"
+            )
 
     # Config class.
     config_class = config_class or TransformerConfig
@@ -904,7 +917,9 @@ def pretrain_cfg_container_from_args(args: Namespace, model_cfg=None) -> Pretrai
     rerunsm_kwargs["check_for_nan_in_loss"] = args.check_for_nan_in_loss_and_grad
 
     optim_cfg, _ = get_megatron_optimizer_config(args)
-    ddp_config = get_megatron_ddp_config(args, use_torch_fsdp2=getattr(args, "use_torch_fsdp2", False))
+    ddp_config = get_megatron_ddp_config(
+        args, use_torch_fsdp2=getattr(args, "use_torch_fsdp2", False)
+    )
 
     cfg = PretrainConfigContainer(
         train=_default_config_from_args(TrainingConfig, args),

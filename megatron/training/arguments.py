@@ -688,6 +688,25 @@ def _validate_loop_param_store(args):
     _validate_loop_checkpoint(args)
 
 
+def _validate_loop_fsdp(args):
+    """A loop model with FSDP: the hybrid loop trains with Megatron-FSDP v1 under every rule of
+    ``guards.validate_loop_fsdp_config`` (``--megatron-fsdp-accumulate-main-grad``, fp32 main
+    and communication gradients, no persistent buffers / fine-grained gather / TE op fuser /
+    delayed wgrad / sampled depths / MoR / attention-residual carrier / HSDP / checkpointing);
+    torch FSDP2, Megatron-FSDP v2 and the GPT loop are refused. A no-op without a loop."""
+    if getattr(args, 'loop_architecture', 'none') == 'none':
+        return
+    if getattr(args, 'use_torch_fsdp2', False):
+        raise ValueError(
+            'Loop decoder does not support torch FSDP2 (use DDP / the distributed optimizer, or '
+            '--use-megatron-fsdp with a hybrid loop)'
+        )
+    if getattr(args, 'use_megatron_fsdp', False):
+        from megatron.core.transformer.loop.guards import validate_loop_fsdp_config
+
+        validate_loop_fsdp_config(args, args)
+
+
 def _validate_loop_checkpoint(args):
     """Checkpoints with the loop parameter store (M3c,
     ``loop_checkpoint.loop_checkpoint_problems``): save in torch_dist only (no local
@@ -1692,12 +1711,18 @@ def validate_args(args, defaults={}):
         assert not args.megatron_fsdp_cache_param_bucket_views, (
             "--megatron-fsdp-cache-param-bucket-views requires " "--use-megatron-fsdp."
         )
+        assert (
+            not args.megatron_fsdp_accumulate_main_grad
+        ), "--megatron-fsdp-accumulate-main-grad requires --use-megatron-fsdp."
 
     if args.fsdp_manual_registration:
         assert (
             args.use_megatron_fsdp
         ), "FSDP manual registration is only supported with Megatron FSDP."
         assert args.nccl_ub, "FSDP manual registration is only supported with --nccl-ub argument."
+
+    # After the Megatron-FSDP normalization above (dtype mapping, implied double buffering).
+    _validate_loop_fsdp(args)
 
     # Parameters dtype.
     args.params_dtype = torch.float
@@ -6054,6 +6079,18 @@ def _add_experimental_args(parser):
         ),
     )
 
+    group.add_argument(
+        '--megatron-fsdp-accumulate-main-grad',
+        action='store_true',
+        default=False,
+        dest='megatron_fsdp_accumulate_main_grad',
+        help=(
+            'If set, Megatron-FSDP v1 accumulates every backward use of a parameter into its '
+            'unsharded gradient bucket (zeroed on its first fetch) instead of letting each use '
+            'overwrite it, so a parameter used several times per microbatch (a loop core) '
+            'keeps the sum of its uses. Required for a loop model with Megatron-FSDP.'
+        ),
+    )
     group.add_argument(
         "--megatron-fsdp-max-pool-double-buffer",
         action='store_true',

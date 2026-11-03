@@ -223,6 +223,18 @@ class DistributedDataParallelConfig:
     Only effective with ``outer_dp_sharding_strategy='optim'``.
     """
 
+    megatron_fsdp_accumulate_main_grad: bool = False
+    """If true, Megatron-FSDP accumulates every backward use of a parameter into the
+      parameter's unsharded gradient bucket. By default a parameter whose gradients are
+      sharded (``optim_grads`` / ``optim_grads_params`` over more than one rank) is marked
+      ``overwrite_main_grad`` at every unshard, so a fused weight-gradient kernel (Transformer
+      Engine ``fuse_wgrad_accumulation``) writes each use's gradient over the bucket and a
+      parameter used several times per microbatch keeps the gradient of its last-computed use
+      only. With this flag the bucket is zeroed on its first fetch after each allocation, every
+      use adds into it, and the reduce-scatter sends the sum. Single-use parameters get the
+      same gradients.
+    """
+
     def __post_init__(self):
         import os
 

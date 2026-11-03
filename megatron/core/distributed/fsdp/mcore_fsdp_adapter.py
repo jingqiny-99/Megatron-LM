@@ -91,8 +91,16 @@ def _get_default_fsdp_unit_modules(overlap_moe_expert_parallel_comm: bool) -> Li
         return fsdp_unit_modules
 
     from megatron.core.models.bagel.transformer_mot_layer import MoTTransformerLayer
+    from megatron.core.models.hybrid.layers.hybrid_hyper_connection import (
+        HyperConnectionHybridLayer,
+    )
 
-    return [*fsdp_unit_modules, MoTTransformerLayer]
+    # The mHC hybrid wrapper runs its inner TransformerLayer's sublayer methods directly, not
+    # through the inner layer's __call__, so unit hooks on the inner layer would never fire
+    # (its weights would not be gathered under optim_grads_params, nor overwrite_main_grad
+    # set). The wrapper is the module the stack calls: hook registration visits it before its
+    # inner layer, makes it the unit and skips the inner layer as a submodule of a unit.
+    return [*fsdp_unit_modules, MoTTransformerLayer, HyperConnectionHybridLayer]
 
 
 def _materialize_meta_module(module: nn.Module, device: torch.device | None) -> None:
@@ -222,6 +230,14 @@ class FullyShardedDataParallelV1(_BaseDataParallel):
                 "before FSDP reduces or releases those buffers. "
                 "Use regular DDP or the distributed optimizer for now."
             )
+
+        if getattr(config, "loop_architecture", "none") != "none":
+            # A loop runs its core weights several times per microbatch: accumulate mode, fp32
+            # gradient buckets and the other loop rules. Imported lazily: the guards module
+            # imports model code.
+            from megatron.core.transformer.loop.guards import validate_loop_fsdp_config
+
+            validate_loop_fsdp_config(config, ddp_config)
 
         if has_config_logger_enabled(config):
             log_config_to_disk(config, locals(), prefix=type(self).__name__)

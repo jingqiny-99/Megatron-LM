@@ -315,6 +315,19 @@ class DistributedDataParallelConfig:
     Only effective with ``outer_dp_sharding_strategy='optim'``.
     """
 
+    megatron_fsdp_accumulate_main_grad: bool = False
+    """If true, Megatron-FSDP (version 1) accumulates every backward use of a parameter into
+      the parameter's unsharded gradient bucket. By default a parameter whose gradients are
+      sharded (``optim_grads`` / ``optim_grads_params`` over more than one rank) is marked
+      ``overwrite_main_grad`` at every unshard, so a fused weight-gradient kernel (Transformer
+      Engine ``fuse_wgrad_accumulation``) writes each use's gradient over the bucket and a
+      parameter used several times per microbatch, such as the core of a loop model, keeps the
+      gradient of its last-computed use only. With this flag the bucket is zeroed on its first
+      fetch after each allocation, every use adds into it, and the reduce-scatter sends the sum.
+      Single-use parameters get the same gradients. Requires ``use_megatron_fsdp`` with
+      ``megatron_fsdp_version=1``.
+    """
+
     @property
     def param_sync_via_bucket_group(self) -> bool:
         """Whether DP parameter synchronization is dispatched through DDP bucket groups.
@@ -382,6 +395,15 @@ class DistributedDataParallelConfig:
             assert (
                 self.use_megatron_fsdp
             ), "megatron_fsdp_cache_param_bucket_views requires use_megatron_fsdp."
+
+        if self.megatron_fsdp_accumulate_main_grad and not (
+            self.use_megatron_fsdp and self.megatron_fsdp_version == 1
+        ):
+            # Only Megatron-FSDP v1 reads the flag; elsewhere it would be ignored silently.
+            raise ValueError(
+                "megatron_fsdp_accumulate_main_grad requires use_megatron_fsdp with "
+                "megatron_fsdp_version=1."
+            )
 
         if self.grad_buffer_offload and self.reuse_grad_buf_for_mxfp8_param_ag:
             raise ValueError(

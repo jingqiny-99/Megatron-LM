@@ -1313,9 +1313,15 @@ class DataParallelBuffer:
         item_index_map: Optional[Dict[int, TensorItemIndex]] = None,
         bucket_index: Optional[BucketIndex] = None,
         shard_bucket_index: Optional[ShardBucketIndex] = None,
+        zero_fresh_bucket: bool = False,
     ) -> None:
         self.ddp_config = ddp_config
         self.params = params
+        # Gradient accumulation mode (megatron_fsdp_accumulate_main_grad): a sharded buffer's
+        # communication bucket is zeroed on its first fetch after each allocation, so every
+        # backward use of a parameter can add into it (see fetch_bucket).
+        self.zero_fresh_bucket = zero_fresh_bucket
+        self._bucket_is_fresh = True
         _param_dtype = {p.dtype for p in self.params}
 
         assert len(_param_dtype) == 1, f"params have different dtypes: {_param_dtype}"
@@ -1435,6 +1441,13 @@ class DataParallelBuffer:
             bucket = self.allocate_bucket_storage(
                 dtype=dtype, device=self.device, strict_assignments=strict_assignments
             )
+            if self.zero_fresh_bucket and self.is_data_distributed and self._bucket_is_fresh:
+                # The first fetch since the bucket was (re)allocated starts its gradient
+                # accumulation at zero. Later fetches return the live bucket unchanged (the
+                # allocator hands back the bucket it holds for this ID) until
+                # free_bucket_storage releases it after its reduce-scatter.
+                bucket.data.zero_()
+                self._bucket_is_fresh = False
 
         # Need to set parameter data after resize model weight buffer data-storage.
         if set_param_data:
@@ -1557,6 +1570,8 @@ class DataParallelBuffer:
         Release the storage of a temporarily-allocated communication bucket.
         """
         self.temporary_bucket_allocator.free(self.bucket_index.bucket_id)
+        # The next fetch allocates again (zeroed under zero_fresh_bucket).
+        self._bucket_is_fresh = True
 
     def reset_param_main_grad(self):
         """
@@ -2943,6 +2958,11 @@ class ParamAndGradBuffer:
                     bucket_id=group_id,
                     chunk_size_factor=group.chunk_size_factor,
                     mem_alloc_context=self.mem_alloc_context,
+                    # Accumulate mode: every backward use of a parameter adds into its
+                    # unsharded gradient bucket, which therefore has to start at zero.
+                    zero_fresh_bucket=getattr(
+                        self.ddp_config, "megatron_fsdp_accumulate_main_grad", False
+                    ),
                     **main_buf_extra_kwargs,
                 )
 
@@ -4095,6 +4115,8 @@ def _create_hfsdp_helper_buffer(
             data_parallel_world_size=inner_dp_group.size(),
             data_parallel_rank=inner_dp_group.rank(),
         ),
+        # A gradient helper is the buffer parameters fetch their gradient bucket from.
+        zero_fresh_bucket=dp_buffer.zero_fresh_bucket,
     )
 
     return helper_buffer

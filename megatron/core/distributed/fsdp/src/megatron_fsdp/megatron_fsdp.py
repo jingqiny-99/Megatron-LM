@@ -290,6 +290,11 @@ class MegatronFSDP(torch.nn.Module):
         recurse_types = fine_grained_recurse_module_types or ()
         self.fine_grained_recurse_module_types: Tuple[Type[nn.Module], ...] = recurse_types
         self.report_nan_in_param_grad = report_nan_in_param_grad
+        # Accumulate mode: every backward use of a parameter adds into its gradient bucket
+        # (see _overwrites_main_grad).
+        self.accumulate_main_grad = bool(
+            getattr(self.ddp_config, "megatron_fsdp_accumulate_main_grad", False)
+        )
 
         # FSDPDistributedIndex stores the process groups and meshes used by Megatron-FSDP.
         # If not provided, Megatron-FSDP will default to a simple data parallel index
@@ -401,6 +406,74 @@ class MegatronFSDP(torch.nn.Module):
         # reducing every backward would rescale those accumulated microbatches repeatedly.
         bucket_id = self.param_and_grad_buffer.param_to_param_group[param]
         return self.grad_reduce_pipeline.get_fsdp_buffer(bucket_id).data_parallel_group.size() > 1
+
+    def _overwrites_main_grad(self, param) -> bool:
+        """
+        Whether a fused weight-gradient kernel writes over this parameter's gradient bucket
+        (``param.overwrite_main_grad``) instead of adding into it.
+
+        A parameter whose gradients are reduced on every backward gets an uninitialized
+        bucket per microbatch, so by default each backward use writes over it: right for a
+        parameter used once per microbatch, while a parameter used several times (the core of
+        a loop model) would keep only the gradient of its last-computed use. In accumulate
+        mode (``megatron_fsdp_accumulate_main_grad``) the bucket is zeroed on its first fetch
+        after each allocation and every use adds into it. A parameter whose gradients are
+        reduced once per optimization cycle always accumulates (its buffer is persistent).
+        """
+        return self._reduces_grad_every_backward(param) and not self.accumulate_main_grad
+
+    def _accumulate_grad(self, param):
+        """
+        Accumulate the gradient in the main_grad buffer.
+
+        Utilizes the patched main_grad property of the parameter to allocate
+        or fetch the main gradient bucket for the parameter.
+        """
+        group_id = self.param_and_grad_buffer.param_to_param_group[param]
+        group = self.param_and_grad_buffer.parameter_groups[group_id]
+        if not group.requires_grad:
+            return
+
+        # Sharded Gradient Buffer
+        gbuf = group.hfsdp_helper_gbuf if group.hfsdp_helper_gbuf else group.main_grad_buffer
+        if gbuf.is_data_distributed:
+            # If TransformerEngine gradient accumulation is fused, then param.get_main_grad()
+            # already holds the wgrad and param.grad_added_to_main_grad=True.
+            if not param.grad_added_to_main_grad:
+                # Allocate a unsharded gradient buffer.
+                param.main_grad = param.get_main_grad()
+                if param.grad is not None:
+                    if self.report_nan_in_param_grad:
+                        _check_nan_in_grad(to_local_if_dtensor(param.grad))
+                    if self.accumulate_main_grad:
+                        # The bucket started at zero on its first fetch: add, so a bucket
+                        # shared with fused-wgrad parameters keeps their sums.
+                        param.main_grad.add_(to_local_if_dtensor(param.grad))
+                    else:
+                        # Copy the gradient into the allocated main gradient bucket.
+                        # It will be reduce-scattered and accumulated into gbuf.
+                        param.main_grad.copy_(to_local_if_dtensor(param.grad))
+                    del param.grad
+                elif not self.accumulate_main_grad:
+                    # (In accumulate mode the slice is already zero.)
+                    param.main_grad.zero_()
+        # Unsharded Gradient Buffer
+        else:
+            if not param.grad_added_to_main_grad:
+                if param.grad is not None:
+                    if self.report_nan_in_param_grad:
+                        _check_nan_in_grad(to_local_if_dtensor(param.grad))
+                    # Accumulate the gradient into the main gradient buffer,
+                    # because we only reduce once per optimization cycle.
+                    param.main_grad = param.get_main_grad()
+                    param.main_grad.add_(to_local_if_dtensor(param.grad))
+                    del param.grad
+
+        if param.grad_added_to_main_grad and param.grad is not None:
+            del param.grad
+
+        # Reset the grad accumulate flag.
+        param.grad_added_to_main_grad = False
 
     def _init_fsdp_param_and_grad_buffer(self):
         if self.calculate_per_token_loss:
@@ -552,11 +625,12 @@ class MegatronFSDP(torch.nn.Module):
             param.__fsdp_param__ = True
             # Transformer Engine accumulates gradient on top of the `main_grad`
             # buffer when gradient accumulation fusion in enabled. When sharding
-            # the gradient, we want to overwrite the allocated gradient buffer.
+            # the gradient, we want to overwrite the allocated gradient buffer, unless
+            # accumulate mode zeroes it on its first fetch so that every use can add.
             # This is a property of the parameter's own strategy: expert and non-expert
             # parameters can differ, and a class whose gradients are not sharded has to
             # keep accumulating across microbatches.
-            param.overwrite_main_grad = self._reduces_grad_every_backward(param)
+            param.overwrite_main_grad = self._overwrites_main_grad(param)
 
     def _register_fsdp_hooks(self, root_module):
         """Register necessary hooks for Fully Sharded Data Parallel (FSDP) execution on the model.
@@ -684,52 +758,7 @@ class MegatronFSDP(torch.nn.Module):
                 if is_float8tensor(param):
                     fp8_discard_transpose_cache(param)
 
-        def _grad_acc(param):
-            """
-            Accumulate the gradient in the main_grad buffer.
-
-            Utilizes the patched main_grad property of the parameter to allocate
-            or fetch the main gradient bucket for the parameter.
-            """
-            group_id = self.param_and_grad_buffer.param_to_param_group[param]
-            group = self.param_and_grad_buffer.parameter_groups[group_id]
-            if not group.requires_grad:
-                return
-
-            # Sharded Gradient Buffer
-            gbuf = group.hfsdp_helper_gbuf if group.hfsdp_helper_gbuf else group.main_grad_buffer
-            if gbuf.is_data_distributed:
-                # If TransformerEngine gradient accumulation is fused, then param.get_main_grad()
-                # already holds the wgrad and param.grad_added_to_main_grad=True.
-                if not param.grad_added_to_main_grad:
-                    # Allocate a unsharded gradient buffer.
-                    param.main_grad = param.get_main_grad()
-                    if param.grad is not None:
-                        if self.report_nan_in_param_grad:
-                            _check_nan_in_grad(to_local_if_dtensor(param.grad))
-                        # Copy the gradient into the allocated main gradient bucket.
-                        # It will be reduce-scattered and accumulated into gbuf.
-                        param.main_grad.copy_(to_local_if_dtensor(param.grad))
-                        del param.grad
-                    else:
-                        param.main_grad.zero_()
-            # Unsharded Gradient Buffer
-            else:
-                if not param.grad_added_to_main_grad:
-                    if param.grad is not None:
-                        if self.report_nan_in_param_grad:
-                            _check_nan_in_grad(to_local_if_dtensor(param.grad))
-                        # Accumulate the gradient into the main gradient buffer,
-                        # because we only reduce once per optimization cycle.
-                        param.main_grad = param.get_main_grad()
-                        param.main_grad.add_(to_local_if_dtensor(param.grad))
-                        del param.grad
-
-            if param.grad_added_to_main_grad and param.grad is not None:
-                del param.grad
-
-            # Reset the grad accumulate flag.
-            param.grad_added_to_main_grad = False
+        _grad_acc = self._accumulate_grad
 
         self._params_require_handle_grad = set()
 
