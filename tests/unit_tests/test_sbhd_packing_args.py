@@ -108,6 +108,11 @@ DSV4 = dict(experimental_attention_variant="dsv4_hybrid", dsa_indexer_loss_coeff
             "without --loop-architecture under --recompute-granularity full",
         ),
         (dict(dsa_kernel_backend="none", mtp_num_layers=1), "with --mtp-num-layers"),
+        (
+            dict(dsa_kernel_backend="none", cuda_graph_impl="transformer_engine"),
+            "under --cuda-graph-impl transformer_engine",
+        ),
+        (dict(dsa_kernel_backend="none", cuda_graph_impl="local"), "--cuda-graph-impl local"),
     ],
 )
 def test_dsv4_indexer_loss_rows(overrides, match):
@@ -133,6 +138,7 @@ def test_dsv4_indexer_loss_on_the_unfused_loop_path_passes(overrides):
         dict(dsa_kernel_backend="none"),
         dict(loop_architecture="none", dsa_kernel_backend="none", mtp_num_layers=None),
         dict(dsa_kernel_backend="none", recompute_granularity="selective"),
+        dict(dsa_kernel_backend="none", cuda_graph_impl="none"),
         # A loop stack enters its own scope inside every replay and around the MTP head.
         dict(loop_architecture="huginn", dsa_kernel_backend="none", recompute_granularity="full"),
         dict(loop_architecture="huginn", dsa_kernel_backend="none", mtp_num_layers=1),
@@ -301,6 +307,7 @@ def test_model_config_backstop(monkeypatch, variant, loop_architecture, backend,
         dsa_kernel_backend=backend,
         recompute_granularity=None,
         mtp_num_layers=None,
+        cuda_graph_impl="none",
     )
     monkeypatch.setattr(pretrain_hybrid, "core_transformer_config_from_args", lambda args: built)
     pretrain_hybrid._check_sbhd_packing_model_config(Namespace(sbhd_document_packing=False))
@@ -314,13 +321,14 @@ def test_model_config_backstop(monkeypatch, variant, loop_architecture, backend,
         for name, value, text in (
             ("recompute_granularity", "full", "--recompute-granularity full"),
             ("mtp_num_layers", 1, "--mtp-num-layers"),
+            ("cuda_graph_impl", "local", "--cuda-graph-impl local"),
         ):
             setattr(built, name, value)
             with pytest.raises(ValueError, match=text):
                 pretrain_hybrid._check_sbhd_packing_model_config(
                     Namespace(sbhd_document_packing=True)
                 )
-            setattr(built, name, None)
+            setattr(built, name, "none" if name == "cuda_graph_impl" else None)
     built.dsa_indexer_loss_coeff = 0.0
     pretrain_hybrid._check_sbhd_packing_model_config(Namespace(sbhd_document_packing=True))
 

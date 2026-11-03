@@ -15,7 +15,7 @@ from megatron.core.tensor_observation import is_observing_tensor, observe_tensor
 from megatron.core.transformer.custom_layers.batch_invariant_kernels import (
     is_batch_invariant_mode_enabled,
 )
-from megatron.core.transformer.forward_replay import in_forward_replay
+from megatron.core.transformer.forward_replay import in_forward_replay, routing_tape_active
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.moe.fused_a2a import HAVE_HYBRIDEP_DENSE_ROUTING
 from megatron.core.transformer.moe.moe_logging import get_moe_metrics_tracker
@@ -1175,9 +1175,14 @@ class TopKRouter(Router):
                     "Quantile Balancing does not yet support padding masks because the "
                     "histogram APIs do not accept a valid-token mask."
                 )
-            # TE capability controls the implementation, not the requested output format.
-            fused = self.config.moe_router_fusion and (
-                not dense_output or fused_topk_with_score_function_supports_topk_indices
+            # TE capability controls the implementation, not the requested output format. A
+            # loop-recompute checkpoint's routing tape (forward_replay.py) records and replays
+            # the top-k of the unfused path only, so a taped call routes unfused and the output
+            # contract (topk_indices, dense_output, the MoonEP gather below) follows from that.
+            fused = (
+                self.config.moe_router_fusion
+                and not routing_tape_active()
+                and (not dense_output or fused_topk_with_score_function_supports_topk_indices)
             )
             topk_indices = (
                 torch.empty(

@@ -532,6 +532,17 @@ def _validate_loop_carrier_diagnostics(args):
                 '--loop-carrier-diagnostics-segments PRELUDE ROUNDS CODA needs PRELUDE >= 0, '
                 f'ROUNDS >= 1 and CODA >= 0, got {segments}'
             )
+        # The boundary hooks index the local decoder's sublayers as the whole model's, and
+        # their metrics reach the loss function only on the last pipeline stage. Inside
+        # validate_args the PP clause decides (VPP is derived later and needs PP > 1); the VPP
+        # clause covers a direct call with a VPP size set.
+        if (getattr(args, 'pipeline_model_parallel_size', 1) or 1) > 1 or getattr(
+            args, 'virtual_pipeline_model_parallel_size', None
+        ) not in (None, 1):
+            raise ValueError(
+                '--loop-carrier-diagnostics-segments supports no pipeline parallelism '
+                '(--pipeline-model-parallel-size 1, no virtual pipeline stages)'
+            )
         return
     if segments is not None:
         raise ValueError(
@@ -772,6 +783,7 @@ def _validate_sbhd_document_packing(args):
             ),
             recompute_granularity=getattr(args, 'recompute_granularity', None),
             mtp_num_layers=getattr(args, 'mtp_num_layers', None),
+            cuda_graph_impl=getattr(args, 'cuda_graph_impl', None),
         )
 
 
@@ -782,6 +794,7 @@ def check_sbhd_packing_indexer_loss(
     backend,
     recompute_granularity=None,
     mtp_num_layers=None,
+    cuda_graph_impl=None,
 ):
     """The DSA indexer-loss rows of ``--sbhd-document-packing``: the row-tail padding must not
     reach an indexer loss. A plain ``dsa`` indexer loss excludes padding only through THD; a
@@ -789,8 +802,9 @@ def check_sbhd_packing_indexer_loss(
     stack's row mask, or a loop-less ``HybridStack`` with ``indexer_loss_row_mask``, which
     ``hybrid_builder`` sets under packing) and only on the unfused SBHD path
     (``dsa_kernel_backend`` 'none'). The loop-less scope covers ``HybridStack._layer_loop``
-    only: full recomputation (``checkpointed_forward``) and the MTP layers run outside it.
-    Takes the resolved variant and backend, so the argument validator and the built-config
+    only: full recomputation (``checkpointed_forward``), the MTP layers and CUDA graphs (TE
+    graphs are captured outside the forward; a local graph replays its capture-time mask) run
+    outside it. Takes the resolved variant and backend, so the argument validator and the built-config
     backstop share it."""
     if not (indexer_loss_coeff or 0) > 0 or variant not in ('dsa', 'dsv4_hybrid'):
         return
@@ -807,6 +821,15 @@ def check_sbhd_packing_indexer_loss(
         reject(
             'a DSv4 indexer loss without --loop-architecture under --recompute-granularity full',
             'full recomputation replays the HybridStack layers outside its indexer-loss row mask',
+        )
+    if loop_architecture == 'none' and cuda_graph_impl not in (None, 'none'):
+        # Conservative: every implementation and scope is refused, also the scopes that leave
+        # the attention eager (mlp, moe_router, moe_preprocess).
+        reject(
+            f'a DSv4 indexer loss without --loop-architecture under --cuda-graph-impl '
+            f'{cuda_graph_impl}',
+            'a captured graph does not run inside the HybridStack indexer-loss row mask '
+            '(refused for every CUDA-graph scope)',
         )
     if loop_architecture == 'none' and mtp_num_layers:
         reject(

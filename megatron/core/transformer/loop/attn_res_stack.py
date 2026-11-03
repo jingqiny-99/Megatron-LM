@@ -70,7 +70,7 @@ from megatron.core.transformer.loop.attn_res import (
 from megatron.core.transformer.loop.guards import ATTN_RES_BLOCKS
 from megatron.core.transformer.loop.hybrid_stack import LoopHybridStack
 from megatron.core.transformer.loop.reporting import stream_mean_rms
-from megatron.core.transformer.loop_transformer_block import recompute_context
+from megatron.core.transformer.loop_transformer_block import loop_checkpoint_context_fn
 
 
 class _SourceMasks:
@@ -355,12 +355,7 @@ class LoopAttnResHybridStack(LoopHybridStack):
                         round_fn,
                         *history,
                         use_reentrant=False,
-                        context_fn=lambda step=step: (
-                            torch.profiler.record_function(
-                                f"{label}/loop={step + 1}/phase=forward"
-                            ),
-                            recompute_context(f"{label}/loop={step + 1}/phase=recompute"),
-                        ),
+                        context_fn=loop_checkpoint_context_fn(f"{label}/loop={step + 1}"),
                     )
                 else:
                     blocks = round_fn(*history)

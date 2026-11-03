@@ -148,8 +148,16 @@ def test_full_records_on_tensorboard_iterations_only(tmp_path, monkeypatch):
     assert len(keys) == roles.core * rounds + roles.coda + 1
     for _, _, _, means in record["entries"]:
         assert sum(means) == pytest.approx(1.0)
-    lines = path.read_text().splitlines()
-    assert len(lines) == 1 and json.loads(lines[0]) == json.loads(json.dumps(record))
+    # The JSONL file is written by the last rank only (each rank has its own tmp_path).
+    is_last = (
+        not torch.distributed.is_initialized()
+        or torch.distributed.get_rank() == torch.distributed.get_world_size() - 1
+    )
+    if is_last:
+        lines = path.read_text().splitlines()
+        assert len(lines) == 1 and json.loads(lines[0]) == json.loads(json.dumps(record))
+    else:
+        assert not path.exists()
     # Taken: the next record starts from zero.
     assert decoder.take_carrier_diagnostics()["weights"] == {}
     writer = FakeWriter()
@@ -243,6 +251,24 @@ def test_enable_needs_a_loop_decoder():
             ),
             "ROUNDS >= 1",
         ),
+        (
+            dict(
+                loop_architecture="none",
+                loop_carrier_diagnostics_segments=[2, 2, 2],
+                hybrid_layer_pattern="*-*-*-",
+                pipeline_model_parallel_size=2,
+            ),
+            "supports no pipeline parallelism",
+        ),
+        (
+            dict(
+                loop_architecture="none",
+                loop_carrier_diagnostics_segments=[2, 2, 2],
+                hybrid_layer_pattern="*-*-*-",
+                virtual_pipeline_model_parallel_size=2,
+            ),
+            "supports no pipeline parallelism",
+        ),
     ],
 )
 def test_segment_argument_rules(overrides, match):
@@ -326,6 +352,43 @@ def test_stream_mean_rms_definition():
     assert stream_mean_rms(x, 1)[0].item() == pytest.approx(x.square().mean().sqrt().item())
     empty = stream_mean_rms(x, _STREAMS, torch.zeros(5, 2, dtype=torch.bool))
     assert empty[0].item() == 0.0 and empty[1].item() == 0
+
+
+def test_unmasked_statistics_take_no_host_to_device_copy(monkeypatch):
+    """Without a padding mask (every LM-stage run) the token counts of ``AttnResStats.add`` and
+    ``stream_mean_rms`` are device fills, and so is the host population of a loop metric's
+    report entry (``loop_metric_report``, every metric of every microbatch):
+    ``torch.tensor`` / ``torch.as_tensor`` of a host number with a device is a pageable copy that
+    synchronizes the stream."""
+    from megatron.core.transformer.loop.attn_res import AttnResStats
+
+    def no_device_copy(real):
+        def guarded(*args, **kwargs):
+            assert kwargs.get("device") is None, "host-to-device copy in a diagnostics statistic"
+            return real(*args, **kwargs)
+
+        return guarded
+
+    alpha = torch.rand(3, 5, 2, device=device())
+    x = torch.randn(5, 2, _STREAMS * 3, device=device())
+    stats = AttnResStats()
+    metrics = {"loop depth": torch.tensor(3.0, device=device()), "loop state rms r1": x.sum()}
+    monkeypatch.setattr(torch, "tensor", no_device_copy(torch.tensor))
+    monkeypatch.setattr(torch, "as_tensor", no_device_copy(torch.as_tensor))
+    stats.add(("core", 0, 1), alpha, None)
+    _, tokens = stream_mean_rms(x, _STREAMS)
+    report = loop_metric_report(
+        metrics, issued_tokens=10, populations={"loop state rms r1": tokens}
+    )
+    monkeypatch.undo()
+    assert tokens.item() == 10 and tokens.dtype == torch.float32
+    weights, counted = stats.sums[("core", 0, 1)]
+    assert counted.item() == 10 and counted.dtype == torch.float32
+    assert torch.allclose(weights, alpha.sum(dim=(1, 2)))
+    assert torch.equal(report["loop depth"], torch.tensor([30.0, 10.0], device=device()))
+    assert torch.equal(
+        report["loop state rms r1"], torch.stack((x.sum() * 10, tokens)).to(torch.float32)
+    )
 
 
 def _plain_mhc_model(pattern):

@@ -66,6 +66,10 @@ PIPELINE_PARALLELISM = "pipeline parallelism"
 CONTEXT_PARALLELISM = "context parallelism"
 SEQUENCE_PARALLELISM = "sequence parallelism"
 DROPOUT = "dropout / MoE input jitter"
+UNTAPED_RECOMPUTE_ROUTING = (
+    "loop_recompute with MoE routing its recompute does not replay (forced load balancing / "
+    "moe_router_force_biased / routing replay / Sinkhorn / quantile balancing)"
+)
 FP4 = "FP4"
 ACTIVATION_OFFLOAD = "activation offload"
 OTHER_RECOMPUTE = "activation recompute other than loop_recompute"
@@ -246,6 +250,29 @@ def validate_loop_carrier_stack(config: "TransformerConfig", accepted: Sequence[
         _raise_if_any([CARRIER_STACK_MISMATCH])
 
 
+def untaped_recompute_routing(config: "TransformerConfig") -> List[str]:
+    """The MoE routing features of a ``loop_recompute`` config whose recompute the routing tape
+    (``forward_replay.RoutingTape``) cannot make route as its forward did; empty without
+    ``loop_recompute`` or MoE. Forced load balancing and force-biased logits draw new random
+    logits from Megatron's CUDA RNG tracker, which ``torch.utils.checkpoint`` does not rewind
+    (the tape would replay the experts with other probabilities); routing replay, Sinkhorn and
+    quantile balancing choose their experts outside the tape (and the quantile-balancing state
+    would update twice), so a recompute that is not bitwise its forward changes the recomputed
+    tensors' shapes (``CheckpointError``). Shared by the hybrid and GPT loop validators."""
+    if not (getattr(config, "loop_recompute", False) and getattr(config, "num_moe_experts", None)):
+        return []
+    balancing = config.moe_router_load_balancing_type
+    balancing = set(balancing) if isinstance(balancing, (list, tuple)) else {balancing}
+    features = {
+        "moe_router_force_load_balancing": config.moe_router_force_load_balancing,
+        "moe_router_force_biased": config.moe_router_force_biased is not None,
+        "moe_enable_routing_replay": config.moe_enable_routing_replay,
+        "sinkhorn": "sinkhorn" in balancing,
+        "quantile_balancing": "quantile_balancing" in balancing,
+    }
+    return [name for name, value in features.items() if value]
+
+
 def validate_hybrid_loop_config(config: "TransformerConfig") -> None:
     """Reject config features the eager hybrid loop does not support.
 
@@ -277,6 +304,8 @@ def validate_hybrid_loop_config(config: "TransformerConfig") -> None:
         DROPOUT: bool(
             config.hidden_dropout or config.attention_dropout or config.moe_input_jitter_eps
         ),
+        # A loop_recompute round's recompute must route as its forward (the routing tape).
+        UNTAPED_RECOMPUTE_ROUTING: bool(untaped_recompute_routing(config)),
         FP4: bool(config.fp4),
         ACTIVATION_OFFLOAD: config.cpu_offloading or config.fine_grained_activation_offloading,
         # Standard recompute hooks would re-enter once per round and nest inside the

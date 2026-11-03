@@ -131,9 +131,8 @@ class AttnResStats:
         alpha = alpha.detach().float()
         if row_weight is None:
             weights = alpha.sum(dim=(1, 2))
-            tokens = torch.tensor(
-                float(alpha.shape[1] * alpha.shape[2]), dtype=torch.float32, device=alpha.device
-            )
+            # A device fill (``torch.tensor(..., device=cuda)`` is a pageable copy that syncs).
+            tokens = alpha.new_full((), float(alpha.shape[1] * alpha.shape[2]))
         else:
             row_weight = row_weight.detach().float()
             weights = (alpha * row_weight).sum(dim=(1, 2))

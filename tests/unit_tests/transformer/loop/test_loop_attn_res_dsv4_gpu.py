@@ -10,7 +10,8 @@ mHC / MTP / hash layer): pattern ``'HEHECEWE'`` (prelude ``HE``, core ``HECE``, 
 
 * T-O1: at ``w = 0`` and RMSNorm eps 1e-12 the carrier equals ``loop_carrier='residual'`` with
   the same weights (the decoder output is after the final norm): fp32 within 1e-4 relative,
-  bf16 with a cosine gate;
+  bf16 with a cosine gate (top-k over all experts and compressed keys, so rounding cannot flip
+  a discrete choice);
 * T-D1: the layer delta of every sublayer (H / C / W attention, MoE) equals
   ``layer(h) - h`` (fp32);
 * T-E1 / T-E3 (aux losses off): a row of a ``depths = [1, 3]`` batch equals that row alone at
@@ -22,7 +23,10 @@ mHC / MTP / hash layer): pattern ``'HEHECEWE'`` (prelude ``HE``, core ``HECE``, 
   value references at most ``n S B x 12`` bytes (+ the mask), forward / backward peaks within
   the per-chunk bound, and the value gradients are separate allocations;
 * the fp32 aggregation stays fp32 with TF32 matmuls on (the NGC default): output and every
-  gradient match a float64 ``native_attn_res`` to about 1e-6 (TF32 would give ~5e-4).
+  gradient match a float64 ``native_attn_res`` to about 1e-6 (TF32 would give ~5e-4). It runs
+  in a child process without ``NVIDIA_TF32_OVERRIDE``: cuBLAS reads that variable once per
+  process, and the fp32 comparisons here (and other modules of the same pytest process) set it
+  to 0.
 
 The fp32 model comparisons (T-O1 fp32, T-D1, T-E1) run with full-precision GEMMs
 (``NVIDIA_TF32_OVERRIDE=0``, ``allow_tf32 = False``), as the loop parity tests do.
@@ -51,6 +55,8 @@ PATTERN = "HEHECEWE"
 _RATIOS = {"W": 0, "C": 4, "H": 128, "E": 0}
 SEQ = 256
 BATCH = 2
+# Top-k over everything: 8 of 8 experts, all SEQ / 4 compressed keys of a ratio-4 layer.
+_ALL_SELECTED = dict(moe_router_topk=8, dsa_indexer_topk=SEQ // 4)
 
 
 @pytest.fixture(scope="module", autouse=True)
@@ -67,19 +73,26 @@ def _model_parallel():
 
 
 @contextlib.contextmanager
-def _hadamard_fallback():
+def _hadamard_fallback(dtype):
+    """``rotate_activation`` (``dsa.py``) runs the bf16-only ``fast_hadamard_transform`` kernel.
+    For an fp32 model, or without the package, both carriers get the same scaled identity
+    instead (the comparisons are between carriers on the same rotation)."""
     from unittest.mock import patch
 
     try:
         from fast_hadamard_transform import hadamard_transform  # noqa: F401
 
-        yield
+        native = dtype == torch.bfloat16
     except ImportError:
-        with patch(
-            "megatron.core.transformer.experimental_attention_variant.csa.rotate_activation",
-            lambda x: x * (x.size(-1) ** -0.5),
-        ):
-            yield
+        native = False
+    if native:
+        yield
+        return
+    with patch(
+        "megatron.core.transformer.experimental_attention_variant.csa.rotate_activation",
+        lambda x: x * (x.size(-1) ** -0.5),
+    ):
+        yield
 
 
 def _model(carrier, dtype, **overrides):
@@ -202,9 +215,19 @@ def full_precision_gemms(monkeypatch):
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16], ids=["fp32", "bf16"])
 def test_zero_query_matches_the_residual_carrier(dtype, k, full_precision_gemms):
     """T-O1 on DSv4 layers (the final norm of the decoder removes the 1 / n of the head)."""
-    with _hadamard_fallback():
-        k3 = _model("attn_res", dtype, layernorm_epsilon=1e-12, loop_attn_res_blocks_per_round=k)
-        residual = _model("residual", dtype, layernorm_epsilon=1e-12)
+    # bf16: every expert and every compressed key is selected (top-k = all), so the bf16 rounding
+    # differences between the carriers stay continuous. With a partial top-k they flip routing
+    # and index choices whose number depends on the weights and EP, not on the carrier.
+    continuous = {} if dtype == torch.float32 else _ALL_SELECTED
+    with _hadamard_fallback(dtype):
+        k3 = _model(
+            "attn_res",
+            dtype,
+            layernorm_epsilon=1e-12,
+            loop_attn_res_blocks_per_round=k,
+            **continuous,
+        )
+        residual = _model("residual", dtype, layernorm_epsilon=1e-12, **continuous)
         _copy_shared_weights(k3, residual)
         x, upstream = _hidden(dtype)
         y, dx = _decoder_forward_backward(k3.decoder, x, upstream)
@@ -215,12 +238,12 @@ def test_zero_query_matches_the_residual_carrier(dtype, k, full_precision_gemms)
         assert _relative(dx, dx_ref) < 1e-3
     else:
         cosine = torch.nn.functional.cosine_similarity(y.flatten(), y_ref.flatten(), dim=0)
-        assert cosine.item() > 0.999
+        assert cosine.item() > 0.999, cosine.item()
 
 
 def test_layer_deltas_of_dsv4_sublayers(full_precision_gemms):
     """T-D1: H / C / W attention and MoE sublayers (fp32)."""
-    with _hadamard_fallback():
+    with _hadamard_fallback(torch.float32):
         model = _model("attn_res", torch.float32)
         decoder = model.decoder
         x, _ = _hidden(torch.float32)
@@ -266,7 +289,7 @@ def _capture_blocks(monkeypatch):
 def test_row_exit_and_zero_gradient_for_skipped_rounds(monkeypatch, full_precision_gemms):
     """T-E1 and T-E3 with EP = W (aux losses off; fp32)."""
     depths = (1, 3)
-    with _hadamard_fallback():
+    with _hadamard_fallback(torch.float32):
         model = _model("attn_res", torch.float32)
         decoder = model.decoder
         x, upstream = _hidden(torch.float32)
@@ -306,7 +329,7 @@ def test_aux_losses_do_not_reach_skipped_rounds(monkeypatch, control):
     from megatron.core.transformer.loop.attn_res_stack import LoopAttnResHybridStack
 
     depths = (1, 3)
-    with _hadamard_fallback():
+    with _hadamard_fallback(torch.float32):
         model = _model(
             "attn_res", torch.float32, moe_aux_loss_coeff=1e-2, dsa_indexer_loss_coeff=1e-2
         )
@@ -354,9 +377,10 @@ def test_aux_losses_do_not_reach_skipped_rounds(monkeypatch, control):
         assert nonzero == 0
 
 
-def test_fp32_aggregation_ignores_tf32():
-    """With TF32 matmuls on (as in NGC containers), the fp32 aggregation and its backward
-    match a float64 ``native_attn_res`` to fp32 rounding; a control GEMM shows TF32 is on."""
+def _tf32_aggregation_errors():
+    """The TF32 check's measurements (run by ``test_fp32_aggregation_ignores_tf32`` in a child
+    process): the control GEMM's TF32 error and the aggregation's output and gradient errors
+    against float64 (``None`` for a gradient that must be exactly zero and is)."""
     from megatron.core.transformer.loop import attn_res
     from tests.unit_tests.transformer.loop.attn_res_reference import native_attn_res
 
@@ -370,31 +394,70 @@ def test_fp32_aggregation_ignores_tf32():
     upstream = torch.randn(sequence, batch, hidden, device="cuda", generator=generator)
     mask = torch.ones(n, batch, dtype=torch.bool, device="cuda")
     mask[-3:-1, 1] = False
-    old_tf32 = torch.backends.cuda.matmul.allow_tf32
     torch.backends.cuda.matmul.allow_tf32 = True
-    try:
-        a = torch.randn(256, hidden, device="cuda", generator=generator)
-        control = _relative((a @ a.t()).double(), a.double() @ a.double().t())
-        if control < 1e-5:
-            pytest.skip(f"TF32 GEMMs are not active here (control error {control:.1e})")
-        inputs = [value.clone().requires_grad_(True) for value in values]
-        q = query.clone().requires_grad_(True)
-        g = norm.clone().requires_grad_(True)
-        out = attn_res.attn_res_aggregate(q, g, 1e-6, inputs, mask)
-        grads = torch.autograd.grad(out, [q, g, *inputs], upstream)
-    finally:
-        torch.backends.cuda.matmul.allow_tf32 = old_tf32
+    a = torch.randn(256, hidden, device="cuda", generator=generator)
+    control = _relative((a @ a.t()).double(), a.double() @ a.double().t())
+    inputs = [value.clone().requires_grad_(True) for value in values]
+    q = query.clone().requires_grad_(True)
+    g = norm.clone().requires_grad_(True)
+    out = attn_res.attn_res_aggregate(q, g, 1e-6, inputs, mask)
+    grads = torch.autograd.grad(out, [q, g, *inputs], upstream)
+    torch.backends.cuda.matmul.allow_tf32 = False
     inputs64 = [value.double().requires_grad_(True) for value in values]
     q64 = query.double().requires_grad_(True)
     g64 = norm.double().requires_grad_(True)
     out64 = native_attn_res(inputs64, q64, g64, 1e-6, mask)
     grads64 = torch.autograd.grad(out64, [q64, g64, *inputs64], upstream.double())
-    assert _relative(out.double(), out64) < 2e-6
-    for index, (grad, grad64) in enumerate(zip(grads, grads64)):
+    grad_errors = []
+    for grad, grad64 in zip(grads, grads64):
         if grad64.abs().max() == 0:
-            assert torch.count_nonzero(grad) == 0, index
+            grad_errors.append(None if torch.count_nonzero(grad) == 0 else float("inf"))
         else:
-            assert _relative(grad.double(), grad64) < 1e-5, index
+            grad_errors.append(_relative(grad.double(), grad64))
+    return {"control": control, "out": _relative(out.double(), out64), "grads": grad_errors}
+
+
+_TF32_CHILD = """
+import json, os, torch
+torch.cuda.set_device(int(os.environ.get("LOCAL_RANK", "0")) % torch.cuda.device_count())
+from tests.unit_tests.transformer.loop.test_loop_attn_res_dsv4_gpu import _tf32_aggregation_errors
+print("TF32_RESULT " + json.dumps(_tf32_aggregation_errors()))
+"""
+
+
+def test_fp32_aggregation_ignores_tf32():
+    """With TF32 matmuls on (as in NGC containers), the fp32 aggregation and its backward
+    match a float64 ``native_attn_res`` to fp32 rounding; a control GEMM shows TF32 is on.
+    Runs in a child process without ``NVIDIA_TF32_OVERRIDE`` (cuBLAS reads it once per
+    process)."""
+    import json
+    import pathlib
+    import subprocess
+    import sys
+
+    root = pathlib.Path(__file__).resolve().parents[4]
+    env = {key: value for key, value in os.environ.items() if key != "NVIDIA_TF32_OVERRIDE"}
+    env["PYTHONPATH"] = os.pathsep.join(filter(None, [str(root), env.get("PYTHONPATH")]))
+    child = subprocess.run(
+        [sys.executable, "-c", _TF32_CHILD],
+        cwd=root,
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=900,
+        check=False,
+    )
+    lines = [line for line in child.stdout.splitlines() if line.startswith("TF32_RESULT ")]
+    if child.returncode != 0 and "busy or unavailable" in child.stderr:
+        # EXCLUSIVE_PROCESS compute mode: the GPU takes no second CUDA context.
+        pytest.skip(f"no second CUDA context on this GPU: {child.stderr[-500:]}")
+    assert child.returncode == 0 and lines, (child.returncode, child.stderr[-4000:])
+    result = json.loads(lines[-1][len("TF32_RESULT ") :])
+    if result["control"] < 1e-5:
+        pytest.skip(f"TF32 GEMMs are not active here (control error {result['control']:.1e})")
+    assert result["out"] < 2e-6, result
+    for index, error in enumerate(result["grads"]):
+        assert error is None or error < 1e-5, (index, result)
 
 
 def test_aggregation_memory():

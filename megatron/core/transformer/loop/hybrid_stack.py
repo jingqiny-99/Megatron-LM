@@ -93,7 +93,7 @@ from megatron.core.transformer.loop_transformer_block import (
     LoopRMSNorm,
     active_causal_mask,
     compact_metadata,
-    recompute_context,
+    loop_checkpoint_context_fn,
     token_depth_distribution,
 )
 
@@ -764,12 +764,7 @@ class LoopHybridStack(HybridStack):
                         state,
                         embedding,
                         use_reentrant=False,
-                        context_fn=lambda step=step: (
-                            torch.profiler.record_function(
-                                f"{label}/loop={step + 1}/phase=forward"
-                            ),
-                            recompute_context(f"{label}/loop={step + 1}/phase=recompute"),
-                        ),
+                        context_fn=loop_checkpoint_context_fn(f"{label}/loop={step + 1}"),
                     )
                 else:
                     updated = recurrence(state, embedding)
@@ -872,10 +867,7 @@ class LoopHybridStack(HybridStack):
                     recurrence,
                     layer_input,
                     use_reentrant=False,
-                    context_fn=lambda loop_label=loop_label: (
-                        torch.profiler.record_function(f"{loop_label}/phase=forward"),
-                        recompute_context(f"{loop_label}/phase=recompute"),
-                    ),
+                    context_fn=loop_checkpoint_context_fn(loop_label),
                 )
             else:
                 updated = recurrence(layer_input)

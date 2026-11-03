@@ -17,7 +17,12 @@ from torch.utils.checkpoint import checkpoint
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.tensor_observation import observe_layer_residuals, suspend_tensor_observations
 from megatron.core.transformer.enums import AttnMaskType
-from megatron.core.transformer.forward_replay import forward_replay
+from megatron.core.transformer.forward_replay import (
+    RoutingTape,
+    forward_replay,
+    record_routing,
+    replay_routing,
+)
 from megatron.core.transformer.transformer_block import TransformerBlock
 
 
@@ -74,6 +79,36 @@ def recompute_context(name):
     """
     with torch.profiler.record_function(name), suspend_tensor_observations(), forward_replay():
         yield
+
+
+@contextmanager
+def _taped_forward(name, tape):
+    with torch.profiler.record_function(name), record_routing(tape):
+        yield
+
+
+@contextmanager
+def _taped_recompute(name, tape):
+    with recompute_context(name), replay_routing(tape):
+        yield
+
+
+def loop_checkpoint_context_fn(prefix):
+    """``context_fn`` of a loop activation checkpoint (``torch.utils.checkpoint``,
+    ``use_reentrant=False``) named ``prefix``: the forward runs in a ``<prefix>/phase=forward``
+    profiler range, the replay in ``recompute_context('<prefix>/phase=recompute')``, and the MoE
+    top-k choices of the forward are replayed by the recompute (``forward_replay.RoutingTape``,
+    one per checkpoint call), so a recompute that is not bitwise equal to its forward still
+    routes every token as the forward did and the recomputed tensors keep their shapes."""
+
+    def context_fn():
+        tape = RoutingTape()
+        return (
+            _taped_forward(f"{prefix}/phase=forward", tape),
+            _taped_recompute(f"{prefix}/phase=recompute", tape),
+        )
+
+    return context_fn
 
 
 def compact_metadata(active):
@@ -143,6 +178,9 @@ class LoopTransformerBlock(TransformerBlock):
 
     @staticmethod
     def _validate_config(config):
+        # pylint: disable=import-outside-toplevel
+        from megatron.core.transformer.loop import guards
+
         unsupported = {
             "pipeline parallelism": config.pipeline_model_parallel_size != 1,
             "context parallelism": config.context_parallel_size != 1
@@ -156,6 +194,8 @@ class LoopTransformerBlock(TransformerBlock):
             "standard recompute (use loop_recompute)": config.recompute_granularity is not None,
             "MoE communication overlap": config.overlap_moe_expert_parallel_comm,
             "dropout": bool(config.hidden_dropout or config.attention_dropout),
+            # A loop_recompute round's recompute must route as its forward (the routing tape).
+            guards.UNTAPED_RECOMPUTE_ROUTING: bool(guards.untaped_recompute_routing(config)),
             "multi-latent attention": config.multi_latent_attention,
             # Hash routing needs per-token input ids in every MoE layer, and compact
             # MoR would also have to gather them. Not supported yet.
@@ -311,12 +351,7 @@ class LoopTransformerBlock(TransformerBlock):
                         state,
                         embedding,
                         use_reentrant=False,
-                        context_fn=lambda step=step: (
-                            torch.profiler.record_function(
-                                f"{label}/loop={step + 1}/phase=forward"
-                            ),
-                            recompute_context(f"{label}/loop={step + 1}/phase=recompute"),
-                        ),
+                        context_fn=loop_checkpoint_context_fn(f"{label}/loop={step + 1}"),
                     )
                 else:
                     state = recurrence(state, embedding)
@@ -411,10 +446,7 @@ class LoopTransformerBlock(TransformerBlock):
                     recurrence,
                     layer_input,
                     use_reentrant=False,
-                    context_fn=lambda loop_label=loop_label: (
-                        torch.profiler.record_function(f"{loop_label}/phase=forward"),
-                        recompute_context(f"{loop_label}/phase=recompute"),
-                    ),
+                    context_fn=loop_checkpoint_context_fn(loop_label),
                 )
             else:
                 updated = recurrence(layer_input)

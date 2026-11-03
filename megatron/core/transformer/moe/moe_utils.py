@@ -25,7 +25,11 @@ from megatron.core.transformer.custom_layers.batch_invariant_kernels import (
     is_batch_invariant_mode_enabled,
 )
 from megatron.core.transformer.enums import CudaGraphModule
-from megatron.core.transformer.forward_replay import in_forward_replay
+from megatron.core.transformer.forward_replay import (
+    in_forward_replay,
+    routing_tape_active,
+    taped_topk,
+)
 from megatron.core.transformer.moe.batch_invariant import (
     build_inverse_permutation_map as build_batch_invariant_inverse_permutation_map,
 )
@@ -902,6 +906,12 @@ def topk_routing_with_score_function(
             raise ValueError("qb_histogram must have dtype torch.int32.")
         if qb_bin_bounds.shape != (2,) or qb_bin_bounds.dtype != torch.float32:
             raise ValueError("qb_bin_bounds must be an FP32 tensor with shape [2].")
+    if fused and routing_tape_active() and not use_quantile_balancing:
+        # A loop-recompute checkpoint records / replays the top-k choices (forward_replay.py's
+        # RoutingTape); the fused TE kernel has no hook for that, so taped forwards take the
+        # unfused path (forward and recompute alike). TopKRouter.routing already decides so
+        # before it picks its output format (``topk_indices`` is not filled here).
+        fused = False
     if fused:
         if not HAVE_TE or fused_topk_with_score_function is None:
             raise ValueError(
@@ -979,7 +989,11 @@ def topk_routing_with_score_function(
         # Default behavior if no replay is active
 
         if router_replay is None:
-            return _compute_topk(scores, topk, num_groups=num_groups, group_topk=group_topk)
+            # Recorded / replayed by a loop-recompute checkpoint's RoutingTape, if one is active.
+            return taped_topk(
+                scores,
+                lambda s: _compute_topk(s, topk, num_groups=num_groups, group_topk=group_topk),
+            )
         else:
             return router_replay.get_replay_topk(
                 scores, topk, num_groups, group_topk, _compute_topk

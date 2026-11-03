@@ -632,8 +632,8 @@ def _check_sbhd_packing_model_config(args: Any) -> None:
     """Backstop of the argument-time packing checks on the built model config (its resolved
     attention variant, loop architecture, DSA kernel backend, recomputation and MTP depth):
     with SBHD document packing no indexer loss may see the row-tail padding (a plain DSA
-    indexer loss, a loop-less DSv4 one outside the HybridStack row mask, or one on the fused
-    kernels, which have no row mask)."""
+    indexer loss, a loop-less DSv4 one outside the HybridStack row mask (full recompute, MTP,
+    CUDA graphs), or one on the fused kernels, which have no row mask)."""
     if not getattr(args, "sbhd_document_packing", False):
         return
     config = core_transformer_config_from_args(args)
@@ -644,6 +644,7 @@ def _check_sbhd_packing_model_config(args: Any) -> None:
         config.dsa_kernel_backend,
         recompute_granularity=config.recompute_granularity,
         mtp_num_layers=config.mtp_num_layers,
+        cuda_graph_impl=getattr(config, "cuda_graph_impl", None),
     )
 
 

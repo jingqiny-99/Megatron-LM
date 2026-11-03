@@ -167,6 +167,38 @@ _CONFIG_RULES = [
     (guards.DROPOUT, dict(hidden_dropout=0.1)),
     (guards.DROPOUT, dict(attention_dropout=0.1)),
     (guards.DROPOUT, dict(moe_input_jitter_eps=0.01)),
+    (
+        guards.UNTAPED_RECOMPUTE_ROUTING,
+        dict(loop_recompute=True, num_moe_experts=4, moe_router_force_load_balancing=True),
+    ),
+    (
+        guards.UNTAPED_RECOMPUTE_ROUTING,
+        dict(loop_recompute=True, num_moe_experts=4, moe_router_force_biased=0.1),
+    ),
+    (
+        guards.UNTAPED_RECOMPUTE_ROUTING,
+        dict(loop_recompute=True, num_moe_experts=4, moe_enable_routing_replay=True),
+    ),
+    (
+        guards.UNTAPED_RECOMPUTE_ROUTING,
+        dict(loop_recompute=True, num_moe_experts=4, moe_router_load_balancing_type="sinkhorn"),
+    ),
+    (
+        guards.UNTAPED_RECOMPUTE_ROUTING,
+        dict(
+            loop_recompute=True,
+            num_moe_experts=4,
+            moe_router_load_balancing_type="quantile_balancing",
+        ),
+    ),
+    (
+        guards.UNTAPED_RECOMPUTE_ROUTING,
+        dict(
+            loop_recompute=True,
+            num_moe_experts=4,
+            moe_router_load_balancing_type=["seq_aux_loss", "sinkhorn"],
+        ),
+    ),
     (guards.FP4, dict(fp4="e2m1")),
     (guards.ACTIVATION_OFFLOAD, dict(cpu_offloading=True)),
     (guards.ACTIVATION_OFFLOAD, dict(fine_grained_activation_offloading=True)),
@@ -221,6 +253,55 @@ def test_valid_configs_pass_config_rules():
             recompute_modules=["mhc"],
         )
     )
+
+
+_UNTAPED_ROUTING = [
+    dict(moe_router_force_load_balancing=True),
+    dict(moe_router_force_biased=-0.1),
+    dict(moe_enable_routing_replay=True),
+    dict(moe_router_load_balancing_type="sinkhorn"),
+    dict(moe_router_load_balancing_type="quantile_balancing"),
+]
+
+
+@pytest.mark.parametrize(
+    "routing", _UNTAPED_ROUTING, ids=["-".join(map(str, r.items())) for r in _UNTAPED_ROUTING]
+)
+def test_loop_recompute_refuses_routing_the_tape_cannot_replay(routing):
+    """Both loop validators refuse, with loop_recompute and MoE, the routing whose recompute the
+    routing tape cannot make route as its forward did (random logits redrawn from the CUDA RNG
+    tracker; expert choices outside the tape); without loop_recompute or MoE they pass."""
+    moe = dict(num_moe_experts=4, **routing)
+    hybrid = _violating(_dense_config(), loop_recompute=True, **moe)
+    assert guards.untaped_recompute_routing(hybrid) == [
+        name if name != "moe_router_load_balancing_type" else value
+        for name, value in routing.items()
+    ]
+    with pytest.raises(ValueError) as excinfo:
+        validate_hybrid_loop_config(hybrid)
+    assert _reported(excinfo) == [guards.UNTAPED_RECOMPUTE_ROUTING]
+    gpt = _violating(_gpt_loop_config(), loop_recompute=True, **moe)
+    with pytest.raises(ValueError, match=re.escape(guards.UNTAPED_RECOMPUTE_ROUTING)):
+        LoopTransformerBlock._validate_config(gpt)
+    for accepted in (
+        _violating(_dense_config(), **moe),  # no loop_recompute
+        _violating(_dense_config(), loop_recompute=True, **routing),  # no MoE
+    ):
+        assert guards.untaped_recompute_routing(accepted) == []
+        validate_hybrid_loop_config(accepted)
+    LoopTransformerBlock._validate_config(_violating(_gpt_loop_config(), **moe))
+
+
+def test_loop_recompute_accepts_learned_routing():
+    # The LM recipes: learned routing (expert bias, sequence aux loss) under loop_recompute.
+    learned = dict(
+        loop_recompute=True,
+        num_moe_experts=4,
+        moe_router_enable_expert_bias=True,
+        moe_router_load_balancing_type="seq_aux_loss",
+    )
+    validate_hybrid_loop_config(_violating(_dense_config(), **learned))
+    LoopTransformerBlock._validate_config(_violating(_gpt_loop_config(), **learned))
 
 
 def test_config_rules_collect_every_violation():

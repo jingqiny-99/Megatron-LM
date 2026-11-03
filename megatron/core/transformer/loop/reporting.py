@@ -38,7 +38,12 @@ def loop_metric_entry(name: str, metric: Tensor, *, population: Union[int, Tenso
             see the module docstring); a host int or a device scalar.
     """
     metric = metric.detach().to(torch.float32)
-    population = torch.as_tensor(population, device=metric.device).to(torch.float32)
+    if isinstance(population, Tensor):
+        population = population.to(device=metric.device, dtype=torch.float32)
+    else:
+        # A device fill: ``torch.as_tensor(<host number>, device=cuda)`` is a pageable copy that
+        # synchronizes the stream (once per metric and microbatch).
+        population = metric.new_full((), float(population))
     total = metric if name in LOOP_TOKEN_COUNT_METRICS else metric * population
     return torch.stack((total.reshape(()), population.reshape(())))
 
@@ -86,7 +91,8 @@ def stream_mean_rms(
         x = x.reshape(*x.shape[:-1], num_streams, x.shape[-1] // num_streams).mean(-2)
     mean_square = x.square().mean(-1)  # [S, B]
     if valid is None:
-        tokens = torch.tensor(float(mean_square.numel()), device=x.device)
+        # A device fill (``torch.tensor(..., device=cuda)`` is a pageable copy that syncs).
+        tokens = mean_square.new_full((), float(mean_square.numel()))
         total = mean_square.sum()
     else:
         weight = valid.to(torch.float32)
