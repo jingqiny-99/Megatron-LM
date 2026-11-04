@@ -2573,7 +2573,7 @@ def test_cudnn_sparse_loss_reduces_attention_target_across_tp(monkeypatch):
     torch.testing.assert_close(seen["attn_score"][0, 0, :4], torch.tensor([0.5, 0.5, 0.0, 0.0]))
 
 
-def test_cudnn_sparse_backward_uses_batch_major_topk_indices_for_batched_kv(monkeypatch):
+def test_cudnn_sparse_backward_uses_per_sample_topk_indices_for_batched_kv(monkeypatch):
     seen = {}
 
     class FakeDSA:
@@ -2634,13 +2634,110 @@ def test_cudnn_sparse_backward_uses_batch_major_topk_indices_for_batched_kv(monk
     )
 
     torch.testing.assert_close(
-        seen["topk_indices"][:, 0, :3], torch.tensor([[3, 1, -1], [4, 6, -1]], dtype=torch.int32)
+        seen["topk_indices"][:, 0, :3], torch.tensor([[3, 1, -1], [0, 2, -1]], dtype=torch.int32)
     )
     torch.testing.assert_close(
         seen["topk_indices"][:, 0, 3:], torch.full((2, 125), -1, dtype=torch.int32)
     )
     assert seen["loss_coeff"] == 0.01
     torch.testing.assert_close(seen["grad_loss"], torch.tensor(1.0))
+
+
+@pytest.mark.parametrize("entry_point", ["full_fusion", "split_topk_loss"])
+@pytest.mark.parametrize("calculate_per_token_loss", [False, True])
+def test_cudnn_sparse_indexer_loss_batch_matches_per_sample_runs(
+    entry_point, calculate_per_token_loss
+):
+    """An SBHD batch of two gives each sample the indexer loss and gradients of a b=1 run."""
+    _skip_if_fused_dsa_unavailable()
+    torch.manual_seed(1234)
+    torch.cuda.manual_seed(1234)
+
+    device = torch.device("cuda")
+    batch = 2
+    seqlen = 256
+    attention_heads = 64
+    attention_dim = 576
+    latent_v_channels = 512
+    indexer_heads = 64
+    indexer_dim = 128
+    topk = 64
+    softmax_scale = attention_dim**-0.5
+    loss_coeff = 0.01
+
+    query = (
+        torch.randn(
+            seqlen, batch, attention_heads, attention_dim, device=device, dtype=torch.bfloat16
+        )
+        * 0.125
+    )
+    key = torch.randn(seqlen, batch, 1, attention_dim, device=device, dtype=torch.bfloat16) * 0.125
+    q_indexer = (
+        torch.randn(seqlen, batch, indexer_heads, indexer_dim, device=device, dtype=torch.bfloat16)
+        * 0.125
+    )
+    k_indexer = torch.randn(seqlen, batch, indexer_dim, device=device, dtype=torch.bfloat16) * 0.125
+    weights = torch.randn(seqlen, batch, indexer_heads, device=device, dtype=torch.bfloat16)
+    # Plain causal key bounds, shared by every sample.
+    ends = torch.arange(1, seqlen + 1, device=device, dtype=torch.int32)
+    starts = torch.zeros_like(ends)
+
+    def run(samples):
+        q_idx, k_idx, w = (
+            t[:, samples].contiguous().requires_grad_() for t in (q_indexer, k_indexer, weights)
+        )
+        if entry_point == "full_fusion":
+            _output, loss = dsa_cudnn_kernels.fused_indexer_sparse_attn(
+                query[:, samples].contiguous(),
+                key[:, samples, 0].contiguous(),
+                q_idx,
+                k_idx,
+                w,
+                indexer_topk=topk,
+                softmax_scale=softmax_scale,
+                loss_coeff=loss_coeff,
+                sparse_loss=True,
+                calculate_per_token_loss=calculate_per_token_loss,
+                d_v=latent_v_channels,
+            )
+        else:
+            result = dsa_cudnn_kernels.run_fused_qk_topk_with_loss(
+                q=q_idx,
+                k=k_idx,
+                weights=w,
+                index_topk=topk,
+                starts=starts,
+                ends=ends,
+                block_size=128,
+                query=query[:, samples].contiguous(),
+                key=key[:, samples].contiguous(),
+                softmax_scale=softmax_scale,
+                loss_coeff=loss_coeff,
+                pg_collection=_SingleRankProcessGroups(),
+                calculate_per_token_loss=calculate_per_token_loss,
+                config=_PackedCpCudnnConfig(calculate_per_token_loss=calculate_per_token_loss),
+            )
+            assert result is not None
+            _topk_indices, _topk_length, loss = result
+        loss.backward()
+        return loss.detach(), (q_idx.grad, k_idx.grad, w.grad)
+
+    batched_loss, batched_grads = run(slice(None))
+    per_sample = [run(slice(sample, sample + 1)) for sample in range(batch)]
+
+    # Without per-token loss, the batched loss averages over all b * sq query rows.
+    scale = 1.0 if calculate_per_token_loss else 1.0 / batch
+    torch.testing.assert_close(
+        batched_loss, scale * sum(loss for loss, _grads in per_sample), rtol=1e-4, atol=0.0
+    )
+    for index, name in enumerate(("q_indexer", "k_indexer", "weights")):
+        for sample, (_loss, grads) in enumerate(per_sample):
+            _assert_similarity(
+                batched_grads[index][:, sample],
+                scale * grads[index][:, 0],
+                eps=1e-5,
+                label=f"{name} grad of sample {sample}",
+            )
 
 
 @pytest.mark.parametrize("source", ["full_fusion", "split_attention"])

@@ -2225,15 +2225,9 @@ def _compute_sparse_indexer_loss_and_grads(
         target, predict_log_probs, loss_coeff, query_valid_rows, calculate_per_token_loss
     )
 
-    topk_indices_for_bwd = topk_indices_cmp
-    if b > 1:
-        batch_offsets = (
-            torch.arange(b, device=query.device, dtype=topk_indices_cmp.dtype)
-            .view(b, 1, 1)
-            .mul(skv)
-        )
-        topk_indices_for_bwd = topk_indices_for_bwd + batch_offsets
-    topk_indices_for_bwd = topk_indices_for_bwd.masked_fill(~valid_positions, -1)
+    # The cuDNN sparse indexer backward takes top-k ids local to each sample and adds
+    # the per-sample key offset itself; it drops ids outside ``[0, skv)``.
+    topk_indices_for_bwd = topk_indices_cmp.masked_fill(~valid_positions, -1)
     attn_score_for_bwd = target
     # The cuDNN sparse indexer-backward score-grad kernel gates the KL gradient
     # on positive predicted probabilities. Preserve the mathematically correct
