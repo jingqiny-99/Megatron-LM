@@ -16,6 +16,7 @@ import os
 import socket
 from argparse import ArgumentParser
 from contextlib import redirect_stdout
+from datetime import timedelta
 from types import SimpleNamespace
 
 import pytest
@@ -35,6 +36,9 @@ VALUES = {
     1: (20 * MB, 40 * MB, 80 * MB, 75 * MB, 85 * MB),
 }
 NAME = "(after 1 iterations)"
+# The two gloo workers' store and collectives fail after this instead of hanging for torch's
+# default 30 minutes.
+STORE_TIMEOUT = timedelta(seconds=120)
 LEGACY_RANK0 = (
     "[Rank 0] (after 1 iterations) memory (MB) | allocated: 10.00 | max allocated: 50.00"
     " | reserved: 60.00 | max reserved: 70.00"
@@ -157,9 +161,16 @@ def _free_port():
 
 
 def _gloo_worker(rank, port, enabled, out_dir):
-    """One rank of the two-process test: report fake memory, record stdout and the gathers."""
+    """One rank of the two-process test: report fake memory, record stdout and the gathers.
+
+    The worker builds its own TCPStore instead of passing a ``tcp://`` init_method: under
+    torchrun (CI) the spawned workers inherit ``TORCHELASTIC_USE_AGENT_STORE=True``, and the
+    ``tcp://`` rendezvous of torch 2.12 then makes every rank a client of a store that nobody
+    hosts, so both workers wait for the whole store timeout.
+    """
     shim = _SetattrShim()
-    dist.init_process_group("gloo", rank=rank, world_size=2, init_method=f"tcp://127.0.0.1:{port}")
+    store = dist.TCPStore("127.0.0.1", port, 2, rank == 0, timeout=STORE_TIMEOUT)
+    dist.init_process_group("gloo", rank=rank, world_size=2, store=store, timeout=STORE_TIMEOUT)
     try:
         _fake_cuda(shim, rank)
         gathers = []
