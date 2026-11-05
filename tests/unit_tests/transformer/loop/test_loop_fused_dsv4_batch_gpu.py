@@ -20,31 +20,79 @@ expert bias, sequence aux loss 1e-4, SwiGLU with the clamp; mHC 4 streams (Sinkh
 bf16; ``loop_recompute`` (round checkpoints) so b = 8 fits one GB200; sequence 4096; vocabulary
 4096 (the heads are not under test).
 
-The fused kernels are bf16-only, so the comparison is bf16 with a measured floor per parameter
-(FSDP-arm deviations D6): the floor is the fused path's own run-to-run difference (the 1-row arm
-twice with training's non-deterministic kernels). Gates, with deterministic kernels and with
-training's: every attached loss sum (LM, aux, indexer) and every row's LM loss within 1e-3
-relative; every parameter gradient (the indexer's ``linear_wq_b``, ``linear_weights_proj`` and
-compressor, the attention compressors' ``linear_wkv``, ``linear_wgate``, ``ape`` and ``norm``
-included) within max(1e-3, 3 x floor) of the 1-row arm, and every one of those indexer and
-compressor weights resolved by the floor (so gated relatively). Gradients the floor does not
-resolve are gated absolutely (``|dg| <= 1e-4 x`` the whole-gradient norm): those whose floor exceeds
-0.5, and the mHC stream-mixing scalars ``alpha_res`` / ``alpha_pre``, which are zero in exact
-arithmetic at initialization (the residual streams are copies; T3's fp32 arms measured them at
-1e-18 to 1e-10): their bf16 values are rounding residuals that depend on the GEMM shapes, so the
-same-shape floor cannot bound their b-row difference (FSDP-arm deviation D54).
+Protocol, per b, with training's kernels: R = 5 alternating runs A1 B1 ... A5 B5 of the 1-row arm
+A (b microbatches of one row) and the b-row arm B (one microbatch of b rows) in one process,
+then one b-row run under the indexer mutant of gate 4. Gates:
 
-The deterministic arms need cuDNN's deterministic DSA sparse-attention backward, which only some
-cuDNN Frontend releases provide (``_deterministic_backward_missing``). Where it is missing, the
-vendor raises in any deterministic fused backward, so the deterministic arms are not run, the
-reason is printed, and the gates apply to training's kernels only: the kernels the fused path
-trains with. CONTRACT D2's fused image (cuDNN Frontend 1.28.0) is such an environment, and D2
-rules out ``--deterministic-mode`` with the fused path (FSDP-arm deviation D51).
+1. Paths: the fused CSA indexer + sparse attention ran at batch 1 and at b; the unfused CSA path
+   never ran.
+2. Losses and rows: every attached loss sum (LM, aux, indexer) and every row's LM loss of every B
+   run within 1e-3 (relative) of every A run.
+3. Every parameter gradient, on the means over the runs (``mbs_invariance_utils.repeat_gate``):
+   x = |mean B - mean A| / |mean A| against the noise of that difference measured from the same
+   runs, e = sqrt((s_A^2 + s_B^2) / R) / |mean A| (s^2: the per-run variance within one arm).
+   * Resolved gradients (per-run noise sqrt((s_A^2 + s_B^2) / 2) at most 0.5 |mean A|): pass iff
+     x <= max(2^-7, 5 e).
+   * Unresolved gradients pass iff |mean B - mean A| <= 1e-4 x the whole-gradient norm (mean A).
+     The mHC stream-mixing scalars ``alpha_res`` / ``alpha_pre`` are always gated this way: they
+     are zero in exact arithmetic at initialization, where the 4 residual streams are copies
+     (T3's fp32 arms measured them at 1e-18 to 1e-10), so their bf16 values are rounding
+     residuals of the GEMM and reduction shapes that no relative bound can hold (FSDP-arm
+     deviation D54).
+   * Every indexer and compressor weight (the indexer's ``linear_wq_b``, ``linear_weights_proj``
+     and compressor; the attention compressors' ``linear_wkv``, ``linear_wgate``, ``ape`` and
+     ``norm``) must be resolved, so that the weights this test is about keep the relative gate.
+   * The TE RMSNorm weights are compared on an fp32 side channel instead of ``main_grad`` (below),
+     after checking in every run that it equals ``main_grad`` within 2^-7.
+4. Teeth: in one more b-row run, every fused CSA call of the step (the recompute replays
+   included) halves the gradients of the last sample's indexer inputs (``q_indexer``,
+   ``k_indexer``, ``weights``). Gated like mean B in gate 3, against mean A with one run's B noise,
+   it must fail on every indexer weight of the C layers that run once per sample (the prelude's
+   and the coda's: layers 4 and 12, 12 weights; the core's C layer is recorded only); the test
+   fails if it passes on any of them. The losses, the rows and the whole gradient stay within
+   their clean spread under this error, so only a per-parameter gate can catch it.
 
-Recorded (printed, not gated): the batch sizes the fused CSA indexer + sparse attention ran at,
-that the unfused CSA path never ran, and whether the DSA cuDNN sparse indexer-loss path
-(``dsa_cudnn_kernels._compute_sparse_indexer_loss_and_grads``, whose b > 1 top-k offset site
-is the known 'D'-path issue) was reached; Flash builds only W / C / H, so it should not be.
+Why repeated runs, not a one-pair floor. With training's kernels the fused DSA backward is not
+deterministic (cuDNN Frontend 1.28.0, CONTRACT D2's image), so every gradient carries run-to-run
+noise and the b-row difference must be judged against it. The previous gate used one draw of
+that noise (the 1-row arm twice) as the floor: relative <= max(1e-3, 3 x floor). For the small
+mHC tensors (the 1-element ``alpha_post``, the biases) the run-to-run differences span one to two
+orders of magnitude, so that floor was a lottery: it failed 2 to 10 parameters in every one of 23
+(A, B, A) triples of correct runs, a different set each time. Means over R = 5 runs and the noise
+of their difference measured from the same runs passed all 7 fused run sets of the lead's check
+(2 for calibration, 5 on held-out rows; at most 0.67 of the bound), while the mutant of gate 4
+failed every one of its 12 weights by 1.38x or more (lead check "T7 verdict", 2026-11-05).
+
+Why an fp32 side channel for the TE RMSNorm weights. TE's RMSNorm backward reduces the weight
+gradient over the rows in fp32 inside the kernel and rounds it to the bf16 weight dtype once per
+call; autograd sums a microbatch's calls in bf16, and DDP adds that sum to the fp32 ``main_grad``
+once per microbatch. Arm A therefore holds sum_i bf16(G_i) over its one-row microbatches and arm
+B holds bf16(sum_i G_i): two roundings of a large row reduction into a small tensor, at different
+granularity, which the runs' noise does not show (layer 4's indexer compressor norm, 128
+elements: 1.6e-3 at a per-run noise of 1e-4, and the same on the unfused path). Accumulated in
+fp32 the difference is at the noise (7e-6), and replaying the bf16 steps reproduces the measured
+``main_grad`` bit for bit. ``mbs_invariance_utils.RMSNormWeightSideChannel`` accumulates
+sum_rows (x * rstd) * dy in fp32 (fp64 sums) in every call of the op's backward, from its saved
+tensors, before TE's own backward runs: a test-only patch that changes no gradient. A bf16
+allowance in the bound would loosen every norm weight instead.
+
+The constants: 2^-7 is one bf16 unit in the last place; it must exceed the one legitimate shape
+effect measured, layer 12's ``attn_sink`` (3.2e-3 to 4.5e-3 between b-row and 1-row steps, on the
+unfused reference path as well). With the factor 5 the clean runs stay at most at 0.67 of their
+bound and the mutant at 1.38x or more of it.
+
+Only training's kernels run. The gate measures their run-to-run noise; cuDNN Frontend 1.28.0 has
+no deterministic DSA sparse-attention backward, and CONTRACT D2 rules out ``--deterministic-mode``
+with the fused path. A deterministic fused backward would leave no noise to measure: it would
+need a bound against a reference difference instead.
+
+Recorded (printed, not gated): every run's losses, time and peak memory; the batch sizes the
+fused CSA indexer + sparse attention ran at; whether the DSA cuDNN sparse indexer-loss path
+(``dsa_cudnn_kernels._compute_sparse_indexer_loss_and_grads``, whose b > 1 top-k offset site is
+the known 'D'-path issue) was reached (Flash builds only W / C / H, so it should not be); the
+compressor norms' gate on ``main_grad`` next to their side-channel gate; the mutant's effect on
+every indexer weight. Cost per b: 11 steps and 11 host copies of the fp32 gradient of this
+3.9 B-element slice (about 170 GB of host memory).
 
 The fused path needs a cuDNN Frontend whose compact DSA indexer wrapper takes ``deterministic``
 (``TransformerConfig`` refuses ``dsa_kernel_backend='cudnn'`` otherwise); without one the module
@@ -52,9 +100,10 @@ is skipped with that error as the reason.
 """
 
 import collections
-import inspect
+import functools
 import math
 import os
+import time
 import warnings
 
 import pytest
@@ -69,21 +118,33 @@ pytestmark = pytest.mark.skipif(
 )
 
 PATTERN = "WEWECEHECEHECE"
+PRELUDE_SUBLAYERS = 6
+CODA_SUBLAYERS = 4
 _RATIOS = {"W": 0, "C": 4, "H": 128, "E": 0}
 SEQ = 4096
 VOCAB = 4096
-MAX_RELATIVE = 1e-3
-FLOOR_FACTOR = 3.0
-# Absolute bound for gradients the floor cannot resolve, as a fraction of the whole-gradient norm
-# (mbs_invariance_utils.resolution_gate's default, as T3).
-ABSOLUTE_FRACTION = 1e-4
-# The mHC stream-mixing scalars whose gradients vanish at initialization, where the 4 residual
-# streams are copies: T3's fp32 arms measured them at 1.6e-18 to 1.5e-10 (zero to fp32 rounding,
-# FSDP-arm deviation D8). In bf16 they are rounding residuals whose value depends on the GEMM and
-# reduction shapes, so one-row and b-row steps legitimately differ in them by more than the
-# same-shape floor bounds; the floor of a 1-element gradient can also agree by chance (both
-# measured in the D2 image, deviation D54).
+ROW_SEED = 777
+
+# The gate (module docstring).
+REPEATS = 5  # R: runs of each arm, alternating A1 B1 ... A5 B5
+GATE_FACTOR = 5.0  # a resolved gradient passes iff x <= max(MIN_RELATIVE, GATE_FACTOR x e)
+MIN_RELATIVE = 2.0**-7  # one bf16 unit in the last place
+UNRESOLVED_NOISE = 0.5  # per-run noise above this fraction of |mean A|: unresolved
+ABSOLUTE_FRACTION = 1e-4  # unresolved: |mean B - mean A| <= this x the whole-gradient norm
+LOSS_ROW_MAX_RELATIVE = 1e-3  # every loss sum and row LM loss, every B run vs every A run
+SIDE_CHANNEL_MAX_RELATIVE = 2.0**-7  # |main_grad - side channel| / |side channel|, every run
+MUTANT_INDEXER_SCALE = 0.5  # the teeth: the last sample's indexer-input gradients halved
+# The mHC stream-mixing scalars, zero in exact arithmetic at initialization (gate 3).
 SYMMETRIC_ZERO_SUFFIXES = (".hyper_connection.alpha_res", ".hyper_connection.alpha_pre")
+# The indexer weights of one C layer (the teeth, gate 4).
+INDEXER_WEIGHTS = (
+    ".indexer.linear_wq_b.",
+    ".indexer.linear_weights_proj.",
+    ".indexer.compressor.linear_wkv.",
+    ".indexer.compressor.linear_wgate.",
+    ".indexer.compressor.ape",
+    ".indexer.compressor.norm.",
+)
 
 
 @pytest.fixture(scope="module", autouse=True)
@@ -164,8 +225,8 @@ def _config():
         loop_carrier="injection",
         loop_iterations=4,
         loop_exit_criterion="fixed",
-        loop_prelude_sublayers=6,
-        loop_coda_sublayers=4,
+        loop_prelude_sublayers=PRELUDE_SUBLAYERS,
+        loop_coda_sublayers=CODA_SUBLAYERS,
         loop_recompute=True,
         calculate_per_token_loss=True,
         deterministic_mode=False,
@@ -194,6 +255,7 @@ def _model(config):
 
 @pytest.fixture(scope="module")
 def runner():
+    """The slice under DDP (``mbs_invariance_utils.StepRunner``), built once per module."""
     try:
         config = _config()
     except ValueError as exc:
@@ -205,13 +267,19 @@ def runner():
             f"fused DSv4 path unavailable in this environment (cudnn-frontend "
             f"{getattr(cudnn, '__version__', '?')}): {exc}"
         )
-    # Per-arm gradients go to host memory: several fp32 copies of a 3.8 B-parameter slice do
-    # not fit next to the b = 8 activations.
+    # Per-run gradients go to host memory: 11 fp32 copies of a 3.9 B-parameter slice do not fit
+    # next to the b = 8 activations.
     return mbs.StepRunner(_model(config), grads_device="cpu")
 
 
 class _KernelLog:
-    """Counts of the CSA / DSA paths the step ran, by batch size."""
+    """Counts of the CSA / DSA paths the step ran, by batch size, and the indexer mutant.
+
+    While ``indexer_scale`` is set, every fused CSA indexer + sparse attention call with b > 1
+    rows (SBHD: ``query`` is (s, b, h, d)), the loop's recompute replays included, scales the
+    gradients of the last sample's indexer inputs (``q_indexer``, ``k_indexer``, ``weights``) by
+    it in the backward (``mbs_invariance_utils.ScaleSampleGrad``); ``mutated`` counts those calls.
+    """
 
     def __init__(self, monkeypatch):
         from megatron.core.transformer.experimental_attention_variant import csa, dsa_cudnn_kernels
@@ -219,13 +287,34 @@ class _KernelLog:
         self.fused_indexer_batches = collections.Counter()
         self.unfused_csa = 0
         self.dsa_sparse_indexer_loss = 0
+        self.indexer_scale = None
+        self.mutated = 0
         fused = csa.fused_csa_indexer_sparse_attn
         unfused = csa.CompressedSparseAttention._forward_unfused_csa
         dsa_loss = dsa_cudnn_kernels._compute_sparse_indexer_loss_and_grads
 
-        def fused_wrapper(query, *args, **kwargs):
-            self.fused_indexer_batches[int(query.shape[1])] += 1
-            return fused(query, *args, **kwargs)
+        def fused_wrapper(
+            query, kv_full, attn_sink, window_idxs, q_indexer, k_indexer, weights, *args, **kwargs
+        ):
+            batch = int(query.shape[1])
+            self.fused_indexer_batches[batch] += 1
+            if self.indexer_scale is not None and batch > 1:
+                sample, scale = batch - 1, self.indexer_scale
+                q_indexer = mbs.ScaleSampleGrad.apply(q_indexer, sample, scale)
+                k_indexer = mbs.ScaleSampleGrad.apply(k_indexer, sample, scale)
+                weights = mbs.ScaleSampleGrad.apply(weights, sample, scale)
+                self.mutated += 1
+            return fused(
+                query,
+                kv_full,
+                attn_sink,
+                window_idxs,
+                q_indexer,
+                k_indexer,
+                weights,
+                *args,
+                **kwargs,
+            )
 
         def unfused_wrapper(attention, *args, **kwargs):
             self.unfused_csa += 1
@@ -256,160 +345,346 @@ def _checked_weight_names(model):
     return {key: [name for name in names if key in name] for key in wanted}
 
 
-def _deterministic_backward_missing():
-    """Why the fused DSA backward cannot run deterministically here, or ``None`` if it can.
+def _indexer_weight_names(model):
+    """``{C layer: its indexer weights}``, and the C layers that run once per sample.
 
-    The same API check as the vendor's guard, which runs on every deterministic fused backward
-    (``fused_sparse_attention._deterministic_sparse_bwd_kwargs``): the cuDNN Frontend's
-    ``sparse_attention_backward_wrapper`` must take ``deterministic`` and ``workspace``, and the
-    frontend must provide ``SparseAttentionBackward``. Without them the guard raises
-    "deterministic mode: the installed cudnn-frontend has no deterministic DSA sparse-attention
-    backward", whatever the batch size.
-    """
-    import cudnn
-
-    from megatron.core.transformer.experimental_attention_variant.csa_utils import (
-        fused_sparse_attention,
-    )
-
-    fused_sparse_attention._ensure_dsa_namespace()
-    dsa = fused_sparse_attention._DSA
-    wrapper = getattr(dsa, "sparse_attention_backward_wrapper", None)
-    try:
-        parameters = inspect.signature(wrapper).parameters if wrapper is not None else {}
-    except (TypeError, ValueError):
-        parameters = {}
-    missing = [name for name in ("deterministic", "workspace") if name not in parameters]
-    if getattr(dsa, "SparseAttentionBackward", None) is None:
-        missing.append("SparseAttentionBackward")
-    if not missing:
-        return None
-    return (
-        f"cudnn-frontend {getattr(cudnn, '__version__', '?')} has no deterministic DSA "
-        f"sparse-attention backward (missing: {', '.join(missing)})"
-    )
-
-
-def _symmetric_zero_floor(floor):
-    """The floor with every mHC stream-symmetry scalar marked unresolved (relative floor inf), so
-    that ``resolution_gate`` gates it absolutely, and the names so marked.
-
-    These gradients are zero in exact arithmetic at initialization (SYMMETRIC_ZERO_SUFFIXES): a
-    relative difference between two bf16 computations of a zero is not a property of the math.
-    Every other parameter keeps the floor-relative gate."""
-    names = [name for name in floor if name.endswith(SYMMETRIC_ZERO_SUFFIXES)]
-    marked = {
-        name: dict(entry, relative=math.inf) if name in names else entry
-        for name, entry in floor.items()
+    The latter are the prelude's and the coda's C layers, whose indexer weights the mutant must
+    fail on (gate 4); the core's C layer runs every round and is reported only."""
+    names = [name for name, _ in model.named_parameters()]
+    layers = [index for index, symbol in enumerate(PATTERN) if symbol == "C"]
+    by_layer = {
+        layer: [name for name in names if f".layers.{layer}." in name and ".indexer." in name]
+        for layer in layers
     }
-    return marked, names
+    coda_start = len(PATTERN) - CODA_SUBLAYERS
+    once = [layer for layer in layers if layer < PRELUDE_SUBLAYERS or layer >= coda_start]
+    return by_layer, once
 
 
-def _set_kernels(monkeypatch, runner, deterministic):
-    from megatron.training.determinism import DETERMINISM_ENV_VAR_DEFAULTS
+def _set_training_kernels(monkeypatch, runner):
+    """Training's kernels: the fused DSA backward's non-deterministic algorithms."""
+    monkeypatch.setenv("NVTE_ALLOW_NONDETERMINISTIC_ALGO", "1")
+    monkeypatch.setattr(runner.model.config, "deterministic_mode", False)
+    torch.use_deterministic_algorithms(False, warn_only=True)
 
-    if deterministic:
-        for name, value in DETERMINISM_ENV_VAR_DEFAULTS.items():
-            monkeypatch.setenv(name, value)
-    else:
-        monkeypatch.setenv("NVTE_ALLOW_NONDETERMINISTIC_ALGO", "1")
-    monkeypatch.setattr(runner.model.config, "deterministic_mode", deterministic)
-    torch.use_deterministic_algorithms(deterministic, warn_only=True)
+
+def _relative(value, reference):
+    """``|value - reference| / |reference|`` in fp64 (0 when both are zero)."""
+    value, reference = value.double().reshape(-1), reference.double().reshape(-1)
+    diff, norm = (value - reference).norm().item(), reference.norm().item()
+    if norm == 0.0:
+        return 0.0 if diff == 0.0 else math.inf
+    return diff / norm
+
+
+def _short(name):
+    return (
+        name.replace("decoder.layers.", "L")
+        .replace(".inner_layer.self_attention.core_attention", "")
+        .replace(".hyper_connection", ".hc")
+    )
+
+
+def _verdict(entry, prefix=""):
+    """One gate entry as text: ``rel`` (resolved) or ``abs`` value, its bound and their ratio;
+    ``prefix='single_'`` for the mutant run."""
+    x, bound = entry[f"{prefix}x"], entry[f"{prefix}bound"]
+    kind = "rel" if entry["resolved"] else "abs"
+    return f"{kind} {x:.2e} / bound {bound:.2e} ({x / bound:.2f})"
+
+
+def _run_arm(runner, log, side, rows, label, micro_batch_size, indexer_scale=None):
+    """One step over ``rows`` in microbatches of ``micro_batch_size`` (with ``indexer_scale``:
+    under the indexer mutant): its losses, rows, final gradients (on the host), the TE RMSNorm
+    side channel in ``main_grad``'s units and its check against ``main_grad``, and its paths."""
+    fused_before, mutated_before = collections.Counter(log.fused_indexer_batches), log.mutated
+    log.indexer_scale = indexer_scale
+    torch.cuda.reset_peak_memory_stats()
+    start = time.perf_counter()
+    try:
+        losses, row_losses, grads = runner.run(rows, micro_batch_size, seq=SEQ)
+    finally:
+        log.indexer_scale = None
+    seconds = time.perf_counter() - start
+    sums, calls = side.take()
+    # main_grad is the step's gradient sum over its loss tokens divided by their number
+    # (calculate_per_token_loss); the side channel is the sum.
+    tokens = float(rows["loss_mask"].sum().item())
+    norms = {name: value / tokens for name, value in sums.items()}
+    run = dict(
+        label=label,
+        losses=losses,
+        rows=row_losses,
+        grads=grads,
+        side=norms,
+        side_calls=calls,
+        side_check={name: _relative(grads[name], value) for name, value in norms.items()},
+        fused=dict(log.fused_indexer_batches - fused_before),
+        mutated=log.mutated - mutated_before,
+    )
+    print(
+        f"[T7 b={rows['tokens'].shape[0]}] run {label}: micro-batch size {micro_batch_size}, "
+        f"{seconds:.1f} s, peak {torch.cuda.max_memory_allocated() / 2**30:.1f} GiB; losses "
+        + ", ".join(f"{key} {value:.6e}" for key, value in losses.items())
+        + f"; fused CSA calls by batch {run['fused']}; mutated calls {run['mutated']}; side "
+        f"channel |main_grad - side| / |side| <= "
+        f"{max(run['side_check'].values(), default=math.nan):.2e}",
+        flush=True,
+    )
+    return run
+
+
+def _run_protocol(runner, log, side, batch):
+    """The runs and statistics of one b (module docstring); returns what the gates need.
+
+    The per-run gradients (15.5 GB each on the host) are released on return."""
+    rows = mbs.make_rows(batch, SEQ, VOCAB, seed=ROW_SEED)
+    runs_a, runs_b = [], []
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        for repeat in range(1, REPEATS + 1):
+            runs_a.append(_run_arm(runner, log, side, rows, f"A{repeat}", 1))
+            runs_b.append(_run_arm(runner, log, side, rows, f"B{repeat}", batch))
+        mutant = _run_arm(runner, log, side, rows, "M", batch, indexer_scale=MUTANT_INDEXER_SCALE)
+    fallbacks = sorted({str(w.message)[:160] for w in caught if "falling back" in str(w.message)})
+    checked = [name for names in _checked_weight_names(runner.model).values() for name in names]
+
+    device = torch.cuda.current_device()
+    main = mbs.repeat_statistics(
+        [run["grads"] for run in runs_a],
+        [run["grads"] for run in runs_b],
+        single_b=mutant["grads"],
+        device=device,
+    )
+    norms = mbs.repeat_statistics(
+        [run["side"] for run in runs_a],
+        [run["side"] for run in runs_b],
+        single_b=mutant["side"],
+        device=device,
+    )
+    whole_norm = math.sqrt(sum(entry["norm"] ** 2 for entry in main.values()))
+    symmetric = [name for name in main if name.endswith(SYMMETRIC_ZERO_SUFFIXES)]
+    gate = functools.partial(
+        mbs.repeat_gate,
+        whole_norm=whole_norm,
+        factor=GATE_FACTOR,
+        min_relative=MIN_RELATIVE,
+        unresolved_noise=UNRESOLVED_NOISE,
+        absolute_fraction=ABSOLUTE_FRACTION,
+        absolute_names=symmetric,
+    )
+    pairs = [(run_b, run_a) for run_b in runs_b for run_a in runs_a]
+    clean = runs_a + runs_b
+    return dict(
+        report=gate({**main, **norms}),  # the TE RMSNorm weights on the side channel
+        norms_on_main_grad=gate({name: main[name] for name in norms}),  # recorded only
+        whole_norm=whole_norm,
+        symmetric=symmetric,
+        checked=checked,
+        not_training=[name for name in checked if runs_a[0]["grads"][name].norm() == 0],
+        reference_losses=runs_a[0]["losses"],
+        loss_rel={
+            key: max(mbs.relative_loss_differences(b["losses"], a["losses"])[key] for b, a in pairs)
+            for key in mbs.LOSS_KEYS
+        },
+        row_rel=max(mbs.max_row_difference(b["rows"], a["rows"]) for b, a in pairs),
+        loss_rel_within_a=max(
+            max(mbs.relative_loss_differences(a2["losses"], a1["losses"]).values())
+            for a1 in runs_a
+            for a2 in runs_a
+            if a1 is not a2
+        ),
+        norm_names=sorted(norms),
+        side_worst=max(
+            (
+                (value, name, run["label"])
+                for run in clean + [mutant]
+                for name, value in run["side_check"].items()
+            ),
+            default=(math.inf, "no TE RMSNorm weight", "-"),
+        ),
+        side_uncalled=[
+            (run["label"], name)
+            for run in clean + [mutant]
+            for name in norms
+            if not run["side_calls"].get(name)
+        ],
+        mutant_fused=mutant["fused"].get(batch, 0),
+        mutant_mutated=mutant["mutated"],
+        fallbacks=fallbacks,
+    )
+
+
+def _print_result(tag, batch, result, log, by_layer, once):
+    """The diagnostics of one b (printed before the gates assert)."""
+    report, norms_main = result["report"], result["norms_on_main_grad"]
+    print(
+        f"[{tag}] paths: fused CSA indexer calls by batch {dict(log.fused_indexer_batches)}; "
+        f"unfused CSA calls {log.unfused_csa}; DSA cuDNN sparse indexer-loss calls (the 'D' "
+        f"path with the b > 1 offset site) {log.dsa_sparse_indexer_loss}; fallback warnings "
+        f"{result['fallbacks']}",
+        flush=True,
+    )
+    print(
+        f"[{tag}] losses, worst B vs A over {REPEATS * REPEATS} pairs: "
+        + ", ".join(f"{key} {value:.2e}" for key, value in result["loss_rel"].items())
+        + f"; worst row {result['row_rel']:.2e} (bound {LOSS_ROW_MAX_RELATIVE:.0e}); worst A vs A "
+        f"{result['loss_rel_within_a']:.2e}",
+        flush=True,
+    )
+    value, name, label = result["side_worst"]
+    print(
+        f"[{tag}] side channel: {len(result['norm_names'])} TE RMSNorm weights; "
+        f"|main_grad - side| / |side| <= {value:.2e} over all runs (bound "
+        f"{SIDE_CHANNEL_MAX_RELATIVE:.2e}; worst {_short(name)} in run {label}); weights without "
+        f"a backward call in some run: {result['side_uncalled']}",
+        flush=True,
+    )
+    ratios = sorted(((r["x"] / r["bound"], name) for name, r in report.items()), reverse=True)
+    unresolved = [name for name, r in report.items() if not r["resolved"]]
+    print(
+        f"[{tag}] gate (R = {REPEATS}, x <= max(2^-7, {GATE_FACTOR:g} e) if resolved, else "
+        f"|dg| <= {ABSOLUTE_FRACTION:.0e} x the whole-gradient norm {result['whole_norm']:.4e} = "
+        f"{ABSOLUTE_FRACTION * result['whole_norm']:.2e}): {len(report)} params, "
+        f"{len(report) - len(unresolved)} resolved, {len(unresolved)} unresolved "
+        f"({len(result['symmetric'])} mHC stream-symmetry scalars); failing "
+        f"{sum(not r['ok'] for r in report.values())}; worst x / bound {ratios[0][0]:.2f} "
+        f"({_short(ratios[0][1])})",
+        flush=True,
+    )
+    print(
+        f"[{tag}] worst: "
+        + "; ".join(
+            f"{_short(name)} {_verdict(report[name])} e {report[name]['e']:.2e} "
+            f"|g| {report[name]['norm']:.2e}"
+            for _, name in ratios[:8]
+        ),
+        flush=True,
+    )
+    for name in result["norm_names"]:
+        if "compressor.norm" in name:
+            print(
+                f"[{tag}]   {_short(name)}: side channel {_verdict(report[name])}; main_grad "
+                f"(recorded only) {_verdict(norms_main[name])}",
+                flush=True,
+            )
+    for name in report:
+        if name.endswith(".attn_sink"):
+            print(f"[{tag}]   {_short(name)}: {_verdict(report[name])}", flush=True)
+    print(
+        f"[{tag}] teeth idx_{MUTANT_INDEXER_SCALE:g}: the last sample's indexer-input gradients "
+        f"scaled in {result['mutant_mutated']} of {result['mutant_fused']} fused CSA calls at "
+        f"batch {batch}; gated against mean A with one run's B noise",
+        flush=True,
+    )
+    for layer, names in by_layer.items():
+        role = "runs once per sample: must fail" if layer in once else "core: recorded only"
+        caught = sum(not report[name]["single_ok"] for name in names)
+        smallest = min(
+            (report[name]["single_x"] / report[name]["single_bound"] for name in names),
+            default=math.nan,
+        )
+        print(
+            f"[{tag}]   layer {layer} ({role}): {caught} of {len(names)} fail, smallest "
+            f"x / bound {smallest:.2f}",
+            flush=True,
+        )
+        for name in names:
+            entry = report[name]
+            print(
+                f"[{tag}]     {_short(name)}: clean {_verdict(entry)}; mutant "
+                f"{_verdict(entry, 'single_')} {'PASSES' if entry['single_ok'] else 'fails'}",
+                flush=True,
+            )
 
 
 @pytest.mark.parametrize("batch", [4, 8])
 def test_fused_kernels_batch_equals_single_rows(runner, monkeypatch, batch):
+    """Gates 1-4 of the module docstring at micro-batch size ``batch``."""
+    tag = f"T7 b={batch}"
     log = _KernelLog(monkeypatch)
-    rows = mbs.make_rows(batch, SEQ, VOCAB, seed=777)
-    missing = _deterministic_backward_missing()
-    # Training's kernels first, then (where available) the deterministic ones.
-    flags = (False,) if missing else (False, True)
-    modes = ("training",) if missing else ("deterministic", "training")
+    side = mbs.RMSNormWeightSideChannel(monkeypatch, runner.model)
+    by_layer, once = _indexer_weight_names(runner.model)
+    # What the gates cover, checked before the runs: the indexer and compressor weights; every
+    # TE RMSNorm weight, a parameter of the model, on the side channel; all six indexer weights
+    # of every C layer that runs once per sample in the teeth.
+    for key, names in _checked_weight_names(runner.model).items():
+        assert names, key
+    parameters = {name for name, _ in runner.model.named_parameters()}
+    assert side.names and set(side.names.values()) <= parameters, sorted(side.names.values())
+    assert once, PATTERN
+    for layer in once:
+        for kind in INDEXER_WEIGHTS:
+            assert any(kind in name for name in by_layer[layer]), (layer, kind)
     print(
-        f"[T7 b={batch}] deterministic arms: "
-        + (f"not run: {missing}" if missing else "run")
-        + f"; gated modes {modes}",
+        f"[{tag}] {REPEATS} alternating runs of {batch} x 1 (A) and 1 x {batch} (B), training's "
+        f"kernels, then one 1 x {batch} run under the indexer mutant; side channel on "
+        f"{len(side.names)} TE RMSNorm weights; teeth layers {once}",
         flush=True,
     )
     previous = torch.are_deterministic_algorithms_enabled()
-    arms = {}
     try:
-        with warnings.catch_warnings(record=True) as caught:
-            warnings.simplefilter("always")
-            for deterministic in flags:
-                _set_kernels(monkeypatch, runner, deterministic)
-                mode = "deterministic" if deterministic else "training"
-                arms[(mode, 1)] = runner.run(rows, 1, seq=SEQ)
-                arms[(mode, batch)] = runner.run(rows, batch, seq=SEQ)
-                if not deterministic:
-                    arms[(mode, "1 again")] = runner.run(rows, 1, seq=SEQ)
+        _set_training_kernels(monkeypatch, runner)
+        result = _run_protocol(runner, log, side, batch)
     finally:
         torch.use_deterministic_algorithms(previous)
-    fallbacks = sorted({str(w.message)[:160] for w in caught if "falling back" in str(w.message)})
-    print(
-        f"[T7 b={batch}] fused CSA indexer calls by batch {dict(log.fused_indexer_batches)}; "
-        f"unfused CSA calls {log.unfused_csa}; DSA cuDNN sparse indexer-loss calls (the 'D' "
-        f"path with the b > 1 offset site) {log.dsa_sparse_indexer_loss}; fallback warnings "
-        f"{fallbacks}",
-        flush=True,
-    )
-    floor = mbs.compare_gradients(
-        arms[("training", "1 again")][2],
-        arms[("training", 1)][2],
-        min_cosine=0.0,
-        max_relative=math.inf,
-    )
-    checked = [name for names in _checked_weight_names(runner.model).values() for name in names]
-    mbs.print_report(f"T7 b={batch} floor (training, 1-row arm twice)", floor, checked[:6])
-    # The fused path ran at both batch sizes and the unfused CSA path never did.
+    report = result["report"]
+    _print_result(tag, batch, result, log, by_layer, once)
+    mbs.dump_report(tag, result)
+
+    # 1. The fused path ran at both batch sizes and the unfused CSA path never did.
     assert log.fused_indexer_batches[1] > 0 and log.fused_indexer_batches[batch] > 0
     assert log.unfused_csa == 0
-    # The gate covers the indexer and compressor weights, and they train.
-    ref_losses, _, ref_grads = arms[("training", 1)]
-    for key, names in _checked_weight_names(runner.model).items():
-        assert names, key
-        for name in names:
-            assert ref_grads[name].norm() > 0, name
-    assert all(ref_losses[key] != 0.0 for key in ("lm", "aux", "indexer")), ref_losses
+    # The checked weights train, every loss is attached, every TE RMSNorm weight was recorded.
+    assert not result["not_training"], result["not_training"]
+    assert all(result["reference_losses"][key] != 0.0 for key in ("lm", "aux", "indexer"))
+    assert sorted(side.names.values()) == result["norm_names"]
+
     failures = []
-    # The mHC stream-mixing scalars have no gradient at initialization: the streams are copies.
-    # Their computed gradients are rounding residuals, gated absolutely (_symmetric_zero_floor).
-    gate_floor, symmetric = _symmetric_zero_floor(floor)
-    for mode in modes:
-        ref_losses, ref_rows, ref_grads = arms[(mode, 1)]
-        losses, rows_b, grads = arms[(mode, batch)]
-        loss_rel = mbs.relative_loss_differences(losses, ref_losses)
-        row_rel = mbs.max_row_difference(rows_b, ref_rows)
-        global_norm = mbs.global_comparison(ref_grads, ref_grads)["norm"]
-        report = mbs.resolution_gate(
-            mbs.compare_gradients(grads, ref_grads, min_cosine=0.0, max_relative=math.inf),
-            gate_floor,
-            global_norm=global_norm,
-            strict=False,
-            min_relative=MAX_RELATIVE,
-            factor=FLOOR_FACTOR,
-            absolute_fraction=ABSOLUTE_FRACTION,
+    # 2. Losses and rows: every B run vs every A run.
+    if (
+        any(value > LOSS_ROW_MAX_RELATIVE for value in result["loss_rel"].values())
+        or result["row_rel"] > LOSS_ROW_MAX_RELATIVE
+    ):
+        failures.append(f"losses {result['loss_rel']}, max row rel {result['row_rel']:.2e}")
+    # 3. The side channel is main_grad without the bf16 roundings, in every run ...
+    if result["side_worst"][0] > SIDE_CHANNEL_MAX_RELATIVE or result["side_uncalled"]:
+        failures.append(
+            f"side channel vs main_grad: worst {result['side_worst']}; without a call "
+            f"{result['side_uncalled']}"
         )
-        tag = f"T7 b={batch} {mode} {batch} x 1 vs 1 x {batch}"
-        print(f"[{tag}] loss rel {loss_rel}; max row rel {row_rel:.2e}", flush=True)
-        largest = max((ref_grads[name].norm().item() for name in symmetric), default=0.0)
-        worst_diff = max((report[name]["diff"] for name in symmetric), default=0.0)
-        print(
-            f"[{tag}] whole-gradient norm {global_norm:.4e}; {len(symmetric)} mHC stream-symmetry "
-            f"scalars gated absolutely (|dg| <= {ABSOLUTE_FRACTION:.0e} x the norm = "
-            f"{ABSOLUTE_FRACTION * global_norm:.2e}): largest |g| {largest:.2e}, largest |dg| "
-            f"{worst_diff:.2e}",
-            flush=True,
+    # ... every parameter passes on the means, and the weights this test is about are resolved.
+    unresolved_checked = [name for name in result["checked"] if not report[name]["resolved"]]
+    if unresolved_checked:
+        failures.append(f"checked weights not resolved: {unresolved_checked}")
+    failing = sorted(
+        (name for name, r in report.items() if not r["ok"]),
+        key=lambda name: -report[name]["x"] / report[name]["bound"],
+    )
+    if failing:
+        failures.append(
+            f"{len(failing)} params: "
+            + "; ".join(
+                f"{name} x {report[name]['x']:.3e} bound {report[name]['bound']:.3e} "
+                f"({'resolved' if report[name]['resolved'] else 'unresolved'})"
+                for name in failing[:8]
+            )
         )
-        mbs.print_report(tag, report, checked[:6])
-        # The weights this test is about must keep the relative gate.
-        unresolved_checked = [name for name in checked if not report[name]["resolved"]]
-        if unresolved_checked:
-            failures.append(f"{mode}: checked weights not resolved: {unresolved_checked}")
-        mbs.dump_report(tag, dict(per_param=report, total=mbs.global_comparison(grads, ref_grads)))
-        if any(value > 1e-3 for value in loss_rel.values()) or row_rel > 1e-3:
-            failures.append(f"{mode}: loss rel {loss_rel}, max row rel {row_rel:.2e}")
-        failing = [name for name, r in report.items() if not r["ok"]]
-        if failing:
-            failures.append(f"{mode}: {len(failing)} params: {mbs.worst(report, failing)}")
+    # 4. Teeth: the mutant ran on every fused call at b and fails on every once-per-sample
+    # indexer weight.
+    if not 0 < result["mutant_mutated"] == result["mutant_fused"]:
+        failures.append(
+            f"teeth: mutated {result['mutant_mutated']} of {result['mutant_fused']} fused CSA "
+            f"calls at batch {batch}"
+        )
+    passed = [
+        name
+        for layer in once
+        for name in by_layer[layer]
+        if not report[name]["resolved"] or report[name]["single_ok"]
+    ]
+    if passed:
+        failures.append(
+            f"teeth: the idx_{MUTANT_INDEXER_SCALE:g} mutant passes the gate on {passed}"
+        )
     assert not failures, failures

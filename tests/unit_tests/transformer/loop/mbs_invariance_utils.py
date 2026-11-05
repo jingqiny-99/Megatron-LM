@@ -26,8 +26,16 @@ difference ``|g - g_ref| / |g_ref|`` and the absolute one; ``global_comparison``
 whole gradient. ``resolution_gate`` gates every parameter against a measured noise floor of the
 same parameter: a resolved gradient by the strict (fp32) or floor-relative (bf16) relative gate,
 an unresolved one (zero up to rounding) absolutely, against the global gradient norm.
+
+Repeated runs (for kernels with run-to-run noise). ``repeat_statistics`` reduces R runs of each
+of two arms to per-parameter means and per-run variances, and ``repeat_gate`` gates the mean
+difference against the noise measured from those runs (see its docstring).
+``RMSNormWeightSideChannel`` records the Transformer Engine RMSNorm weight gradients in fp32,
+before their per-call bf16 rounding; ``ScaleSampleGrad`` is a mutation that scales one sample's
+gradient in the backward.
 """
 
+import collections
 import contextlib
 import functools
 import json
@@ -320,6 +328,204 @@ def resolution_gate(
             ok = entry["relative"] <= bound
         out[name] = dict(entry, floor=noise, bound=bound, resolved=resolved, ok=ok)
     return out
+
+
+def _stacked(runs: Sequence[Dict[str, torch.Tensor]], name: str, device) -> torch.Tensor:
+    """The runs' tensors ``name`` as the rows of one fp64 matrix on ``device``."""
+    out = torch.empty((len(runs), runs[0][name].numel()), dtype=torch.float64, device=device)
+    for row, run in zip(out, runs):
+        row.copy_(run[name].reshape(-1))
+    return out
+
+
+def repeat_statistics(
+    runs_a: Sequence[Dict[str, torch.Tensor]],
+    runs_b: Sequence[Dict[str, torch.Tensor]],
+    *,
+    single_b: Optional[Dict[str, torch.Tensor]] = None,
+    device=None,
+) -> Dict[str, dict]:
+    """Per tensor name, the statistics of R_A runs of arm A and R_B runs of arm B, in fp64.
+
+    Each run is ``{name: tensor}``. Per name: ``norm`` = |mean A|, ``diff`` = |mean B - mean A|,
+    ``var_a`` = sum_i |a_i - mean A|^2 / (R_A - 1), the per-run variance of A summed over the
+    elements (half the mean squared distance between two runs; ``var_b`` likewise), ``runs_a`` /
+    ``runs_b`` = R_A / R_B and ``numel``. With ``single_b`` (one more run of B, such as a
+    mutant), ``single_diff`` = |b - mean A|, else None. ``device``: where the arithmetic runs.
+    """
+    assert len(runs_a) >= 2 and len(runs_b) >= 2, (len(runs_a), len(runs_b))
+    out = {}
+    for name in runs_a[0]:
+        a = _stacked(runs_a, name, device)
+        b = _stacked(runs_b, name, device)
+        mean_a, mean_b = a.mean(dim=0), b.mean(dim=0)
+        entry = dict(
+            numel=a.shape[1],
+            norm=mean_a.norm().item(),
+            diff=(mean_b - mean_a).norm().item(),
+            var_a=(a - mean_a).pow(2).sum().item() / (len(runs_a) - 1),
+            var_b=(b - mean_b).pow(2).sum().item() / (len(runs_b) - 1),
+            runs_a=len(runs_a),
+            runs_b=len(runs_b),
+            single_diff=None,
+        )
+        if single_b is not None:
+            single = single_b[name].reshape(-1).to(device=device, dtype=torch.float64)
+            entry["single_diff"] = (single - mean_a).norm().item()
+        out[name] = entry
+        del a, b, mean_a, mean_b
+    return out
+
+
+def _repeat_judgement(
+    diff, variance, *, norm, resolved, whole_norm, factor, min_relative, absolute_fraction
+):
+    """``(x, bound, ok)`` of one mean difference ``diff`` whose noise has variance ``variance``."""
+    if resolved:
+        x, bound = diff / norm, max(min_relative, factor * math.sqrt(variance) / norm)
+    else:
+        x, bound = diff, absolute_fraction * whole_norm
+    return x, bound, x <= bound
+
+
+def repeat_gate(
+    stats: Dict[str, dict],
+    *,
+    whole_norm: float,
+    factor: float,
+    min_relative: float,
+    unresolved_noise: float = 0.5,
+    absolute_fraction: float = 1e-4,
+    absolute_names: Sequence[str] = (),
+) -> Dict[str, dict]:
+    """Gate every mean difference of ``repeat_statistics`` against the noise of the same runs.
+
+    For kernels with run-to-run noise, the difference between the means of R_A and R_B runs has
+    the noise ``e = sqrt(var_a / R_A + var_b / R_B)``, measured from the runs themselves; one run
+    has the per-run noise ``sqrt((var_a + var_b) / 2)``. Per parameter:
+
+    * *resolved* when that per-run noise is at most ``unresolved_noise x |mean A|`` and the name is
+      not in ``absolute_names``: ``x = |mean B - mean A| / |mean A|`` passes iff
+      ``x <= max(min_relative, factor x e / |mean A|)``;
+    * otherwise *unresolved* (zero up to rounding): ``x = |mean B - mean A|`` passes iff
+      ``x <= absolute_fraction x whole_norm``.
+
+    With ``single_diff`` (one more run of B), the same gate on ``|b - mean A|`` with one run's
+    noise for B (R_B = 1): ``single_x``, ``single_bound``, ``single_ok``. Every entry also has
+    ``resolved``, ``x``, ``bound``, ``ok``, ``noise`` (per-run, relative to |mean A|), ``e``
+    (relative) and the statistics.
+    """
+    absolute = set(absolute_names)
+    out = {}
+    for name, entry in stats.items():
+        norm = entry["norm"]
+        noise = math.sqrt((entry["var_a"] + entry["var_b"]) / 2.0)
+        resolved = norm > 0.0 and noise <= unresolved_noise * norm and name not in absolute
+        judge = functools.partial(
+            _repeat_judgement,
+            norm=norm,
+            resolved=resolved,
+            whole_norm=whole_norm,
+            factor=factor,
+            min_relative=min_relative,
+            absolute_fraction=absolute_fraction,
+        )
+        variance = entry["var_a"] / entry["runs_a"] + entry["var_b"] / entry["runs_b"]
+        x, bound, ok = judge(entry["diff"], variance)
+        result = dict(
+            entry,
+            resolved=resolved,
+            noise=noise / norm if norm > 0.0 else math.inf,
+            e=math.sqrt(variance) / norm if norm > 0.0 else math.inf,
+            x=x,
+            bound=bound,
+            ok=ok,
+        )
+        if entry["single_diff"] is not None:
+            x, bound, ok = judge(
+                entry["single_diff"], entry["var_a"] / entry["runs_a"] + entry["var_b"]
+            )
+            result.update(single_x=x, single_bound=bound, single_ok=ok)
+        out[name] = result
+    return out
+
+
+class ScaleSampleGrad(torch.autograd.Function):
+    """Identity in the forward; in the backward, one sample's gradient scaled.
+
+    ``ScaleSampleGrad.apply(tensor, sample, scale)`` returns a copy of ``tensor``. In the
+    backward, the gradient that reaches ``tensor`` is the incoming one with sample ``sample``
+    (index along dim 1, the batch dimension of SBHD tensors) multiplied by ``scale``: a mutation
+    of one sample's gradient that no forward value shows.
+    """
+
+    @staticmethod
+    def forward(ctx, tensor, sample, scale):  # pylint: disable=arguments-differ
+        """A copy of ``tensor``; remembers which sample to scale by how much."""
+        ctx.sample = sample
+        ctx.scale = scale
+        return tensor.clone()
+
+    @staticmethod
+    def backward(ctx, grad):  # pylint: disable=arguments-differ
+        """The incoming gradient with sample ``ctx.sample`` scaled by ``ctx.scale``."""
+        grad = grad.clone()
+        grad.select(1, ctx.sample).mul_(ctx.scale)
+        return grad, None, None
+
+
+class RMSNormWeightSideChannel:
+    """The weight gradients of ``model``'s Transformer Engine RMSNorms, accumulated in fp32.
+
+    TE's RMSNorm backward reduces the weight gradient over the rows in fp32 inside the kernel and
+    rounds it to the weight dtype (bf16) once per call; autograd sums a microbatch's calls in bf16,
+    and DDP adds the sum to the fp32 ``main_grad`` once per microbatch. Steps that cut the same rows
+    into different microbatches therefore round at different granularity. In every call of the
+    RMSNorm op's backward, this side channel computes ``sum_rows (x * rstd) * dy`` from the op's
+    saved tensors (fp32 products, fp64 sum) before TE's own backward runs, and sums it over the
+    calls: the same gradient without the bf16 roundings. The model still trains on TE's bf16
+    gradient; nothing else changes.
+
+    ``monkeypatch`` (pytest's) undoes the patch of the op's backward after the test. ``names``:
+    ``{id(op): weight name}``. ``take()`` returns ``({weight name: fp64 sum}, {weight name:
+    calls})`` since the previous ``take`` (on the host) and resets.
+    """
+
+    def __init__(self, monkeypatch, model):
+        from transformer_engine.pytorch.ops.basic import rmsnorm
+
+        op_class = rmsnorm.RMSNorm
+        self.names = {
+            id(module): f"{name}.weight"
+            for name, module in model.named_modules()
+            if isinstance(module, op_class)
+        }
+        self.sums: Dict[str, torch.Tensor] = {}
+        self.calls = collections.Counter()
+        original = op_class.op_backward
+        channel = self
+
+        def op_backward(op, ctx, grad_output):
+            name = channel.names.get(id(op))
+            if name is not None:
+                x, rstd = ctx.saved_tensors[:2]
+                dy = grad_output.contiguous().view(x.size())
+                products = (x.float() * rstd.float().view(-1, 1)).mul_(dy.float())
+                weight_grad = products.sum(dim=0, dtype=torch.float64).view(op.weight.shape)
+                del products
+                previous = channel.sums.get(name)
+                channel.sums[name] = weight_grad if previous is None else previous + weight_grad
+                channel.calls[name] += 1
+            return original(op, ctx, grad_output)
+
+        monkeypatch.setattr(op_class, "op_backward", op_backward)
+
+    def take(self):
+        """The sums and call counts since the previous ``take``; resets them."""
+        sums = {name: value.cpu() for name, value in self.sums.items()}
+        calls = dict(self.calls)
+        self.sums, self.calls = {}, collections.Counter()
+        return sums, calls
 
 
 def dump_report(tag: str, report: dict) -> None:
