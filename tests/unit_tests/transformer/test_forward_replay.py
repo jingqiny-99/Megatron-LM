@@ -434,14 +434,14 @@ def test_loop_recompute_with_a_non_bitwise_replay_keeps_the_routing(monkeypatch,
     e.g. the unpermute's ``scatter_add_``), on the injection carrier (``LoopHybridStack``) and
     on the attention-residual carrier (``LoopAttnResHybridStack``, the loop-attnres variants'
     round checkpoint). With the routing tape the backward runs and the gradients are finite;
-    the control (the stack's checkpoint context without the tape, patched in the module that
-    owns the site) raises the original CheckpointError."""
+    the control (the round checkpoint's context without the tape, patched where
+    ``loop_round_checkpoint`` reads it) raises the original CheckpointError."""
     from torch.utils.checkpoint import CheckpointError
 
     from megatron.core.models.hybrid.hybrid_layer_allocation import validate_segment_layers
     from megatron.core.process_groups_config import ProcessGroupCollection
     from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
-    from megatron.core.transformer.loop import attn_res_stack, hybrid_stack
+    from megatron.core.transformer import loop_transformer_block
     from megatron.core.transformer.loop.attn_res_stack import LoopAttnResHybridStack
     from megatron.core.transformer.loop.hybrid_specs import (
         loop_attn_res_hybrid_stack_spec,
@@ -466,8 +466,8 @@ def test_loop_recompute_with_a_non_bitwise_replay_keeps_the_routing(monkeypatch,
                 recompute_context(f"{prefix}/phase=recompute"),
             )
 
-        owner = attn_res_stack if carrier == "attn_res" else hybrid_stack
-        monkeypatch.setattr(owner, "loop_checkpoint_context_fn", untaped)
+        # Every loop round checkpoint takes its context from loop_round_checkpoint.
+        monkeypatch.setattr(loop_transformer_block, "loop_checkpoint_context_fn", untaped)
 
     def perturb_replay(module, args, kwargs):
         if not in_forward_replay():

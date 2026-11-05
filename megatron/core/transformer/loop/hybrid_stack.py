@@ -66,7 +66,6 @@ from typing import Optional
 import torch
 import torch.distributed as dist
 from torch import Tensor, nn
-from torch.utils.checkpoint import checkpoint
 
 from megatron.core.models.hybrid.hybrid_block import HybridStack, HybridStackLayerContext
 from megatron.core.models.hybrid.layers.utils import Symbols
@@ -93,7 +92,7 @@ from megatron.core.transformer.loop_transformer_block import (
     LoopRMSNorm,
     active_causal_mask,
     compact_metadata,
-    loop_checkpoint_context_fn,
+    loop_round_checkpoint,
     token_depth_distribution,
 )
 
@@ -759,12 +758,14 @@ class LoopHybridStack(HybridStack):
             binned = forward_statistics_round(step + 1, rounds) if step < rounds else nullcontext()
             with context, binned:
                 if self.config.loop_recompute and torch.is_grad_enabled():
-                    updated = checkpoint(
+                    # A residual round returns its last sublayer's output; an injection round
+                    # ends in the loop norm, after its last layer.
+                    updated = loop_round_checkpoint(
                         recurrence,
                         state,
                         embedding,
-                        use_reentrant=False,
-                        context_fn=loop_checkpoint_context_fn(f"{label}/loop={step + 1}"),
+                        label=f"{label}/loop={step + 1}",
+                        round_ends_in_layer=residual,
                     )
                 else:
                     updated = recurrence(state, embedding)
@@ -863,11 +864,8 @@ class LoopHybridStack(HybridStack):
                     return self._run_range(x, core_start, core_end, loop_ctx, loop_label)
 
             if self.config.loop_recompute and torch.is_grad_enabled():
-                updated = checkpoint(
-                    recurrence,
-                    layer_input,
-                    use_reentrant=False,
-                    context_fn=loop_checkpoint_context_fn(loop_label),
+                updated = loop_round_checkpoint(
+                    recurrence, layer_input, label=loop_label, round_ends_in_layer=True
                 )
             else:
                 updated = recurrence(layer_input)

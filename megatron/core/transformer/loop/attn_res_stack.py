@@ -49,7 +49,6 @@ from typing import Dict, List, Optional, Sequence, Tuple
 
 import torch
 from torch import Tensor, nn
-from torch.utils.checkpoint import checkpoint
 
 from megatron.core.models.hybrid.hybrid_block import HybridStackLayerContext
 from megatron.core.tensor_observation import is_observing_tensor, observe_layer_residuals
@@ -70,7 +69,7 @@ from megatron.core.transformer.loop.attn_res import (
 from megatron.core.transformer.loop.guards import ATTN_RES_BLOCKS
 from megatron.core.transformer.loop.hybrid_stack import LoopHybridStack
 from megatron.core.transformer.loop.reporting import stream_mean_rms
-from megatron.core.transformer.loop_transformer_block import loop_checkpoint_context_fn
+from megatron.core.transformer.loop_transformer_block import loop_round_checkpoint
 
 
 class _SourceMasks:
@@ -351,11 +350,12 @@ class LoopAttnResHybridStack(LoopHybridStack):
             )
             with binned:
                 if self.config.loop_recompute and torch.is_grad_enabled():
-                    blocks = checkpoint(
+                    # The round returns its block sums: it ends in its last sublayer.
+                    blocks = loop_round_checkpoint(
                         round_fn,
                         *history,
-                        use_reentrant=False,
-                        context_fn=loop_checkpoint_context_fn(f"{label}/loop={step + 1}"),
+                        label=f"{label}/loop={step + 1}",
+                        round_ends_in_layer=True,
                     )
                 else:
                     blocks = round_fn(*history)
