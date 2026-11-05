@@ -26,7 +26,13 @@ twice with training's non-deterministic kernels). Gates, with deterministic kern
 training's: every attached loss sum (LM, aux, indexer) and every row's LM loss within 1e-3
 relative; every parameter gradient (the indexer's ``linear_wq_b``, ``linear_weights_proj`` and
 compressor, the attention compressors' ``linear_wkv``, ``linear_wgate``, ``ape`` and ``norm``
-included) within max(1e-3, 3 x floor) of the 1-row arm.
+included) within max(1e-3, 3 x floor) of the 1-row arm, and every one of those indexer and
+compressor weights resolved by the floor (so gated relatively). Gradients the floor does not
+resolve are gated absolutely (``|dg| <= 1e-4 x`` the whole-gradient norm): those whose floor exceeds
+0.5, and the mHC stream-mixing scalars ``alpha_res`` / ``alpha_pre``, which are zero in exact
+arithmetic at initialization (the residual streams are copies; T3's fp32 arms measured them at
+1e-18 to 1e-10): their bf16 values are rounding residuals that depend on the GEMM shapes, so the
+same-shape floor cannot bound their b-row difference (FSDP-arm deviation D54).
 
 The deterministic arms need cuDNN's deterministic DSA sparse-attention backward, which only some
 cuDNN Frontend releases provide (``_deterministic_backward_missing``). Where it is missing, the
@@ -68,6 +74,16 @@ SEQ = 4096
 VOCAB = 4096
 MAX_RELATIVE = 1e-3
 FLOOR_FACTOR = 3.0
+# Absolute bound for gradients the floor cannot resolve, as a fraction of the whole-gradient norm
+# (mbs_invariance_utils.resolution_gate's default, as T3).
+ABSOLUTE_FRACTION = 1e-4
+# The mHC stream-mixing scalars whose gradients vanish at initialization, where the 4 residual
+# streams are copies: T3's fp32 arms measured them at 1.6e-18 to 1.5e-10 (zero to fp32 rounding,
+# FSDP-arm deviation D8). In bf16 they are rounding residuals whose value depends on the GEMM and
+# reduction shapes, so one-row and b-row steps legitimately differ in them by more than the
+# same-shape floor bounds; the floor of a 1-element gradient can also agree by chance (both
+# measured in the D2 image, deviation D54).
+SYMMETRIC_ZERO_SUFFIXES = (".hyper_connection.alpha_res", ".hyper_connection.alpha_pre")
 
 
 @pytest.fixture(scope="module", autouse=True)
@@ -274,6 +290,21 @@ def _deterministic_backward_missing():
     )
 
 
+def _symmetric_zero_floor(floor):
+    """The floor with every mHC stream-symmetry scalar marked unresolved (relative floor inf), so
+    that ``resolution_gate`` gates it absolutely, and the names so marked.
+
+    These gradients are zero in exact arithmetic at initialization (SYMMETRIC_ZERO_SUFFIXES): a
+    relative difference between two bf16 computations of a zero is not a property of the math.
+    Every other parameter keeps the floor-relative gate."""
+    names = [name for name in floor if name.endswith(SYMMETRIC_ZERO_SUFFIXES)]
+    marked = {
+        name: dict(entry, relative=math.inf) if name in names else entry
+        for name, entry in floor.items()
+    }
+    return marked, names
+
+
 def _set_kernels(monkeypatch, runner, deterministic):
     from megatron.training.determinism import DETERMINISM_ENV_VAR_DEFAULTS
 
@@ -341,22 +372,40 @@ def test_fused_kernels_batch_equals_single_rows(runner, monkeypatch, batch):
             assert ref_grads[name].norm() > 0, name
     assert all(ref_losses[key] != 0.0 for key in ("lm", "aux", "indexer")), ref_losses
     failures = []
+    # The mHC stream-mixing scalars have no gradient at initialization: the streams are copies.
+    # Their computed gradients are rounding residuals, gated absolutely (_symmetric_zero_floor).
+    gate_floor, symmetric = _symmetric_zero_floor(floor)
     for mode in modes:
         ref_losses, ref_rows, ref_grads = arms[(mode, 1)]
         losses, rows_b, grads = arms[(mode, batch)]
         loss_rel = mbs.relative_loss_differences(losses, ref_losses)
         row_rel = mbs.max_row_difference(rows_b, ref_rows)
+        global_norm = mbs.global_comparison(ref_grads, ref_grads)["norm"]
         report = mbs.resolution_gate(
             mbs.compare_gradients(grads, ref_grads, min_cosine=0.0, max_relative=math.inf),
-            floor,
-            global_norm=mbs.global_comparison(ref_grads, ref_grads)["norm"],
+            gate_floor,
+            global_norm=global_norm,
             strict=False,
             min_relative=MAX_RELATIVE,
             factor=FLOOR_FACTOR,
+            absolute_fraction=ABSOLUTE_FRACTION,
         )
         tag = f"T7 b={batch} {mode} {batch} x 1 vs 1 x {batch}"
         print(f"[{tag}] loss rel {loss_rel}; max row rel {row_rel:.2e}", flush=True)
+        largest = max((ref_grads[name].norm().item() for name in symmetric), default=0.0)
+        worst_diff = max((report[name]["diff"] for name in symmetric), default=0.0)
+        print(
+            f"[{tag}] whole-gradient norm {global_norm:.4e}; {len(symmetric)} mHC stream-symmetry "
+            f"scalars gated absolutely (|dg| <= {ABSOLUTE_FRACTION:.0e} x the norm = "
+            f"{ABSOLUTE_FRACTION * global_norm:.2e}): largest |g| {largest:.2e}, largest |dg| "
+            f"{worst_diff:.2e}",
+            flush=True,
+        )
         mbs.print_report(tag, report, checked[:6])
+        # The weights this test is about must keep the relative gate.
+        unresolved_checked = [name for name in checked if not report[name]["resolved"]]
+        if unresolved_checked:
+            failures.append(f"{mode}: checked weights not resolved: {unresolved_checked}")
         mbs.dump_report(tag, dict(per_param=report, total=mbs.global_comparison(grads, ref_grads)))
         if any(value > 1e-3 for value in loss_rel.values()) or row_rel > 1e-3:
             failures.append(f"{mode}: loss rel {loss_rel}, max row rel {row_rel:.2e}")
