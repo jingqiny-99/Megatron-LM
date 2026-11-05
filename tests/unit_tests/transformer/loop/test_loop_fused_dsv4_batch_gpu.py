@@ -28,6 +28,13 @@ relative; every parameter gradient (the indexer's ``linear_wq_b``, ``linear_weig
 compressor, the attention compressors' ``linear_wkv``, ``linear_wgate``, ``ape`` and ``norm``
 included) within max(1e-3, 3 x floor) of the 1-row arm.
 
+The deterministic arms need cuDNN's deterministic DSA sparse-attention backward, which only some
+cuDNN Frontend releases provide (``_deterministic_backward_missing``). Where it is missing, the
+vendor raises in any deterministic fused backward, so the deterministic arms are not run, the
+reason is printed, and the gates apply to training's kernels only: the kernels the fused path
+trains with. CONTRACT D2's fused image (cuDNN Frontend 1.28.0) is such an environment, and D2
+rules out ``--deterministic-mode`` with the fused path (FSDP-arm deviation D51).
+
 Recorded (printed, not gated): the batch sizes the fused CSA indexer + sparse attention ran at,
 that the unfused CSA path never ran, and whether the DSA cuDNN sparse indexer-loss path
 (``dsa_cudnn_kernels._compute_sparse_indexer_loss_and_grads``, whose b > 1 top-k offset site
@@ -39,6 +46,7 @@ is skipped with that error as the reason.
 """
 
 import collections
+import inspect
 import math
 import os
 import warnings
@@ -232,6 +240,40 @@ def _checked_weight_names(model):
     return {key: [name for name in names if key in name] for key in wanted}
 
 
+def _deterministic_backward_missing():
+    """Why the fused DSA backward cannot run deterministically here, or ``None`` if it can.
+
+    The same API check as the vendor's guard, which runs on every deterministic fused backward
+    (``fused_sparse_attention._deterministic_sparse_bwd_kwargs``): the cuDNN Frontend's
+    ``sparse_attention_backward_wrapper`` must take ``deterministic`` and ``workspace``, and the
+    frontend must provide ``SparseAttentionBackward``. Without them the guard raises
+    "deterministic mode: the installed cudnn-frontend has no deterministic DSA sparse-attention
+    backward", whatever the batch size.
+    """
+    import cudnn
+
+    from megatron.core.transformer.experimental_attention_variant.csa_utils import (
+        fused_sparse_attention,
+    )
+
+    fused_sparse_attention._ensure_dsa_namespace()
+    dsa = fused_sparse_attention._DSA
+    wrapper = getattr(dsa, "sparse_attention_backward_wrapper", None)
+    try:
+        parameters = inspect.signature(wrapper).parameters if wrapper is not None else {}
+    except (TypeError, ValueError):
+        parameters = {}
+    missing = [name for name in ("deterministic", "workspace") if name not in parameters]
+    if getattr(dsa, "SparseAttentionBackward", None) is None:
+        missing.append("SparseAttentionBackward")
+    if not missing:
+        return None
+    return (
+        f"cudnn-frontend {getattr(cudnn, '__version__', '?')} has no deterministic DSA "
+        f"sparse-attention backward (missing: {', '.join(missing)})"
+    )
+
+
 def _set_kernels(monkeypatch, runner, deterministic):
     from megatron.training.determinism import DETERMINISM_ENV_VAR_DEFAULTS
 
@@ -248,12 +290,22 @@ def _set_kernels(monkeypatch, runner, deterministic):
 def test_fused_kernels_batch_equals_single_rows(runner, monkeypatch, batch):
     log = _KernelLog(monkeypatch)
     rows = mbs.make_rows(batch, SEQ, VOCAB, seed=777)
+    missing = _deterministic_backward_missing()
+    # Training's kernels first, then (where available) the deterministic ones.
+    flags = (False,) if missing else (False, True)
+    modes = ("training",) if missing else ("deterministic", "training")
+    print(
+        f"[T7 b={batch}] deterministic arms: "
+        + (f"not run: {missing}" if missing else "run")
+        + f"; gated modes {modes}",
+        flush=True,
+    )
     previous = torch.are_deterministic_algorithms_enabled()
     arms = {}
     try:
         with warnings.catch_warnings(record=True) as caught:
             warnings.simplefilter("always")
-            for deterministic in (False, True):
+            for deterministic in flags:
                 _set_kernels(monkeypatch, runner, deterministic)
                 mode = "deterministic" if deterministic else "training"
                 arms[(mode, 1)] = runner.run(rows, 1, seq=SEQ)
@@ -289,7 +341,7 @@ def test_fused_kernels_batch_equals_single_rows(runner, monkeypatch, batch):
             assert ref_grads[name].norm() > 0, name
     assert all(ref_losses[key] != 0.0 for key in ("lm", "aux", "indexer")), ref_losses
     failures = []
-    for mode in ("deterministic", "training"):
+    for mode in modes:
         ref_losses, ref_rows, ref_grads = arms[(mode, 1)]
         losses, rows_b, grads = arms[(mode, batch)]
         loss_rel = mbs.relative_loss_differences(losses, ref_losses)
