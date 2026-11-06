@@ -4501,7 +4501,7 @@ def setup_model_and_optimizer(
 
         check_loop_sharded_state_dict(model, when="setup")
 
-    # Classify each GTP param's prefetch chain after model build + DDP wrap, before the
+    # Register default GTP prefetch chains and finalize capture scopes after DDP wrap, before the
     # first forward. Placed here (not in get_model) so it also covers the config-container
     # builder path.
     if is_gtp_remat_active(args):
