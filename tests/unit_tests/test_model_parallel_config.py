@@ -6,7 +6,7 @@ import pytest
 import torch
 
 import megatron.core.transformer.transformer_config as transformer_config_module
-from megatron.core.model_parallel_config import ModelParallelConfig
+from megatron.core.model_parallel_config import ModelParallelConfig, normalize_gtp_nccl_ub
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.training.arguments import parse_args, validate_args
 
@@ -192,6 +192,22 @@ def test_contiguous_context_parallel_rejects_bshd_inputs():
             context_parallel_size=2,
             cp_partition_mode="contiguous",
         )
+
+
+@pytest.mark.parametrize(
+    "value,expected",
+    [
+        (None, None),
+        (False, None),
+        (True, ["ag", "rs"]),
+        ([], ["ag", "rs"]),
+        (["rs", "ag", "rs"], ["ag", "rs"]),
+    ],
+)
+def test_gtp_nccl_ub_is_normalized(value, expected):
+    # The --gtp(-expert)-remat-nccl-ub values are argparse arguments on this branch (not
+    # ModelParallelConfig fields); validate_args normalizes them with this helper.
+    assert normalize_gtp_nccl_ub(value) == expected
 
 
 def test_dynamic_cp_selects_default_scheduler_and_variable_lengths():

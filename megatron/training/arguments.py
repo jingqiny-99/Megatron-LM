@@ -18,7 +18,10 @@ from megatron.core.activations import situlu, squared_relu
 from megatron.core.config import set_experimental_flag
 from megatron.core.dist_checkpointing.validation import StrictHandling
 from megatron.core.fusions.fused_bias_geglu import quick_gelu
-from megatron.core.model_parallel_config import _parse_pad_packed_seq_alignment
+from megatron.core.model_parallel_config import (
+    _parse_pad_packed_seq_alignment,
+    normalize_gtp_nccl_ub,
+)
 from megatron.core.msc_utils import MultiStorageClientFeature
 from megatron.core.quantization.utils import (
     kitchen_quantization_recipe_config,
@@ -2162,16 +2165,21 @@ def validate_args(args, defaults={}):
                 "buffer via replace_raw_data is unsupported)."
             )
 
+        for attr in ("gtp_remat_nccl_ub", "gtp_expert_remat_nccl_ub"):
+            setattr(args, attr, normalize_gtp_nccl_ub(getattr(args, attr, None)))
+
+        gtp_ub_collectives = (args.gtp_remat_nccl_ub or []) + (args.gtp_expert_remat_nccl_ub or [])
+
         # GTP symmetric memory registers pools with symmetric=True (NVLS needs symmetric
         # windows), which contradicts --disable-symmetric-registration.
-        if getattr(args, 'gtp_remat_nccl_ub', False) or getattr(
-            args, 'gtp_expert_remat_nccl_ub', False
-        ):
+        if gtp_ub_collectives:
             assert not getattr(args, 'disable_symmetric_registration', False), (
                 "--gtp-remat-nccl-ub/--gtp-expert-remat-nccl-ub require symmetric window registration and "
                 "cannot be combined with --disable-symmetric-registration."
             )
-            if getattr(args, 'gtp_remat_reduce_scatter_with_fp32_accumulation', False):
+            if "rs" in gtp_ub_collectives and getattr(
+                args, 'gtp_remat_reduce_scatter_with_fp32_accumulation', False
+            ):
                 print_rank_0(
                     "WARNING: --gtp-remat-nccl-ub/--gtp-expert-remat-nccl-ub take precedence over "
                     "--gtp-remat-reduce-scatter-with-fp32-accumulation on their groups: NVLS "
@@ -5062,17 +5070,21 @@ def _add_distributed_args(parser):
     )
     group.add_argument(
         '--gtp-remat-nccl-ub',
-        action='store_true',
+        nargs='*',
+        choices=['ag', 'rs'],
         dest='gtp_remat_nccl_ub',
-        default=False,
-        help='Register the wgrad reduce-scatter send buffers with NCCL symmetric '
-        'memory on the GTP group, independent of --use-nccl-ub (which covers the DP group).',
+        default=None,
+        help='Use NCCL symmetric memory for GTP communication on the dense GTP group, '
+        'independent of --use-nccl-ub (which covers the DP group). Takes a subset of {ag, rs}: '
+        '"ag" registers the weight all-gather buffers, "rs" the wgrad reduce-scatter send '
+        'buffers. A bare flag enables both.',
     )
     group.add_argument(
         '--gtp-expert-remat-nccl-ub',
-        action='store_true',
+        nargs='*',
+        choices=['ag', 'rs'],
         dest='gtp_expert_remat_nccl_ub',
-        default=False,
+        default=None,
         help='Like --gtp-remat-nccl-ub but for routed-expert (EGTP) groups.',
     )
     group.add_argument(

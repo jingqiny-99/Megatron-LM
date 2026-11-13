@@ -62,6 +62,17 @@ def resolve_tensor_parallel_weight_shards(
     return tensor_parallel_num_weight_shards, gtp_weight_remat_size
 
 
+def normalize_gtp_nccl_ub(value) -> Optional[list[str]]:
+    """Normalize a ``gtp*_remat_nccl_ub`` value: ``None``/``False`` -> ``None`` (off);
+    ``True`` (the old boolean form) or ``[]`` (a bare flag) -> ``["ag", "rs"]``; otherwise the
+    sorted, de-duplicated collectives."""
+    if value is None or value is False:
+        return None
+    if value is True:
+        return ["ag", "rs"]
+    return sorted(set(value)) or ["ag", "rs"]
+
+
 @dataclass
 @experimental_api
 class ModelParallelConfig:
