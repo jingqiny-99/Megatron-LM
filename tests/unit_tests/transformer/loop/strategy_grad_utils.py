@@ -369,8 +369,6 @@ SGD_AS_ADAM = dict(
     adam_beta2=0.0,
     adam_eps=SGD_ADAM_EPS,
 )
-# Step 2 runs on weights updated from fp32-reassociated step-1 gradients.
-STEP2_LOSS_RELATIVE = 1e-5
 
 
 def optimizer(wrapped, **overrides):
@@ -402,19 +400,6 @@ def optimizer(wrapped, **overrides):
 def step_optimizer(opt):
     update_successful, _, _ = opt.step()
     assert update_successful
-
-
-def assert_step_losses_match(step_index, step, reference, name, step2_relative=None):
-    """Step 1: ``assert_losses_match``. Later steps run on weights updated from gradients that
-    differ by fp32 reassociation: relative difference <= ``step2_relative`` (default
-    ``STEP2_LOSS_RELATIVE``)."""
-    if step_index == 0:
-        assert_losses_match(step, reference, name)
-        return
-    bound = STEP2_LOSS_RELATIVE if step2_relative is None else step2_relative
-    rel = mbs.relative_loss_differences(step.losses, reference.losses)
-    print(f"[{name}] losses {step.losses} rel {rel}", flush=True)
-    assert all(value <= bound for value in rel.values()), rel
 
 
 def fused_core_weights(model):
