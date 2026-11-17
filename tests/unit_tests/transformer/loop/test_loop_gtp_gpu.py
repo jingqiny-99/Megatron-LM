@@ -8,7 +8,11 @@ function of step 1's gradients, so a gather issued before the update and read af
 the step-2 gate; the second step is also the first with DDP's overlapped reduction armed) of
 the model of ``strategy_grad_utils`` (a core of 8 sublayers run exactly 4 times, block + edge
 ``loop_recompute`` with stride 4, three microbatches of one row per rank, per-token loss,
-``finalize_model_grads``), from the same full weights and rows in every arm:
+``finalize_model_grads``; the persistent buffers restored before every step), from the same
+full weights and rows in every arm. Step 2 is teacher-forced (``strategy_grad_utils``): after
+its step-1 gradient is read (and no GTP reduce-scatter is pending), every arm's ``main_grad``
+takes its reference's step-1 gradient (a GTP shard: its rows), and the arm runs its own
+optimizer step, parameter gather and step 2:
 
 * ``ref``: no GTP (``gtp_remat_size = 1``), DDP over the whole data-parallel group;
 * ``gtp``: dense and expert weight remat of degree ``G`` (``LOOP_GTP_DEGREE``, default the world
@@ -22,8 +26,8 @@ the model of ``strategy_grad_utils`` (a core of 8 sublayers run exactly 4 times,
   expert gradients take DDP's expert data-parallel reduction;
 * ``gtp_simple``: ``gtp`` with prefetch and asynchronous reduce-scatter off (every use gathers
   and reduce-scatters synchronously: GTP's simplest path);
-* ``noverify`` (diagnostic, not gated): ``gtp`` with the prefetch verification turned off after
-  construction, i.e. the static chains trusted.
+* ``noverify`` (diagnostic, not gated; forced): ``gtp`` with the prefetch verification turned
+  off after construction, i.e. the static chains trusted.
 
 Every use of a GTP weight gathers it and reduce-scatters its weight gradient into the shard's
 ``main_grad`` (a weight's next reduce-scatter first finalizes, i.e. adds, the previous one); a
@@ -31,15 +35,21 @@ core weight is used 4 times per microbatch, in the forward and again in the bloc
 
 * Every parameter's reduced fp32 gradient (GTP shards all-gathered over their group, padding
   stripped) of both steps matches ``ref``'s: cosine >= 0.9999 and relative difference <= 1e-3 (a
-  gradient zero to fp32 precision: absolute, at most 1e-6 of the whole gradient's norm); step
-  1's losses and every row's LM loss equal ``ref``'s, step 2's losses are within 1e-5.
+  gradient zero to fp32 precision: absolute, at most 1e-6 of the whole gradient's norm); the
+  losses of both steps and every row's LM loss equal ``ref``'s within 1e-6. Before step 2 is
+  gated, the precondition: no GTP reduce-scatter was pending at the forcing, the forced gradient
+  reads back on every rank, and every weight step 2 ran on equals ``ref``'s bitwise (a GTP
+  shard: its rows of the zero-padded weight, so the padding rows stay zero).
+* Given the same step-1 gradient the un-forced ``gtp`` path agrees at step 2: ``gtp_unforced``
+  against ``ref_from_gtp`` (``ref`` stepping on its step-1 gradient), from bitwise-equal
+  weights. The un-forced step 2 against ``ref`` is printed (diagnostic).
 * Reduce-scatters per GTP weight (a dense weight, or a grouped expert projection's leading
   weight) and microbatch: 4 for a core weight, 1 for a prelude or coda weight (one per use).
 * The prefetch verification's decisions are printed: how many consumes found a prefetch handle
   whose buffer did not hold this consume's gather (they gathered on demand).
-* Teeth, must fail: ``drop_rs``, the second backward use's weight gradient of every core GTP
-  weight zeroed before its reduce-scatter (one round's reduce-scatter dropped): at least 90% of
-  the core GTP weights fail the gate.
+* Teeth, must fail (step 1): ``drop_rs``, the second backward use's weight gradient of every
+  core GTP weight zeroed before its reduce-scatter (one round's reduce-scatter dropped): at
+  least 90% of the core GTP weights fail the gate.
 
 Needs TransformerEngine >= 2.19 (GTP). Launch once per degree: ``torchrun --nproc-per-node 2 -m
 pytest -q tests/unit_tests/transformer/loop/test_loop_gtp_gpu.py`` and ``--nproc-per-node 4``
@@ -126,22 +136,23 @@ def _is_gtp(param):
     return is_gtp_param(param)
 
 
+def _gtp_layout(param):
+    """``(rows, group size, group rank)`` of a GTP shard (``sgu.gtp_rows``'s arguments)."""
+    return param.shape[0], param.group.size(), param.group.rank()
+
+
+def _shard_of(param, full):
+    """The part of ``full`` (a full tensor of ``param``'s) that ``param`` holds: a GTP shard's
+    rows of the zero-padded tensor, or all of it."""
+    return sgu.gtp_rows(full, *_gtp_layout(param)) if _is_gtp(param) else full
+
+
 def _load_full_state(model, state):
     """Load full (unsharded) weights into a model whose GTP weights are shards: shard ``r`` of
     a weight holds rows ``[r S, (r + 1) S)`` of the weight padded to ``S x G`` rows."""
     with torch.no_grad():
         for name, param in model.named_parameters():
-            full = state[name].to(param.dtype)
-            if _is_gtp(param):
-                rows, size = param.shape[0], param.group.size()
-                padded = torch.zeros(
-                    (rows * size, *full.shape[1:]), dtype=full.dtype, device="cuda"
-                )
-                padded[: full.shape[0]].copy_(full)
-                rank = param.group.rank()
-                param.data.copy_(padded[rank * rows : (rank + 1) * rows])
-            else:
-                param.data.copy_(full)
+            param.data.copy_(_shard_of(param, state[name].to("cuda", param.dtype)))
         _restore_buffers(model, state)
 
 
@@ -237,22 +248,32 @@ class _Instrument:
         del self.gtp._GATHER_LEDGER.take  # back to the class method
 
 
-def _run_reference(state, ep=1):
+def _run_reference(state, ep=1, forced=None):
+    """``STEPS`` steps without GTP; returns ``[(step result, grads)]`` and a record: the full
+    weights the last step ran on (``weights``) and, with ``forced`` (step-1 gradients to step
+    on: the teacher forcing), the read-back count (``readback``)."""
     _initialize(1, ep=ep)
     model = sgu.build_model(state, expert_model_parallel_size=ep)
     ddp = _ddp(model, distributed_optimizer=False)
     opt = sgu.optimizer(ddp)
     out = []
+    info = dict(readback=None, pending=0)
     for step in range(STEPS):
         _restore_buffers(model, state)
         opt.zero_grad()
         result = sgu.run_step(ddp, model, sgu.make_rows(step))
         out.append((result, sgu.ddp_grads(ddp, model)))
         if step + 1 < STEPS:
+            if forced is not None:
+                sgu.force_main_grads(model, forced)
+                info["readback"] = sgu.agreed(
+                    len(sgu.mismatches(sgu.ddp_grads(ddp, model), forced))
+                )
             sgu.step_optimizer(opt)
+    info["weights"] = {name: param.detach().clone() for name, param in model.named_parameters()}
     del opt, ddp, model
     torch.cuda.empty_cache()
-    return out, None
+    return out, info
 
 
 def _run_gtp(
@@ -265,7 +286,15 @@ def _run_gtp(
     expert_degree=None,
     ep=1,
     steps=STEPS,
+    forced=None,
 ):
+    """``steps`` steps of one GTP arm; returns ``[(step result, grads, record)]`` and the info:
+    the GTP names and consumers, the overlap's recorded counts, the weights the last step ran on
+    (``weights``; GTP shards) with each GTP shard's layout (``layout``) and, with ``forced``
+    (full step-1 gradients to step on: the teacher forcing), the GTP reduce-scatters still
+    pending at the forcing (``pending``) and the read-back count (``readback``), both agreed
+    over the ranks."""
+    from megatron.core.tensor_parallel import generalized_tensor_parallelism as gtp
     from megatron.core.tensor_parallel.generalized_tensor_parallelism import GTP_CONFIG
     from megatron.core.tensor_parallel.gtp_api import (
         classify_gtp_remat_chains,
@@ -303,6 +332,7 @@ def _run_gtp(
         core_ids = {pid for pid, name in gtp_names.items() if sgu.role(name)[0] == "core"}
         instrument = _Instrument(drop_ids=core_ids & consumers, drop_use=drop_use)
         out = []
+        forcing = dict(pending=None, readback=None)
         with instrument:
             for step in range(steps):
                 _restore_buffers(model, state)
@@ -320,6 +350,20 @@ def _run_gtp(
                 )
                 instrument.takes.clear()
                 if step + 1 < steps:
+                    if forced is not None:
+                        # Nothing may land in main_grad after the forcing.
+                        pending = len(gtp._GTP_PENDING_WGRAD_ACCUM) + sum(
+                            getattr(p, "_wgrad_rs_handle", None) is not None
+                            for p in model.parameters()
+                            if _is_gtp(p)
+                        )
+                        forcing["pending"] = sgu.agreed(pending)
+                        sgu.force_main_grads(
+                            model, forced, shard=lambda name, param, full: _shard_of(param, full)
+                        )
+                        forcing["readback"] = sgu.agreed(
+                            len(sgu.mismatches(_full_grads(ddp, model), forced))
+                        )
                     sgu.step_optimizer(opt)
         golden = {}
         groups = ddp.bucket_groups + ddp.expert_parallel_bucket_groups
@@ -339,6 +383,11 @@ def _run_gtp(
             ),
         )
         info["golden"] = golden
+        info.update(forcing)
+        info["weights"] = {name: p.detach().clone() for name, p in model.named_parameters()}
+        info["layout"] = {
+            name: _gtp_layout(p) for name, p in model.named_parameters() if _is_gtp(p)
+        }
         del opt, ddp, model
         torch.cuda.empty_cache()
         return out, info
@@ -349,33 +398,78 @@ def _run_gtp(
 
 @pytest.fixture(scope="module")
 def results():
-    """Every arm, run once from the same full weights and rows."""
+    """Every arm, run once from the same full weights and rows; the arms take their reference's
+    step-1 gradient before their optimizer step (teacher forcing). The preconditions are agreed
+    over the ranks at the end (in a fixed order) and asserted by the tests."""
     _initialize(1)
     state = sgu.clone_state(sgu.build_model())
     out = {}
     out["ref"] = _run_reference(state)
-    out["gtp"] = _run_gtp(state)
-    out["gtp_overlap"] = _run_gtp(state, overlap=True)
-    out["gtp_simple"] = _run_gtp(state, simple=True)
-    out["noverify"] = _run_gtp(state, verify=False)
+    forced = out["ref"][0][0][1]
+    out["gtp"] = _run_gtp(state, forced=forced)
+    out["gtp_overlap"] = _run_gtp(state, overlap=True, forced=forced)
+    out["gtp_simple"] = _run_gtp(state, simple=True, forced=forced)
+    out["noverify"] = _run_gtp(state, verify=False, forced=forced)
     out["drop_rs"] = _run_gtp(state, drop_use=2, steps=1)
+    # Un-forced: gtp on its own step-1 gradient, and ref stepping on that same gradient.
+    out["gtp_unforced"] = _run_gtp(state)
+    out["ref_from_gtp"] = _run_reference(state, forced=out["gtp_unforced"][0][0][1])
     if RUN_GTP_EP:
         # Expert weights depend on the EP layout: the arm and its reference share a state
         # built at that EP (per rank: its local experts; the dense weights are replicated).
         _initialize(1, ep=GTP_EP)
         state_ep = sgu.clone_state(sgu.build_model(expert_model_parallel_size=GTP_EP))
         out["ref_ep"] = _run_reference(state_ep, ep=GTP_EP)
-        out["gtp_ep"] = _run_gtp(state_ep, expert_degree=1, ep=GTP_EP)
+        out["gtp_ep"] = _run_gtp(
+            state_ep, expert_degree=1, ep=GTP_EP, forced=out["ref_ep"][0][0][1]
+        )
+    for arm in ARMS + ["noverify"]:
+        info = out[arm][1]
+        start = _start_mismatches(info, out[REFERENCE.get(arm, "ref")][1]["weights"])
+        info["forcing"] = sgu.forcing_record(info["readback"], start)
+    info = out["ref_from_gtp"][1]
+    start = _start_mismatches(out["gtp_unforced"][1], info["weights"])
+    info["forcing"] = sgu.forcing_record(info["readback"], start)
     return out
+
+
+def _start_mismatches(info, reference):
+    """Where the weights a GTP arm's step 2 ran on (``info["weights"]``, GTP shards) differ
+    bitwise from ``reference``'s full weights, each GTP shard against its rows of the
+    zero-padded weight (local)."""
+    expected = {}
+    for name, value in info["weights"].items():
+        full = reference[name].to(value.device)
+        layout = info["layout"].get(name)
+        expected[name] = sgu.gtp_rows(full, *layout) if layout else full
+    return sgu.mismatches(info["weights"], expected)
 
 
 def _name(text):
     return sgu.tag(f"GTP G{DEGREE}", text)
 
 
+def _assert_forced(results, arm):
+    """The teacher-forcing precondition of a GTP arm: no GTP reduce-scatter pending at the
+    forcing, the forced gradient read back, and the weights step 2 ran on equal to its
+    reference's (a GTP shard: its rows) bitwise."""
+    info = results[arm][1]
+    assert (
+        info["pending"] == 0
+    ), f"{arm}: {info['pending']} GTP reduce-scatters pending at the forcing"
+    sgu.assert_teacher_forced(info["forcing"], arm, f"{REFERENCE.get(arm, 'ref')}'s")
+
+
+@pytest.mark.parametrize("arm", ARMS)
+def test_step_two_starts_from_the_reference_state(results, arm):
+    _assert_forced(results, arm)
+
+
 @pytest.mark.parametrize("arm", ARMS)
 @pytest.mark.parametrize("step", range(STEPS))
 def test_gradients_match_the_reference(results, arm, step):
+    if step > 0:
+        _assert_forced(results, arm)
     _, reference = results[REFERENCE[arm]][0][step]
     _, grads, record = results[arm][0][step]
     print(f"[{_name(f'{arm} step {step + 1}')}] verification takes {record['takes']}", flush=True)
@@ -386,9 +480,42 @@ def test_gradients_match_the_reference(results, arm, step):
 @pytest.mark.parametrize("arm", ARMS)
 def test_losses_match_the_reference(results, arm):
     for step in range(STEPS):
+        if step > 0:
+            _assert_forced(results, arm)
         reference, _ = results[REFERENCE[arm]][0][step]
         result, _, _ = results[arm][0][step]
-        sgu.assert_step_losses_match(step, result, reference, _name(f"{arm} step {step + 1}"))
+        sgu.assert_losses_match(result, reference, _name(f"{arm} step {step + 1}"))
+
+
+def test_step_two_agrees_given_the_same_step_one_gradient(results):
+    """The un-forced path: ``gtp_unforced`` steps on its own step-1 gradient and
+    ``ref_from_gtp`` (``ref``) on that same gradient. From bitwise-equal weights, their step-2
+    gradients pass the gate and their losses are equal."""
+    sgu.assert_teacher_forced(
+        results["ref_from_gtp"][1]["forcing"], "ref_from_gtp", "gtp_unforced's"
+    )
+    reference_result, reference = results["ref_from_gtp"][0][1]
+    result, grads, _ = results["gtp_unforced"][0][1]
+    report, failing = sgu.report_and_fail(
+        _name("gtp_unforced step 2 vs ref_from_gtp"), grads, reference
+    )
+    assert not failing, sgu.mbs.worst(report, failing)
+    sgu.assert_losses_match(result, reference_result, _name("gtp_unforced step 2"))
+
+
+def test_report_unforced_step_two(results):
+    """Diagnostic only (prints, asserts nothing): step 2 without teacher forcing against
+    ``ref``: ``gtp_unforced`` (its own step-1 gradient), and ``ref_from_gtp`` (``ref`` on
+    ``gtp_unforced``'s step-1 gradient, which differs from its own by fp32 reassociation)."""
+    reference_result, reference = results["ref"][0][1]
+    for arm in ("gtp_unforced", "ref_from_gtp"):
+        result, grads = results[arm][0][1][:2]
+        report, failing = sgu.report_and_fail(
+            _name(f"{arm} step 2 vs ref (diagnostic)"), grads, reference
+        )
+        print(f"[{_name(arm)}] step 2 failing {len(failing)} of {len(report)}", flush=True)
+        rel = sgu.mbs.relative_loss_differences(result.losses, reference_result.losses)
+        print(f"[{_name(f'{arm} step 2')}] losses rel {rel} (diagnostic)", flush=True)
 
 
 @pytest.mark.parametrize("arm", ARMS)
@@ -439,9 +566,11 @@ def test_gtp_ep_arm_keeps_experts_out_of_gtp(results):
 
 
 def test_report_without_prefetch_verification(results):
-    """Diagnostic only: the static chains trusted (the verification off). Prints the gate's
-    result; whether it fails depends on buffer sharing and timing, which this model may not
-    hit."""
+    """Diagnostic only: the static chains trusted (the verification off; teacher-forced like
+    ``gtp``). Prints the precondition and the gate's result; whether it fails depends on buffer
+    sharing and timing, which this model may not hit."""
+    forcing = results["noverify"][1]["forcing"]
+    print(f"[{_name('noverify')}] forcing {forcing}", flush=True)
     _, reference = results["ref"][0][1]
     _, grads, record = results["noverify"][0][1]
     report, failing = sgu.report_and_fail(_name("noverify step 2 vs ref"), grads, reference)
