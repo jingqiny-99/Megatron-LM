@@ -3,10 +3,10 @@
 """DDP communication overlap on a fixed-depth DSv4 loop (GPU; the lifted guard
 ``validate_loop_ddp_config``).
 
-Two training steps (SGD without momentum, run as Adam: ``strategy_grad_utils.SGD_AS_ADAM``; so
-the second step's weights are a plain function of the first step's gradients) of the model of ``strategy_grad_utils`` (a core of 8 sublayers run exactly 4 times,
-block + edge ``loop_recompute`` with stride 4, three microbatches of one row per rank, per-token
-loss, ``finalize_model_grads``), from the same weights and rows in every arm:
+Two training steps (SGD without momentum, run as Adam: ``strategy_grad_utils.SGD_AS_ADAM``) of
+the model of ``strategy_grad_utils`` (a core of 8 sublayers run exactly 4 times, block + edge
+``loop_recompute`` with stride 4, three microbatches of one row per rank, per-token loss,
+``finalize_model_grads``), from the same weights and rows in every arm:
 
 * ``ref``: DDP with the distributed optimizer, no overlap (one bucket, synchronous
   reduce-scatter after the backward, synchronous parameter all-gather in the optimizer step);
@@ -22,20 +22,32 @@ checkpoints). Overlapped parameter gather waits on a bucket's all-gather in the 
 pre-hook of a module that owns one of its parameters; later rounds and the recompute find the
 bucket published.
 
+Step 2 is teacher-forced (``strategy_grad_utils``): after its step-1 gradient is read, every arm
+and mutant takes ``ref``'s reduced step-1 gradient into its ``main_grad`` and then runs its own
+optimizer step, gradient-buffer reset, parameter gathers and overlapped step 2.
+
 * Every parameter's reduced fp32 gradient of steps 1 and 2 matches ``ref``'s: cosine >= 0.9999
   and relative difference <= 1e-3 (a gradient that is zero to fp32 precision: absolute, at most
-  1e-6 of the whole gradient's norm). Both arms run the same bf16 kernels on the same weights;
-  they differ in bucket boundaries (the fp32 association of the reduction).
-* The losses of both steps (and every row's LM loss) equal ``ref``'s.
+  1e-6 of the whole gradient's norm). Before step 2 is gated, the precondition: the forced
+  gradient reads back on every rank, and the weights step 2 ran on and the persistent buffers
+  it started with equal ``ref``'s bitwise.
+* The losses of both steps (and every row's LM loss) equal ``ref``'s within 1e-6.
 * Step 2 of ``ovl`` / ``ovl_ddp``: every bucket group's reduction is started from the gradient
   hook (overlapped), exactly once; the recorded grad-ready counts are printed (1 per backward
   for every parameter: no module GTP here).
+* Given the same step-1 gradient, the un-forced overlap path agrees at step 2:
+  ``ovl_unforced`` (``ovl`` stepping on its own step-1 gradient) against ``ref_from_ovl``
+  (``ref`` stepping on ``ovl_unforced``'s step-1 gradient), from a bitwise-equal state.
 * Teeth, each must fail on step 2: ``early``, a bucket group reduced as soon as its first
-  parameter is ready (before the other parameters' last uses); ``stale``, step 2's parameter
-  all-gathers skipped (the forward reads last step's weights outside the local shard).
-* Diagnostics, not gated: ``ref_buckets`` (``ref`` with the overlap arms' buckets, no overlap)
-  and ``ovl_rs`` (overlapped reduce-scatter, no overlapped parameter gather) gated at step 2
-  against ``ref`` and printed, with every arm's step-2 weights compared to ``ref``'s.
+  parameter is ready in the last microbatch (before the other parameters' last uses; it acts
+  from step 2, the first overlapped step), from ``ref``'s state; ``stale``, step 2's parameter
+  all-gathers skipped (the forward reads step 1's weights outside the local shard: every weight
+  element is ``ref``'s or the initial one, and both occur).
+* Diagnostics, not gated: ``ovl_rs`` (overlapped reduce-scatter, no overlapped parameter
+  gather; forced) at step 2; the un-forced ``ovl_unforced`` against ``ref`` at step 2 (the
+  weights that differ, with dtype and size of the difference, and the losses); ``ref_from_ovl``
+  against ``ref`` (``ref``'s own step 2 moved by a step-1 gradient that differs only by fp32
+  reassociation).
 
 Launch: ``torchrun --nproc-per-node 2 -m pytest -q tests/unit_tests/transformer/loop/
 test_loop_ddp_overlap_gpu.py`` (2 or 4 GPUs; ``LOOP_DDP_EP`` sets the expert-parallel size,
@@ -64,7 +76,7 @@ pytestmark = pytest.mark.skipif(
 
 BUCKET_SIZE = 200_000  # elements: several bucket groups for the tiny model
 STEPS = 2
-STEP2_LOSS_RELATIVE = 1e-5  # step 2 runs on weights updated from fp32-reassociated gradients
+FORCED = ["ovl", "ovl_ddp", "ovl_rs", "early"]  # teacher-forced, held to ref's step-2 state
 
 
 @pytest.fixture(scope="module", autouse=True)
@@ -80,14 +92,13 @@ def _model_parallel():
             torch.use_deterministic_algorithms(False)
 
 
-def _ddp(model, *, overlap, distributed_optimizer, param_gather=None, small_buckets=None):
-    """``param_gather`` and ``small_buckets`` (both default ``overlap``) split the overlap arms'
-    settings for the diagnostic arms."""
+def _ddp(model, *, overlap, distributed_optimizer, param_gather=None):
+    """``param_gather`` (default ``overlap``) splits the overlap arms' settings for the
+    diagnostic arm. Without ``overlap_grad_reduce`` DDP uses one bucket whatever the size."""
     from megatron.core.distributed import DistributedDataParallel, DistributedDataParallelConfig
     from megatron.core.process_groups_config import ProcessGroupCollection
 
     param_gather = overlap if param_gather is None else param_gather
-    small_buckets = overlap if small_buckets is None else small_buckets
     return DistributedDataParallel(
         model.config,
         DistributedDataParallelConfig(
@@ -95,7 +106,7 @@ def _ddp(model, *, overlap, distributed_optimizer, param_gather=None, small_buck
             overlap_param_gather=param_gather and distributed_optimizer,
             use_distributed_optimizer=distributed_optimizer,
             grad_reduce_in_fp32=True,
-            bucket_size=BUCKET_SIZE if small_buckets else None,
+            bucket_size=BUCKET_SIZE if overlap else None,
         ),
         model,
         pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
@@ -152,15 +163,19 @@ def _early_dispatch():
     return early
 
 
-def _run(state, *, overlap, distributed_optimizer, mutation=None, **ddp_options):
-    """``STEPS`` steps of one arm; returns ``[(step result, grads)]`` per step and the dispatch
-    record, with the bf16 weights the last step ran on (``weights``)."""
+def _run(state, *, overlap, distributed_optimizer, mutation=None, forced=None, **ddp_options):
+    """``STEPS`` steps of one arm; returns ``[(step result, grads)]`` per step and the record:
+    the dispatches, the bf16 weights the last step ran on (``weights``), the persistent buffers
+    step 2 started with (``buffers``) and, with ``forced`` (a reference's step-1 gradients, the
+    teacher forcing), the number of tensors whose reduced gradient read back after the forcing
+    differs from the forced one (``readback``, agreed over the ranks)."""
     from megatron.core.distributed.param_and_grad_buffer import _ParamAndGradBucketGroup
 
     model = sgu.build_model(state, expert_model_parallel_size=EP)
     ddp = _ddp(model, overlap=overlap, distributed_optimizer=distributed_optimizer, **ddp_options)
     optimizer = sgu.optimizer(ddp)
     out = []
+    readback = buffers = None
     original_start_param_sync = _ParamAndGradBucketGroup.start_param_sync
     with _DispatchRecorder() as recorder:
         if mutation == "early":
@@ -179,8 +194,14 @@ def _run(state, *, overlap, distributed_optimizer, mutation=None, **ddp_options)
                 grads = sgu.ddp_grads(ddp, model)
                 out.append((result, grads))
                 if step + 1 < STEPS:
+                    if forced is not None:
+                        sgu.force_main_grads(model, forced)
+                        readback = sgu.agreed(
+                            len(sgu.mismatches(sgu.ddp_grads(ddp, model), forced))
+                        )
                     update_successful, _, _ = optimizer.step()
                     assert update_successful
+                    buffers = sgu.persistent_buffers(model)
         finally:
             _ParamAndGradBucketGroup.start_param_sync = original_start_param_sync
     groups = ddp.bucket_groups + ddp.expert_parallel_bucket_groups
@@ -194,23 +215,61 @@ def _run(state, *, overlap, distributed_optimizer, mutation=None, **ddp_options)
     weights = {name: param.detach().clone() for name, param in model.named_parameters()}
     del optimizer, ddp, model
     torch.cuda.empty_cache()
-    return out, dict(dispatches=dispatches, golden=golden, groups=len(groups), weights=weights)
+    record = dict(dispatches=dispatches, golden=golden, groups=len(groups), weights=weights)
+    record.update(buffers=buffers, readback=readback)
+    return out, record
+
+
+def _start_mismatches(record, reference):
+    """Where the state ``record``'s step 2 ran from differs bitwise from ``reference``'s
+    (local): the weights it ran on and the persistent buffers it started with."""
+    found = sgu.mismatches(record["weights"], reference["weights"])
+    for name, value in sgu.mismatches(record["buffers"], reference["buffers"]).items():
+        found[f"buffer {name}"] = value
+    return found
 
 
 @pytest.fixture(scope="module")
 def results():
-    """Every arm, run once from the same weights and rows."""
+    """Every arm, run once from the same weights and rows; the forced arms and mutants take
+    ``ref``'s step-1 gradient before their optimizer step. The preconditions are agreed over the
+    ranks here (in a fixed order) and asserted by the tests."""
     state = sgu.clone_state(sgu.build_model(expert_model_parallel_size=EP))
-    out = {}
+    out = {"initial": state}
     out["ref"] = _run(state, overlap=False, distributed_optimizer=True)
-    out["ovl"] = _run(state, overlap=True, distributed_optimizer=True)
-    out["ovl_ddp"] = _run(state, overlap=True, distributed_optimizer=False)
-    out["early"] = _run(state, overlap=True, distributed_optimizer=True, mutation="early")
-    out["stale"] = _run(state, overlap=True, distributed_optimizer=True, mutation="stale")
-    # Diagnostics (not gated): the overlap arms' bucket boundaries without any overlap, and the
-    # overlapped reduce-scatter without the overlapped parameter gather.
-    out["ref_buckets"] = _run(state, overlap=False, distributed_optimizer=True, small_buckets=True)
-    out["ovl_rs"] = _run(state, overlap=True, distributed_optimizer=True, param_gather=False)
+    forced = out["ref"][0][0][1]
+    out["ovl"] = _run(state, overlap=True, distributed_optimizer=True, forced=forced)
+    out["ovl_ddp"] = _run(state, overlap=True, distributed_optimizer=False, forced=forced)
+    out["early"] = _run(
+        state, overlap=True, distributed_optimizer=True, mutation="early", forced=forced
+    )
+    out["stale"] = _run(
+        state, overlap=True, distributed_optimizer=True, mutation="stale", forced=forced
+    )
+    # Diagnostic: the overlapped reduce-scatter without the overlapped parameter gather.
+    out["ovl_rs"] = _run(
+        state, overlap=True, distributed_optimizer=True, param_gather=False, forced=forced
+    )
+    # Un-forced: ovl on its own step-1 gradient, and ref stepping on that same gradient.
+    out["ovl_unforced"] = _run(state, overlap=True, distributed_optimizer=True)
+    out["ref_from_ovl"] = _run(
+        state, overlap=False, distributed_optimizer=True, forced=out["ovl_unforced"][0][0][1]
+    )
+    reference = out["ref"][1]
+    for arm in FORCED:
+        record = out[arm][1]
+        record["forcing"] = sgu.forcing_record(
+            record["readback"], _start_mismatches(record, reference)
+        )
+    # stale's weights differ from ref's by design (checked by its test); its buffers do not.
+    stale = out["stale"][1]
+    stale["forcing"] = sgu.forcing_record(
+        stale["readback"], sgu.mismatches(stale["buffers"], reference["buffers"])
+    )
+    record = out["ref_from_ovl"][1]
+    record["forcing"] = sgu.forcing_record(
+        record["readback"], _start_mismatches(record, out["ovl_unforced"][1])
+    )
     return out
 
 
@@ -218,9 +277,19 @@ def _name(text):
     return sgu.tag(f"DDP-overlap EP{EP}", text)
 
 
+@pytest.mark.parametrize("arm", FORCED)
+def test_step_two_starts_from_the_reference_state(results, arm):
+    """The teacher-forcing precondition: the forced gradient read back on every rank, and the
+    arm's own optimizer step on it (and its parameter gather) reproduced ``ref``'s weights and
+    buffers bitwise."""
+    sgu.assert_teacher_forced(results[arm][1]["forcing"], arm)
+
+
 @pytest.mark.parametrize("arm", ["ovl", "ovl_ddp"])
 @pytest.mark.parametrize("step", range(STEPS))
 def test_gradients_match_the_reference(results, arm, step):
+    if step > 0:
+        sgu.assert_teacher_forced(results[arm][1]["forcing"], arm)
     _, reference = results["ref"][0][step]
     _, grads = results[arm][0][step]
     report, failing = sgu.report_and_fail(_name(f"{arm} step {step + 1} vs ref"), grads, reference)
@@ -230,15 +299,11 @@ def test_gradients_match_the_reference(results, arm, step):
 @pytest.mark.parametrize("arm", ["ovl", "ovl_ddp"])
 def test_losses_match_the_reference(results, arm):
     for step in range(STEPS):
+        if step > 0:
+            sgu.assert_teacher_forced(results[arm][1]["forcing"], arm)
         reference, _ = results["ref"][0][step]
         result, _ = results[arm][0][step]
-        name = _name(f"{arm} step {step + 1}")
-        if step == 0:
-            sgu.assert_losses_match(result, reference, name)
-        else:
-            rel = sgu.mbs.relative_loss_differences(result.losses, reference.losses)
-            print(f"[{name}] losses {result.losses} rel {rel}", flush=True)
-            assert all(value <= STEP2_LOSS_RELATIVE for value in rel.values()), rel
+        sgu.assert_losses_match(result, reference, _name(f"{arm} step {step + 1}"))
 
 
 @pytest.mark.parametrize("arm", ["ovl", "ovl_ddp"])
@@ -248,53 +313,89 @@ def test_every_bucket_group_reduces_once_from_its_hook(results, arm):
     autograd-hooked parameter is expected to be ready once per backward: no module GTP in this
     model)."""
     _, record = results[arm]
-    print(f"[{_name(arm)}] {record}", flush=True)
-    assert record["groups"] > 1, record
-    assert record["dispatches"][0] == [0] * record["groups"], record
-    assert record["dispatches"][1] == [1] * record["groups"], record
+    print(f"[{_name(arm)}] dispatches {record['dispatches']} golden {record['golden']}", flush=True)
+    assert record["groups"] > 1, record["groups"]
+    assert record["dispatches"][0] == [0] * record["groups"], record["dispatches"]
+    assert record["dispatches"][1] == [1] * record["groups"], record["dispatches"]
     assert all(values and values[0] >= 1 for values in record["golden"]), record["golden"]
 
 
-@pytest.mark.parametrize("arm", ["ref_buckets", "ovl_rs", "ovl", "ovl_ddp"])
-def test_report_step_two_diagnostics(results, arm):
-    """Diagnostic only (prints, asserts nothing): which part of an overlap arm moves step 2.
+def test_step_two_agrees_given_the_same_step_one_gradient(results):
+    """The un-forced overlap path: ``ovl_unforced`` steps on its own step-1 gradient and
+    ``ref_from_ovl`` (``ref``) on that same gradient. From a bitwise-equal state, their step-2
+    gradients pass the gate and their losses are equal."""
+    sgu.assert_teacher_forced(
+        results["ref_from_ovl"][1]["forcing"], "ref_from_ovl", "ovl_unforced's"
+    )
+    reference_result, reference = results["ref_from_ovl"][0][1]
+    result, grads = results["ovl_unforced"][0][1]
+    report, failing = sgu.report_and_fail(
+        _name("ovl_unforced step 2 vs ref_from_ovl"), grads, reference
+    )
+    assert not failing, sgu.mbs.worst(report, failing)
+    sgu.assert_losses_match(result, reference_result, _name("ovl_unforced step 2"))
 
-    * ``ref_buckets``: ``ref`` with the overlap arms' bucket boundaries and no overlap, i.e.
-      how far step 2 moves from a step-1 gradient that differs only by fp32 reassociation;
-    * ``ovl_rs``: the overlapped reduce-scatter without the overlapped parameter gather;
-    * every arm: the bf16 weights its last step ran on against ``ref``'s (equal weights with
-      different losses on some ranks would mean a forward read weights other than these).
+
+def test_report_unforced_step_two(results):
+    """Diagnostic only (prints, asserts nothing): step 2 without teacher forcing, against
+    ``ref``.
+
+    * ``ovl_unforced``: the per-parameter report, every weight that differs at step 2 (dtype,
+      differing elements, max abs difference) and the losses;
+    * ``ref_from_ovl``: ``ref`` stepping on ``ovl``'s step-1 gradient, which differs from its own
+      only by fp32 reassociation. If it fails like ``ovl_unforced`` while the forced ``ovl``
+      passes, the un-forced step-2 gate fails ``ref`` against itself;
+    * ``ovl_rs`` (forced): the overlapped reduce-scatter without the overlapped parameter gather.
     """
     _, reference = results["ref"][0][1]
-    _, grads = results[arm][0][1]
-    report, failing = sgu.report_and_fail(
-        _name(f"{arm} step 2 vs ref (diagnostic)"), grads, reference
-    )
-    print(f"[{_name(arm)}] step 2 failing {len(failing)} of {len(report)}", flush=True)
-    ref_weights = results["ref"][1]["weights"]
-    weights = results[arm][1]["weights"]
-    differing = {
-        name: int((weights[name] != ref_weights[name]).sum().item())
-        for name in ref_weights
-        if not torch.equal(weights[name], ref_weights[name])
-    }
-    worst = sorted(differing.items(), key=lambda item: -item[1])[:8]
-    print(
-        f"[{_name(arm)}] step-2 weights differ from ref in {len(differing)} of "
-        f"{len(ref_weights)} params ({sum(differing.values())} elements): {worst}",
-        flush=True,
-    )
-    for step in range(STEPS):
-        rel = sgu.mbs.relative_loss_differences(
-            results[arm][0][step][0].losses, results["ref"][0][step][0].losses
+    for arm in ("ovl_unforced", "ref_from_ovl", "ovl_rs"):
+        _, grads = results[arm][0][1]
+        report, failing = sgu.report_and_fail(
+            _name(f"{arm} step 2 vs ref (diagnostic)"), grads, reference
         )
-        print(f"[{_name(f'{arm} step {step + 1}')}] losses rel {rel} (diagnostic)", flush=True)
+        print(f"[{_name(arm)}] step 2 failing {len(failing)} of {len(report)}", flush=True)
+        differing = sgu.mismatches(results[arm][1]["weights"], results["ref"][1]["weights"])
+        print(
+            f"[{_name(arm)}] step-2 weights differ from ref in {len(differing)} of "
+            f"{len(reference)} params: {sorted(differing.items(), key=lambda item: -item[1][0])}",
+            flush=True,
+        )
+        rel = sgu.mbs.relative_loss_differences(
+            results[arm][0][1][0].losses, results["ref"][0][1][0].losses
+        )
+        print(f"[{_name(f'{arm} step 2')}] losses rel {rel} (diagnostic)", flush=True)
+
+
+def _stale_weights(record, reference, initial):
+    """The ``stale`` mutant's step-2 weights against ``ref``'s and the initial ones: the names
+    with an element that is neither, whether some element differs from ``ref``'s (the mutation
+    acted) and whether some element that ``ref``'s update moved equals ``ref``'s (the forced
+    update landed in the local shard)."""
+    foreign, acted, landed = [], False, False
+    for name, want in reference.items():
+        have = record["weights"][name]
+        start = initial[name].to(have.device, have.dtype)
+        if not bool(((have == want) | (have == start)).all()):
+            foreign.append(name)
+        acted |= bool((have != want).any())
+        landed |= bool(((want != start) & (have == want)).any())
+    return foreign, acted, landed
 
 
 @pytest.mark.parametrize("mutation", ["early", "stale"])
 def test_mutations_fail_the_gate(results, mutation):
     """A reduction started before the last use of every parameter in its bucket group, or a
-    forward on stale gathered weights, must fail the step-2 gradient gate."""
+    forward on stale gathered weights, must fail the step-2 gradient gate: ``early`` from
+    ``ref``'s state, ``stale`` with ``ref``'s update in the local shard only."""
+    record = results[mutation][1]
+    if mutation == "early":
+        sgu.assert_teacher_forced(record["forcing"], mutation)
+    else:
+        assert record["readback"] == 0 and record["forcing"]["agreed"] == 0, record["forcing"]
+        foreign, acted, landed = _stale_weights(
+            record, results["ref"][1]["weights"], results["initial"]
+        )
+        assert not foreign and acted and landed, (foreign[:8], acted, landed)
     _, reference = results["ref"][0][1]
     _, grads = results[mutation][0][1]
     report, failing = sgu.report_and_fail(
