@@ -47,6 +47,12 @@ updated weights (under HFSDP: the DP-Outer and DP-Shard gathers).
   host tensors. Step 1's gradients pass the gate against a DDP run, and its step-2 losses are
   within 1e-3 of that run stepped with the GPU Adam (a different update kernel) and closer to
   it than to the same run with a learning rate of zero (the update happened).
+* ``cpu_adam`` checkpoint: the same optimizer on ``hfsdp_recipe`` (in ``Float16Module``, as in
+  training), two steps on random gradients, an ``fsdp_dtensor`` save and a strict load into a
+  fresh model and optimizer as save_checkpoint and load_checkpoint build them
+  (``preprocess_fsdp_dtensor_state_dict``: the SwiGLU split of every ``linear_fc1``, the
+  expert renames, the uneven-DTensor metadata). Every parameter's weight, host master,
+  moments and step are restored bitwise, and the moments stay on the host.
 * Teeth, each must fail (step 1): ``overwrite`` (accumulate mode off, the loop guard bypassed:
   each use overwrites the bucket, so the core's fused-wgrad weights keep one round);
   ``outer_each`` (the DP-Outer reduction on every microbatch: earlier microbatches' sums are
@@ -211,9 +217,9 @@ class _ReductionRecorder:
         self.cls._bucket_group_gradient_reduce = self.original
 
 
-def _inner_optimizers(optimizer):
-    """The torch-level optimizer of every leaf Megatron optimizer (a ``ChainedOptimizer`` of
-    dense and expert groups is walked through ``chained_optimizers``)."""
+def _leaf_optimizers(optimizer):
+    """Every leaf Megatron optimizer (a ``ChainedOptimizer`` of dense and expert groups is
+    walked through ``chained_optimizers``), in a fixed order."""
     pending, found = [optimizer], []
     while pending:
         current = pending.pop()
@@ -221,8 +227,13 @@ def _inner_optimizers(optimizer):
         if chained is not None:
             pending.extend(chained)
         else:
-            found.append(current.optimizer)
+            found.append(current)
     return found
+
+
+def _inner_optimizers(optimizer):
+    """The torch-level optimizer of every leaf Megatron optimizer."""
+    return [leaf.optimizer for leaf in _leaf_optimizers(optimizer)]
 
 
 def _host(tensor):
@@ -411,6 +422,145 @@ def _run_fsdp(
     return out, record
 
 
+def _fsdp_dtensor_state(fsdp, opt, is_loading):
+    """The state of an ``fsdp_dtensor`` checkpoint as save_checkpoint and load_checkpoint build
+    it: the model and every leaf optimizer's ``sharded_param_state_fsdp_dtensor`` (which, when
+    loading, first allocates the state with a zero-gradient step), preprocessed by
+    ``preprocess_fsdp_dtensor_state_dict`` with the model's SwiGLU and expert settings (the
+    SwiGLU split of every ``linear_fc1``, the expert renames, the uneven-DTensor metadata).
+    Also returns the leaf optimizers and their unsplit state dicts (a load hands those to the
+    optimizers' ``load_state_dict``)."""
+    from types import SimpleNamespace
+
+    from megatron.training.checkpointing import preprocess_fsdp_dtensor_state_dict
+
+    leaves = _leaf_optimizers(opt)
+    raws = [leaf.sharded_param_state_fsdp_dtensor(is_loading=is_loading) for leaf in leaves]
+    optimizer_state = {}
+    for raw in raws:
+        optimizer_state.update(raw["state"])
+    args = SimpleNamespace(
+        swiglu=bool(fsdp.config.gated_linear_unit), num_experts=fsdp.config.num_moe_experts
+    )
+    state = preprocess_fsdp_dtensor_state_dict(
+        args,
+        {"model": fsdp.state_dict_for_save_checkpoint(), "optimizer": {"state": optimizer_state}},
+        fsdp,
+    )
+    return state, leaves, raws
+
+
+def _random_step(hdo):
+    """One step of ``hdo`` on random gradients of every parameter's local shard (as DTensors
+    like the parameter; ``randn_like`` of an unevenly sharded DTensor would not match the
+    local shard's shape)."""
+    from torch.distributed.tensor import DTensor
+
+    for group in hdo.param_groups:
+        for param in group["params"]:
+            local = param.to_local()
+            if local.numel() == 0:
+                param.grad = None
+                continue
+            param.grad = DTensor.from_local(
+                torch.randn_like(local),
+                param.device_mesh,
+                param.placements,
+                run_check=False,
+                shape=param.shape,
+                stride=param.stride(),
+            )
+    hdo.step()
+    hdo.zero_grad()
+
+
+def _cpu_adam_checkpoint_round_trip(state):
+    """``fsdp_dtensor`` save of ``hfsdp_recipe`` with the CPU-offloaded Adam after two steps
+    on random gradients (``HybridDeviceOptimizer.dummy_step``: moments and weights move), then
+    a load into a fresh model and optimizer (strict: every key it asks for must be in the
+    checkpoint), as load_checkpoint does it. The model is wrapped in ``Float16Module`` as in
+    training, which gives the state dict keys the ``module.`` levels the checkpoint handlers
+    expect. Returns the parameters whose weight, host master, moments or step differ (bitwise)
+    from the saved run's, or whose moments are not on the host, the number of parameters
+    checked and how many of them are SwiGLU ``linear_fc1`` weights (whose state the checkpoint
+    splits into W and V)."""
+    import shutil
+    import tempfile
+
+    import torch.distributed.checkpoint as dcp
+
+    from megatron.core.transformer.module import Float16Module
+
+    rank = torch.distributed.get_rank()
+    directory = [tempfile.mkdtemp(prefix="loop_hsdp_ckpt_") if rank == 0 else None]
+    torch.distributed.broadcast_object_list(directory, src=0)
+    directory = directory[0]
+    arms = []
+    try:
+        for train in (True, False):
+            model = sgu.build_model(state, expert_model_parallel_size=EP)
+            fsdp = _hsdp(
+                Float16Module(model.config, model),
+                ARMS["hfsdp_recipe"]["outer"],
+                expert=ARMS["hfsdp_recipe"]["expert"],
+            )
+            opt = sgu.optimizer(fsdp, **_adam(cpu_offload=True))
+            arms.append((model, fsdp, opt))
+            if train:
+                for _ in range(2):
+                    for hdo in _inner_optimizers(opt):
+                        _random_step(hdo)
+        (_, fsdp_a, opt_a), (_, fsdp_b, opt_b) = arms
+        saved, leaves_a, _ = _fsdp_dtensor_state(fsdp_a, opt_a, is_loading=False)
+        dcp.save(saved, checkpoint_id=directory)
+        loading, leaves_b, raws_b = _fsdp_dtensor_state(fsdp_b, opt_b, is_loading=True)
+        with torch.no_grad():
+            dcp.load(loading, checkpoint_id=directory)
+        for leaf, raw in zip(leaves_b, raws_b):
+            leaf.load_state_dict(raw)
+
+        problems, checked, fc1 = [], 0, 0
+        for leaf_a, leaf_b in zip(leaves_a, leaves_b):
+            hdo_a, hdo_b = leaf_a.optimizer, leaf_b.optimizer
+            params_b = {
+                leaf_b._param_name(param): param
+                for group in hdo_b.param_groups
+                for param in group["params"]
+            }
+            for group in hdo_a.param_groups:
+                for param_a in group["params"]:
+                    name = leaf_a._param_name(param_a)
+                    param_b = params_b[name]
+                    if not torch.equal(_host(param_a), _host(param_b)):
+                        problems.append(f"{name}: weight")
+                    master_a = hdo_a.param_to_inner_param[param_a]
+                    master_b = hdo_b.param_to_inner_param[param_b]
+                    if not torch.equal(master_a, master_b):
+                        problems.append(f"{name}: host master")
+                    state_a, state_b = hdo_a.state.get(param_a, {}), hdo_b.state.get(param_b, {})
+                    if set(state_a) != set(state_b):
+                        problems.append(f"{name}: state keys {set(state_a)} {set(state_b)}")
+                        continue
+                    for key in ("step", "exp_avg", "exp_avg_sq"):
+                        if key not in state_a:
+                            continue
+                        if not torch.equal(_host(state_a[key]), _host(state_b[key])):
+                            problems.append(f"{name}: {key}")
+                        if key != "step" and state_b[key].to_local().device.type != "cpu":
+                            problems.append(f"{name}: {key} on {state_b[key].to_local().device}")
+                    checked += 1
+                    fc1 += int("linear_fc1" in name)
+        return dict(problems=problems, checked=checked, fc1=fc1)
+    finally:
+        for _, fsdp, _ in arms:
+            fsdp.stop_communication()
+        del arms
+        torch.cuda.empty_cache()
+        torch.distributed.barrier()
+        if rank == 0:
+            shutil.rmtree(directory, ignore_errors=True)
+
+
 ARMS = {
     "hsdp": dict(outer="no_shard"),
     "hfsdp": dict(outer="optim"),
@@ -444,6 +594,10 @@ def results():
         )
     except Exception:  # pylint: disable=broad-except
         out["cpu_adam_error"] = traceback.format_exc()
+    try:
+        out["cpu_adam_checkpoint"] = _cpu_adam_checkpoint_round_trip(state)
+    except Exception:  # pylint: disable=broad-except
+        out["cpu_adam_checkpoint_error"] = traceback.format_exc()
     return out
 
 
@@ -531,6 +685,25 @@ def test_cpu_offloaded_adam_steps_on_the_recipe_layout(results):
     print(f"[{_name('cpu_adam step 2')}] rel to GPU Adam {to_adam}, to lr 0 {to_frozen}")
     assert max(to_adam.values()) <= CPU_ADAM_LOSS_RELATIVE, to_adam
     assert max(to_adam.values()) < max(to_frozen.values()), (to_adam, to_frozen)
+
+
+def test_cpu_offloaded_adam_fsdp_dtensor_checkpoint_round_trip(results):
+    """The recipes' optimizer through an ``fsdp_dtensor`` save and load on the recipes' layout
+    (see ``_cpu_adam_checkpoint_round_trip``): weights, host masters, moments and steps are
+    restored bitwise and the moments stay on the host, SwiGLU ``linear_fc1`` included."""
+    if "cpu_adam_checkpoint_error" in results:
+        pytest.fail(
+            f"the cpu_adam checkpoint round trip raised:\n{results['cpu_adam_checkpoint_error']}",
+            pytrace=False,
+        )
+    record = results["cpu_adam_checkpoint"]
+    print(
+        f"[{_name('cpu_adam checkpoint')}] checked {record['checked']} (linear_fc1 "
+        f"{record['fc1']}), problems {len(record['problems'])}",
+        flush=True,
+    )
+    assert not record["problems"], record["problems"][:20]
+    assert record["checked"] > 0 and record["fc1"] > 0, record
 
 
 def test_overwrite_mutation_fails_on_the_core_fused_weights(results):
