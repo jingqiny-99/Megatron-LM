@@ -178,7 +178,9 @@ def _run_fsdp(state, outer, *, accumulate=True, outer_override=None):
     # {bucket id: DP-Shard size}: a bucket whose DP-Shard group is one rank shards nothing and
     # is reduced once per step (MegatronFSDP._reduces_grad_every_backward).
     buckets = {
-        bucket_id: fsdp.grad_reduce_pipeline.get_fsdp_buffer(bucket_id).data_parallel_group.size()
+        bucket_id: fsdp.module.grad_reduce_pipeline.get_fsdp_buffer(
+            bucket_id
+        ).data_parallel_group.size()
         for bucket_id, group in enumerate(fsdp.param_and_grad_buffer.parameter_groups)
         if group.main_grad_buffer is not None and group.requires_grad
     }
