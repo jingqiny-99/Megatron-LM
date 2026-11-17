@@ -12,6 +12,16 @@ Add these flags to enable optimizer cpu offload in MCore.
 
 Gradient copy from GPU to CPU, CPU optimizer step, and subsequent parameter copy from CPU to GPU can be time-consuming operations, and it is recommended to use the flag `--overlap-cpu-optimizer-d2h-h2d` to execute them concurrently.
 
+## With Megatron-FSDP
+
+Under Megatron-FSDP (v1) the optimizer parameters are DTensors over each rank's shard of the
+main weight buffer. The offloaded optimizer keeps a plain host copy of each parameter's local
+shard (`to_local()`), copies the gradient's local shard to the host, steps there, and copies the
+updated shard back into the parameter's local shard; it never pins or clones a DTensor. Its
+`state` shows each offloaded parameter's moments and `master_param` as DTensors with the
+parameter's mesh and placements over the host tensors, so `--ckpt-format fsdp_dtensor` saves
+them sharded like the parameter and loads them in place on the host.
+
 ## Chunked GPU optimizer-state offload
 
 `--chunked-optimizer-state-offload` keeps a configurable fraction of optimizer tensor state and
