@@ -36,10 +36,52 @@ def _is_device_tensor(tensor: torch.Tensor) -> bool:
     return _local_data(tensor).is_cuda
 
 
-def _pin_memory(tensor: torch.Tensor) -> torch.Tensor:
-    """Pinned copy of a host tensor (substituted by the CPU unit tests, where there is no CUDA
-    host allocator)."""
-    return tensor.pin_memory()
+# Pinned host buffers are carved out of slabs of at least this many bytes (a power of two).
+_HOST_SLAB_BYTES = 1 << 28
+# Every buffer starts at a multiple of this many bytes of its slab.
+_HOST_ALIGN_BYTES = 64
+
+
+def _empty_pinned_bytes(nbytes: int) -> torch.Tensor:
+    """An uninitialized pinned host buffer of ``nbytes`` bytes (substituted by the CPU unit
+    tests, where there is no CUDA host allocator)."""
+    return torch.empty(nbytes, dtype=torch.uint8, pin_memory=True)
+
+
+class _HostBufferPool:
+    """Host tensors for the offloaded parameters' copies and gradients.
+
+    torch's pinned-memory allocator (``CachingHostAllocator``) rounds every allocation up to
+    the next power of two, so one pinned tensor per parameter shard can cost up to twice its
+    size. Pinned tensors are instead carved, first fit, out of power-of-two slabs of at least
+    ``_HOST_SLAB_BYTES``: the allocator adds nothing, and the only waste is the slabs' unused
+    tails. The pool never frees a slab. Unpinned tensors are plain allocations (no rounding).
+    """
+
+    def __init__(self, pin: bool):
+        self.pin = pin
+        self.slabs = []  # pinned uint8 slabs
+        self.used = []  # bytes handed out of each slab
+
+    def empty(self, shape, dtype: torch.dtype) -> torch.Tensor:
+        """An uninitialized host tensor of ``shape`` and ``dtype``."""
+        shape = torch.Size(shape)
+        nbytes = shape.numel() * torch.empty((), dtype=dtype).element_size()
+        if not self.pin or nbytes == 0:
+            return torch.empty(shape, dtype=dtype, device="cpu")
+        size = -(-nbytes // _HOST_ALIGN_BYTES) * _HOST_ALIGN_BYTES
+        for index, slab in enumerate(self.slabs):
+            if slab.numel() - self.used[index] >= size:
+                break
+        else:
+            index = len(self.slabs)
+            self.slabs.append(
+                _empty_pinned_bytes(max(_HOST_SLAB_BYTES, 1 << (size - 1).bit_length()))
+            )
+            self.used.append(0)
+        start = self.used[index]
+        self.used[index] = start + size
+        return self.slabs[index][start : start + nbytes].view(dtype).view(shape)
 
 
 def _param_generator(cpu_optimizer):
@@ -126,6 +168,11 @@ class HybridDeviceOptimizer(torch.optim.Optimizer):
         self.overlap_cpu_optimizer_d2h_h2d = overlap_cpu_optimizer_d2h_h2d
         self.param_update_in_fp32 = param_update_in_fp32
         self.sub_optimizer_kwargs = kwargs
+        # Host copies of the offloaded parameters and their gradient buffers.
+        self._host_param_pool = _HostBufferPool(pin_cpu_params)
+        self._host_grad_pool = _HostBufferPool(pin_cpu_grads)
+        self.gpu_params_map_cpu_copy = {}
+        self.cpu_copy_map_grad: Dict[torch.Tensor, torch.Tensor] = {}
 
         self._init_sub_optimizers()
         self._register_load_state_dict_hooks()
@@ -158,8 +205,8 @@ class HybridDeviceOptimizer(torch.optim.Optimizer):
 
                 param.requires_grad = False
                 if param not in self.cpu_copy_map_grad:
-                    self.cpu_copy_map_grad[param] = torch.empty(
-                        param.shape, dtype=param.dtype, pin_memory=self.pin_cpu_grads, device="cpu"
+                    self.cpu_copy_map_grad[param] = self._host_grad_pool.empty(
+                        param.shape, param.dtype
                     )
 
                 param.grad = self.cpu_copy_map_grad[param]
@@ -251,14 +298,20 @@ class HybridDeviceOptimizer(torch.optim.Optimizer):
         #   in param_groups.
         self._sync_sub_optimizers_state_to_hdo()
 
-    def _init_sub_optimizers(self):
+    def _init_sub_optimizers(self, reuse_host_copies: bool = False):
+        """(Re)build the sub-optimizers. ``reuse_host_copies`` (after a load): an offloaded
+        parameter keeps its host copy and its host gradient buffer, refreshed from the
+        parameter (or, by ``_update_fp32_params_by_new_state``, from a loaded master), instead
+        of pinning new ones while the old ones are still referenced (the pool never frees)."""
+        reuse = dict(self.gpu_params_map_cpu_copy) if reuse_host_copies else {}
+        host_grads = self.cpu_copy_map_grad if reuse_host_copies else {}
         (
             self.cpu_param_groups,
             self.gpu_param_groups,
             self.gpu_params_map_cpu_copy,
             self.cpu_copys_map_gpu_param,
             self.param_to_fp32_param,
-        ) = self._get_sub_optimizer_param_groups(self.offload_fraction)
+        ) = self._get_sub_optimizer_param_groups(self.offload_fraction, reuse)
         self.param_to_inner_param = {}
         self.inner_param_to_orig_param = {}
         for group in self.param_groups:
@@ -292,7 +345,9 @@ class HybridDeviceOptimizer(torch.optim.Optimizer):
         else:
             self.gpu_optimizer = None
 
-        self.cpu_copy_map_grad: Dict[torch.Tensor, torch.Tensor] = defaultdict(torch.Tensor)
+        self.cpu_copy_map_grad: Dict[torch.Tensor, torch.Tensor] = {
+            host: host_grads[host] for host in self.cpu_copys_map_gpu_param if host in host_grads
+        }
         self._d2h_stream = torch.cuda.current_stream()
         self._h2d_stream = torch.cuda.current_stream()
         if self.overlap_cpu_optimizer_d2h_h2d:
@@ -327,7 +382,10 @@ class HybridDeviceOptimizer(torch.optim.Optimizer):
                 cpu_optimizers.append(cpu_optimizer_cls([_cpu_param_group]))
         return cpu_optimizers
 
-    def _get_sub_optimizer_param_groups(self, offload_fraction: float):
+    def _get_sub_optimizer_param_groups(self, offload_fraction: float, reuse=None):
+        """Split the parameters into CPU and device groups. ``reuse``: host copies to keep,
+        by parameter (see ``_init_sub_optimizers``)."""
+        reuse = reuse or {}
         params = []
         for group in self.param_groups:
             params.extend(group["params"])
@@ -356,14 +414,29 @@ class HybridDeviceOptimizer(torch.optim.Optimizer):
                 cpu_copy = False
                 if offload_params_numel < offload_threshold and on_device:
                     # The host copy of a DTensor parameter is a plain tensor holding this
-                    # rank's local shard; the DTensor itself is never cloned or pinned.
-                    param = _pin_memory(_local_data(param).detach().clone().cpu())
+                    # rank's local shard; the DTensor itself is never cloned or pinned. With
+                    # ``param_update_in_fp32`` it is the fp32 master. It comes from the host
+                    # pool (pinned with ``pin_cpu_params``).
+                    local = _local_data(param)
+                    host_dtype = torch.float32 if self.param_update_in_fp32 else local.dtype
+                    host = reuse.get(orig_param)
+                    if host is None or host.shape != local.shape or host.dtype != host_dtype:
+                        host = self._host_param_pool.empty(local.shape, host_dtype)
+                        host.copy_(local)
+                    elif not (
+                        host_dtype != local.dtype
+                        and "master_param" in self.state.get(orig_param, {})
+                    ):
+                        # A kept host copy is refreshed from the (loaded) parameter, unless
+                        # it is a master that the loaded state restores.
+                        host.copy_(local)
+                    param = host
                     offload_params_numel += orig_param.numel()
                     cpu_copy = True
-                if self.param_update_in_fp32 and param.dtype != torch.float32:
+                    if host_dtype != local.dtype:
+                        param_to_fp32_param[orig_param] = param
+                elif self.param_update_in_fp32 and param.dtype != torch.float32:
                     param = param.detach().clone().float()
-                    if cpu_copy and self.pin_cpu_params:
-                        param = param.pin_memory()
                     param_to_fp32_param[orig_param] = param
 
                 if cpu_copy:
@@ -638,8 +711,9 @@ class HybridDeviceOptimizer(torch.optim.Optimizer):
 
             # 2. After loading state_dict, the parameters may change, and we need to
             # reinitialize the sub-optimizers to regenerate the new parameters and
-            # cpu copy pairs.
-            self._init_sub_optimizers()
+            # cpu copy pairs. The host copies and gradient buffers are kept (refreshed),
+            # not pinned again.
+            self._init_sub_optimizers(reuse_host_copies=True)
             self._sync_hdo_param_groups_to_sub_optimizers()
             self._sync_hdo_state_to_sub_optimizers()
 

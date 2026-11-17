@@ -9,24 +9,30 @@ gradient's local shard device to host, steps the CPU optimizer, and copies the u
 shard back into the parameter's local shard (the buffer).
 
 These tests run two gloo processes on a CPU device mesh. There is no accelerator, so each
-worker makes CPU tensors offload candidates (``_is_device_tensor``), skips pinning
-(``_pin_memory``) and replaces the CUDA streams and events with no-ops; everything else is the
-production code. Every parameter's local shard is a view of one flat per-rank buffer (as under
-Megatron-FSDP), with uneven shards, an empty shard on rank 1 (no gradient there, as
-Megatron-FSDP sets it) and a replicated parameter.
+worker makes CPU tensors offload candidates (``_is_device_tensor``), takes the pinned slabs of
+the host buffer pool from plain memory (``_empty_pinned_bytes``, recorded, with small slabs)
+and replaces the CUDA streams and events with no-ops; everything else is the production code.
+Every parameter's local shard is a view of one flat per-rank buffer (as under Megatron-FSDP),
+with uneven shards, an empty shard on rank 1 (no gradient there, as Megatron-FSDP sets it) and
+a replicated parameter.
 
 * Each step of the offloaded optimizer on DTensor shards matches, bitwise, a reference CPU
   optimizer of the same class stepping a plain copy of the local shard (fp32 parameters, and
-  bf16 parameters with an fp32 master); the buffer holds the update, a DTensor is never pinned
-  or cloned, and the same holds for plain parameters (unchanged path).
+  bf16 parameters with an fp32 master); the buffer holds the update, the host copies and
+  gradient buffers are disjoint pieces of power-of-two pinned slabs (no DTensor is pinned or
+  cloned), and the same holds for plain parameters (unchanged path). At an offload fraction
+  of 0.5 the parameters left on the device are stepped from ``decoupled_grad`` too.
 * Checkpoint, as Megatron-FSDP's ``fsdp_dtensor`` format does it (``DistributedOptimizer.
   sharded_param_state_fsdp_dtensor`` and its ``load_state_dict``): ``state`` presents the
-  per-element state and the master as DTensors sharded like the parameter over the CPU
-  optimizer's own host tensors; a ``torch.distributed.checkpoint`` save of the model and that
-  state, then a load into a second optimizer from other weights (after the dummy step that
-  allocates its state) and its ``load_state_dict``, restores the weights, masters and state
-  bitwise, in place on the host, and the next step of both matches bitwise. Also with the
-  uneven-DTensor preprocessing of ``fsdp_dtensor`` checkpoints.
+  per-element state (and a bf16 parameter's master) as DTensors sharded like the parameter
+  over the CPU optimizer's own host tensors; a ``torch.distributed.checkpoint`` save of the
+  model and that state, then a load into a second optimizer from other weights (after the
+  dummy step that allocates its state) and its ``load_state_dict``, restores the weights,
+  masters and state bitwise, in place on the host, without pinning new host memory, and the
+  next step of both matches bitwise. Also with the uneven-DTensor preprocessing of
+  ``fsdp_dtensor`` checkpoints, with an fp32 checkpoint that has no ``master_param`` (as the
+  GPU optimizer writes it), and through the SwiGLU split of ``linear_fc1`` on CUDA-labelled
+  meshes.
 * ``update_fp32_param_by_new_param`` (``reload_model_params``) refreshes the host copies from
   the parameters' local shards.
 """
@@ -74,20 +80,47 @@ class _NoOpStream:
         pass
 
 
+# Small slabs, so that the host buffer pool fills several of them.
+SLAB_BYTES = 256
+
+
 def _emulate_offload_device(pinned):
-    """Make CPU tensors offload candidates in this worker; ``pinned`` records every tensor
-    passed to ``_pin_memory``."""
+    """Make CPU tensors offload candidates in this worker; ``pinned`` records every slab the
+    host buffer pool asks the pinned allocator for (plain memory here)."""
     from megatron.core.optimizer.cpu_offloading import hybrid_optimizer
 
-    def pin(tensor):
-        pinned.append(tensor)
-        return tensor
+    def empty_pinned_bytes(nbytes):
+        slab = torch.empty(nbytes, dtype=torch.uint8)
+        pinned.append(slab)
+        return slab
 
     hybrid_optimizer._is_device_tensor = lambda tensor: True
-    hybrid_optimizer._pin_memory = pin
+    hybrid_optimizer._empty_pinned_bytes = empty_pinned_bytes
+    hybrid_optimizer._HOST_SLAB_BYTES = SLAB_BYTES
     torch.cuda.current_stream = lambda *args, **kwargs: _NoOpStream()
     torch.cuda.Stream = _NoOpStream
     torch.cuda.stream = lambda stream: contextlib.nullcontext()
+
+
+def _assert_host_buffers_in_slabs(hdo, slabs):
+    """Every non-empty host copy and host gradient buffer is a piece of one of ``slabs`` (each a
+    power of two bytes, so the pinned allocator's power-of-two rounding adds nothing), and no
+    two of them overlap."""
+    assert slabs and all(slab.numel() & (slab.numel() - 1) == 0 for slab in slabs), [
+        slab.numel() for slab in slabs
+    ]
+    bounds = [(slab.data_ptr(), slab.data_ptr() + slab.numel()) for slab in slabs]
+    pieces = []
+    buffers = list(hdo.gpu_params_map_cpu_copy.values()) + list(hdo.cpu_copy_map_grad.values())
+    for tensor in buffers:
+        if tensor.numel() == 0:
+            continue
+        start = tensor.data_ptr()
+        end = start + tensor.numel() * tensor.element_size()
+        assert any(low <= start and end <= high for low, high in bounds), tensor.shape
+        pieces.append((start, end))
+    pieces.sort()
+    assert all(a[1] <= b[0] for a, b in zip(pieces, pieces[1:])), pieces
 
 
 def _init(rank, port):
@@ -187,8 +220,8 @@ def _hdo(params, fused, overlap=True):
         cpu_optimizer_cls=torch.optim.AdamW,
         gpu_optimizer_cls=torch.optim.AdamW,
         param_update_in_fp32=True,
-        pin_cpu_grads=False,
-        pin_cpu_params=False,
+        pin_cpu_grads=True,
+        pin_cpu_params=True,
         overlap_cpu_optimizer_d2h_h2d=overlap,
         fused=fused,
         **ADAMW,
@@ -225,8 +258,9 @@ def _step_matches_reference_worker(rank, port, dtype, dtensor, fused, grad_attr,
             host = hdo.gpu_params_map_cpu_copy[param]
             assert type(host) is torch.Tensor and not isinstance(host, DTensor)
             assert host.dtype == torch.float32 and host.shape == _local(param).shape
-        # Only plain host tensors are pinned (fp32: the host copy; bf16: before the cast).
-        assert pinned and not any(isinstance(tensor, DTensor) for tensor in pinned)
+        # The host copies are pieces of power-of-two pinned slabs; no DTensor is pinned.
+        _assert_host_buffers_in_slabs(hdo, pinned)
+        assert not any(isinstance(tensor, DTensor) for tensor in pinned)
 
         masters, reference = _reference(rank, dtype, fused)
         for step in range(STEPS):
@@ -251,6 +285,11 @@ def _step_matches_reference_worker(rank, port, dtype, dtensor, fused, grad_attr,
         # Rank 1's empty shard never had a gradient: no state; every other one has stepped.
         for param, master in zip(params, masters):
             assert (param in hdo.state) == (master in reference.state), (rank, param.shape)
+        # The gradient buffers (allocated at the first step) are slab pieces too, and the
+        # pool filled more than one slab.
+        assert len(hdo.cpu_copy_map_grad) > 0
+        _assert_host_buffers_in_slabs(hdo, pinned)
+        assert len(pinned) > 1, len(pinned)
     finally:
         dist.destroy_process_group()
 
@@ -291,8 +330,8 @@ def _partial_offload_worker(rank, port, dtype):
             cpu_optimizer_cls=torch.optim.AdamW,
             gpu_optimizer_cls=torch.optim.AdamW,
             param_update_in_fp32=True,
-            pin_cpu_grads=False,
-            pin_cpu_params=False,
+            pin_cpu_grads=True,
+            pin_cpu_params=True,
             overlap_cpu_optimizer_d2h_h2d=True,
             fused=False,
             **ADAMW,
@@ -396,7 +435,8 @@ def _checkpoint_round_trip_worker(rank, port, checkpoint_dir, dtype, uneven):
     )
 
     mesh = _init(rank, port)
-    _emulate_offload_device([])
+    pinned = []
+    _emulate_offload_device(pinned)
     layout = LAYOUT_NO_EMPTY if uneven else LAYOUT
     try:
         params_a, _ = _make_params(mesh, rank, dtype, True, seed=0, layout=layout)
@@ -442,6 +482,11 @@ def _checkpoint_round_trip_worker(rank, port, checkpoint_dir, dtype, uneven):
         torch.optim.Optimizer._process_value_according_to_param_policy = staticmethod(
             recording_policy
         )
+        hosts, host_grads, slabs = (
+            dict(hdo_b.gpu_params_map_cpu_copy),
+            dict(hdo_b.cpu_copy_map_grad),
+            len(pinned),
+        )
         try:
             hdo_b.load_state_dict(
                 _optimizer_state_dict_by_name(hdo_b, params_b, loading["optimizer"]["state"])
@@ -449,6 +494,12 @@ def _checkpoint_round_trip_worker(rank, port, checkpoint_dir, dtype, uneven):
         finally:
             torch.optim.Optimizer._process_value_according_to_param_policy = staticmethod(policy)
         assert casts and all(types == (torch.Tensor, torch.Tensor) for types in casts), casts
+        # The load kept the host copies and gradient buffers: no new pinned memory.
+        assert len(pinned) == slabs, (len(pinned), slabs)
+        assert all(hdo_b.gpu_params_map_cpu_copy[p] is host for p, host in hosts.items())
+        assert host_grads and all(
+            hdo_b.cpu_copy_map_grad[host] is grad for host, grad in host_grads.items()
+        )
 
         _assert_state_is_presented_as_dtensors(hdo_b, params_b)
         for index, (param_a, param_b) in enumerate(zip(params_a, params_b)):
@@ -468,9 +519,10 @@ def _checkpoint_round_trip_worker(rank, port, checkpoint_dir, dtype, uneven):
                 ptr = hdo_b.state[param_b][key]._local_tensor.data_ptr()
                 assert ptr == loaded_ptrs[(f"param{index}", key)], (index, key)
 
-        # The next step of both optimizers matches bitwise.
+        # The next step of both optimizers matches bitwise (and pins nothing new).
         _step(hdo_a, params_a, 2, rank, dtype, layout)
         _step(hdo_b, params_b, 2, rank, dtype, layout)
+        assert len(pinned) == slabs, (len(pinned), slabs)
         for index, (param_a, param_b) in enumerate(zip(params_a, params_b)):
             assert torch.equal(_local(param_a), _local(param_b)), index
             if param_a in hdo_a.state:
