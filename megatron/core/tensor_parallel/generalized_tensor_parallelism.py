@@ -434,6 +434,67 @@ _wgrad_buf_pool: Dict[tuple, list] = {}
 _GTP_GROUPED_BUF_PARITY_COUNTER: Dict[tuple, int] = {}
 
 
+class _GatherLedger:
+    """Which gather each all-gather buffer holds (``GTP_CONFIG.verify_prefetched_gathers``).
+
+    Gather buffers are shared: every ticket with the same cache key (scheduling domain, gathered
+    shape and dtype, expert index, parity) gets the same pooled buffer, and the chains keep two
+    users of one buffer apart only along their own order. A weight consumed in another order
+    (a loop's next round, its recompute in the backward) can find its prefetched buffer
+    rewritten by another weight's gather, or find a prefetch issued for the other direction.
+
+    ``record`` stamps a buffer with the gather written into it (weight, slot, serial) when the
+    gather is issued; issue order is the order of the writes, since the gathers sharing a
+    buffer share an AG stream and an on-demand gather first waits for that stream. ``take``
+    consumes a weight's pending prefetch of a slot and tells whether the buffer still holds it.
+    Slots: ``"fwd"`` and ``"bwd"`` (the forward and backward tickets) and ``"recompute"``.
+
+    Pure bookkeeping: buffers and weights are keyed by ``id``, both live as long as the cache
+    and the model (``clear`` runs with ``GTPWeightCache.clear`` and ``reset_gtp_state``).
+    """
+
+    def __init__(self):
+        self._serial = 0
+        # id(buffer) -> (id(weight), slot, serial) of the last gather written into the buffer.
+        self._holder: Dict[int, tuple] = {}
+        # (id(weight), slot) -> serial of the weight's prefetch not yet consumed.
+        self._pending: Dict[tuple, int] = {}
+
+    def record(self, weight, slot: str, buffer, prefetch: bool) -> None:
+        """Stamp ``buffer`` with a gather of ``weight`` for ``slot``; ``prefetch``: issued
+        ahead of its consume (pending until ``take``), else consumed on the spot."""
+        self._serial += 1
+        self._holder[id(buffer)] = (id(weight), slot, self._serial)
+        if prefetch:
+            self._pending[(id(weight), slot)] = self._serial
+        else:
+            self._pending.pop((id(weight), slot), None)
+
+    def is_current(self, weight, slot: str, buffer) -> bool:
+        """True if ``weight`` has a pending prefetch of ``slot`` and ``buffer`` still holds it."""
+        serial = self._pending.get((id(weight), slot))
+        return serial is not None and self._holder.get(id(buffer)) == (id(weight), slot, serial)
+
+    def take(self, weight, slot: str, buffer) -> bool:
+        """Consume ``weight``'s pending prefetch of ``slot``; ``is_current`` before it."""
+        current = self.is_current(weight, slot, buffer)
+        self._pending.pop((id(weight), slot), None)
+        return current
+
+    def clear(self) -> None:
+        """Forget every buffer and pending prefetch."""
+        self._holder.clear()
+        self._pending.clear()
+
+
+_GATHER_LEDGER = _GatherLedger()
+
+
+def _gather_slot(fwd: bool, recompute: bool = False) -> str:
+    """The ``_GatherLedger`` slot of a gather."""
+    return "recompute" if recompute else ("fwd" if fwd else "bwd")
+
+
 def _alloc_symmetric_wgrad_buffer(weight, dtype, device) -> torch.Tensor:
     """Padded send buffer from the registered recycling pool, pad tail zeroed (the RS
     sends the whole buffer, and a recycled buffer may hold stale rows)."""
@@ -634,6 +695,13 @@ class GTPRematConfig:
     # TODO: Infer each domain's ring size automatically.
     graph_wgrad_ring_size: int = 2
     eager_wgrad_ring_size: int = 2
+    # Treat the prefetch chains as hints (eager chains only). A consume takes a prefetched
+    # buffer only if that buffer still holds the gather issued for this weight and direction
+    # since its last consume (_GatherLedger); otherwise it gathers on demand, after the AG
+    # stream's queued gathers (they may write the same shared buffer). Needed when a weight is
+    # consumed more often, or in another order, than the chains assume: a loop model runs its
+    # core weights once per round, in the forward and again in the recompute. Off by default.
+    verify_prefetched_gathers: bool = False
 
 
 GTP_CONFIG = GTPRematConfig()
@@ -1782,6 +1850,18 @@ class GTPShardedParam(torch.nn.Parameter):
                 out_buffers
             ), "Duplicate output buffers in batched all-gather — experts need distinct cache keys"
 
+        if self._verify_gathers():
+            if not async_op:
+                # An on-demand gather writes on the caller's stream into a buffer that a gather
+                # queued on the AG stream (another weight's prefetch, one this consume will not
+                # use) may still be writing: order it after them.
+                torch.cuda.current_stream().wait_stream(
+                    get_ag_stream(self.chain_id, gtp_remat_group)
+                )
+            slot = _gather_slot(fwd, recompute)
+            for w, buf in zip(weights, out_buffers):
+                _GATHER_LEDGER.record(w, slot, buf, prefetch=async_op)
+
         # ASYNC AG: issue on ag_stream so its tail reflects the collective's full lifecycle
         # (what external wait_stream(ag_stream) drains depend on). The explicit outer→ag_stream
         # sync event preserves the upstream quantize-writer edge the bare stream context drops;
@@ -1884,6 +1964,35 @@ class GTPShardedParam(torch.nn.Parameter):
         """
         return self._prefetch_handle is not None or getattr(self, "_already_ag_drained", False)
 
+    def _verify_gathers(self) -> bool:
+        """True when consumes check their prefetched buffers (``_GatherLedger``): with
+        ``GTP_CONFIG.verify_prefetched_gathers``, on eager chains outside CUDA-graph capture
+        (a captured schedule replays without the host-side check)."""
+        return (
+            GTP_CONFIG.verify_prefetched_gathers
+            and not _chain_is_graphed(self.chain_id)
+            and not torch.cuda.is_current_stream_capturing()
+        )
+
+    def _prefetched_buffers_current(self, slot: str, consume: bool = True) -> bool:
+        """True if every buffer of this weight's ``slot`` (every expert of a grouped weight)
+        still holds the weight's pending prefetch; ``consume`` also retires the pending entries
+        in the ledger (a consume), else only looks (a peek)."""
+        cache = get_global_GTP_cache()
+        ticket_attr = {
+            "fwd": "_ag_ticket_fwd",
+            "bwd": "_ag_ticket_bwd",
+            "recompute": "_ag_ticket_recompute",
+        }[slot]
+        check = _GATHER_LEDGER.take if consume else _GATHER_LEDGER.is_current
+        current = True
+        for w in self._weights:
+            ticket = getattr(w, ticket_attr)
+            # Check every expert, so a consume leaves none with a stale pending entry.
+            if ticket is None or not check(w, slot, cache.get(ticket)):
+                current = False
+        return current
+
     def _get_prefetched_weight(self, fwd):
         # Stale-read guard: state must reflect an AG issued for this cycle;
         # otherwise cache.get() would return the prior iter's AG buffer.
@@ -1910,6 +2019,10 @@ class GTPShardedParam(torch.nn.Parameter):
         else:
             # Intra-graph or eager consume: drain inline.
             self._wait_param_gather()
+        if self._verify_gathers() and not self._prefetched_buffers_current(_gather_slot(fwd)):
+            # The prefetch was issued for the other direction, or a later gather of another
+            # weight has rewritten the shared buffer: gather this consume's weight now.
+            return self._all_gather_weight_on_demand(fwd)
         self.ag_event.wait()
 
         # Retrieve prefetched results from cache
@@ -1954,6 +2067,15 @@ class GTPShardedParam(torch.nn.Parameter):
             )
         if not GTP_CONFIG.weight_prefetch:
             return self._all_gather_weight_on_demand(fwd)
+        if (
+            self._prefetch_available()
+            and self._verify_gathers()
+            and not self._prefetched_buffers_current(_gather_slot(fwd), consume=False)
+        ):
+            # A prefetch exists, but not of this direction or no longer in its buffer: retire it
+            # and issue this weight's own, as at a chain head.
+            self._wait_param_gather()
+            self._already_ag_drained = False
         if not self._prefetch_available():
             nvtx_label = self._debug_name + (".fwd" if fwd else ".bwd") + ".peek"
             _, handle = self._all_gather_weight(async_op=True, fwd=fwd, nvtx_label=nvtx_label)
@@ -1993,6 +2115,11 @@ class GTPShardedParam(torch.nn.Parameter):
             self._recompute_already_drained = False
         else:
             self._wait_recompute_param_gather()
+        if self._verify_gathers() and not self._prefetched_buffers_current("recompute"):
+            # No recompute-chain prefetch was issued for this consume (the chain links the first
+            # backward's recompute order, which a later replay need not follow), or its buffer
+            # was rewritten since: gather on demand into the recompute buffer.
+            return self._all_gather_weight_on_demand(True, recompute=True)
         self._recompute_ag_event.wait()
 
         result = []
@@ -3021,6 +3148,8 @@ class GTPWeightCache:
             slot.buf = None
         self._pool.clear()
         self._total_bytes = 0
+        # The ledger keys buffers by id; dropped buffers' ids may be reused.
+        _GATHER_LEDGER.clear()
 
 
 def get_global_GTP_cache() -> GTPWeightCache:
@@ -3228,6 +3357,7 @@ def reset_gtp_state():
     GTPShardedParam._link_tables_flushed = False
     GTPShardedParam._recompute_link_tables_flushed = False
     _GTP_GROUPED_BUF_PARITY_COUNTER.clear()
+    _GATHER_LEDGER.clear()
     # A backward that never reached the fence leaves entries pointing at a torn-down model, and
     # a surviving _buf would make the next iteration's first backward ADD onto a stale sum.
     for param in _GTP_PENDING_WGRAD_ACCUM:
