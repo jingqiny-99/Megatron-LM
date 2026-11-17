@@ -1,7 +1,9 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 """The DSA indexer's FP32 weights projection (``_DSAWeightsProjection``) with fused WGrad
-accumulation, on CPU (torch.mm path; no TE):
+accumulation, on the torch.mm path (no TE GEMM). The tensors live on the current CUDA device when
+there is one: with TE installed, the backward's dummy weight gradient comes from TE's
+``get_dummy_wgrad``, which allocates on CUDA (as the weight always is outside this test).
 
 * one call carrying ``is_first_microbatch=True`` writes over ``main_grad`` (a fresh microbatch);
 * a module called again before the first call's backward (a loop core run several times per
@@ -20,13 +22,21 @@ from megatron.core.transformer.experimental_attention_variant.dsa import _DSAWei
 IN, OUT, TOKENS = 16, 4, 6
 
 
+def _device():
+    """The current CUDA device (where TE's dummy weight gradient is allocated), else the CPU."""
+    if torch.cuda.is_available():
+        return torch.device("cuda", torch.cuda.current_device())
+    return torch.device("cpu")
+
+
 class _Linear(torch.nn.Module):
     """Stand-in for the indexer's ``linear_weights_proj`` with fused WGrad accumulation."""
 
     def __init__(self, repeated=False):
         super().__init__()
-        self.weight = torch.nn.Parameter(torch.randn(OUT, IN, dtype=torch.bfloat16))
-        self.weight.main_grad = torch.zeros(OUT, IN, dtype=torch.float32)
+        device = _device()
+        self.weight = torch.nn.Parameter(torch.randn(OUT, IN, dtype=torch.bfloat16, device=device))
+        self.weight.main_grad = torch.zeros(OUT, IN, dtype=torch.float32, device=device)
         self.weight.grad_added_to_main_grad = False
         self.fuse_wgrad_accumulation = True
         self.is_first_microbatch = True
@@ -40,8 +50,9 @@ def _indexer():
 
 def _inputs(count, seed):
     generator = torch.Generator().manual_seed(seed)
-    xs = [torch.randn(TOKENS, IN, generator=generator).bfloat16() for _ in range(count)]
-    grads = [torch.randn(TOKENS, OUT, generator=generator) for _ in range(count)]
+    device = _device()
+    xs = [torch.randn(TOKENS, IN, generator=generator).bfloat16().to(device) for _ in range(count)]
+    grads = [torch.randn(TOKENS, OUT, generator=generator).to(device) for _ in range(count)]
     return xs, grads
 
 
