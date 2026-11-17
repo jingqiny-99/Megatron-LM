@@ -73,7 +73,7 @@ from typing import Optional
 import torch
 import torch.distributed as dist
 from torch import Tensor, nn
-from torch.utils.checkpoint import checkpoint
+from torch.utils.checkpoint import checkpoint, set_checkpoint_early_stop
 
 from megatron.core.models.hybrid.hybrid_block import HybridStack, HybridStackLayerContext
 from megatron.core.models.hybrid.layers.utils import Symbols
@@ -617,6 +617,15 @@ class LoopHybridStack(HybridStack):
         The checkpointed function opens the profiler / NVTX range ``{label}/block={k}``
         (``loop_range``), so the range appears in the forward and again in the block's
         recompute during the backward.
+
+        A block that ends inside a layer (every block but the last of an injection round, which
+        ends in the loop norm, and every prelude / coda block) is checkpointed with early stop
+        off, as ``loop_round_checkpoint`` does for such rounds: its replay runs the block's last
+        sublayer to its end instead of raising inside it, so no cut-off replay stays referenced
+        by the layer's per-call state (``mlp_norm_manager``, the MoE dispatcher's routing state),
+        every module of the block finishes its forward hooks in the replay (Megatron-FSDP's
+        post-forward release, DDP's and GTP's gathers), and the routing tape's end-of-replay
+        count check runs. Forward ops and gradients are unchanged.
         """
         stride = self.config.loop_recompute_block_stride
         cuts = list(range(start, end, stride))
@@ -649,12 +658,16 @@ class LoopHybridStack(HybridStack):
                             h = self._loop_norm(step)(h)
                 return h
 
-            x = checkpoint(
-                block,
-                *((x, injection) if adapter else (x,)),
-                use_reentrant=False,
-                context_fn=loop_checkpoint_context_fn(f"{label}/block={k}"),
-            )
+            ends_in_layer = not (tail and not residual)
+            # torch reads the flag when the checkpoint frame is built (here), so the frame's
+            # backward replay runs with it too.
+            with set_checkpoint_early_stop(False) if ends_in_layer else nullcontext():
+                x = checkpoint(
+                    block,
+                    *((x, injection) if adapter else (x,)),
+                    use_reentrant=False,
+                    context_fn=loop_checkpoint_context_fn(f"{label}/block={k}"),
+                )
         return x
 
     def _layer_forward_flops(self, index, tokens, squared_lengths, sequence, arbitrary_mask):

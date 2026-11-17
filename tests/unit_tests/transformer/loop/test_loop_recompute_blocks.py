@@ -596,6 +596,39 @@ def test_blocks_keep_only_their_inputs(request, mhc, stride):
     assert sum(none["in_loop"].values()) > sum(round_mode["in_loop"].values())
 
 
+def test_block_replays_run_their_last_sublayer_to_the_end():
+    """A block that ends inside a layer is checkpointed with early stop off: its replay runs
+    the block's last sublayer to its end (the sublayer's forward hook fires in every replay),
+    so no cut-off replay stays referenced by the layer. The last block of an injection round
+    ends in the loop norm and keeps early stop (its last sublayer finishes before the norm).
+    Stride 2 on the core '*-*-': blocks '*-' | '*-' per round; edges: prelude and coda in 2
+    blocks each."""
+    rounds, stride = 2, 2
+    stack = _stack((stride, True))
+    x, upstream = _inputs()
+    # The last sublayer ('-') of every block; the core's second block is a round's tail.
+    block_ends = {start + stride - 1 for start in range(0, len(stack.layers), stride)}
+    replays = {index: 0 for index in block_ends}
+
+    def count_replay(index):
+        def hook(module, args, output):
+            if in_forward_replay():
+                replays[index] += 1
+
+        return hook
+
+    handles = [stack.layers[i].register_forward_hook(count_replay(i)) for i in block_ends]
+    try:
+        _run(stack, x, upstream)
+    finally:
+        for handle in handles:
+            handle.remove()
+    roles = stack.loop_roles
+    for index, count in sorted(replays.items()):
+        expected = rounds if roles.core_start <= index < roles.core_end else 1
+        assert count == expected, (index, count, replays)
+
+
 def test_edges_leave_the_embedding_head_and_mtp_activations(cpu_mtp):
     tokens, labels = _tokens()
     position_ids = torch.arange(SEQ, device=device()).repeat(BATCH, 1)
