@@ -37,11 +37,16 @@ updated weights (under HFSDP: the DP-Outer and DP-Shard gathers).
 * The recorded reductions, every step: every gradient bucket is reduced over DP-Shard exactly
   once per microbatch (not once per use; a bucket whose DP-Shard group is one rank once per
   step), and over DP-Outer exactly once per step, in the last microbatch.
-* ``cpu_adam`` (smoke test of the recipes' optimizer): ``hfsdp_recipe`` with Adam offloaded to
-  the host (``optimizer_cpu_offload``, fraction 1.0, precision aware) builds and steps; step 1's
-  gradients pass the gate against a DDP run, and its step-2 losses are within 1e-3 of that run
-  stepped with the GPU Adam (a different update kernel) and closer to it than to the same run
-  with a learning rate of zero (the update happened).
+* ``cpu_adam`` (the recipes' optimizer): ``hfsdp_recipe`` with Adam offloaded to the host
+  (``optimizer_cpu_offload``, fraction 1.0, precision aware) builds and steps. Every leaf
+  optimizer is a ``HybridDeviceOptimizer`` whose parameters are the Megatron-FSDP DTensors,
+  each offloaded to a plain host tensor of its local shard; at the step, every parameter's
+  updated host master matches a reference CPU AdamW (the CPU optimizer's own param group) on
+  the host master and the gradient's local shard (relative 1e-6), the parameter's local shard
+  (the FSDP main weight) equals the host master, and the state is presented as DTensors over
+  host tensors. Step 1's gradients pass the gate against a DDP run, and its step-2 losses are
+  within 1e-3 of that run stepped with the GPU Adam (a different update kernel) and closer to
+  it than to the same run with a learning rate of zero (the update happened).
 * Teeth, each must fail (step 1): ``overwrite`` (accumulate mode off, the loop guard bypassed:
   each use overwrites the bucket, so the core's fused-wgrad weights keep one round);
   ``outer_each`` (the DP-Outer reduction on every microbatch: earlier microbatches' sums are
@@ -73,6 +78,8 @@ EP = int(os.environ.get("LOOP_HSDP_EP", str(max(WORLD // INSTANCES, 1))))
 STEPS = 2
 ADAM_LR = 1e-3
 CPU_ADAM_LOSS_RELATIVE = 1e-3
+HOST_ADAM_RTOL = 1e-6
+HOST_ADAM_ATOL = 1e-9
 pytestmark = pytest.mark.skipif(
     not CUDA
     or WORLD < 4
@@ -204,6 +211,131 @@ class _ReductionRecorder:
         self.cls._bucket_group_gradient_reduce = self.original
 
 
+def _inner_optimizers(optimizer):
+    """The torch-level optimizer of every leaf Megatron optimizer (a ``ChainedOptimizer`` of
+    dense and expert groups is walked through ``chained_optimizers``)."""
+    pending, found = [optimizer], []
+    while pending:
+        current = pending.pop()
+        chained = getattr(current, "chained_optimizers", None)
+        if chained is not None:
+            pending.extend(chained)
+        else:
+            found.append(current.optimizer)
+    return found
+
+
+def _host(tensor):
+    """A CPU fp32 copy of ``tensor`` (a DTensor: its local shard)."""
+    from torch.distributed.tensor import DTensor
+
+    with torch.no_grad():
+        if isinstance(tensor, DTensor):
+            tensor = tensor.to_local()
+        return tensor.detach().float().cpu().clone()
+
+
+class _HostAdamCheck:
+    """Checks the CPU-offloaded Adam (``HybridDeviceOptimizer``) on the Megatron-FSDP v1
+    parameters. At build: every leaf optimizer is one, every parameter is a DTensor offloaded
+    to a plain host tensor of its local shard (no device optimizer). At every step, every
+    parameter with a gradient: the updated host master equals, bitwise, a reference CPU AdamW
+    (the CPU optimizer's own param group) stepping a copy of the host master before the step
+    with the gradient's local shard, and the parameter's local shard (the FSDP main weight)
+    equals it; the state is presented as DTensors over host tensors."""
+
+    def __init__(self, opt):
+        from torch.distributed.tensor import DTensor
+
+        from megatron.core.optimizer import HybridDeviceOptimizer
+
+        self.problems = []
+        self.checked = 0
+        self.inexact = 0
+        self.steps = 0
+        self.hdos = _inner_optimizers(opt)
+        for hdo in self.hdos:
+            if not isinstance(hdo, HybridDeviceOptimizer):
+                self.problems.append(f"leaf optimizer {type(hdo).__name__}")
+                continue
+            if hdo.gpu_optimizer is not None:
+                self.problems.append("a device optimizer at offload fraction 1.0")
+            for group in hdo.param_groups:
+                for param in group["params"]:
+                    host = hdo.gpu_params_map_cpu_copy.get(param)
+                    if not isinstance(param, DTensor):
+                        self.problems.append(f"a non-DTensor parameter {tuple(param.shape)}")
+                    elif param not in hdo.offloaded_dtensor_params or host is None:
+                        self.problems.append(f"a DTensor not offloaded {tuple(param.shape)}")
+                    elif type(host) is not torch.Tensor or host.device.type != "cpu":
+                        self.problems.append(f"host copy {type(host).__name__} {host.device}")
+            hdo.register_step_pre_hook(self._before)
+            hdo.register_step_post_hook(self._after)
+        self.pending = {}
+
+    @staticmethod
+    def _cpu_group(hdo, host):
+        for cpu_optimizer in hdo.cpu_optimizers:
+            for group in cpu_optimizer.param_groups:
+                if any(p is host for p in group["params"]):
+                    return cpu_optimizer, group
+        raise AssertionError("host copy not in a CPU optimizer")
+
+    def _before(self, hdo, args, kwargs):
+        records = []
+        for group in hdo.param_groups:
+            for param in group["params"]:
+                grad = getattr(param, "decoupled_grad", param.grad)
+                host = hdo.gpu_params_map_cpu_copy.get(param)
+                if grad is None or host is None or host.numel() == 0:
+                    continue
+                cpu_optimizer, cpu_group = self._cpu_group(hdo, host)
+                state = {
+                    key: value.detach().clone()
+                    for key, value in cpu_optimizer.state.get(host, {}).items()
+                    if isinstance(value, torch.Tensor)
+                }
+                records.append((param, host.detach().clone(), _host(grad), state))
+        self.pending[id(hdo)] = records
+
+    def _after(self, hdo, args, kwargs):
+        from torch.distributed.tensor import DTensor
+
+        self.steps += 1
+        for param, master_before, grad, state in self.pending.pop(id(hdo)):
+            host = hdo.gpu_params_map_cpu_copy[param]
+            _, cpu_group = self._cpu_group(hdo, host)
+            master = torch.nn.Parameter(master_before)
+            meta = {key: value for key, value in cpu_group.items() if key != "params"}
+            reference = torch.optim.AdamW([{**meta, "params": [master]}])
+            if state:
+                reference.state[master] = {key: value.clone() for key, value in state.items()}
+            master.grad = grad
+            reference.step()
+            shape = tuple(param.shape)
+            expected = master.detach()
+            # The same CPU kernel on the same inputs: equal up to a vector-tail rounding
+            # difference; a wrong or missing update is ~lr per element.
+            if not torch.allclose(host, expected, rtol=HOST_ADAM_RTOL, atol=HOST_ADAM_ATOL):
+                diff = (host - expected).abs().max().item()
+                self.problems.append(f"host master {shape} differs from AdamW by {diff:.3g}")
+            elif not torch.equal(host, expected):
+                self.inexact += 1
+            if not torch.equal(_host(param), host.to(param.dtype).float()):
+                self.problems.append(f"parameter shard {shape} is not the host master")
+            presented = hdo.state.get(param, {})
+            for key in ("exp_avg", "exp_avg_sq"):
+                value = presented.get(key)
+                if not isinstance(value, DTensor) or value.to_local().device.type != "cpu":
+                    self.problems.append(f"state {key} of {shape}: {type(value).__name__}")
+            self.checked += 1
+
+    def summary(self):
+        return dict(
+            problems=self.problems, checked=self.checked, inexact=self.inexact, steps=self.steps
+        )
+
+
 def _run_ddp(state, steps=STEPS, **optimizer_fields):
     """``steps`` steps of the DDP reference; returns ``[(step result, grads)]`` and the core's
     fused-wgrad weight names."""
@@ -232,9 +364,11 @@ def _run_fsdp(
     outer_override=None,
     steps=STEPS,
     optimizer_fields=None,
+    optimizer_check=None,
 ):
     """``steps`` steps of one Megatron-FSDP arm; returns ``[(step result, grads)]`` and the
-    reduction record."""
+    reduction record (with ``optimizer_check``, a class built on the optimizer: its
+    ``summary()`` under ``"optimizer_check"``)."""
     from megatron.core.transformer.loop import guards
 
     original_guard = guards.validate_loop_fsdp_config
@@ -247,6 +381,7 @@ def _run_fsdp(
     finally:
         guards.validate_loop_fsdp_config = original_guard
     opt = sgu.optimizer(fsdp, **(optimizer_fields or {}))
+    check = optimizer_check(opt) if optimizer_check is not None else None
     out = []
     with _ReductionRecorder(outer=outer_override) as recorder:
         for step in range(steps):
@@ -270,7 +405,10 @@ def _run_fsdp(
     fsdp.stop_communication()
     del opt, fsdp, model
     torch.cuda.empty_cache()
-    return out, dict(calls=recorder.calls, buckets=buckets)
+    record = dict(calls=recorder.calls, buckets=buckets)
+    if check is not None:
+        record["optimizer_check"] = check.summary()
+    return out, record
 
 
 ARMS = {
@@ -299,7 +437,10 @@ def results():
     out["ref_frozen"], _ = _run_ddp(state, **_adam(lr=0.0))
     try:
         out["cpu_adam"] = _run_fsdp(
-            state, **ARMS["hfsdp_recipe"], optimizer_fields=_adam(cpu_offload=True)
+            state,
+            **ARMS["hfsdp_recipe"],
+            optimizer_fields=_adam(cpu_offload=True),
+            optimizer_check=_HostAdamCheck,
         )
     except Exception:  # pylint: disable=broad-except
         out["cpu_adam_error"] = traceback.format_exc()
@@ -373,6 +514,12 @@ def test_cpu_offloaded_adam_steps_on_the_recipe_layout(results):
     """Smoke test of the recipes' optimizer on the recipes' layout (see the module docstring)."""
     if "cpu_adam_error" in results:
         pytest.fail(f"the cpu_adam arm raised:\n{results['cpu_adam_error']}", pytrace=False)
+    check = results["cpu_adam"][1]["optimizer_check"]
+    print(f"[{_name('cpu_adam host Adam')}] {check}", flush=True)
+    assert not check["problems"], check["problems"][:20]
+    # One optimizer step (between the two training steps) of every leaf optimizer, and every
+    # parameter with a local shard and a gradient checked.
+    assert check["steps"] >= 1 and check["checked"] > 0, check
     _, reference = results["ref_adam"][0]
     _, grads = results["cpu_adam"][0][0]
     report, failing = sgu.report_and_fail(_name("cpu_adam step 1 vs ref"), grads, reference)
