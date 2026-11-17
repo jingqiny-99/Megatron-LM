@@ -11,6 +11,8 @@
   ``reset``), on a stand-in bucket group: the first batch records how often each parameter is
   ready in the last microbatch (a GTP shard: once per use), later batches start the reduction
   when every parameter reached its count, and a count above it raises instead of losing a use.
+* The GPU tests' Megatron-FSDP gradient reader (``strategy_grad_utils.fsdp_bucket_part``) on
+  emulated buffers: every strategy, and DP-Outer sharding's logical shard order.
 
 The GPU tests of the same paths are ``test_loop_gtp_gpu.py`` and ``test_loop_ddp_overlap_gpu.py``.
 """
@@ -18,6 +20,7 @@ The GPU tests of the same paths are ``test_loop_gtp_gpu.py`` and ``test_loop_ddp
 from types import SimpleNamespace
 
 import pytest
+import torch
 
 from megatron.core.distributed.param_and_grad_buffer import _ParamAndGradBucketGroup
 from megatron.core.tensor_parallel import generalized_tensor_parallelism as gtp
@@ -223,3 +226,87 @@ def test_a_use_beyond_the_count_raises_before_the_reduction_too():
     with pytest.raises(RuntimeError, match="became grad-ready 2 times"):
         _ready(group, core, 2)
     assert group.starts == 0
+
+
+# ---------------------------------------------------------------------------------------------
+# The GPU tests' Megatron-FSDP gradient reader (strategy_grad_utils.fsdp_bucket_part)
+# ---------------------------------------------------------------------------------------------
+
+BUCKET = 4 * 64  # elements; a multiple of every emulated group size
+
+
+def _hfsdp_logical_rank(rank, outer, inner):
+    """FSDPDistributedIndex.get_logical_hybrid_fsdp_rank: DP group rank (outer-major) to the
+    shard index DP-Outer sharding uses (DP-Shard-major)."""
+    return (rank % inner) * outer + rank // inner
+
+
+def _emulated_buffers(strategy, world, logical_rank, reduced):
+    """The main gradient buffer of every rank of a ``world``-rank group after the reduction:
+    rank ``r`` owns the shard at ``logical_rank(r)``; an ``optim`` (unsharded) buffer keeps
+    rank-local, unreduced values outside its shard."""
+    from megatron.core.distributed.fsdp.src.megatron_fsdp.param_and_grad_buffer import (
+        BucketIndex,
+        _get_dp_buffer_shard_bucket_index,
+    )
+
+    bucket = BucketIndex(bucket_id=0, global_data_index=0, size=BUCKET, items=[])
+    distributed = strategy != "optim"
+    buffers = []
+    for rank in range(world):
+        index = _get_dp_buffer_shard_bucket_index(bucket, distributed, world, logical_rank(rank))
+        shard = slice(index.bucket_data_index, index.bucket_data_index + index.size)
+        if distributed:
+            data = reduced[shard].clone()
+        else:
+            data = torch.full((BUCKET,), 100.0 + rank)  # local, unreduced sums
+            data[shard] = reduced[shard]
+        buffers.append(
+            SimpleNamespace(
+                bucket_index=bucket, shard_bucket_index=index, dtype=torch.float32, data=data
+            )
+        )
+    return buffers
+
+
+@pytest.mark.parametrize(
+    "layout", ["fsdp", "hfsdp", "hfsdp_expert_shard1"], ids=lambda layout: layout
+)
+@pytest.mark.parametrize("strategy", ["optim_grads_params", "optim_grads", "optim"])
+def test_fsdp_bucket_parts_sum_to_the_reduced_bucket(layout, strategy):
+    """Summing every rank's part gives the reduced bucket for every strategy and for DP-Outer
+    sharding's logical shard order. The previous reader (all-gather in group order, the whole
+    slice of an unsharded buffer) misplaced HFSDP shards and read unreduced values."""
+    from tests.unit_tests.transformer.loop import strategy_grad_utils as sgu
+
+    if layout != "fsdp" and strategy == "optim":
+        pytest.skip("DP-Outer sharding refuses a replicated-gradient strategy")
+    outer, inner = dict(fsdp=(1, 4), hfsdp=(2, 2), hfsdp_expert_shard1=(2, 1))[layout]
+    world = outer * inner
+    logical = lambda rank: _hfsdp_logical_rank(rank, outer, inner)  # noqa: E731
+    reduced = torch.randn(BUCKET, generator=torch.Generator().manual_seed(7))
+    buffers = _emulated_buffers(strategy, world, logical, reduced)
+    total = torch.zeros(BUCKET)
+    for gbuf in buffers:
+        part, partial = sgu.fsdp_bucket_part(gbuf, strategy)
+        assert partial
+        total += part
+    assert torch.equal(total, reduced)
+
+    # What the previous reader produced.
+    if strategy == "optim":
+        assert not torch.equal(buffers[0].data, reduced)
+    elif world > 1:
+        gathered = torch.cat([gbuf.data for gbuf in buffers])  # group-rank order
+        assert torch.equal(gathered, reduced) == all(logical(r) == r for r in range(world))
+
+
+def test_fsdp_bucket_part_of_a_replicated_bucket_is_the_whole_bucket():
+    from tests.unit_tests.transformer.loop import strategy_grad_utils as sgu
+
+    data = torch.randn(BUCKET)
+    gbuf = SimpleNamespace(
+        bucket_index=SimpleNamespace(global_data_index=0, size=BUCKET), data=data
+    )
+    part, partial = sgu.fsdp_bucket_part(gbuf, "no_shard")
+    assert not partial and torch.equal(part, data)

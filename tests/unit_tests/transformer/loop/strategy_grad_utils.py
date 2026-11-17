@@ -212,9 +212,37 @@ def ddp_grads(ddp, model):
     }
 
 
+def fsdp_bucket_part(gbuf, strategy):
+    """This rank's reduced part of a Megatron-FSDP gradient bucket (``gbuf``: a group's main
+    gradient buffer; ``strategy``: the group's sharding strategy) in a bucket-sized tensor, and
+    whether the other ranks' parts have to be summed in over ``gbuf.data_parallel_group``.
+
+    * ``no_shard``: the whole bucket is all-reduced on every rank (returned as is).
+    * Otherwise only the rank's shard is reduced. A sharded buffer stores just that shard; an
+      ``optim`` (ZeRO-1) buffer is unsharded, and outside the shard it keeps the rank's own
+      unreduced sums. The shard is placed at its offset in the bucket and the rest is zero.
+      The offset comes from the buffer's own shard index: under DP-Outer sharding (HFSDP)
+      shards are indexed by the logical hybrid rank (DP-Shard major), not by the rank's
+      position in the group, so the parts are summed rather than all-gathered in group order.
+    """
+    from megatron.core.distributed.fsdp.src.megatron_fsdp.param_and_grad_buffer import (
+        DataParallelBuffer,
+    )
+
+    size = gbuf.bucket_index.size
+    if strategy == "no_shard":
+        start = gbuf.bucket_index.global_data_index
+        return gbuf.data[start : start + size], False
+    index = gbuf.shard_bucket_index
+    part = torch.zeros(size, dtype=gbuf.dtype, device=gbuf.data.device)
+    shard = DataParallelBuffer.get_shard_from_local_buffer(gbuf)
+    part[index.bucket_data_index : index.bucket_data_index + index.size].copy_(shard)
+    return part, True
+
+
 def fsdp_grads(fsdp):
-    """Every parameter's reduced gradient under Megatron-FSDP: each group's gradient shards
-    all-gathered over the group's data-parallel group."""
+    """Every parameter's reduced gradient under Megatron-FSDP: each group's reduced shards
+    summed over the group's data-parallel group (``fsdp_bucket_part``)."""
     from megatron.core.distributed.fsdp.src.megatron_fsdp.param_and_grad_buffer import Bucket
 
     buffer = fsdp.param_and_grad_buffer
@@ -223,12 +251,9 @@ def fsdp_grads(fsdp):
         gbuf = group.main_grad_buffer
         if gbuf is None or not group.requires_grad:
             continue
-        if gbuf.is_data_distributed:
-            full = torch.empty(gbuf.bucket_index.size, dtype=gbuf.dtype, device="cuda")
-            dist.all_gather_into_tensor(full, gbuf.data, group=gbuf.data_parallel_group)
-        else:
-            start = gbuf.bucket_index.global_data_index
-            full = gbuf.data[start : start + gbuf.bucket_index.size]
+        full, partial = fsdp_bucket_part(gbuf, group.sharding_strategy)
+        if partial:
+            dist.all_reduce(full, group=gbuf.data_parallel_group)
         for param in group.params:
             item = gbuf.get_item_from_bucket(Bucket(data=full), gbuf.param_idx[param])
             grads[buffer.param_to_name[param]] = item.view(param.shape).float().clone()
@@ -304,6 +329,55 @@ def assert_losses_match(step, reference, name):
     assert all(reference.losses[key] != 0.0 for key in mbs.LOSS_KEYS), reference.losses
     assert all(value <= LOSS_RELATIVE for value in loss_rel.values()), loss_rel
     assert mbs.max_row_difference(step.rows, reference.rows) <= LOSS_RELATIVE
+
+
+SGD_LR = 0.1
+# Step 2 runs on weights updated from fp32-reassociated step-1 gradients.
+STEP2_LOSS_RELATIVE = 1e-5
+
+
+def optimizer(wrapped, **overrides):
+    """A Megatron optimizer over ``wrapped`` (DDP or Megatron-FSDP): SGD without momentum by
+    default, so the step-2 weights are a plain function of step 1's gradients;
+    ``overrides``: further ``OptimizerConfig`` fields (e.g. the CPU-offloaded Adam)."""
+    from megatron.core.optimizer import OptimizerConfig, get_megatron_optimizer
+    from megatron.core.process_groups_config import ProcessGroupCollection
+
+    fields = dict(
+        optimizer="sgd",
+        lr=SGD_LR,
+        sgd_momentum=0.0,
+        weight_decay=0.0,
+        clip_grad=0.0,
+        use_distributed_optimizer=wrapped.ddp_config.use_distributed_optimizer,
+        bf16=True,
+        params_dtype=torch.bfloat16,
+    )
+    fields.update(overrides)
+    return get_megatron_optimizer(
+        OptimizerConfig(**fields),
+        [wrapped],
+        use_gloo_process_groups=False,
+        pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
+    )
+
+
+def step_optimizer(opt):
+    update_successful, _, _ = opt.step()
+    assert update_successful
+
+
+def assert_step_losses_match(step_index, step, reference, name, step2_relative=None):
+    """Step 1: ``assert_losses_match``. Later steps run on weights updated from gradients that
+    differ by fp32 reassociation: relative difference <= ``step2_relative`` (default
+    ``STEP2_LOSS_RELATIVE``)."""
+    if step_index == 0:
+        assert_losses_match(step, reference, name)
+        return
+    bound = STEP2_LOSS_RELATIVE if step2_relative is None else step2_relative
+    rel = mbs.relative_loss_differences(step.losses, reference.losses)
+    print(f"[{name}] losses {step.losses} rel {rel}", flush=True)
+    assert all(value <= bound for value in rel.values()), rel
 
 
 def fused_core_weights(model):
