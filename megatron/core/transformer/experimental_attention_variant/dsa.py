@@ -1793,9 +1793,22 @@ class _DSAWeightsProjection(torch.autograd.Function):
         ctx.linear = linear
         # This path does not use TE's parameter-transpose cache. Keep the
         # first-microbatch signal solely for fused WGrad overwrite/accumulate semantics.
-        ctx.is_first_microbatch = getattr(linear, "is_first_microbatch", None)
+        is_first_microbatch = getattr(linear, "is_first_microbatch", None)
         if hasattr(linear, "is_first_microbatch"):
             linear.is_first_microbatch = False
+        # A True makes the fused WGrad overwrite main_grad. It belongs to the first call, whose
+        # backward runs last when the module is called again before that backward (a loop
+        # core run several times per microbatch, a repeated MTP layer): the overwrite would
+        # drop the later calls' gradients. A later call therefore withdraws the pending True,
+        # and a layer marked is_repeated_layer never overwrites (as TE's linears).
+        if getattr(linear, "is_repeated_layer", False) and is_first_microbatch is True:
+            is_first_microbatch = None
+        pending = getattr(linear, "_dsa_pending_first_call", None)
+        if pending is not None:
+            pending[0] = None
+        # Read at backward time (one-element holder, so a later call can still withdraw it).
+        ctx.first_call = [is_first_microbatch]
+        linear._dsa_pending_first_call = ctx.first_call if is_first_microbatch is True else None
         output, indexer._weights_proj_te_gemm_supported = _dsa_weights_proj_forward_gemm(
             x, weight, indexer._weights_proj_te_gemm_supported
         )
@@ -1813,6 +1826,10 @@ class _DSAWeightsProjection(torch.autograd.Function):
             grad_input = torch.mm(grad_output_2d.float(), weight.float())
             grad_input = grad_input.reshape_as(x).to(dtype=x.dtype)
 
+        is_first_microbatch = ctx.first_call[0]
+        if getattr(linear, "_dsa_pending_first_call", None) is ctx.first_call:
+            linear._dsa_pending_first_call = None
+
         grad_weight = None
         if ctx.needs_input_grad[1]:
             if (
@@ -1823,12 +1840,12 @@ class _DSAWeightsProjection(torch.autograd.Function):
                     _dsa_weights_proj_wgrad,
                     weight=weight,
                     linear=linear,
-                    is_first_microbatch=ctx.is_first_microbatch,
+                    is_first_microbatch=is_first_microbatch,
                 )
                 linear.wgrad_store.put([x, grad_output], wgrad_func)
             else:
                 grad_weight, _ = _dsa_weights_proj_wgrad(
-                    x, grad_output, weight, linear, ctx.is_first_microbatch
+                    x, grad_output, weight, linear, is_first_microbatch
                 )
 
             if getattr(linear, "fuse_wgrad_accumulation", False) and hasattr(
