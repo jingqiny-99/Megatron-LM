@@ -167,6 +167,24 @@ class HybridDeviceOptimizer(torch.optim.Optimizer):
                 self.cpu_copy_map_grad[param].data.copy_(_local_data(grad), non_blocking=True)
             self._cpu_optimizer_map_data_event[optimizer] = self._d2h_stream.record_event()
 
+    def _set_gpu_optimizer_decoupled_grads(self):
+        """Hand the device optimizer the gradients of the parameters it steps directly (not
+        through an fp32 copy) that are kept in ``decoupled_grad``: the device optimizer is
+        built without ``use_decoupled_grad`` and reads ``.grad``, while Megatron-FSDP (with the
+        precision-aware optimizer that CPU offload requires) sets only ``decoupled_grad``.
+        Without this those parameters were never updated at an offload fraction below 1."""
+        for param in _param_generator(self.gpu_optimizer):
+            if param in self.fp32_param_to_orig_param:
+                # An fp32 copy: its gradient was set by _set_sub_optimizer_grads.
+                continue
+            decoupled_grad = getattr(param, "decoupled_grad", None)
+            if decoupled_grad is not None:
+                param.grad = (
+                    decoupled_grad
+                    if decoupled_grad.dtype == param.dtype
+                    else decoupled_grad.to(param.dtype)
+                )
+
     def _register_param_copy_back_gpu_hook(self):
         def param_copy_back_gpu_hook_closure():
             def param_copy_back_gpu_hook(optimizer, args, kwargs):
@@ -219,6 +237,7 @@ class HybridDeviceOptimizer(torch.optim.Optimizer):
 
         # Step the sub-optimizers.
         if self.gpu_optimizer:
+            self._set_gpu_optimizer_decoupled_grads()
             self.gpu_optimizer.step(closure)
 
         for cpu_optimizer in self.cpu_optimizers:

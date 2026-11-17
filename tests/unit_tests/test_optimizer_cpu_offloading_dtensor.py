@@ -278,6 +278,52 @@ def test_cpu_adam_step_without_overlap_matches_reference():
     )
 
 
+def _partial_offload_worker(rank, port, dtype):
+    from megatron.core.optimizer.cpu_offloading import HybridDeviceOptimizer
+
+    mesh = _init(rank, port)
+    _emulate_offload_device([])
+    try:
+        params, _ = _make_params(mesh, rank, dtype, True)
+        hdo = HybridDeviceOptimizer(
+            params,
+            offload_fraction=0.5,
+            cpu_optimizer_cls=torch.optim.AdamW,
+            gpu_optimizer_cls=torch.optim.AdamW,
+            param_update_in_fp32=True,
+            pin_cpu_grads=False,
+            pin_cpu_params=False,
+            overlap_cpu_optimizer_d2h_h2d=True,
+            fused=False,
+            **ADAMW,
+        )
+        assert hdo.gpu_optimizer is not None
+        assert 0 < len(hdo.gpu_params_map_cpu_copy) < len(params)
+        masters, reference = _reference(rank, dtype, fused=False)
+        for step in range(STEPS):
+            grads = _grads(step, rank, dtype)
+            hdo.zero_grad()
+            # Megatron-FSDP with the precision-aware optimizer sets only decoupled_grad.
+            _set_grads(params, grads, "decoupled_grad")
+            for master, grad in zip(masters, grads):
+                master.grad = None if grad is None else grad.float()
+            hdo.step()
+            reference.step()
+            for index, (param, master) in enumerate(zip(params, masters)):
+                offloaded = param in hdo.gpu_params_map_cpu_copy
+                expected = master.detach().to(dtype)
+                assert torch.equal(_local(param), expected), (rank, step, index, offloaded)
+    finally:
+        dist.destroy_process_group()
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16], ids=["fp32", "bf16"])
+def test_partial_offload_steps_device_parameters_with_decoupled_grad(dtype):
+    """``offload_fraction`` 0.5 with gradients in ``decoupled_grad`` only (Megatron-FSDP): the
+    parameters left on the device are stepped too (the device optimizer reads ``.grad``)."""
+    mp.spawn(_partial_offload_worker, args=(_free_port(), dtype), nprocs=WORLD, join=True)
+
+
 PER_ELEMENT_STATE = ("exp_avg", "exp_avg_sq", "master_param")
 
 
