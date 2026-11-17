@@ -33,6 +33,9 @@ bucket published.
 * Teeth, each must fail on step 2: ``early``, a bucket group reduced as soon as its first
   parameter is ready (before the other parameters' last uses); ``stale``, step 2's parameter
   all-gathers skipped (the forward reads last step's weights outside the local shard).
+* Diagnostics, not gated: ``ref_buckets`` (``ref`` with the overlap arms' buckets, no overlap)
+  and ``ovl_rs`` (overlapped reduce-scatter, no overlapped parameter gather) gated at step 2
+  against ``ref`` and printed, with every arm's step-2 weights compared to ``ref``'s.
 
 Launch: ``torchrun --nproc-per-node 2 -m pytest -q tests/unit_tests/transformer/loop/
 test_loop_ddp_overlap_gpu.py`` (2 or 4 GPUs; ``LOOP_DDP_EP`` sets the expert-parallel size,
@@ -77,18 +80,22 @@ def _model_parallel():
             torch.use_deterministic_algorithms(False)
 
 
-def _ddp(model, *, overlap, distributed_optimizer):
+def _ddp(model, *, overlap, distributed_optimizer, param_gather=None, small_buckets=None):
+    """``param_gather`` and ``small_buckets`` (both default ``overlap``) split the overlap arms'
+    settings for the diagnostic arms."""
     from megatron.core.distributed import DistributedDataParallel, DistributedDataParallelConfig
     from megatron.core.process_groups_config import ProcessGroupCollection
 
+    param_gather = overlap if param_gather is None else param_gather
+    small_buckets = overlap if small_buckets is None else small_buckets
     return DistributedDataParallel(
         model.config,
         DistributedDataParallelConfig(
             overlap_grad_reduce=overlap,
-            overlap_param_gather=overlap and distributed_optimizer,
+            overlap_param_gather=param_gather and distributed_optimizer,
             use_distributed_optimizer=distributed_optimizer,
             grad_reduce_in_fp32=True,
-            bucket_size=BUCKET_SIZE if overlap else None,
+            bucket_size=BUCKET_SIZE if small_buckets else None,
         ),
         model,
         pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
@@ -145,13 +152,13 @@ def _early_dispatch():
     return early
 
 
-def _run(state, *, overlap, distributed_optimizer, mutation=None):
+def _run(state, *, overlap, distributed_optimizer, mutation=None, **ddp_options):
     """``STEPS`` steps of one arm; returns ``[(step result, grads)]`` per step and the dispatch
-    record."""
+    record, with the bf16 weights the last step ran on (``weights``)."""
     from megatron.core.distributed.param_and_grad_buffer import _ParamAndGradBucketGroup
 
     model = sgu.build_model(state, expert_model_parallel_size=EP)
-    ddp = _ddp(model, overlap=overlap, distributed_optimizer=distributed_optimizer)
+    ddp = _ddp(model, overlap=overlap, distributed_optimizer=distributed_optimizer, **ddp_options)
     optimizer = sgu.optimizer(ddp)
     out = []
     original_start_param_sync = _ParamAndGradBucketGroup.start_param_sync
@@ -182,9 +189,12 @@ def _run(state, *, overlap, distributed_optimizer, mutation=None):
         step: [recorder.hook_dispatches.get((step, id(group)), 0) for group in groups]
         for step in range(STEPS)
     }
+    # Every bucket's all-gather has been waited on by the end of the last step's forward, so
+    # these are the weights that step ran on (without overlap: gathered in the optimizer step).
+    weights = {name: param.detach().clone() for name, param in model.named_parameters()}
     del optimizer, ddp, model
     torch.cuda.empty_cache()
-    return out, dict(dispatches=dispatches, golden=golden, groups=len(groups))
+    return out, dict(dispatches=dispatches, golden=golden, groups=len(groups), weights=weights)
 
 
 @pytest.fixture(scope="module")
@@ -197,6 +207,10 @@ def results():
     out["ovl_ddp"] = _run(state, overlap=True, distributed_optimizer=False)
     out["early"] = _run(state, overlap=True, distributed_optimizer=True, mutation="early")
     out["stale"] = _run(state, overlap=True, distributed_optimizer=True, mutation="stale")
+    # Diagnostics (not gated): the overlap arms' bucket boundaries without any overlap, and the
+    # overlapped reduce-scatter without the overlapped parameter gather.
+    out["ref_buckets"] = _run(state, overlap=False, distributed_optimizer=True, small_buckets=True)
+    out["ovl_rs"] = _run(state, overlap=True, distributed_optimizer=True, param_gather=False)
     return out
 
 
@@ -239,6 +253,42 @@ def test_every_bucket_group_reduces_once_from_its_hook(results, arm):
     assert record["dispatches"][0] == [0] * record["groups"], record
     assert record["dispatches"][1] == [1] * record["groups"], record
     assert all(values and values[0] >= 1 for values in record["golden"]), record["golden"]
+
+
+@pytest.mark.parametrize("arm", ["ref_buckets", "ovl_rs", "ovl", "ovl_ddp"])
+def test_report_step_two_diagnostics(results, arm):
+    """Diagnostic only (prints, asserts nothing): which part of an overlap arm moves step 2.
+
+    * ``ref_buckets``: ``ref`` with the overlap arms' bucket boundaries and no overlap, i.e.
+      how far step 2 moves from a step-1 gradient that differs only by fp32 reassociation;
+    * ``ovl_rs``: the overlapped reduce-scatter without the overlapped parameter gather;
+    * every arm: the bf16 weights its last step ran on against ``ref``'s (equal weights with
+      different losses on some ranks would mean a forward read weights other than these).
+    """
+    _, reference = results["ref"][0][1]
+    _, grads = results[arm][0][1]
+    report, failing = sgu.report_and_fail(
+        _name(f"{arm} step 2 vs ref (diagnostic)"), grads, reference
+    )
+    print(f"[{_name(arm)}] step 2 failing {len(failing)} of {len(report)}", flush=True)
+    ref_weights = results["ref"][1]["weights"]
+    weights = results[arm][1]["weights"]
+    differing = {
+        name: int((weights[name] != ref_weights[name]).sum().item())
+        for name in ref_weights
+        if not torch.equal(weights[name], ref_weights[name])
+    }
+    worst = sorted(differing.items(), key=lambda item: -item[1])[:8]
+    print(
+        f"[{_name(arm)}] step-2 weights differ from ref in {len(differing)} of "
+        f"{len(ref_weights)} params ({sum(differing.values())} elements): {worst}",
+        flush=True,
+    )
+    for step in range(STEPS):
+        rel = sgu.mbs.relative_loss_differences(
+            results[arm][0][step][0].losses, results["ref"][0][step][0].losses
+        )
+        print(f"[{_name(f'{arm} step {step + 1}')}] losses rel {rel} (diagnostic)", flush=True)
 
 
 @pytest.mark.parametrize("mutation", ["early", "stale"])
