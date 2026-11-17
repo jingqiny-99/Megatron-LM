@@ -331,6 +331,9 @@ class HybridDeviceOptimizer(torch.optim.Optimizer):
             param for param in self.gpu_params_map_cpu_copy if _is_dtensor(param)
         }
         self._dtensor_state_specs = {}
+        # (parameter, state key) -> (host tensor, its DTensor view), rebuilt only when the host
+        # tensor changes (the first step, a load).
+        self._dtensor_state_views = {}
 
         self.cpu_optimizers = []
         if self.overlap_cpu_optimizer_d2h_h2d:
@@ -487,10 +490,18 @@ class HybridDeviceOptimizer(torch.optim.Optimizer):
                     new_state[orig_param]["master_param"] = param
         self.state = new_state
 
-    def _dtensor_like(self, orig_param, host_tensor):
+    def _dtensor_like(self, orig_param, host_tensor, state_key=None):
         """A DTensor with ``orig_param``'s mesh, placements, global shape and stride over
         ``host_tensor`` (a tensor of this rank's local shard shape, on the host): no copy and no
-        communication; ``host_tensor`` keeps its device and dtype."""
+        communication; ``host_tensor`` keeps its device and dtype. With ``state_key``, the view
+        is cached while the state key holds the same host tensor (no new DTensor per step)."""
+        if state_key is not None:
+            cached = self._dtensor_state_views.get((orig_param, state_key))
+            if cached is not None and cached[0] is host_tensor:
+                return cached[1]
+            view = self._dtensor_like(orig_param, host_tensor)
+            self._dtensor_state_views[(orig_param, state_key)] = (host_tensor, view)
+            return view
         key = (orig_param, host_tensor.dtype)
         spec = self._dtensor_state_specs.get(key)
         if spec is None:
@@ -511,7 +522,7 @@ class HybridDeviceOptimizer(torch.optim.Optimizer):
         ``master_param`` (the fp32 host copy) is added only for a parameter of lower precision
         (one in ``param_to_fp32_param``), whose master holds more than the parameter. An fp32
         parameter (a Megatron-FSDP main weight) is its own master: the model checkpoint holds
-        it, the host copy is re-made from it after a load, and a separate ``master_param``
+        it, the host copy is refreshed from it after a load, and a separate ``master_param``
         would duplicate it in the checkpoint and could override it (a checkpoint without the
         key, e.g. written with the GPU optimizer, would leave a stale one)."""
         view = {}
@@ -522,10 +533,10 @@ class HybridDeviceOptimizer(torch.optim.Optimizer):
                 and not _is_dtensor(value)
                 and value.shape == host_param.shape
             ):
-                value = self._dtensor_like(orig_param, value)
+                value = self._dtensor_like(orig_param, value, key)
             view[key] = value
         if self.param_update_in_fp32 and orig_param in self.param_to_fp32_param:
-            view["master_param"] = self._dtensor_like(orig_param, host_param)
+            view["master_param"] = self._dtensor_like(orig_param, host_param, "master_param")
         return view
 
     def _sync_hdo_state_to_sub_optimizers(self):

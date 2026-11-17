@@ -263,6 +263,7 @@ def _step_matches_reference_worker(rank, port, dtype, dtensor, fused, grad_attr,
         assert not any(isinstance(tensor, DTensor) for tensor in pinned)
 
         masters, reference = _reference(rank, dtype, fused)
+        views = None
         for step in range(STEPS):
             grads = _grads(step, rank, dtype)
             hdo.zero_grad()
@@ -271,6 +272,17 @@ def _step_matches_reference_worker(rank, port, dtype, dtensor, fused, grad_attr,
                 master.grad = None if grad is None else grad.float()
             hdo.step()
             reference.step()
+            # The DTensor views of the state are built once, not at every step.
+            current = {
+                (index, key): value
+                for index, param in enumerate(params)
+                for key, value in hdo.state.get(param, {}).items()
+                if isinstance(value, DTensor)
+            }
+            assert bool(current) == dtensor, (dtensor, len(current))
+            if views is not None:
+                assert all(current[k] is v for k, v in views.items()), step
+            views = current
             for index, (param, master) in enumerate(zip(params, masters)):
                 local = _local(param)
                 assert type(local) is torch.Tensor
