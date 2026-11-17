@@ -38,10 +38,11 @@ core weight is used 4 times per microbatch, in the forward and again in the bloc
   gradient zero to fp32 precision: absolute, at most 1e-6 of the whole gradient's norm); the
   losses of both steps and every row's LM loss equal ``ref``'s within 1e-6. Before step 2 is
   gated, the precondition: no GTP reduce-scatter was pending at the forcing, the forced gradient
-  reads back on every rank, and every weight step 2 ran on equals ``ref``'s bitwise (a GTP
+  reads back on every rank, and every weight at the end of step 2 (the step-1 update the
+  optimizer installed; a GTP shard is gathered per use from it) equals ``ref``'s exactly (a GTP
   shard: its rows of the zero-padded weight, so the padding rows stay zero).
 * Given the same step-1 gradient the un-forced ``gtp`` path agrees at step 2: ``gtp_unforced``
-  against ``ref_from_gtp`` (``ref`` stepping on its step-1 gradient), from bitwise-equal
+  against ``ref_from_gtp`` (``ref`` stepping on its step-1 gradient), from exactly equal
   weights. The un-forced step 2 against ``ref`` is printed (diagnostic).
 * Reduce-scatters per GTP weight (a dense weight, or a grouped expert projection's leading
   weight) and microbatch: 4 for a core weight, 1 for a prelude or coda weight (one per use).
@@ -250,7 +251,7 @@ class _Instrument:
 
 def _run_reference(state, ep=1, forced=None):
     """``STEPS`` steps without GTP; returns ``[(step result, grads)]`` and a record: the full
-    weights the last step ran on (``weights``) and, with ``forced`` (step-1 gradients to step
+    weights at the end of the last step (``weights``) and, with ``forced`` (step-1 gradients to step
     on: the teacher forcing), the read-back count (``readback``)."""
     _initialize(1, ep=ep)
     model = sgu.build_model(state, expert_model_parallel_size=ep)
@@ -289,11 +290,11 @@ def _run_gtp(
     forced=None,
 ):
     """``steps`` steps of one GTP arm; returns ``[(step result, grads, record)]`` and the info:
-    the GTP names and consumers, the overlap's recorded counts, the weights the last step ran on
-    (``weights``; GTP shards) with each GTP shard's layout (``layout``) and, with ``forced``
-    (full step-1 gradients to step on: the teacher forcing), the GTP reduce-scatters still
-    pending at the forcing (``pending``) and the read-back count (``readback``), both agreed
-    over the ranks."""
+    the GTP names and consumers, the overlap's recorded counts, the weights at the end of the
+    last step (``weights``; GTP shards) with each GTP shard's layout (``layout``) and, with
+    ``forced`` (full step-1 gradients to step on: the teacher forcing), the GTP reduce-scatters
+    still pending at the forcing (``pending``) and the read-back count (``readback``), both
+    agreed over the ranks."""
     from megatron.core.tensor_parallel import generalized_tensor_parallelism as gtp
     from megatron.core.tensor_parallel.generalized_tensor_parallelism import GTP_CONFIG
     from megatron.core.tensor_parallel.gtp_api import (
@@ -434,8 +435,8 @@ def results():
 
 
 def _start_mismatches(info, reference):
-    """Where the weights a GTP arm's step 2 ran on (``info["weights"]``, GTP shards) differ
-    bitwise from ``reference``'s full weights, each GTP shard against its rows of the
+    """Where the weights at the end of a GTP arm's step 2 (``info["weights"]``, GTP shards)
+    differ from ``reference``'s full weights, each GTP shard against its rows of the
     zero-padded weight (local)."""
     expected = {}
     for name, value in info["weights"].items():
@@ -451,8 +452,8 @@ def _name(text):
 
 def _assert_forced(results, arm):
     """The teacher-forcing precondition of a GTP arm: no GTP reduce-scatter pending at the
-    forcing, the forced gradient read back, and the weights step 2 ran on equal to its
-    reference's (a GTP shard: its rows) bitwise."""
+    forcing, the forced gradient read back, and the weights at the end of step 2 equal to its
+    reference's (a GTP shard: its rows) exactly."""
     info = results[arm][1]
     assert (
         info["pending"] == 0
@@ -489,7 +490,7 @@ def test_losses_match_the_reference(results, arm):
 
 def test_step_two_agrees_given_the_same_step_one_gradient(results):
     """The un-forced path: ``gtp_unforced`` steps on its own step-1 gradient and
-    ``ref_from_gtp`` (``ref``) on that same gradient. From bitwise-equal weights, their step-2
+    ``ref_from_gtp`` (``ref``) on that same gradient. From exactly equal weights, their step-2
     gradients pass the gate and their losses are equal."""
     sgu.assert_teacher_forced(
         results["ref_from_gtp"][1]["forcing"], "ref_from_gtp", "gtp_unforced's"
