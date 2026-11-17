@@ -332,27 +332,41 @@ def assert_losses_match(step, reference, name):
 
 
 SGD_LR = 0.1
+# The distributed optimizer refuses torch/TE SGD (DistributedOptimizer.__init__ takes Adam or an
+# optimizer with an init_state_fn, for checkpointing), so SGD without momentum runs as Adam with
+# beta1 = beta2 = 0 (m = g, v = g * g, both bias corrections 1) and an eps far above every
+# gradient entry: the update lr * g / (|g| + eps) is SGD_LR * g / (1 + |g| / eps), i.e.
+# SGD_LR * g to fp32 rounding while |g| < 4 (half an fp32 ulp of 1e8). 1e8 and SGD_LR * 1e8 are
+# exact in fp32. Every arm, with or without the distributed optimizer, uses the same optimizer.
+SGD_ADAM_EPS = 1e8
+SGD_AS_ADAM = dict(
+    optimizer="adam",
+    lr=SGD_LR * SGD_ADAM_EPS,
+    adam_beta1=0.0,
+    adam_beta2=0.0,
+    adam_eps=SGD_ADAM_EPS,
+)
 # Step 2 runs on weights updated from fp32-reassociated step-1 gradients.
 STEP2_LOSS_RELATIVE = 1e-5
 
 
 def optimizer(wrapped, **overrides):
     """A Megatron optimizer over ``wrapped`` (DDP or Megatron-FSDP): SGD without momentum by
-    default, so the step-2 weights are a plain function of step 1's gradients;
-    ``overrides``: further ``OptimizerConfig`` fields (e.g. the CPU-offloaded Adam)."""
+    default (``SGD_AS_ADAM``), so the step-2 weights are a plain function of step 1's gradients;
+    ``overrides``: further ``OptimizerConfig`` fields (e.g. the CPU-offloaded Adam). An override
+    that names ``optimizer`` replaces the SGD emulation as a whole."""
     from megatron.core.optimizer import OptimizerConfig, get_megatron_optimizer
     from megatron.core.process_groups_config import ProcessGroupCollection
 
     fields = dict(
-        optimizer="sgd",
-        lr=SGD_LR,
-        sgd_momentum=0.0,
         weight_decay=0.0,
         clip_grad=0.0,
         use_distributed_optimizer=wrapped.ddp_config.use_distributed_optimizer,
         bf16=True,
         params_dtype=torch.bfloat16,
     )
+    if "optimizer" not in overrides:
+        fields.update(SGD_AS_ADAM)
     fields.update(overrides)
     return get_megatron_optimizer(
         OptimizerConfig(**fields),

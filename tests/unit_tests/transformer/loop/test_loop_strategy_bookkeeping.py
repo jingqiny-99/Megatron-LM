@@ -13,6 +13,8 @@
   when every parameter reached its count, and a count above it raises instead of losing a use.
 * The GPU tests' Megatron-FSDP gradient reader (``strategy_grad_utils.fsdp_bucket_part``) on
   emulated buffers: every strategy, and DP-Outer sharding's logical shard order.
+* The GPU tests' optimizer (``strategy_grad_utils.SGD_AS_ADAM``): Adam that steps as SGD without
+  momentum, since the distributed optimizer refuses SGD.
 
 The GPU tests of the same paths are ``test_loop_gtp_gpu.py`` and ``test_loop_ddp_overlap_gpu.py``.
 """
@@ -310,3 +312,41 @@ def test_fsdp_bucket_part_of_a_replicated_bucket_is_the_whole_bucket():
     )
     part, partial = sgu.fsdp_bucket_part(gbuf, "no_shard")
     assert not partial and torch.equal(part, data)
+
+
+# ---------------------------------------------------------------------------------------------
+# The GPU tests' optimizer (strategy_grad_utils.SGD_AS_ADAM)
+# ---------------------------------------------------------------------------------------------
+
+
+def test_sgd_as_adam_steps_as_sgd_without_momentum():
+    """The distributed optimizer refuses SGD, so the GPU tests run SGD without momentum as Adam
+    (beta1 = beta2 = 0, eps far above the gradients): every step's update equals SGD's to fp32
+    rounding, also on a step after another (no momentum, no bias-correction drift)."""
+    from megatron.core.optimizer import OptimizerConfig
+    from tests.unit_tests.transformer.loop import strategy_grad_utils as sgu
+
+    config = OptimizerConfig(**sgu.SGD_AS_ADAM)
+    assert config.optimizer == "adam"
+    generator = torch.Generator().manual_seed(0)
+    adam_param = torch.nn.Parameter(torch.zeros(4096))
+    sgd_param = torch.nn.Parameter(torch.zeros(4096))
+    adam = torch.optim.Adam(
+        [adam_param],
+        lr=config.lr,
+        betas=(config.adam_beta1, config.adam_beta2),
+        eps=config.adam_eps,
+        weight_decay=0.0,
+    )
+    sgd = torch.optim.SGD([sgd_param], lr=sgu.SGD_LR, momentum=0.0)
+    # Each step starts from zero weights, so the weights after it are the update itself (no
+    # cancellation hides a wrong update); entries reach ~12 at scale 3, past |g| < 4.
+    for scale in (1e-6, 1.0, 3.0):
+        grad = torch.randn(4096, generator=generator) * scale
+        for param in (adam_param, sgd_param):
+            param.data.zero_()
+            param.grad = grad.clone()
+        adam.step()
+        sgd.step()
+        torch.testing.assert_close(adam_param.detach(), sgd_param.detach(), rtol=1e-6, atol=0.0)
+        torch.testing.assert_close(adam_param.detach(), -0.1 * grad, rtol=1e-6, atol=0.0)

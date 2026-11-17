@@ -3,8 +3,8 @@
 """DDP communication overlap on a fixed-depth DSv4 loop (GPU; the lifted guard
 ``validate_loop_ddp_config``).
 
-Two training steps (SGD, so the second step's weights are a plain function of the first step's
-gradients) of the model of ``strategy_grad_utils`` (a core of 8 sublayers run exactly 4 times,
+Two training steps (SGD without momentum, run as Adam: ``strategy_grad_utils.SGD_AS_ADAM``; so
+the second step's weights are a plain function of the first step's gradients) of the model of ``strategy_grad_utils`` (a core of 8 sublayers run exactly 4 times,
 block + edge ``loop_recompute`` with stride 4, three microbatches of one row per rank, per-token
 loss, ``finalize_model_grads``), from the same weights and rows in every arm:
 
@@ -59,7 +59,6 @@ pytestmark = pytest.mark.skipif(
     reason="DSv4 / MoE layers need CUDA; overlap needs data parallelism (W >= 2)",
 )
 
-LR = 0.1
 BUCKET_SIZE = 200_000  # elements: several bucket groups for the tiny model
 STEPS = 2
 STEP2_LOSS_RELATIVE = 1e-5  # step 2 runs on weights updated from fp32-reassociated gradients
@@ -92,27 +91,6 @@ def _ddp(model, *, overlap, distributed_optimizer):
             bucket_size=BUCKET_SIZE if overlap else None,
         ),
         model,
-        pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
-    )
-
-
-def _optimizer(ddp):
-    from megatron.core.optimizer import OptimizerConfig, get_megatron_optimizer
-    from megatron.core.process_groups_config import ProcessGroupCollection
-
-    return get_megatron_optimizer(
-        OptimizerConfig(
-            optimizer="sgd",
-            lr=LR,
-            sgd_momentum=0.0,
-            weight_decay=0.0,
-            clip_grad=0.0,
-            use_distributed_optimizer=ddp.ddp_config.use_distributed_optimizer,
-            bf16=True,
-            params_dtype=torch.bfloat16,
-        ),
-        [ddp],
-        use_gloo_process_groups=False,
         pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
     )
 
@@ -174,7 +152,7 @@ def _run(state, *, overlap, distributed_optimizer, mutation=None):
 
     model = sgu.build_model(state, expert_model_parallel_size=EP)
     ddp = _ddp(model, overlap=overlap, distributed_optimizer=distributed_optimizer)
-    optimizer = _optimizer(ddp)
+    optimizer = sgu.optimizer(ddp)
     out = []
     original_start_param_sync = _ParamAndGradBucketGroup.start_param_sync
     with _DispatchRecorder() as recorder:
