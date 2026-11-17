@@ -40,10 +40,12 @@ optimizer step, weight install, gradient-buffer reset, gathers and step 2.
   whole gradient's norm); the losses of both steps and every row's LM loss equal ``ref``'s
   within 1e-6. Before step 2 is gated, the precondition: the forced gradient reads back on every
   rank, and the fp32 main weights the arm's optimizer produced (this rank's slices) and the
-  persistent buffers equal ``ref``'s masters and buffers bitwise.
+  persistent buffers equal ``ref``'s masters and buffers exactly. The compute weights the
+  optimizer step installed (this rank's shard of every model weight buffer) equal ``ref``'s bf16
+  weights after that step exactly (a test of its own).
 * Given the same step-1 gradient the un-forced ``per_use`` path agrees at step 2:
   ``per_use_unforced`` against ``ref_from_per_use`` (``ref`` stepping on its step-1 gradient),
-  from bitwise-equal main weights. The un-forced step 2 against ``ref`` is printed (diagnostic).
+  from exactly equal main weights. The un-forced step 2 against ``ref`` is printed (diagnostic).
 * The recorded reductions, every step: every bucket's DP-Shard size is the layout's; a bucket
   whose strategy shards gradients over more than one rank is reduced by the gradient hooks
   exactly once per microbatch, a core bucket also once after each earlier use (3, or 4 when a
@@ -58,7 +60,7 @@ optimizer step, weight install, gradient-buffer reset, gathers and step 2.
   gradient TE accumulates in place. ``skip_use`` (the second per-use reduction of every bucket
   in the first microbatch is dropped and its bucket freed unreduced) must fail every such weight
   whose bucket is reduced per use, and leave those reduced once per step (derived from the
-  layout, equal to those observed on the ``per_use`` arm) bitwise equal to the ``per_use``
+  layout, equal to those observed on the ``per_use`` arm) exactly equal to the ``per_use``
   arm's. ``outer_never`` (no DP-Outer reduction) must fail every fused core weight, the
   once-per-step ones included (some at ``EP = W / 2``, none at ``EP = 1``).
 
@@ -69,6 +71,7 @@ experts are sharded over DP-Shard as well). ``MBS_REPORT_DIR`` dumps every per-p
 """
 
 import os
+import traceback
 
 import pytest
 import torch
@@ -251,14 +254,15 @@ class _Instrumentation:
 
 def _run_ddp(state, forced=None):
     """``STEPS`` steps of the DDP reference; returns ``[(step result, grads)]`` and a record:
-    the core's fused-wgrad weight names (``fused``), the fp32 masters after the step-1 update
-    (``masters``), the persistent buffers step 2 starts with (``buffers``) and, with ``forced``
-    (step-1 gradients to step on: the teacher forcing), the read-back count (``readback``)."""
+    the core's fused-wgrad weight names (``fused``), the fp32 masters and the model weights
+    (bf16: the masters rounded) after the step-1 update (``masters``, ``weights``), the
+    persistent buffers step 2 starts with (``buffers``) and, with ``forced`` (step-1 gradients
+    to step on: the teacher forcing), the read-back count (``readback``)."""
     model = sgu.build_model(state, expert_model_parallel_size=EP)
     ddp = _ddp(model)
     opt = sgu.optimizer(ddp)
     out = []
-    info = dict(masters=None, buffers=None, readback=None)
+    info = dict(masters=None, weights=None, buffers=None, readback=None)
     for step in range(STEPS):
         opt.zero_grad()
         result = sgu.run_step(ddp, model, sgu.make_rows(step))
@@ -271,6 +275,7 @@ def _run_ddp(state, forced=None):
                 )
             sgu.step_optimizer(opt)
             info["masters"] = sgu.float16_optimizer_masters(opt, model)
+            info["weights"] = {name: p.detach().clone() for name, p in model.named_parameters()}
             info["buffers"] = sgu.persistent_buffers(model)
     info["fused"] = sgu.fused_core_weights(model)
     del opt, ddp, model
@@ -292,14 +297,16 @@ def _run_fsdp(
     """``steps`` steps of one arm; returns ``[(step result, grads)]`` and the record: the
     reductions (``calls``), the gradient-bucket peak, the bucket layout (``buckets``: DP-Shard
     size and roles; names and expert flags), after the step-1 update this rank's fp32 main
-    weight slices (``main``) and the persistent buffers (``buffers``), and with ``forced``
-    (step-1 gradients to step on: the teacher forcing) the read-back count (``readback``) and
-    the optimizer parameters' gradients against ``forced`` (``optimizer_grads``, local)."""
+    weight slices (``main``), its installed compute weight slices (``installed``, or the error
+    reading them under ``installed_error``) and the persistent buffers (``buffers``), and with
+    ``forced`` (step-1 gradients to step on: the teacher forcing) the read-back count
+    (``readback``) and the optimizer parameters' gradients against ``forced``
+    (``optimizer_grads``, local)."""
     model = sgu.build_model(state, expert_model_parallel_size=EP)
     fsdp = _fsdp(model, per_use=per_use, outer=outer, strategy=strategy, expert=expert)
     opt = sgu.optimizer(fsdp)
     out = []
-    record = dict(main=None, buffers=None, readback=None, optimizer_grads=None)
+    record = dict(main=None, installed=None, buffers=None, readback=None, optimizer_grads=None)
     with _Instrumentation(mutation=mutation) as instrumentation:
         for step in range(steps):
             instrumentation.step = step
@@ -317,6 +324,10 @@ def _run_fsdp(
                     record["optimizer_grads"] = sgu.fsdp_optimizer_grad_mismatches(fsdp, forced)
                 sgu.step_optimizer(opt)
                 record["main"] = sgu.fsdp_main_weight_slices(fsdp)
+                try:  # local reads only: an error is kept for the install test to report
+                    record["installed"] = sgu.fsdp_model_weight_slices(fsdp)
+                except Exception:  # pylint: disable=broad-except
+                    record["installed_error"] = traceback.format_exc()
                 record["buffers"] = sgu.persistent_buffers(model)
     layout = sgu.fsdp_bucket_layout(fsdp)
     # {bucket id: (DP-Shard size, roles of its parameters)}.
@@ -378,6 +389,7 @@ def results():
         record = out[arm][1]
         start = sgu.fsdp_start_mismatches(record, out["ref_info"])
         record["forcing"] = sgu.forcing_record(record["readback"], start)
+        record["install"] = sgu.install_record(record, out["ref_info"]["weights"])
     record, info = out["ref_from_per_use_info"], out["per_use_unforced"][1]
     record["forcing"] = sgu.forcing_record(
         record["readback"], sgu.fsdp_start_mismatches(info, record)
@@ -393,10 +405,24 @@ def _name(text):
 def test_step_two_starts_from_the_reference_state(results, arm):
     """The teacher-forcing precondition: the forced gradient read back on every rank, and the
     arm's own optimizer step on it produced ``ref``'s fp32 masters (this rank's slices) and
-    buffers bitwise. On failure, ``optimizer_grads`` names gradients the forcing missed."""
+    buffers exactly. On failure, ``optimizer_grads`` names gradients the forcing missed."""
     record = results[arm][1]
     print(f"[{_name(arm)}] optimizer grads off the forced ones {record['optimizer_grads']}")
     sgu.assert_teacher_forced(record["forcing"], arm)
+
+
+@pytest.mark.parametrize("arm", list(ARMS))
+def test_step_two_runs_on_the_installed_reference_weights(results, arm):
+    """The compute weights the arm's step-1 optimizer step installed (this rank's shard of
+    every model weight buffer, read right after the step) equal ``ref``'s bf16 weights after
+    the same step exactly, on every rank (the check's teeth: ``test_loop_hsdp_gpu.py``'s
+    ``no_install``)."""
+    install = results[arm][1]["install"]
+    assert install["agreed"] == 0, (
+        f"{arm}: the installed compute weights differ from ref's in {len(install['local'])} "
+        f"tensors on this rank ({install['agreed']} on the worst rank)",
+        sorted(install["local"].items())[:8],
+    )
 
 
 @pytest.mark.parametrize("arm", list(ARMS))
@@ -422,7 +448,7 @@ def test_losses_match_the_reference(results, arm):
 
 def test_step_two_agrees_given_the_same_step_one_gradient(results):
     """The un-forced path: ``per_use_unforced`` steps on its own step-1 gradient and
-    ``ref_from_per_use`` (``ref``) on that same gradient. From bitwise-equal fp32 main weights
+    ``ref_from_per_use`` (``ref``) on that same gradient. From exactly equal fp32 main weights
     and buffers, their step-2 gradients pass the gate and their losses are equal."""
     sgu.assert_teacher_forced(
         results["ref_from_per_use_info"]["forcing"], "ref_from_per_use", "per_use_unforced's"
@@ -541,12 +567,14 @@ def _once_per_step(results, mutation):
 
 @pytest.mark.parametrize("mutation", ["overwrite", "skip_use", "outer_never"])
 def test_mutations_fail_on_the_core_fused_weights(results, mutation):
-    """``overwrite`` and ``outer_never`` reach every fused core weight (``overwrite`` zeroes the
-    target shard before every reduction, a once-per-step bucket's whole persistent buffer
-    included); ``skip_use`` drops a per-use reduction, so it must fail every fused core weight
-    whose bucket is reduced per use and leave those reduced once per step bitwise equal to the
-    ``per_use`` arm's. Once-per-step fused weights exist exactly when the experts' DP-Shard
-    group is one rank."""
+    """``overwrite`` and ``outer_never`` reach every fused core weight. ``overwrite`` zeroes the
+    target shard before every reduction; for a once-per-step bucket (a one-rank DP-Shard group)
+    that is its whole persistent buffer before its only reduction, so those weights fail with an
+    all-zero gradient: a degenerate detection, not overwrite-instead-of-add, and ``outer_never``
+    is the check of that path. ``skip_use`` drops a per-use reduction, so it must fail every
+    fused core weight whose bucket is reduced per use and leave those reduced once per step
+    exactly equal to the ``per_use`` arm's. Once-per-step fused weights exist exactly when the
+    experts' DP-Shard group is one rank."""
     _, reference = results["ref"][0]
     _, grads = results[mutation][0][0]
     report, _ = sgu.report_and_fail(_name(f"{mutation} (mutation) vs ref"), grads, reference)
