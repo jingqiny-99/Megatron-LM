@@ -4,6 +4,41 @@ from typing import Dict
 
 import torch
 
+try:
+    from torch.distributed.tensor import DTensor
+except ImportError:  # torch < 2.5
+    try:
+        from torch.distributed._tensor import DTensor
+    except ImportError:
+        DTensor = None
+
+
+def _is_dtensor(tensor) -> bool:
+    return DTensor is not None and isinstance(tensor, DTensor)
+
+
+def _local_data(tensor: torch.Tensor) -> torch.Tensor:
+    """The storage the optimizer reads and writes, outside autograd: ``tensor.data`` of a plain
+    tensor, and this rank's local shard (``to_local()``) of a DTensor, e.g. a Megatron-FSDP v1
+    parameter or gradient, whose local shard is a view of the FSDP main weight / gradient
+    buffer. Writes to the returned tensor land in that storage."""
+    if _is_dtensor(tensor):
+        with torch.no_grad():
+            return tensor.to_local().detach()
+    return tensor.data
+
+
+def _is_device_tensor(tensor: torch.Tensor) -> bool:
+    """Whether ``tensor`` (a DTensor: its local shard) lives on the accelerator, i.e. is a
+    candidate for offloading. The CPU unit tests substitute this to offload CPU tensors."""
+    return _local_data(tensor).is_cuda
+
+
+def _pin_memory(tensor: torch.Tensor) -> torch.Tensor:
+    """Pinned copy of a host tensor (substituted by the CPU unit tests, where there is no CUDA
+    host allocator)."""
+    return tensor.pin_memory()
+
 
 def _param_generator(cpu_optimizer):
     for group in cpu_optimizer.param_groups:
@@ -40,6 +75,13 @@ class HybridDeviceOptimizer(torch.optim.Optimizer):
         This optimizer is particularly useful in scenarios where memory
         constraints are present or when leveraging both CPU and GPU resources
         can lead to performance improvements.
+
+    DTensor parameters (Megatron-FSDP v1, whose optimizer parameters are DTensors over this
+    rank's shard of the main weight buffer): an offloaded DTensor parameter's host copy is a
+    plain tensor holding this rank's local shard (``to_local()``); the gradient's local shard is
+    copied device to host, and the updated host shard is copied back into the parameter's local
+    shard. A DTensor itself is never cloned or pinned. The offload decision counts a
+    parameter's global ``numel()``, so every rank offloads the same parameters.
     """
 
     def __init__(
@@ -113,7 +155,8 @@ class HybridDeviceOptimizer(torch.optim.Optimizer):
                     )
 
                 param.grad = self.cpu_copy_map_grad[param]
-                self.cpu_copy_map_grad[param].data.copy_(grad, non_blocking=True)
+                # A DTensor gradient (Megatron-FSDP): copy this rank's local shard.
+                self.cpu_copy_map_grad[param].data.copy_(_local_data(grad), non_blocking=True)
             self._cpu_optimizer_map_data_event[optimizer] = self._d2h_stream.record_event()
 
     def _register_param_copy_back_gpu_hook(self):
@@ -123,7 +166,8 @@ class HybridDeviceOptimizer(torch.optim.Optimizer):
                 with torch.cuda.stream(self._h2d_stream):
                     for param in _param_generator(optimizer):
                         gpu_param = self.cpu_copys_map_gpu_param[param]
-                        gpu_param.data.copy_(param.data, non_blocking=True)
+                        # A DTensor parameter: into this rank's local shard.
+                        _local_data(gpu_param).copy_(param.data, non_blocking=True)
                 self._h2d_stream.record_event().wait(torch.cuda.current_stream())
 
             return param_copy_back_gpu_hook
@@ -254,8 +298,12 @@ class HybridDeviceOptimizer(torch.optim.Optimizer):
         params = []
         for group in self.param_groups:
             params.extend(group["params"])
+        # A DTensor's numel() is its global numel: the same on every rank, so every rank makes
+        # the same offload decisions.
         params_total_numel = sum([param.numel() for param in params])
-        gpu_params_total_numel = sum([param.numel() for param in params if param.is_cuda])
+        gpu_params_total_numel = sum(
+            [param.numel() for param in params if _is_device_tensor(param)]
+        )
         cpu_params_total_numel = params_total_numel - gpu_params_total_numel
         offload_threshold = gpu_params_total_numel * offload_fraction
         offload_params_numel = 0
@@ -271,10 +319,13 @@ class HybridDeviceOptimizer(torch.optim.Optimizer):
             cpu_group["params"] = []
             for param in group["params"]:
                 orig_param = param
+                on_device = _is_device_tensor(param)
                 cpu_copy = False
-                if offload_params_numel < offload_threshold and param.is_cuda:
-                    param = param.detach().clone().cpu().pin_memory()
-                    offload_params_numel += param.numel()
+                if offload_params_numel < offload_threshold and on_device:
+                    # The host copy of a DTensor parameter is a plain tensor holding this
+                    # rank's local shard; the DTensor itself is never cloned or pinned.
+                    param = _pin_memory(_local_data(param).detach().clone().cpu())
+                    offload_params_numel += orig_param.numel()
                     cpu_copy = True
                 if self.param_update_in_fp32 and param.dtype != torch.float32:
                     param = param.detach().clone().float()
@@ -286,7 +337,8 @@ class HybridDeviceOptimizer(torch.optim.Optimizer):
                     gpu_params_map_cpu_copy[orig_param] = param
                     cpu_copys_map_gpu_param[param] = orig_param
 
-                if param.is_cuda:
+                # The fp32 copy above stays on its source's device.
+                if on_device and not cpu_copy:
                     gpu_group["params"].append(param)
                 else:
                     cpu_group["params"].append(param)
