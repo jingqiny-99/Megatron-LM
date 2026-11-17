@@ -31,6 +31,16 @@ def _get_process_group_ranks(group) -> Optional[Tuple[int, ...]]:
         return None
 
 
+def _group_spans(group, subgroup) -> bool:
+    """Return whether every rank of ``subgroup`` is in ``group`` (``group`` None: the world).
+    False when the ranks cannot be read (distributed not initialized)."""
+    group_ranks = _get_process_group_ranks(group)
+    subgroup_ranks = _get_process_group_ranks(subgroup)
+    if group_ranks is None or subgroup_ranks is None:
+        return False
+    return set(subgroup_ranks) <= set(group_ranks)
+
+
 def _tracker_pp_group_matches(tracker, prefix: str, pp_group) -> bool:
     """Return whether a cached group is the same object or spans the same ordered ranks."""
     cached_group = tracker.get(f"{prefix}_pp_group")
@@ -207,6 +217,7 @@ class DSAIndexerLossLoggingHelper:
         dp_group: Optional[torch.distributed.ProcessGroup] = None,
         pg_collection: Optional[ProcessGroupCollection] = None,
         loop_rounds: Optional[int] = None,
+        gtp_remat_group: Optional[torch.distributed.ProcessGroup] = None,
     ):
         """Collect and reduce the indexer losses across ranks.
 
@@ -232,10 +243,17 @@ class DSAIndexerLossLoggingHelper:
             loop_rounds: The loop's round count: the per-(round, layer) bins (zeros where
                 nothing was recorded) are reduced with the same collectives as the values.
                 Must be the same on every rank.
+            gtp_remat_group: GTP weight-remat group of the language model (``pg_collection.
+                gtp_remat`` when omitted). Its ranks each run their own micro-batches, a second
+                data dimension beside ``dp_group``, so the metric is also averaged over it
+                unless the data-parallel group already spans it (``dp_gtp_remat``, which
+                training passes under the GTP-remat grid).
         """
         if pg_collection is not None:
             pp_group = pg_collection.pp if pp_group is None else pp_group
             dp_group = pg_collection.dp if dp_group is None else dp_group
+            if gtp_remat_group is None:
+                gtp_remat_group = getattr(pg_collection, "gtp_remat", None)
 
         tracker = DSAIndexerLossLoggingHelper.tracker
         if pp_group is None:
@@ -309,6 +327,16 @@ class DSAIndexerLossLoggingHelper:
         if dp_group is None and dynamic_cp_parent_group is None:
             # Legacy fallback; explicit process-group collections are preferred.
             dp_group = parallel_state.get_data_parallel_group(with_context_parallel=False)
+        # GTP remat ranks each carry their own micro-batches: a second data dimension beside
+        # DP (and DP x CP). The groups are orthogonal and of equal size, so averaging over the
+        # GTP group after the DP average gives the mean over every rank holding a distinct
+        # micro-batch. Skip it when the data group already spans the GTP group.
+        data_group = dp_group if dynamic_cp_parent_group is None else dynamic_cp_parent_group
+        average_over_gtp_remat = (
+            gtp_remat_group is not None
+            and get_pg_size(gtp_remat_group) > 1
+            and not _group_spans(data_group, gtp_remat_group)
+        )
         for values in reduced:
             if dynamic_cp_parent_group is not None:
                 torch.distributed.all_reduce(values, group=pp_group)
@@ -329,6 +357,10 @@ class DSAIndexerLossLoggingHelper:
                 torch.distributed.all_reduce(values, group=pp_group)
                 torch.distributed.all_reduce(
                     values, group=dp_group, op=torch.distributed.ReduceOp.AVG
+                )
+            if average_over_gtp_remat:
+                torch.distributed.all_reduce(
+                    values, group=gtp_remat_group, op=torch.distributed.ReduceOp.AVG
                 )
 
     @staticmethod
@@ -412,6 +444,7 @@ class DSAIndexerLossLoggingHelper:
         if pg_collection is not None:
             pp_group = pg_collection.pp if pp_group is None else pp_group
             dp_group = pg_collection.dp if dp_group is None else dp_group
+        gtp_remat_group = getattr(pg_collection, "gtp_remat", None)
 
         DSAIndexerLossLoggingHelper.reduce_loss_in_tracker(
             num_layers=num_layers,
@@ -419,8 +452,9 @@ class DSAIndexerLossLoggingHelper:
             configured_cp_size=configured_cp_size,
             pp_group=pp_group,
             dp_group=dp_group,
-            # Only pass the loop keyword when set: keeps the pre-loop call shape.
+            # Only pass the loop and GTP keywords when set: keeps the pre-loop call shape.
             **({} if loop_rounds is None else {"loop_rounds": loop_rounds}),
+            **({} if gtp_remat_group is None else {"gtp_remat_group": gtp_remat_group}),
         )
         tracker = DSAIndexerLossLoggingHelper.tracker
         if "values" not in tracker:
