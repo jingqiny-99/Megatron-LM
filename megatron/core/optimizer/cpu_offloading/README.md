@@ -18,9 +18,17 @@ Under Megatron-FSDP (v1) the optimizer parameters are DTensors over each rank's 
 main weight buffer. The offloaded optimizer keeps a plain host copy of each parameter's local
 shard (`to_local()`), copies the gradient's local shard to the host, steps there, and copies the
 updated shard back into the parameter's local shard; it never pins or clones a DTensor. Its
-`state` shows each offloaded parameter's moments and `master_param` as DTensors with the
-parameter's mesh and placements over the host tensors, so `--ckpt-format fsdp_dtensor` saves
-them sharded like the parameter and loads them in place on the host.
+`state` shows each offloaded parameter's moments as DTensors with the parameter's mesh and
+placements over the host tensors, so `--ckpt-format fsdp_dtensor` saves them sharded like the
+parameter (the SwiGLU, GDN and MLA splits of fused parameters included) and loads them in place
+on the host. An fp32 parameter (a Megatron-FSDP main weight) is its own master and has no
+`master_param`; a lower-precision parameter's fp32 master is saved as `master_param`. With an
+offload fraction below 1, the parameters left on the GPU are stepped from `decoupled_grad`.
+
+The host copies and host gradient buffers are carved out of power-of-two pinned slabs (at least
+256 MiB each), because torch's pinned-memory allocator rounds every allocation up to a power of
+two. `--no-pin-cpu-params` and `--no-pin-cpu-grads` turn the pinning off. A checkpoint load
+keeps the host buffers.
 
 ## Chunked GPU optimizer-state offload
 
