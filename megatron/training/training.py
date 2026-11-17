@@ -6662,6 +6662,30 @@ def loop_rsbf_status_group(args):
     return mpu.get_data_parallel_group_gloo(with_context_parallel=False)
 
 
+def reduces_grads_during_backward(model_chunk) -> bool:
+    """Whether ``model_chunk`` reduces gradients from its backward hooks, so the schedule must
+    wrap every microbatch but the last in its ``no_sync()`` (``config.no_sync_func``).
+
+    MFSDP v2 always reduces gradients during backward -- that is how FSDP shards them -- and
+    defers only the DP-outer axis to the last microbatch, so it needs no_sync_func to know which
+    backward that is. Without it every backward finalizes that axis, the accumulation buffer is
+    dropped, and only the last microbatch's gradient survives.
+
+    DDP and MFSDP v1 reduce during backward when their ``ddp_config.overlap_grad_reduce`` is on.
+    That is the wrapper's config, not ``args.overlap_grad_reduce``: MFSDP v1 turns it on itself
+    for the gradient-sharding strategies (``optim_grads`` / ``optim_grads_params``,
+    ``MegatronFSDP.__init__``). There it reduces over DP-Outer (HSDP / HFSDP) only in the
+    backward it sees as the last microbatch's (``is_last_microbatch``, set by ``no_sync()``
+    on exit), so without no_sync_func the DP-Outer reduction never runs and every instance
+    steps on its own instance's gradient sum.
+    """
+    if isinstance(model_chunk, FullyShardedDataParallelV2):
+        return True
+    if isinstance(model_chunk, (FullyShardedDataParallelV1, DDP)):
+        return bool(model_chunk.ddp_config.overlap_grad_reduce)
+    return False
+
+
 def train(
     forward_step_func,
     model,
@@ -6871,15 +6895,7 @@ def train(
     # Setup some training config params.
     config.grad_scale_func = optimizer.scale_loss if optimizer is not None else None
     config.timers = timers
-    # MFSDP v2 always reduces gradients during backward -- that is how FSDP shards them --
-    # and defers only the DP-outer axis to the last microbatch, so it needs no_sync_func to
-    # know which backward that is. Without it every backward finalizes that axis, the
-    # accumulation buffer is dropped, and only the last microbatch's gradient survives.
-    # DDP and MFSDP v1 instead reduce during backward only when overlap_grad_reduce is on,
-    # so without that flag there is nothing for no_sync to suppress.
-    if isinstance(model[0], FullyShardedDataParallelV2) or (
-        isinstance(model[0], (FullyShardedDataParallelV1, DDP)) and args.overlap_grad_reduce
-    ):
+    if reduces_grads_during_backward(model[0]):
         assert config.no_sync_func is None, (
             'When overlap_grad_reduce is True, config.no_sync_func must be None; '
             'a custom no_sync_func is not supported when overlapping grad-reduce'
