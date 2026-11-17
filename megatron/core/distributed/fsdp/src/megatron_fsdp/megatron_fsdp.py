@@ -295,6 +295,19 @@ class MegatronFSDP(torch.nn.Module):
         self.accumulate_main_grad = bool(
             getattr(self.ddp_config, "megatron_fsdp_accumulate_main_grad", False)
         )
+        # Per-use reduce-scatter mode: every backward use of an FSDP unit reduce-scatters the
+        # unit's sharded gradient buckets (see _reduce_scatter_use).
+        self.reduce_scatter_per_use = bool(
+            getattr(self.ddp_config, "megatron_fsdp_reduce_scatter_per_use", False)
+        )
+        if self.reduce_scatter_per_use and not self.accumulate_main_grad:
+            # Each use's reduction must start from a zeroed bucket that every gradient of the
+            # use adds into (a bucket also holds parameters whose gradients arrive only after
+            # their last use).
+            raise ValueError(
+                "[Megatron-FSDP] megatron_fsdp_reduce_scatter_per_use requires "
+                "megatron_fsdp_accumulate_main_grad."
+            )
 
         # FSDPDistributedIndex stores the process groups and meshes used by Megatron-FSDP.
         # If not provided, Megatron-FSDP will default to a simple data parallel index
@@ -421,6 +434,35 @@ class MegatronFSDP(torch.nn.Module):
         reduced once per optimization cycle always accumulates (its buffer is persistent).
         """
         return self._reduces_grad_every_backward(param) and not self.accumulate_main_grad
+
+    def _reduce_scatter_use(self, module):
+        """
+        Per-use reduce-scatter mode (``megatron_fsdp_reduce_scatter_per_use``): reduce-scatter
+        what one backward use of the FSDP unit ``module`` added into its sharded gradient
+        buckets. Runs from the unit's post-backward hook, once per call of the unit.
+
+        Accumulate mode alone keeps a parameter's unsharded gradient bucket from its first
+        backward use to its last, where its ``register_post_accumulate_grad_hook`` reduces it:
+        a loop core's buckets all stay alive across the rounds. Here every use's gradients are
+        reduced into the sharded main gradient (which accumulates) and the bucket is freed
+        before the next use writes again (``GradReducePipeline.before_main_grad_fetch``), so
+        the next use starts from a fresh, zeroed bucket. The gradient hooks still reduce the
+        buckets after their parameters' last use, with the DP-Outer reduction on the last
+        microbatch; a bucket they already reduced in this backward is skipped here. Gradients
+        that arrive only at a hook (parameters without fused weight-gradient accumulation) are
+        part of that last reduction. Every gradient written into a bucket is therefore reduced
+        exactly once.
+        """
+        param_to_group = self.param_and_grad_buffer.param_to_param_group
+        bucket_ids = {
+            param_to_group[param]
+            for param in module.parameters()
+            if self._reduces_grad_every_backward(param)
+        }
+        if bucket_ids:
+            self.grad_reduce_pipeline.reduce_scatter_use(
+                sorted(bucket_ids), suggested_queue_capacity=self.suggested_RS_queue_capacity
+            )
 
     def _accumulate_grad(self, param):
         """
@@ -783,6 +825,12 @@ class MegatronFSDP(torch.nn.Module):
             # Transition this module back to the IDLE training state.
             for sub_module in module.modules():
                 sub_module._training_state = TrainingState.IDLE
+
+        @torch.compiler.disable
+        def _post_backward_reduce_scatter_use(module, *unused):
+            """Post-backward hook of an FSDP unit in per-use reduce-scatter mode: reduce the
+            gradients of this backward use of the unit (one call of its forward)."""
+            self._reduce_scatter_use(module)
 
         @torch.compiler.disable
         def _process_post_backward_gradients(param_list):
@@ -1225,6 +1273,17 @@ class MegatronFSDP(torch.nn.Module):
                         module.register_forward_pre_hook(
                             functools.partial(
                                 _register_post_backward_hook, _post_backward_release_module
+                            ),
+                            with_kwargs=True,
+                        )
+                    )
+                if self.reduce_scatter_per_use:
+                    # Registered on every call of the unit, so it fires after every backward
+                    # use (each call's inputs get their own post-backward function).
+                    self.forward_pre_hooks[f"module {name} register per-use reduce-scatter"] = (
+                        module.register_forward_pre_hook(
+                            functools.partial(
+                                _register_post_backward_hook, _post_backward_reduce_scatter_use
                             ),
                             with_kwargs=True,
                         )

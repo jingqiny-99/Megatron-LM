@@ -3380,9 +3380,10 @@ class ParamAndGradBuffer:
                     # Get gradient buffer and item ID.
                     gbuf = p._gbuf
                     item_id = p._item_id
-                    # Need to free a bucket for the incoming bucket if double-buffering.
-                    p._megatron_fsdp_model.grad_reduce_pipeline._enforce_double_buffer_limit(
-                        [gbuf.bucket_id]
+                    # Need to free a bucket for the incoming bucket if double-buffering, and
+                    # to finish a per-use reduction of the bucket (per-use reduce-scatter mode).
+                    p._megatron_fsdp_model.grad_reduce_pipeline.before_main_grad_fetch(
+                        gbuf.bucket_id
                     )
                     # Make sure main_grad memory is allocated when initially accessed.
                     # When gradients are sharded, we can pre-allocate a communication
@@ -4243,6 +4244,14 @@ class GradReducePipeline:
         self.bucket_grad_ready_params = [set() for _ in range(self.buffer.num_buckets)]
         self.rs_stream = rs_stream
         self.check_nans = check_nans
+        # Per-use reduce-scatter mode (megatron_fsdp_reduce_scatter_per_use): every backward use
+        # of an FSDP unit reduce-scatters the unit's sharded buckets (reduce_scatter_use). The
+        # buckets already reduced after their parameters' last use in this backward
+        # (reduce_gradients) are skipped by later per-use reductions until reset().
+        self.reduce_scatter_per_use = bool(
+            getattr(self.buffer.ddp_config, "megatron_fsdp_reduce_scatter_per_use", False)
+        )
+        self._reduced_after_last_use = set()
 
         # Init outer-DP group gradient reduction related attributes.
         dist_index = self.buffer.dist_index
@@ -4277,6 +4286,7 @@ class GradReducePipeline:
             gbuf.free_bucket_storage()
             gbuf.reset_param_main_grad()
             self.bucket_status[bucket_id] = BucketStatus.EMPTY
+        self._reduced_after_last_use = set()
 
     def reduce_gradients(
         self,
@@ -4316,11 +4326,74 @@ class GradReducePipeline:
                 self.wait_for_previous_grad_reduce(
                     suggested_queue_capacity=suggested_queue_capacity
                 )
+                if self.reduce_scatter_per_use:
+                    # Release a queued per-use reduction of these buckets first, so this one
+                    # starts from fresh (zeroed) buckets instead of reducing that data again.
+                    for group_bucket_id in bucket_group:
+                        self.wait_for_bucket_reduce(group_bucket_id)
+                    self._reduced_after_last_use.update(bucket_group)
                 self._bucket_group_gradient_reduce(
                     bucket_group,
                     async_op=True,
                     outer_fsdp_group_grad_reduce=outer_fsdp_group_grad_reduce,
                 )
+
+    def reduce_scatter_use(
+        self, bucket_ids: List[int], suggested_queue_capacity: Optional[int] = None
+    ):
+        """Reduce-scatter what one backward use of an FSDP unit added into its sharded gradient
+        buckets ``bucket_ids`` (per-use reduce-scatter mode).
+
+        Each bucket is reduced over DP-Shard and its reduced shard is added into the sharded
+        main gradient, as after a parameter's last use, but without the DP-Outer reduction and
+        without marking parameters ready; the bucket is freed when the reduction is drained,
+        at the latest by the next fetch of the bucket (``before_main_grad_fetch``), so the next
+        use writes into a fresh, zeroed bucket. A bucket already reduced after its parameters'
+        last use in this backward (``reduce_gradients``) is skipped: that reduction carries the
+        DP-Outer reduction and is the bucket's last in this backward.
+
+        Each reduction is a collective: every data-parallel rank must run the same units in
+        the same order. Which buckets are skipped depends only on the order of the gradient
+        hooks, not on when reductions are drained.
+        """
+        bucket_ids = [
+            bucket_id
+            for bucket_id in bucket_ids
+            if bucket_id in self.bucket_status and bucket_id not in self._reduced_after_last_use
+        ]
+        # One coalesced reduction per data-parallel group (expert and non-expert parameters
+        # have their own DP-Shard groups), in bucket order.
+        groups = {}
+        for bucket_id in sorted(bucket_ids):
+            # A queued reduction of an earlier use still holds the bucket's storage.
+            self.wait_for_bucket_reduce(bucket_id)
+            dp_group = self.get_fsdp_buffer(bucket_id).data_parallel_group
+            groups.setdefault(dp_group, []).append(bucket_id)
+        for bucket_group in groups.values():
+            self.wait_for_previous_grad_reduce(suggested_queue_capacity=suggested_queue_capacity)
+            self._bucket_group_gradient_reduce(
+                bucket_group, async_op=True, outer_fsdp_group_grad_reduce=False, per_use=True
+            )
+
+    def wait_for_bucket_reduce(self, bucket_id: int):
+        """Finish a queued reduction of ``bucket_id``: drain the reduction queue, oldest first,
+        until the bucket's entry is out (the current stream waits for each reduction, then its
+        bucket is freed). A no-op if the bucket has no queued reduction."""
+        while any(queued_id == bucket_id for _, _, queued_id in self.grad_reduce_queue):
+            grad_reduce_event, free_up_grad_bucket, _ = self.grad_reduce_queue.pop(0)
+            grad_reduce_event.wait()
+            free_up_grad_bucket()
+
+    def before_main_grad_fetch(self, bucket_id: int):
+        """Called by a parameter's main-gradient getter before it fetches the gradient bucket.
+
+        With double buffering, frees a pool buffer for the bucket. In per-use reduce-scatter
+        mode, finishes a queued per-use reduction of the bucket, so that this use writes into a
+        fresh, zeroed bucket instead of the storage that reduction is still reading and will
+        free."""
+        self._enforce_double_buffer_limit([bucket_id])
+        if self.reduce_scatter_per_use:
+            self.wait_for_bucket_reduce(bucket_id)
 
     def wait_for_previous_grad_reduce(
         self, suggested_queue_size: int = 1, suggested_queue_capacity: Optional[int] = None
@@ -4420,6 +4493,7 @@ class GradReducePipeline:
         bucket_group: List[int],
         async_op: bool = False,
         outer_fsdp_group_grad_reduce: bool = False,
+        per_use: bool = False,
     ) -> bool:
         """Mark the bucket ready for reduce-scatter/all-reduce, if all bucket in
         the bucket group are ready, then do the reduce-scatter/all-reduce.
@@ -4428,6 +4502,9 @@ class GradReducePipeline:
             bucket_group (List[int]): The bucket group to be reduced.
             async_op (bool, optional): Whether to do the reduce-scatter/all-reduce
                 asynchronously. Defaults to False.
+            per_use (bool, optional): A per-use reduction (``reduce_scatter_use``): freeing
+                the bucket keeps its parameters' grad-ready marks, which belong to the
+                reduction after their last use. Defaults to False.
         Returns:
             bool: True if the bucket is go for reduce-scatter/all-reduce.
         """
@@ -4655,7 +4732,8 @@ class GradReducePipeline:
             def get_closure(bucket_id):
                 def free_up_grad_bucket():
                     # Empty the set of parameters that are ready for gradient reduction.
-                    self.bucket_grad_ready_params[bucket_id] = set()
+                    if not per_use:
+                        self.bucket_grad_ready_params[bucket_id] = set()
                     gbuf = self.get_fsdp_buffer(bucket_id)
                     # Free the memory backing the temporarily-allocated communication
                     # bucket associated with this buffer. Only exists for sharded
