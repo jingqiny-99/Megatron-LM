@@ -512,6 +512,9 @@ def saved_activations(module):
     inside = [0]
     layer_loop = LoopHybridStack._layer_loop
     real_checkpoint = hybrid_stack.checkpoint
+    # Whole-round checkpoints go through loop_transformer_block.loop_round_checkpoint, which
+    # calls that module's checkpoint.
+    real_round_checkpoint = loop_transformer_block.checkpoint
 
     def tracked_layer_loop(self, *args, **kwargs):
         inside[0] += 1
@@ -520,12 +523,19 @@ def saved_activations(module):
         finally:
             inside[0] -= 1
 
-    def tracked_checkpoint(function, *args, **kwargs):
+    def track_inputs(args):
         for arg in args:
             if isinstance(arg, torch.Tensor) and _storage(arg)[0] not in params:
                 ptr, nbytes = _storage(arg)
                 found["checkpoint_inputs"][ptr] = nbytes
+
+    def tracked_checkpoint(function, *args, **kwargs):
+        track_inputs(args)
         return real_checkpoint(function, *args, **kwargs)
+
+    def tracked_round_checkpoint(function, *args, **kwargs):
+        track_inputs(args)
+        return real_round_checkpoint(function, *args, **kwargs)
 
     def pack(tensor):
         ptr, nbytes = _storage(tensor)
@@ -536,6 +546,7 @@ def saved_activations(module):
     with pytest.MonkeyPatch.context() as patch:
         patch.setattr(LoopHybridStack, "_layer_loop", tracked_layer_loop)
         patch.setattr(hybrid_stack, "checkpoint", tracked_checkpoint)
+        patch.setattr(loop_transformer_block, "checkpoint", tracked_round_checkpoint)
         with torch.autograd.graph.saved_tensors_hooks(pack, lambda tensor: tensor):
             yield found
 
