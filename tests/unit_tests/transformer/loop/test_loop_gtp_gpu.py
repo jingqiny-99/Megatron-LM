@@ -3,18 +3,23 @@
 """Module GTP weight remat on a fixed-depth DSv4 loop (GPU; the lifted guard
 ``GTP_WEIGHT_REMAT``).
 
-Two training steps without an optimizer step (the same weights; the second step is the first
-with DDP's overlapped reduction armed) of the model of ``strategy_grad_utils`` (a core of 8
-sublayers run exactly 4 times, block + edge ``loop_recompute`` with stride 4, three microbatches
-of one row per rank, per-token loss, ``finalize_model_grads``), from the same full weights and
-rows in every arm:
+Two training steps with an SGD step between them (no momentum: the step-2 weights are a plain
+function of step 1's gradients, so a gather issued before the update and read after it fails
+the step-2 gate; the second step is also the first with DDP's overlapped reduction armed) of
+the model of ``strategy_grad_utils`` (a core of 8 sublayers run exactly 4 times, block + edge
+``loop_recompute`` with stride 4, three microbatches of one row per rank, per-token loss,
+``finalize_model_grads``), from the same full weights and rows in every arm:
 
 * ``ref``: no GTP (``gtp_remat_size = 1``), DDP over the whole data-parallel group;
 * ``gtp``: dense and expert weight remat of degree ``G`` (``LOOP_GTP_DEGREE``, default the world
   size: 2 or 4), DDP with the distributed optimizer, prefetch and asynchronous reduce-scatter
   on (the defaults), ``GTP_CONFIG.verify_prefetched_gathers`` on (set by the loop stack);
-* ``gtp_overlap``: ``gtp`` with DDP's ``overlap_grad_reduce`` (a GTP shard becomes grad-ready
-  once per use, so a core shard's recorded count is 4);
+* ``gtp_overlap``: ``gtp`` with DDP's ``overlap_grad_reduce`` and small buckets (several bucket
+  groups, so a group can start its reduction while another group's GTP shards still have uses
+  to come; a GTP shard becomes grad-ready once per use, so a core shard's recorded count is 4);
+* ``gtp_ep`` (against its own ``ref_ep`` at the same EP): the full recipe's layout, dense GTP of
+  degree ``G``, experts expert-parallel (``LOOP_GTP_EP``, default 2) with no expert GTP, so the
+  expert gradients take DDP's expert data-parallel reduction;
 * ``gtp_simple``: ``gtp`` with prefetch and asynchronous reduce-scatter off (every use gathers
   and reduce-scatters synchronously: GTP's simplest path);
 * ``noverify`` (diagnostic, not gated): ``gtp`` with the prefetch verification turned off after
@@ -26,8 +31,8 @@ core weight is used 4 times per microbatch, in the forward and again in the bloc
 
 * Every parameter's reduced fp32 gradient (GTP shards all-gathered over their group, padding
   stripped) of both steps matches ``ref``'s: cosine >= 0.9999 and relative difference <= 1e-3 (a
-  gradient zero to fp32 precision: absolute, at most 1e-6 of the whole gradient's norm); the
-  losses and every row's LM loss equal ``ref``'s.
+  gradient zero to fp32 precision: absolute, at most 1e-6 of the whole gradient's norm); step
+  1's losses and every row's LM loss equal ``ref``'s, step 2's losses are within 1e-5.
 * Reduce-scatters per GTP weight (a dense weight, or a grouped expert projection's leading
   weight) and microbatch: 4 for a core weight, 1 for a prelude or coda weight (one per use).
 * The prefetch verification's decisions are printed: how many consumes found a prefetch handle
@@ -38,7 +43,8 @@ core weight is used 4 times per microbatch, in the forward and again in the bloc
 
 Needs TransformerEngine >= 2.19 (GTP). Launch once per degree: ``torchrun --nproc-per-node 2 -m
 pytest -q tests/unit_tests/transformer/loop/test_loop_gtp_gpu.py`` and ``--nproc-per-node 4``
-(``LOOP_GTP_DEGREE=2`` on 4 GPUs gives replicate DP 2 x GTP 2). ``MBS_REPORT_DIR`` dumps every
+(``LOOP_GTP_DEGREE=2`` on 4 GPUs gives replicate DP 2 x GTP 2). ``LOOP_GTP_EP`` sets the
+``gtp_ep`` arm's expert-parallel size (1 skips the arm). ``MBS_REPORT_DIR`` dumps every
 per-parameter report.
 """
 
@@ -66,6 +72,11 @@ pytestmark = pytest.mark.skipif(
 
 STEPS = 2
 MIN_FAILING_CORE_FRACTION = 0.9
+BUCKET_SIZE = 200_000  # elements: several bucket groups for the tiny model (overlap arm)
+GTP_EP = int(os.environ.get("LOOP_GTP_EP", "2"))
+RUN_GTP_EP = GTP_EP > 1 and WORLD % GTP_EP == 0 and sgu.NUM_EXPERTS % GTP_EP == 0
+ARMS = ["gtp", "gtp_overlap", "gtp_simple"] + (["gtp_ep"] if RUN_GTP_EP else [])
+REFERENCE = {arm: "ref_ep" if arm == "gtp_ep" else "ref" for arm in ARMS}
 
 
 @pytest.fixture(scope="module", autouse=True)
@@ -84,9 +95,10 @@ def _environment():
             Utils.destroy_model_parallel()
 
 
-def _initialize(degree):
-    """Model parallelism with (expert) GTP weight remat of ``degree`` (1: none), and a clean
-    GTP runtime (chains, buffer cache, ledger, the global parameter list)."""
+def _initialize(degree, expert_degree=None, ep=1):
+    """Model parallelism with GTP weight remat of ``degree`` (1: none), expert GTP of
+    ``expert_degree`` (default ``degree``) and expert parallelism ``ep``, and a clean GTP
+    runtime (chains, buffer cache, ledger, the global parameter list)."""
     from megatron.core.tensor_parallel.generalized_tensor_parallelism import (
         _GTP_PARAMS,
         get_global_GTP_cache,
@@ -98,7 +110,13 @@ def _initialize(degree):
     reset_gtp_state()
     _GTP_PARAMS.clear()
     get_global_GTP_cache().clear()
-    Utils.initialize_model_parallel(1, 1, gtp_remat_size=degree, expert_gtp_remat_size=degree)
+    Utils.initialize_model_parallel(
+        1,
+        1,
+        gtp_remat_size=degree,
+        expert_gtp_remat_size=degree if expert_degree is None else expert_degree,
+        expert_model_parallel_size=ep,
+    )
     model_parallel_cuda_manual_seed(123)
 
 
@@ -164,6 +182,7 @@ def _ddp(model, *, overlap=False, distributed_optimizer=True):
             overlap_grad_reduce=overlap,
             use_distributed_optimizer=distributed_optimizer,
             grad_reduce_in_fp32=True,
+            bucket_size=BUCKET_SIZE if overlap else None,
         ),
         model,
         pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
@@ -218,21 +237,35 @@ class _Instrument:
         del self.gtp._GATHER_LEDGER.take  # back to the class method
 
 
-def _run_reference(state):
-    _initialize(1)
-    model = sgu.build_model(state)
+def _run_reference(state, ep=1):
+    _initialize(1, ep=ep)
+    model = sgu.build_model(state, expert_model_parallel_size=ep)
     ddp = _ddp(model, distributed_optimizer=False)
+    opt = sgu.optimizer(ddp)
     out = []
     for step in range(STEPS):
         _restore_buffers(model, state)
+        opt.zero_grad()
         result = sgu.run_step(ddp, model, sgu.make_rows(step))
         out.append((result, sgu.ddp_grads(ddp, model)))
-    del ddp, model
+        if step + 1 < STEPS:
+            sgu.step_optimizer(opt)
+    del opt, ddp, model
     torch.cuda.empty_cache()
     return out, None
 
 
-def _run_gtp(state, *, overlap=False, simple=False, verify=True, drop_use=None):
+def _run_gtp(
+    state,
+    *,
+    overlap=False,
+    simple=False,
+    verify=True,
+    drop_use=None,
+    expert_degree=None,
+    ep=1,
+    steps=STEPS,
+):
     from megatron.core.tensor_parallel.generalized_tensor_parallelism import GTP_CONFIG
     from megatron.core.tensor_parallel.gtp_api import (
         classify_gtp_remat_chains,
@@ -240,19 +273,24 @@ def _run_gtp(state, *, overlap=False, simple=False, verify=True, drop_use=None):
     )
 
     saved = (GTP_CONFIG.weight_prefetch, GTP_CONFIG.async_reduction)
-    _initialize(DEGREE)
+    expert_degree = DEGREE if expert_degree is None else expert_degree
+    _initialize(DEGREE, expert_degree=expert_degree, ep=ep)
     configure_gtp_remat_from_recipe(calculate_per_token_loss=True)
     GTP_CONFIG.weight_prefetch = not simple
     GTP_CONFIG.async_reduction = not simple
     try:
         model = sgu.build_model(
-            None, gtp_weight_remat_size=DEGREE, expert_gtp_weight_remat_size=DEGREE
+            None,
+            gtp_weight_remat_size=DEGREE,
+            expert_gtp_weight_remat_size=expert_degree,
+            expert_model_parallel_size=ep,
         )
         assert GTP_CONFIG.verify_prefetched_gathers, "the loop stack turns the verification on"
         GTP_CONFIG.verify_prefetched_gathers = verify
         _load_full_state(model, state)
         ddp = _ddp(model, overlap=overlap)
         classify_gtp_remat_chains([ddp])
+        opt = sgu.optimizer(ddp)
         gtp_names = {id(p): name for name, p in model.named_parameters() if _is_gtp(p)}
         assert gtp_names, "no GTP-sharded weight in the model"
         # The weights GTP reduce-scatters through: a dense weight, or the leading weight of a
@@ -266,9 +304,10 @@ def _run_gtp(state, *, overlap=False, simple=False, verify=True, drop_use=None):
         instrument = _Instrument(drop_ids=core_ids & consumers, drop_use=drop_use)
         out = []
         with instrument:
-            for step in range(STEPS):
+            for step in range(steps):
                 _restore_buffers(model, state)
                 instrument.rs.clear()
+                opt.zero_grad()
                 result = sgu.run_step(
                     ddp, model, sgu.make_rows(step), on_microbatch=instrument.on_microbatch
                 )
@@ -280,9 +319,12 @@ def _run_gtp(state, *, overlap=False, simple=False, verify=True, drop_use=None):
                     )
                 )
                 instrument.takes.clear()
+                if step + 1 < steps:
+                    sgu.step_optimizer(opt)
         golden = {}
+        groups = ddp.bucket_groups + ddp.expert_parallel_bucket_groups
         if overlap:
-            for group in ddp.bucket_groups + ddp.expert_parallel_bucket_groups:
+            for group in groups:
                 for param, count in group.golden_per_param_grad_ready_counts.items():
                     if id(param) in gtp_names:
                         golden[gtp_names[id(param)]] = count
@@ -290,9 +332,14 @@ def _run_gtp(state, *, overlap=False, simple=False, verify=True, drop_use=None):
             gtp_names=gtp_names,
             consumers=consumers,
             core_names=sorted(gtp_names[i] for i in core_ids),
+            # Bucket groups holding a GTP shard: a group of its own per shard set would never
+            # start before another group's last use.
+            gtp_groups=sum(
+                any(id(param) in gtp_names for param in group.params) for group in groups
+            ),
         )
         info["golden"] = golden
-        del ddp, model
+        del opt, ddp, model
         torch.cuda.empty_cache()
         return out, info
     finally:
@@ -311,7 +358,14 @@ def results():
     out["gtp_overlap"] = _run_gtp(state, overlap=True)
     out["gtp_simple"] = _run_gtp(state, simple=True)
     out["noverify"] = _run_gtp(state, verify=False)
-    out["drop_rs"] = _run_gtp(state, drop_use=2)
+    out["drop_rs"] = _run_gtp(state, drop_use=2, steps=1)
+    if RUN_GTP_EP:
+        # Expert weights depend on the EP layout: the arm and its reference share a state
+        # built at that EP (per rank: its local experts; the dense weights are replicated).
+        _initialize(1, ep=GTP_EP)
+        state_ep = sgu.clone_state(sgu.build_model(expert_model_parallel_size=GTP_EP))
+        out["ref_ep"] = _run_reference(state_ep, ep=GTP_EP)
+        out["gtp_ep"] = _run_gtp(state_ep, expert_degree=1, ep=GTP_EP)
     return out
 
 
@@ -319,25 +373,25 @@ def _name(text):
     return sgu.tag(f"GTP G{DEGREE}", text)
 
 
-@pytest.mark.parametrize("arm", ["gtp", "gtp_overlap", "gtp_simple"])
+@pytest.mark.parametrize("arm", ARMS)
 @pytest.mark.parametrize("step", range(STEPS))
 def test_gradients_match_the_reference(results, arm, step):
-    _, reference = results["ref"][0][step]
+    _, reference = results[REFERENCE[arm]][0][step]
     _, grads, record = results[arm][0][step]
     print(f"[{_name(f'{arm} step {step + 1}')}] verification takes {record['takes']}", flush=True)
     report, failing = sgu.report_and_fail(_name(f"{arm} step {step + 1} vs ref"), grads, reference)
     assert not failing, sgu.mbs.worst(report, failing)
 
 
-@pytest.mark.parametrize("arm", ["gtp", "gtp_overlap", "gtp_simple"])
+@pytest.mark.parametrize("arm", ARMS)
 def test_losses_match_the_reference(results, arm):
     for step in range(STEPS):
-        reference, _ = results["ref"][0][step]
+        reference, _ = results[REFERENCE[arm]][0][step]
         result, _, _ = results[arm][0][step]
-        sgu.assert_losses_match(result, reference, _name(f"{arm} step {step + 1}"))
+        sgu.assert_step_losses_match(step, result, reference, _name(f"{arm} step {step + 1}"))
 
 
-@pytest.mark.parametrize("arm", ["gtp", "gtp_overlap", "gtp_simple"])
+@pytest.mark.parametrize("arm", ARMS)
 def test_one_reduce_scatter_per_use(results, arm):
     """Every core GTP weight is reduce-scattered 4 times per microbatch, every prelude and coda
     GTP weight once."""
@@ -359,14 +413,29 @@ def test_overlap_counts_one_grad_ready_per_use(results):
     every core GTP weight is 4, of every prelude and coda GTP weight 1."""
     _, info = results["gtp_overlap"]
     golden = info["golden"]
-    print(f"[{_name('gtp_overlap golden counts')}] {golden}", flush=True)
+    print(
+        f"[{_name('gtp_overlap golden counts')}] {golden}; bucket groups with GTP shards "
+        f"{info['gtp_groups']}",
+        flush=True,
+    )
     assert golden
+    # Several groups: one can start its reduction while another's shards still have uses.
+    assert info["gtp_groups"] > 1, info["gtp_groups"]
     for name, count in golden.items():
         where = sgu.role(name)[0]
         if where == "core":
             assert count == sgu.ROUNDS, (name, count)
         elif where in ("prelude", "coda"):
             assert count == 1, (name, count)
+
+
+def test_gtp_ep_arm_keeps_experts_out_of_gtp(results):
+    """The full recipe's layout: no expert weight is a GTP shard, every dense GTP consumer is."""
+    if not RUN_GTP_EP:
+        pytest.skip("LOOP_GTP_EP does not give an expert-parallel layout here")
+    model_info = results["gtp_ep"][1]
+    names = model_info["gtp_names"].values()
+    assert names and not any(".experts." in name for name in names), sorted(names)[:8]
 
 
 def test_report_without_prefetch_verification(results):
