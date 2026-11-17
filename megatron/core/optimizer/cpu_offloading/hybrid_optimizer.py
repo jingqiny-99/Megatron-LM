@@ -84,11 +84,12 @@ class HybridDeviceOptimizer(torch.optim.Optimizer):
     copied device to host, and the updated host shard is copied back into the parameter's local
     shard. A DTensor itself is never cloned or pinned. The offload decision counts a
     parameter's global ``numel()``, so every rank offloads the same parameters.
-    ``self.state`` presents an offloaded DTensor parameter's per-element state (and
-    ``master_param``) as DTensors with the parameter's mesh and placements over the host tensors
-    the CPU optimizer steps (no copy), so a DTensor checkpoint (``fsdp_dtensor``) saves them
-    sharded like the parameter and loads them in place; ``load_state_dict`` keeps them on the
-    host.
+    ``self.state`` presents an offloaded DTensor parameter's per-element state (and, for a
+    parameter of lower precision than fp32, ``master_param``) as DTensors with the parameter's
+    mesh and placements over the host tensors the CPU optimizer steps (no copy), so a DTensor
+    checkpoint (``fsdp_dtensor``) saves them sharded like the parameter and loads them in place;
+    ``load_state_dict`` keeps them on the host. An fp32 parameter (a Megatron-FSDP main weight)
+    is its own master and gets no ``master_param``.
     """
 
     def __init__(
@@ -411,9 +412,16 @@ class HybridDeviceOptimizer(torch.optim.Optimizer):
 
     def _dtensor_state_view(self, orig_param, host_param, host_state):
         """``self.state`` of an offloaded DTensor parameter: the CPU optimizer's state of its
-        host copy ``host_param``, every per-element tensor (and ``master_param``, the host copy)
-        as a DTensor like ``orig_param`` over the host tensor, so a DTensor checkpoint saves
-        them sharded like the parameter and a load writes them in place."""
+        host copy ``host_param``, every per-element tensor as a DTensor like ``orig_param`` over
+        the host tensor, so a DTensor checkpoint saves them sharded like the parameter and a
+        load writes them in place.
+
+        ``master_param`` (the fp32 host copy) is added only for a parameter of lower precision
+        (one in ``param_to_fp32_param``), whose master holds more than the parameter. An fp32
+        parameter (a Megatron-FSDP main weight) is its own master: the model checkpoint holds
+        it, the host copy is re-made from it after a load, and a separate ``master_param``
+        would duplicate it in the checkpoint and could override it (a checkpoint without the
+        key, e.g. written with the GPU optimizer, would leave a stale one)."""
         view = {}
         for key, value in host_state.items():
             if (
@@ -424,7 +432,7 @@ class HybridDeviceOptimizer(torch.optim.Optimizer):
             ):
                 value = self._dtensor_like(orig_param, value)
             view[key] = value
-        if self.param_update_in_fp32:
+        if self.param_update_in_fp32 and orig_param in self.param_to_fp32_param:
             view["master_param"] = self._dtensor_like(orig_param, host_param)
         return view
 
@@ -439,8 +447,8 @@ class HybridDeviceOptimizer(torch.optim.Optimizer):
                         continue
                     if orig_param in self.offloaded_dtensor_params:
                         # The CPU optimizer steps plain host tensors: the local shards of
-                        # DTensor values. ``master_param`` is the host copy itself (restored
-                        # by _update_fp32_params_by_new_state).
+                        # DTensor values. ``master_param`` (lower-precision parameters only) is
+                        # the host copy itself (restored by _update_fp32_params_by_new_state).
                         new_state[param] = {
                             k: _local_data(v) if _is_dtensor(v) else v
                             for k, v in self.state[orig_param].items()
@@ -506,10 +514,8 @@ class HybridDeviceOptimizer(torch.optim.Optimizer):
                     # An offloaded DTensor parameter's master is its host local shard.
                     master_param = _local_data(master_param)
                 fp32_param.data.copy_(master_param)
-            elif param in self.offloaded_dtensor_params and "master_param" in v:
-                # An offloaded native-FP32 DTensor parameter: its host copy is the master
-                # (precision-aware FusedAdam keeps one in the same state key).
-                self.gpu_params_map_cpu_copy[param].data.copy_(_local_data(v["master_param"]))
+            # An offloaded native-FP32 DTensor parameter has no separate master: its host copy
+            # was re-made from the (loaded) parameter by _init_sub_optimizers.
 
     def update_fp32_param_by_new_param(self):
         """

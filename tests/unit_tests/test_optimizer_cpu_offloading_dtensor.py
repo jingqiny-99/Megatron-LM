@@ -281,6 +281,15 @@ def test_cpu_adam_step_without_overlap_matches_reference():
 PER_ELEMENT_STATE = ("exp_avg", "exp_avg_sq", "master_param")
 
 
+def _per_element_state(hdo, param):
+    """The per-element state keys ``hdo.state`` presents for ``param``: the moments, and the
+    fp32 master only for a lower-precision (bf16) parameter. An fp32 parameter (a Megatron-FSDP
+    main weight) is its own master."""
+    if param in hdo.param_to_fp32_param:
+        return PER_ELEMENT_STATE
+    return ("exp_avg", "exp_avg_sq")
+
+
 def _assert_state_is_presented_as_dtensors(hdo, params):
     """Every stepped parameter's per-element state in ``hdo.state`` is a DTensor like the
     parameter over the CPU optimizer's own host tensor (no copy); ``step`` stays plain."""
@@ -299,9 +308,9 @@ def _assert_state_is_presented_as_dtensors(hdo, params):
         host_state = cpu_optimizer.state[host_param]
         assert "master_param" not in host_state
         state = hdo.state[param]
-        assert set(state) == {"step", *PER_ELEMENT_STATE}, set(state)
+        assert set(state) == {"step", *_per_element_state(hdo, param)}, set(state)
         assert not isinstance(state["step"], DTensor)
-        for key in PER_ELEMENT_STATE:
+        for key in _per_element_state(hdo, param):
             value = state[key]
             assert isinstance(value, DTensor), key
             assert value.placements == param.placements and value.device_mesh == param.device_mesh
@@ -372,7 +381,7 @@ def _checkpoint_round_trip_worker(rank, port, checkpoint_dir, dtype, uneven):
         # The load landed in place: the CPU optimizer's host tensors hold the saved state.
         loaded_ptrs = {}
         for name, state in loading["optimizer"]["state"].items():
-            for key in PER_ELEMENT_STATE:
+            for key in (k for k in PER_ELEMENT_STATE if k in state):
                 loaded_ptrs[(name, key)] = state[key]._local_tensor.data_ptr()
         # torch's load casts every state tensor to its parameter's device and dtype: it must
         # see the host copy and plain host tensors (on a GPU a DTensor parameter would move the
@@ -405,7 +414,7 @@ def _checkpoint_round_trip_worker(rank, port, checkpoint_dir, dtype, uneven):
             assert (param_a in hdo_a.state) == (param_b in hdo_b.state), index
             if param_a not in hdo_a.state:
                 continue
-            for key in ("step", *PER_ELEMENT_STATE):
+            for key in ("step", *_per_element_state(hdo_a, param_a)):
                 value_a, value_b = hdo_a.state[param_a][key], hdo_b.state[param_b][key]
                 assert torch.equal(_local(value_a), _local(value_b)), (index, key)
             for key in ("exp_avg", "exp_avg_sq"):
@@ -419,7 +428,7 @@ def _checkpoint_round_trip_worker(rank, port, checkpoint_dir, dtype, uneven):
         for index, (param_a, param_b) in enumerate(zip(params_a, params_b)):
             assert torch.equal(_local(param_a), _local(param_b)), index
             if param_a in hdo_a.state:
-                for key in PER_ELEMENT_STATE:
+                for key in _per_element_state(hdo_a, param_a):
                     assert torch.equal(
                         _local(hdo_a.state[param_a][key]), _local(hdo_b.state[param_b][key])
                     ), (index, key)
@@ -433,6 +442,70 @@ def test_dtensor_checkpoint_round_trip(tmp_path, dtype, uneven):
     mp.spawn(
         _checkpoint_round_trip_worker,
         args=(_free_port(), str(tmp_path / "checkpoint"), dtype, uneven),
+        nprocs=WORLD,
+        join=True,
+    )
+
+
+def _checkpoint_without_master_worker(rank, port, checkpoint_dir):
+    import torch.distributed.checkpoint as dcp
+    from torch.distributed.checkpoint.default_planner import DefaultLoadPlanner
+
+    mesh = _init(rank, port)
+    _emulate_offload_device([])
+    layout, dtype = LAYOUT_NO_EMPTY, torch.float32
+    try:
+        params_a, _ = _make_params(mesh, rank, dtype, True, seed=0, layout=layout)
+        hdo_a = _hdo(params_a, fused=True)
+        for step in range(2):
+            _step(hdo_a, params_a, step, rank, dtype, layout)
+        saved = _model_and_optimizer_state(hdo_a, params_a)
+        # As the GPU optimizer writes it under Megatron-FSDP (FusedAdam without master weights).
+        saved["optimizer"]["state"] = {
+            name: {key: value for key, value in state.items() if key != "master_param"}
+            for name, state in saved["optimizer"]["state"].items()
+        }
+        dcp.save(saved, checkpoint_id=checkpoint_dir)
+
+        params_b, _ = _make_params(mesh, rank, dtype, True, seed=1, layout=layout)
+        hdo_b = _hdo(params_b, fused=True)
+        for param in params_b:
+            param.grad = torch.zeros_like(param)
+        hdo_b.step()
+        hdo_b.zero_grad()
+        loading = _model_and_optimizer_state(hdo_b, params_b)
+        # fp32 parameters ask for no master: the checkpoint has every key they ask for.
+        assert all("master_param" not in state for state in loading["optimizer"]["state"].values())
+        with torch.no_grad():
+            # load_checkpoint's default (allow_partial_load unless --strict-fsdp-dtensor-load).
+            dcp.load(
+                loading,
+                checkpoint_id=checkpoint_dir,
+                planner=DefaultLoadPlanner(allow_partial_load=True),
+            )
+        hdo_b.load_state_dict(
+            _optimizer_state_dict_by_name(hdo_b, params_b, loading["optimizer"]["state"])
+        )
+        for index, (param_a, param_b) in enumerate(zip(params_a, params_b)):
+            assert torch.equal(_local(param_a), _local(param_b)), index
+            # The host master is the loaded main weight, not the pre-load one.
+            assert torch.equal(hdo_b.param_to_inner_param[param_b], _local(param_b)), index
+        _step(hdo_a, params_a, 2, rank, dtype, layout)
+        _step(hdo_b, params_b, 2, rank, dtype, layout)
+        for index, (param_a, param_b) in enumerate(zip(params_a, params_b)):
+            assert torch.equal(_local(param_a), _local(param_b)), index
+    finally:
+        dist.destroy_process_group()
+
+
+def test_fp32_checkpoint_without_master_param_loads(tmp_path):
+    """An fp32 DTensor parameter is its own master: ``state`` has no ``master_param`` for it,
+    so a checkpoint without one (written with the GPU optimizer) loads, and the host master is
+    the loaded main weight (a stale separate master would revert the weights at the next
+    step)."""
+    mp.spawn(
+        _checkpoint_without_master_worker,
+        args=(_free_port(), str(tmp_path / "checkpoint")),
         nprocs=WORLD,
         join=True,
     )
@@ -472,7 +545,7 @@ def _reference_state(hdo, params, masters, reference):
             state_dict["state"][index] = {
                 key: _local(value).clone() for key, value in hdo.state[param].items()
             }
-            del state_dict["state"][index]["master_param"]
+            state_dict["state"][index].pop("master_param", None)
     return state_dict
 
 
@@ -635,13 +708,19 @@ def _swiglu_round_trip_worker(rank, port, checkpoint_dir, dtype):
         dist_index.label_meshes("cuda")
         fc1 = FC_LAYOUT[0][0]
         saved, _ = _fsdp_dtensor_state(_FcModel(by_name_a), by_name_a, hdo_a)
-        # The split moments are views of the CPU optimizer's host tensors, not device copies.
+        # The split moments (and a bf16 parameter's fp32 master) are views of the CPU
+        # optimizer's host tensors, not device copies, split like the parameter.
+        fc1_keys = _per_element_state(hdo_a, by_name_a[fc1])
+        assert ("master_param" in fc1_keys) == (dtype != torch.float32)
         for half in ("_w", "_v"):
-            for key in ("exp_avg", "exp_avg_sq"):
-                local = saved["optimizer"]["state"][f"module.{fc1}{half}"][key]._local_tensor
+            state = saved["optimizer"]["state"][f"module.{fc1}{half}"]
+            for key in fc1_keys:
+                local = state[key]._local_tensor
                 host = hdo_a.state[by_name_a[fc1]][key]._local_tensor
                 assert local.device.type == "cpu", (half, key, local.device)
                 assert _storage_ptr(local) == _storage_ptr(host), (half, key)
+                assert state[key].shape == (6, 3), (half, key, state[key].shape)
+            assert set(state) == {"step", *fc1_keys}, (half, set(state))
         # The other fused-parameter splits (MLA down-projection, GDN) wrap in place as well.
         exp_avg = hdo_a.state[by_name_a[fc1]]["exp_avg"]
         sections = fdc.split_fused_fsdp_param(exp_avg, by_name_a[fc1], [6, 6])

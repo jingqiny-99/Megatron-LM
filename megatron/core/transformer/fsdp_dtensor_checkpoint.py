@@ -59,6 +59,17 @@ def _strip_wrapper_prefixes(path):
     return '.'.join(parts)
 
 
+def _split_optimizer_state_keys(param_state):
+    """The per-element optimizer state of a fused parameter that its handler splits with it:
+    Adam's moments and, when present, ``master_param`` (the fp32 host master that the
+    CPU-offloaded ``HybridDeviceOptimizer`` keeps for a lower-precision parameter). A key left
+    unsplit would be saved with the fused layout under every section's key."""
+    keys = ["exp_avg", "exp_avg_sq"]
+    if "master_param" in param_state:
+        keys.append("master_param")
+    return keys
+
+
 def _intersect_slice(s1, s2):
     """Intersection of two step-1 slices, or an empty slice when they do not overlap."""
     start = max(s1.start, s2.start)
@@ -402,7 +413,7 @@ def handle_swiglu_in_state_dict(model, model_state_dict, optimizer_state_dict):
                     continue
                 new_opt_state_dict[f"{key}_w"] = opt_state_dict[key].copy()
                 new_opt_state_dict[f"{key}_v"] = opt_state_dict[key].copy()
-                for subkey in ["exp_avg", "exp_avg_sq"]:
+                for subkey in _split_optimizer_state_keys(opt_state_dict[key]):
                     dist_param = model.get_parameter(
                         expert_param_local_key(key[len("module.") :], num_experts)
                     )
@@ -649,7 +660,7 @@ def handle_gdn_in_state_dict(
                     continue
                 for sub_name in names:
                     new_opt_state[f"{key}.{sub_name}"] = opt_state[key].copy()
-                for subkey in ["exp_avg", "exp_avg_sq"]:
+                for subkey in _split_optimizer_state_keys(opt_state[key]):
                     dist_param = model.get_parameter(key[len("module.") :])
                     sub_tensors = split_gdn_fused(opt_state[key][subkey], dist_param, sizes, dim)
                     for sub_name, tensor in zip(names, sub_tensors):
@@ -872,7 +883,7 @@ def handle_mla_down_proj_in_state_dict(model, model_state_dict, optimizer_state_
             for new_key in new_keys:
                 new_optimizer_state[new_key] = optimizer_state[key].copy()
             dist_param = model.get_parameter(key[len("module.") :])
-            for subkey in ["exp_avg", "exp_avg_sq"]:
+            for subkey in _split_optimizer_state_keys(optimizer_state[key]):
                 sections = split_fused_fsdp_param(
                     optimizer_state[key][subkey], dist_param, split_sizes
                 )
