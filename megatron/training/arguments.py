@@ -1711,6 +1711,25 @@ def validate_args(args, defaults={}):
                 "supported or necessary for the 'no_shard' / 0 sharding strategy."
             )
 
+        if (
+            args.megatron_fsdp_version == 1
+            and args.num_distributed_optimizer_instances > 1
+            and args.outer_dp_sharding_strategy != "no_shard"
+        ):
+            # DP-Outer sharding (HFSDP) reduce-scatters the gradient shard that the DP-Shard
+            # reduction produced, so every parameter class has to shard gradients on DP-Shard.
+            # fully_shard() refuses the other strategies; the MCore wrapper builds MegatronFSDP
+            # directly and would only fail when it allocates the gradient buffers.
+            replicated = sorted(sharding_strategies & {"no_shard", "optim"})
+            if replicated:
+                raise ValueError(
+                    f"--outer-dp-sharding-strategy {args.outer_dp_sharding_strategy} with "
+                    "--num-distributed-optimizer-instances > 1 needs a DP-Shard strategy that "
+                    "shards gradients (optim_grads or optim_grads_params) for dense and expert "
+                    f"parameters, but got {replicated} (--data-parallel-sharding-strategy / "
+                    "--expert-data-parallel-sharding-strategy)."
+                )
+
         if args.megatron_fsdp_reduce_scatter_per_use:
             # After the double-buffer normalization above. The DDP config repeats these checks
             # for callers that build it directly.

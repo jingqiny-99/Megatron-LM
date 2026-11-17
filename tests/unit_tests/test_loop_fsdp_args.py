@@ -24,6 +24,7 @@ The rules themselves are tested in ``transformer/loop/test_loop_guards.py``; the
 
 import inspect
 import os
+import re
 import socket
 import sys
 from dataclasses import dataclass
@@ -34,6 +35,7 @@ import torch
 import torch.distributed as dist
 
 from megatron.core.transformer.loop import guards
+from megatron.training import arguments as megatron_arguments
 from megatron.training import checkpointing, training
 from megatron.training.argument_utils import core_transformer_config_from_args
 from megatron.training.arguments import _validate_loop_fsdp, parse_args, validate_args
@@ -170,6 +172,58 @@ def test_per_use_flag_requirements_at_argument_validation(monkeypatch, flags, me
     args = _parsed(monkeypatch, *flags, **overrides)
     with pytest.raises(AssertionError, match=message):
         validate_args(args)
+
+
+_HFSDP_FLAGS = [
+    "--use-megatron-fsdp",
+    "--data-parallel-sharding-strategy",
+    "optim_grads_params",
+    "--num-distributed-optimizer-instances",
+    "2",
+    "--outer-dp-sharding-strategy",
+    "optim",
+]
+
+
+def _validated_hfsdp(monkeypatch, *flags):
+    overrides = dict(_MODEL_ARGS, ckpt_format="fsdp_dtensor")
+    monkeypatch.delenv("CUDA_DEVICE_MAX_CONNECTIONS", raising=False)
+    # validate_args reads the device architecture after the Megatron-FSDP checks.
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda *_, **__: (10, 0))
+    monkeypatch.setattr(megatron_arguments, "get_device_arch_version", lambda: 10)
+    args = _parsed(monkeypatch, *_HFSDP_FLAGS, *flags, **overrides)
+    validate_args(args)
+    return args
+
+
+@pytest.mark.parametrize(
+    "flags,replicated",
+    [
+        # The Pro FSDP recipes' first layout: experts ZeRO-1 under DP-Outer optimizer sharding.
+        (["--expert-data-parallel-sharding-strategy", "optim"], "['optim']"),
+        (["--expert-data-parallel-sharding-strategy", "no_shard"], "['no_shard']"),
+        (["--data-parallel-sharding-strategy", "optim"], "['optim']"),
+    ],
+)
+def test_hfsdp_refuses_a_replicated_gradient_strategy(monkeypatch, flags, replicated):
+    """DP-Outer sharding (outer optim, several instances) needs every parameter class to shard
+    its gradients on DP-Shard; Megatron-FSDP's buffer would refuse it only at the wrap."""
+    with pytest.raises(ValueError, match=re.escape(f"but got {replicated}")):
+        _validated_hfsdp(monkeypatch, *flags)
+
+
+@pytest.mark.parametrize(
+    "flags",
+    [
+        [],
+        ["--expert-data-parallel-sharding-strategy", "optim_grads"],
+        # Outer no_shard (HSDP) keeps replicated strategies.
+        ["--expert-data-parallel-sharding-strategy", "optim", "--outer-dp-sharding-strategy",
+         "no_shard"],  # fmt: skip
+    ],
+)
+def test_hfsdp_admits_gradient_sharding_strategies(monkeypatch, flags):
+    _validated_hfsdp(monkeypatch, *flags)
 
 
 def test_argument_validation_runs_the_loop_fsdp_rules(monkeypatch):
