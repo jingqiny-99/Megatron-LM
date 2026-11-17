@@ -385,8 +385,9 @@ def test_recipe_arm_has_one_rank_expert_shards_at_the_default_ep(results):
     _, record = results["per_use_recipe"]
     sizes = sorted({shard_size for shard_size, _ in record["buckets"].values()})
     print(f"[{_name('per_use_recipe')}] DP-Shard sizes {sizes}", flush=True)
-    if EP == WORLD // INSTANCES:
-        assert 1 in sizes and max(sizes) > 1, sizes
+    if EP != WORLD // INSTANCES:
+        pytest.skip(f"EP {EP} is not the recipe's expert layout (W / {INSTANCES})")
+    assert 1 in sizes and max(sizes) > 1, sizes
 
 
 @pytest.mark.parametrize("arm", PER_USE_ARMS)

@@ -55,6 +55,7 @@ DP-Shard as well). ``MBS_REPORT_DIR`` dumps every per-parameter report.
 
 import collections
 import os
+import traceback
 
 import pytest
 import torch
@@ -282,20 +283,26 @@ ARMS = {
 
 @pytest.fixture(scope="module")
 def results():
-    """Every arm, run once from the same weights and rows."""
+    """Every arm, run once from the same weights and rows. The ``cpu_adam`` smoke arm runs
+    last, and an error of it (raised identically on every rank, e.g. while building the
+    optimizer) is kept for its own test to raise: it does not take the gated arms and the
+    mutations down with it."""
     state = sgu.clone_state(sgu.build_model(expert_model_parallel_size=EP))
     out = {}
     out["ref"], out["fused_core_weights"] = _run_ddp(state)
     for arm, kwargs in ARMS.items():
         out[arm] = _run_fsdp(state, **kwargs)
-    out["ref_adam"], _ = _run_ddp(state, **_adam())
-    out["ref_frozen"], _ = _run_ddp(state, **_adam(lr=0.0))
-    out["cpu_adam"] = _run_fsdp(
-        state, **ARMS["hfsdp_recipe"], optimizer_fields=_adam(cpu_offload=True)
-    )
     out["overwrite"] = _run_fsdp(state, "no_shard", accumulate=False, steps=1)
     out["outer_each"] = _run_fsdp(state, "no_shard", outer_override="each", steps=1)
     out["outer_never"] = _run_fsdp(state, "no_shard", outer_override="never", steps=1)
+    out["ref_adam"], _ = _run_ddp(state, **_adam())
+    out["ref_frozen"], _ = _run_ddp(state, **_adam(lr=0.0))
+    try:
+        out["cpu_adam"] = _run_fsdp(
+            state, **ARMS["hfsdp_recipe"], optimizer_fields=_adam(cpu_offload=True)
+        )
+    except Exception:  # pylint: disable=broad-except
+        out["cpu_adam_error"] = traceback.format_exc()
     return out
 
 
@@ -357,12 +364,15 @@ def test_recipe_arm_has_one_rank_expert_shards_at_the_default_ep(results):
     _, record = results["hfsdp_recipe"]
     sizes = sorted(set(record["buckets"].values()))
     print(f"[{_name('hfsdp_recipe')}] DP-Shard sizes {sizes}", flush=True)
-    if EP == WORLD // INSTANCES:
-        assert 1 in sizes and max(sizes) > 1, sizes
+    if EP != WORLD // INSTANCES:
+        pytest.skip(f"EP {EP} is not the recipes' expert layout (W / {INSTANCES})")
+    assert 1 in sizes and max(sizes) > 1, sizes
 
 
 def test_cpu_offloaded_adam_steps_on_the_recipe_layout(results):
     """Smoke test of the recipes' optimizer on the recipes' layout (see the module docstring)."""
+    if "cpu_adam_error" in results:
+        pytest.fail(f"the cpu_adam arm raised:\n{results['cpu_adam_error']}", pytrace=False)
     _, reference = results["ref_adam"][0]
     _, grads = results["cpu_adam"][0][0]
     report, failing = sgu.report_and_fail(_name("cpu_adam step 1 vs ref"), grads, reference)
