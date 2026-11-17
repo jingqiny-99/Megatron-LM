@@ -596,6 +596,24 @@ class MegatronFSDP(torch.nn.Module):
 
         self.suggested_RS_queue_capacity = suggested_communication_unit_size
         self.suggested_AG_prefetch_size = suggested_communication_unit_size // 2
+        if (
+            self.reduce_scatter_per_use
+            and self.ddp_config.suggested_communication_unit_size is None
+            and not any_sharding_strategy_in(self.ddp_config, ["optim_grads_params"])
+        ):
+            # A per-use reduction's bucket is released when the queue drains it, at the latest
+            # at the bucket's next fetch. Bound the queue by FSDP unit size as ZeRO-3 does, so
+            # that under ZeRO-2 too a reduced bucket is released within about two units instead
+            # of staying queued until the next round.
+            unit_sizes = [
+                sum(p.numel() for p in module.parameters())
+                for module in self.module.modules()
+                if isinstance(module, tuple(self.fsdp_unit_modules))
+            ]
+            if unit_sizes:
+                self.suggested_RS_queue_capacity = min(
+                    self.suggested_RS_queue_capacity, sum(unit_sizes) // len(unit_sizes) * 2
+                )
 
         # Only optim_grads_params shards model weights, so only those parameters are
         # released after use and have to be all-gathered before being accessed again.
