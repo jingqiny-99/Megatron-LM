@@ -164,7 +164,8 @@ def replay_routing(tape: RoutingTape) -> Iterator[None]:
     A recompute that runs to the end of the checkpointed function must have used every recorded
     choice. Under torch's default early stop the recompute stops once its last saved tensor is
     rebuilt (``_StopRecomputationError`` raises through the scope), so this count check runs
-    only with ``torch.utils.checkpoint.set_checkpoint_early_stop(False)``. It is a safety net: a
+    only with ``torch.utils.checkpoint.set_checkpoint_early_stop(False)`` (the loop round
+    checkpoints of rounds that end inside a layer, ``loop_round_checkpoint``). It is a safety net: a
     recompute that routes fewer times also saves fewer tensors (CheckpointError), and one that
     routes more raises in ``taped_topk``."""
     tape.cursor = 0

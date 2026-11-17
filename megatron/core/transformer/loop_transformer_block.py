@@ -12,7 +12,7 @@ import torch
 import torch.distributed as dist
 import torch.nn.functional as F
 from torch import nn
-from torch.utils.checkpoint import checkpoint
+from torch.utils.checkpoint import checkpoint, set_checkpoint_early_stop
 
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.tensor_observation import observe_layer_residuals, suspend_tensor_observations
@@ -109,6 +109,34 @@ def loop_checkpoint_context_fn(prefix):
         )
 
     return context_fn
+
+
+def loop_round_checkpoint(function, *args, label, round_ends_in_layer):
+    """One loop round as a non-reentrant ``torch.utils.checkpoint`` (``loop_recompute``) with
+    ``loop_checkpoint_context_fn(label)``; returns ``function(*args)``.
+
+    By default (``early_stop``) a non-reentrant checkpoint ends its replay by raising inside
+    the op that packs the round's last saved tensor. When the round ends inside a layer
+    (``round_ends_in_layer``: the round returns a layer's output, as the residual and
+    attention-residual carriers and MoR do), that op is inside the round's last sublayer, and
+    the exception skips the per-call state the layer clears only on its success path:
+    ``TransformerLayer.mlp_norm_manager`` (the MLP input) and the MoE alltoall dispatcher's
+    ``probs`` / ``routing_map`` / permutation map (cleared in ``combine_postprocess``). That
+    state references the cut-off replay's autograd graph and keeps the whole replay alive after
+    the round has back-propagated, until the layer runs again: one finished replay held next to
+    the one in progress. Such rounds are therefore checkpointed with early stop off, so each
+    replay runs the round to its end (forward ops and gradients unchanged; the replay also runs
+    the round's last sublayer tail, and ``forward_replay.replay_routing``'s end-of-replay tape
+    check). A round that ends in an op saving its own input after the last layer (the loop norm
+    of the injection carrier) keeps early stop: its replay stops after the layer finished.
+    """
+    early_stop = set_checkpoint_early_stop(False) if round_ends_in_layer else nullcontext()
+    # torch reads the flag when the checkpoint frame is built (in this forward call), so the
+    # backward replay of this frame runs with it too.
+    with early_stop:
+        return checkpoint(
+            function, *args, use_reentrant=False, context_fn=loop_checkpoint_context_fn(label)
+        )
 
 
 def compact_metadata(active):
@@ -346,12 +374,13 @@ class LoopTransformerBlock(TransformerBlock):
             context = torch.no_grad() if step < first_grad else nullcontext()
             with context:
                 if self.config.loop_recompute and torch.is_grad_enabled():
-                    state = checkpoint(
+                    # The round ends in the loop norm, after its last layer: early stop.
+                    state = loop_round_checkpoint(
                         recurrence,
                         state,
                         embedding,
-                        use_reentrant=False,
-                        context_fn=loop_checkpoint_context_fn(f"{label}/loop={step + 1}"),
+                        label=f"{label}/loop={step + 1}",
+                        round_ends_in_layer=False,
                     )
                 else:
                     state = recurrence(state, embedding)
@@ -442,11 +471,8 @@ class LoopTransformerBlock(TransformerBlock):
                     )
 
             if self.config.loop_recompute and torch.is_grad_enabled():
-                updated = checkpoint(
-                    recurrence,
-                    layer_input,
-                    use_reentrant=False,
-                    context_fn=loop_checkpoint_context_fn(loop_label),
+                updated = loop_round_checkpoint(
+                    recurrence, layer_input, label=loop_label, round_ends_in_layer=True
                 )
             else:
                 updated = recurrence(layer_input)

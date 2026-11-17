@@ -21,7 +21,7 @@ Per site:
 * perturbed recompute (the router input of a replay gets noise, a stand-in for the non-bitwise
   recompute of a learned-routing round): with the tape the backward runs and every gradient,
   the routers' included, is finite; the control, the site's checkpoint context without the tape
-  (patched in the module that owns the site), raises the deep probe's ``CheckpointError``.
+  (patched where ``loop_round_checkpoint`` reads it), raises the deep probe's ``CheckpointError``.
 
 Local layers, fp32: CPU (gloo, one rank) or CUDA; model parallel is initialized once per module.
 """
@@ -36,7 +36,6 @@ from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_local_submodu
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer import loop_transformer_block
 from megatron.core.transformer.forward_replay import in_forward_replay, routing_tape_active
-from megatron.core.transformer.loop import attn_res_stack, hybrid_stack
 from megatron.core.transformer.loop.attn_res_stack import LoopAttnResHybridStack
 from megatron.core.transformer.loop.hybrid_stack import LoopHybridStack
 from megatron.core.transformer.loop_transformer_block import LoopTransformerBlock, recompute_context
@@ -157,22 +156,16 @@ def _gpt(recompute, **fields):
 _MOR = dict(loop_architecture="mor", loop_token_execution="masked")
 _ATTN_RES = dict(loop_carrier="attn_res")
 
-# site: (the stack builder, given loop_recompute; the module whose loop_checkpoint_context_fn
-# the site calls)
+# site: the stack builder, given loop_recompute. Every site checkpoints its round through
+# loop_transformer_block.loop_round_checkpoint, which reads loop_checkpoint_context_fn there.
 SITES = {
-    "gpt_huginn": (lambda recompute: _gpt(recompute), loop_transformer_block),
-    "gpt_mor": (lambda recompute: _gpt(recompute, **_MOR), loop_transformer_block),
-    "hybrid_huginn": (lambda recompute: _hybrid(LoopHybridStack, recompute), hybrid_stack),
-    "hybrid_mor": (lambda recompute: _hybrid(LoopHybridStack, recompute, **_MOR), hybrid_stack),
-    "attn_res_k1": (
-        lambda recompute: _hybrid(LoopAttnResHybridStack, recompute, **_ATTN_RES),
-        attn_res_stack,
-    ),
-    "attn_res_k2": (
-        lambda recompute: _hybrid(
-            LoopAttnResHybridStack, recompute, loop_attn_res_blocks_per_round=2, **_ATTN_RES
-        ),
-        attn_res_stack,
+    "gpt_huginn": lambda recompute: _gpt(recompute),
+    "gpt_mor": lambda recompute: _gpt(recompute, **_MOR),
+    "hybrid_huginn": lambda recompute: _hybrid(LoopHybridStack, recompute),
+    "hybrid_mor": lambda recompute: _hybrid(LoopHybridStack, recompute, **_MOR),
+    "attn_res_k1": lambda recompute: _hybrid(LoopAttnResHybridStack, recompute, **_ATTN_RES),
+    "attn_res_k2": lambda recompute: _hybrid(
+        LoopAttnResHybridStack, recompute, loop_attn_res_blocks_per_round=2, **_ATTN_RES
     ),
 }
 
@@ -204,7 +197,7 @@ def _run(stack):
 
 @pytest.mark.parametrize("site", list(SITES))
 def test_exact_recompute_is_bitwise_and_replays_the_tape(site):
-    build, _ = SITES[site]
+    build = SITES[site]
     reference = build(False)
     stack = build(True)
     stack.load_state_dict(reference.state_dict())
@@ -229,9 +222,9 @@ def test_exact_recompute_is_bitwise_and_replays_the_tape(site):
 @pytest.mark.parametrize("taped", [True, False], ids=["taped", "control"])
 @pytest.mark.parametrize("site", list(SITES))
 def test_perturbed_recompute_keeps_the_routing(monkeypatch, site, taped):
-    build, owner = SITES[site]
+    build = SITES[site]
     if not taped:
-        monkeypatch.setattr(owner, "loop_checkpoint_context_fn", _untaped)
+        monkeypatch.setattr(loop_transformer_block, "loop_checkpoint_context_fn", _untaped)
     stack = build(True)
     RoutedStubMoE.perturb_replay = True
     if not taped:
