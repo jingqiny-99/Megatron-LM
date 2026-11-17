@@ -17,7 +17,7 @@
   (``fsdp_force_bucket_part``) is the reader's inverse on the same emulated buffers and keeps a
   ZeRO-1 buffer's unreduced sums outside the shard; a GTP shard's rows (``gtp_rows``)
   reassemble to the full tensor with zero padding; the optimizer windows (``item_window``) cover
-  every item once over the ranks; the DDP writer and the bitwise comparison.
+  every item once over the ranks; the DDP writer and the exact comparison.
 * The GPU tests' Megatron-FSDP reduction schedule expectation (``reduced_every_microbatch``,
   ``expected_once_per_step``, ``observed_once_per_step``) and the per-backward mutation check
   (``assert_per_backward_mutation``).
@@ -451,7 +451,7 @@ def test_force_main_grads_copies_in_place_and_shards():
         sgu.force_main_grads(net, full)
 
 
-def test_mismatches_are_bitwise_and_name_dtype_and_size():
+def test_mismatches_are_exact_and_name_dtype_and_size():
     from tests.unit_tests.transformer.loop import strategy_grad_utils as sgu
 
     want = {"x": torch.ones(4), "y": torch.zeros(2, dtype=torch.bfloat16), "z": torch.ones(3)}
@@ -462,7 +462,14 @@ def test_mismatches_are_bitwise_and_name_dtype_and_size():
     assert found["y"] == (1, "bfloat16", 2**-10)
     assert found["z"][0] == "shape"
     assert sgu.mismatches(want, want) == {}
-    assert sgu.mismatches({"x": -torch.zeros(1)}, {"x": torch.zeros(1)}) == {}  # -0 == 0
+    # Values, not bit patterns: a read-back through a sum with zeros turns -0.0 into +0.0.
+    assert sgu.mismatches({"x": -torch.zeros(1)}, {"x": torch.zeros(1)}) == {}
+    assert set(
+        sgu.mismatches({"x": torch.full((1,), float("nan"))}, {"x": torch.full((1,), float("nan"))})
+    ) == {"x"}
+    # A different dtype is a mismatch even when the values are representable in both.
+    found = sgu.mismatches({"x": torch.ones(4, dtype=torch.bfloat16)}, {"x": torch.ones(4)})
+    assert found == {"x": ("dtype", "torch.bfloat16", "torch.float32")}
 
 
 def test_persistent_buffers_and_float16_masters():
@@ -499,6 +506,9 @@ def test_slice_mismatches_compare_the_window():
     assert set(sgu.slice_mismatches(slices, full)) == {"w"}
     assert sgu.slice_relative_difference(slices, full) > 0
     assert sgu.slice_relative_difference({"w": ((0, 0), torch.zeros(0))}, full) == 0.0
+    # A bf16 slice is not compared with the fp32 masters after rounding them: a mismatch.
+    slices = {"w": ((2, 7), torch.arange(2.0, 7.0).bfloat16())}
+    assert sgu.slice_mismatches(slices, full)["w"][0] == "dtype"
 
 
 def test_assert_teacher_forced_needs_readback_and_start():
@@ -513,6 +523,169 @@ def test_assert_teacher_forced_needs_readback_and_start():
     ):
         with pytest.raises(AssertionError):
             sgu.assert_teacher_forced(forcing, "arm")
+
+
+_ITEMS = [(0, 10), (10, 70), (80, 100), (180, 76)]  # (start, size) in a BUCKET-sized bucket
+
+
+def _emulated_weight_buffers(strategy, world, logical_rank, weights):
+    """The model weight buffer of every rank of a ``world``-rank group right after the install
+    (``weights``: the installed bucket): a sharded buffer stores its shard; an unsharded one
+    (``optim`` / ``optim_grads``) the whole bucket, where only its (virtual) shard is fresh, the
+    rest stale."""
+    from megatron.core.distributed.fsdp.src.megatron_fsdp.param_and_grad_buffer import (
+        BucketIndex,
+        _get_dp_buffer_shard_bucket_index,
+    )
+
+    bucket = BucketIndex(bucket_id=0, global_data_index=0, size=BUCKET, items=[])
+    items = {
+        item_id: SimpleNamespace(global_data_index=start, size=size)
+        for item_id, (start, size) in enumerate(_ITEMS)
+    }
+    distributed = strategy == "optim_grads_params"
+    buffers = []
+    for rank in range(world):
+        index = _get_dp_buffer_shard_bucket_index(bucket, distributed, world, logical_rank(rank))
+        shard = slice(index.bucket_data_index, index.bucket_data_index + index.size)
+        if distributed:
+            data = weights[shard].clone()
+        else:
+            data = torch.full((BUCKET,), -7.0)  # stale outside the shard
+            data[shard] = weights[shard]
+        buffers.append(
+            SimpleNamespace(
+                bucket_index=bucket, shard_bucket_index=index, item_index_map=items, data=data
+            )
+        )
+    return buffers
+
+
+@pytest.mark.parametrize(
+    "layout", ["fsdp", "hfsdp", "hfsdp_expert_shard1"], ids=lambda layout: layout
+)
+@pytest.mark.parametrize("strategy", ["optim_grads_params", "optim_grads", "optim"])
+def test_buffer_item_shard_reads_what_each_rank_installs(layout, strategy):
+    """Each rank's part of every item of the model weight buffer is its shard's intersection
+    with the item (the optimizer window, ``item_window``), read at the right place of a sharded
+    or an unsharded buffer (never its stale rest), and the parts of all ranks tile the item."""
+    from tests.unit_tests.transformer.loop import strategy_grad_utils as sgu
+
+    outer, inner = dict(fsdp=(1, 4), hfsdp=(2, 2), hfsdp_expert_shard1=(2, 1))[layout]
+    world = outer * inner
+    logical = lambda rank: _hfsdp_logical_rank(rank, outer, inner)  # noqa: E731
+    weights = torch.randn(BUCKET, generator=torch.Generator().manual_seed(3))
+    buffers = _emulated_weight_buffers(strategy, world, logical, weights)
+    for item_id, (start, size) in enumerate(_ITEMS):
+        covered = torch.zeros(size, dtype=torch.int64)
+        for buf in buffers:
+            (lo, hi), values = sgu.buffer_item_shard(buf, item_id)
+            index = buf.shard_bucket_index
+            assert (lo, hi) == sgu.item_window(
+                start, size, index.bucket_data_index, index.size, True
+            )
+            assert torch.equal(values, weights[start + lo : start + hi])
+            covered[lo:hi] += 1
+        assert bool((covered == 1).all()), (item_id, covered)
+
+
+def _emulated_fsdp(wbuf, params, no_shard_param):
+    """A Megatron-FSDP stand-in for ``fsdp_model_weight_slices``: one sharded group whose
+    parameters live in ``wbuf``, one ``no_shard`` group (no model weight buffer) and a frozen
+    group, which is skipped."""
+    sharded = SimpleNamespace(
+        requires_grad=True, main_grad_buffer=object(), model_weight_buffer=wbuf, params=params
+    )
+    replicated = SimpleNamespace(
+        requires_grad=True,
+        main_grad_buffer=object(),
+        model_weight_buffer=None,
+        params=[no_shard_param],
+    )
+    frozen = SimpleNamespace(requires_grad=False, main_grad_buffer=None, params=[])
+    names = {param: f"p{i}" for i, param in enumerate(params)}
+    names[no_shard_param] = "replicated"
+    wbuf.param_idx = {param: i for i, param in enumerate(params)}
+    return SimpleNamespace(
+        param_and_grad_buffer=SimpleNamespace(
+            parameter_groups=[sharded, replicated, frozen], param_to_name=names
+        )
+    )
+
+
+def test_fsdp_model_weight_slices_and_install_mismatches():
+    """The installed compute weights are read from the model weight buffer's shard (or, for a
+    ``no_shard`` group, the whole module parameter) and compared with the reference weights in
+    the optimizer's windows; a wrong element in this rank's window, a wrong dtype, a window that
+    differs from the optimizer's and a parameter not installed are all reported."""
+    from tests.unit_tests.transformer.loop import strategy_grad_utils as sgu
+
+    weights = torch.randn(BUCKET, generator=torch.Generator().manual_seed(4))
+    wbuf = _emulated_weight_buffers("optim_grads_params", 4, lambda rank: rank, weights)[1]
+    params = [torch.empty(size) for _, size in _ITEMS]
+    replicated = torch.randn(5)
+    installed = sgu.fsdp_model_weight_slices(_emulated_fsdp(wbuf, params, replicated))
+    reference = {f"p{i}": weights[start : start + size] for i, (start, size) in enumerate(_ITEMS)}
+    reference["replicated"] = replicated.clone()
+    main = {name: (window, None) for name, (window, _) in installed.items()}
+    assert set(installed) == set(reference)
+    assert installed["replicated"][0] == (0, 5)
+    assert sgu.install_mismatches(installed, reference, main) == {}
+
+    # Item 1 (bucket 10..80) meets rank 1's shard (bucket 64..128) in its elements 54..70.
+    assert installed["p1"][0] == (54, 70)
+    stale = dict(reference, p1=reference["p1"].clone())
+    stale["p1"][60] += 1.0  # inside rank 1's window: caught
+    assert set(sgu.install_mismatches(installed, stale, main)) == {"p1"}
+    stale["p1"] = reference["p1"].clone()
+    stale["p1"][0] += 1.0  # rank 0's part: not this rank's to check
+    assert sgu.install_mismatches(installed, stale, main) == {}
+    rounded = dict(reference, p2=reference["p2"].bfloat16())
+    assert sgu.install_mismatches(installed, rounded, main)["p2"][0] == "dtype"
+    shifted = dict(main, p3=((0, 1), None))
+    assert sgu.install_mismatches(installed, reference, shifted)["p3"][0] == "window"
+    extra = dict(main, missing=((0, 1), None))
+    assert sgu.install_mismatches(installed, reference, extra)["missing"] == ("not installed",)
+
+
+def test_fsdp_optimizer_grads_are_looked_up_as_the_hybrid_optimizer_does():
+    """``decoupled_grad`` when the attribute exists, even as None (the host Adam then consumes
+    no gradient: a mismatch), else ``grad``."""
+    from tests.unit_tests.transformer.loop import strategy_grad_utils as sgu
+
+    forced = torch.randn(BUCKET, generator=torch.Generator().manual_seed(5))
+    gbuf = _emulated_weight_buffers("optim_grads_params", 4, lambda rank: rank, forced)[1]
+    origs = [torch.empty(size) for _, size in _ITEMS]
+    gbuf.param_idx = {orig: i for i, orig in enumerate(origs)}
+    group = SimpleNamespace(
+        requires_grad=True, main_grad_buffer=gbuf, sharding_strategy="optim_grads_params"
+    )
+    reference = {f"p{i}": forced[start : start + size] for i, (start, size) in enumerate(_ITEMS)}
+
+    def fsdp_with(make_param):
+        named = [
+            (f"p{i}", make_param(orig, sgu.buffer_item_shard(gbuf, i)[1]))
+            for i, orig in enumerate(origs)
+        ]
+        return SimpleNamespace(
+            param_and_grad_buffer=SimpleNamespace(
+                optimizer_named_parameters=named,
+                parameter_groups=[group],
+                param_to_param_group={orig: 0 for orig in origs},
+            )
+        )
+
+    plain = fsdp_with(lambda orig, values: SimpleNamespace(orig_param=orig, grad=values))
+    assert sgu.fsdp_optimizer_grad_mismatches(plain, reference) == {}
+    decoupled = fsdp_with(
+        lambda orig, values: SimpleNamespace(orig_param=orig, grad=None, decoupled_grad=values)
+    )
+    assert sgu.fsdp_optimizer_grad_mismatches(decoupled, reference) == {}
+    unset = fsdp_with(
+        lambda orig, values: SimpleNamespace(orig_param=orig, grad=values, decoupled_grad=None)
+    )
+    # Rank 1's shard (bucket 64..128) meets items 1 and 2: those have no consumed gradient.
+    assert set(sgu.fsdp_optimizer_grad_mismatches(unset, reference)) == {"p1", "p2"}
 
 
 # ---------------------------------------------------------------------------------------------
@@ -592,7 +765,7 @@ def test_observed_once_per_step():
 
 def test_assert_per_backward_mutation():
     """Every fused weight reduced per backward must fail; the once-per-step ones must equal the
-    arm's bitwise (the mutation cannot reach them), and some must be per backward."""
+    arm's exactly (the mutation cannot reach them), and some must be per backward."""
     from tests.unit_tests.transformer.loop import strategy_grad_utils as sgu
 
     fused = ["dense", "expert"]
@@ -609,6 +782,84 @@ def test_assert_per_backward_mutation():
         sgu.assert_per_backward_mutation(failing, reached, arm, fused, {"expert"})
     with pytest.raises(AssertionError):  # nothing per backward left to check
         sgu.assert_per_backward_mutation(failing, mutant, arm, fused, {"dense", "expert"})
+
+
+_BUCKET_NAMES = {
+    0: ["decoder.layers.7.self_attention.linear_qkv.weight"],
+    1: ["decoder.layers.7.mlp.experts.linear_fc1.weight0"],
+}
+
+
+def _reduction_record(
+    expert_every, *, dense_every=True, outer_every=False, sizes=(2, 2), per_use=False
+):
+    """A two-step record of a dense bucket 0 and an expert bucket 1, each reduced by the hooks
+    every microbatch (``*_every``) or only in the last one, over DP-Outer in the last microbatch
+    (or every one), optionally with a per-use reduction of bucket 0."""
+    calls = []
+    for step in range(2):
+        for microbatch in range(3):
+            last = microbatch == 2
+            for bucket_id, every in ((0, dense_every), (1, expert_every)):
+                if every or last:
+                    calls.append((step, microbatch, (bucket_id,), last or outer_every, False))
+        if per_use:
+            calls.append((step, 0, (0,), False, True))
+    return dict(
+        calls=calls,
+        buckets=dict(enumerate(sizes)),
+        names=_BUCKET_NAMES,
+        expert_params={0: False, 1: True},
+    )
+
+
+@pytest.mark.parametrize(
+    "ep,expert,expert_every,sizes,kinds",
+    [
+        # W4, two instances, EP1: experts over a two-rank DP-Shard group.
+        (1, None, True, (2, 2), set()),
+        (1, "optim", False, (2, 2), set()),  # ZeRO-1 experts: once per step
+        (1, "optim", True, (2, 2), {("DP-Shard", 1)}),  # ZeRO-1 reduced every microbatch
+        (1, None, False, (2, 2), {("DP-Shard", 1)}),  # ZeRO-3 over two ranks reduced once
+        (1, "optim_grads", False, (2, 2), {("DP-Shard", 1)}),  # ZeRO-2 likewise
+        # EP2: a one-rank expert DP-Shard group, reduced once per step whatever the strategy.
+        (2, None, False, (2, 1), set()),
+        (2, "optim_grads", True, (2, 1), {("DP-Shard", 1)}),
+        (2, None, False, (2, 2), {("DP-Shard size", 1)}),  # not the layout's group
+    ],
+)
+def test_reduction_problems_check_the_dp_shard_schedule(ep, expert, expert_every, sizes, kinds):
+    """The checker of the HSDP GPU test's reduction records (``reduction_problems``) has teeth
+    on its DP-Shard branch: it rejects a ZeRO-1 bucket reduced every microbatch, a ZeRO-2/3
+    bucket over two ranks reduced once per step, and a DP-Shard size off the layout, in every
+    step, and accepts the schedule the strategy and layout imply."""
+    from tests.unit_tests.transformer.loop import strategy_grad_utils as sgu
+
+    record = _reduction_record(expert_every, sizes=sizes)
+    problems = sgu.reduction_problems(
+        record, dense="optim_grads_params", expert=expert, world=4, ep=ep, instances=2, steps=2
+    )
+    assert {(problem[0], problem[2]) for problem in problems} == kinds, problems
+    for kind, _ in kinds:
+        assert {problem[1] for problem in problems if problem[0] == kind} == {0, 1}, problems
+
+
+def test_reduction_problems_check_the_dp_outer_and_per_use_schedule():
+    from tests.unit_tests.transformer.loop import strategy_grad_utils as sgu
+
+    def kinds(record):
+        problems = sgu.reduction_problems(
+            record, dense="optim_grads_params", expert=None, world=4, ep=1, instances=2, steps=2
+        )
+        return {(problem[0], problem[2]) for problem in problems}
+
+    assert kinds(_reduction_record(True, outer_every=True)) == {("DP-Outer", 0), ("DP-Outer", 1)}
+    never = _reduction_record(True)
+    never["calls"] = [call[:3] + (False,) + call[4:] for call in never["calls"]]
+    assert kinds(never) == {("DP-Outer", 0), ("DP-Outer", 1)}
+    assert kinds(_reduction_record(True, per_use=True)) == {("per use", 0)}
+    # The dense bucket reduced once per step though its strategy shards over two ranks.
+    assert kinds(_reduction_record(True, dense_every=False)) == {("DP-Shard", 0)}
 
 
 # ---------------------------------------------------------------------------------------------

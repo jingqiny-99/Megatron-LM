@@ -19,12 +19,16 @@ Teacher forcing of step 2. Step 1 of every arm is gated against its reference as
 arm's reduced step-1 gradient storage (what its optimizer reads) is overwritten in place with the
 reference's reduced step-1 gradient, and the arm runs its own optimizer step, gradient-buffer
 reset, parameter gathers and step-2 forward / backward. Step 2 is gated only after an asserted
-precondition: the arm starts step 2 from a state bitwise equal to the reference's (weights, or
-for Megatron-FSDP the fp32 main weights the optimizer produced, and the persistent buffers).
-Without it the step-2 gate would ask the model to be insensitive to step-1 gradients that differ
-by fp32 reassociation: the zero-initialised fp32 parameters (``hyper_connection.bias``,
-``attn_sink``, ``hc_head_base``) take those last bits straight into their weights, and a tipped
-bf16 activation can flip a top-k routing or indexer decision. The un-forced step 2 is kept as an
+precondition: the arm starts step 2 from a state exactly equal to the reference's (weights, or
+for Megatron-FSDP the fp32 main weights the optimizer produced, and the persistent buffers; the
+Megatron-FSDP compute weights the optimizer step installed are checked in a test of their own).
+"Exactly equal" is ``mismatches``: same dtype and shape and ``torch.equal`` element values, so
+-0.0 equals +0.0 (a read-back that sums a rank's part with the other ranks' zeros turns -0.0
+into +0.0) and NaN equals nothing. Without the forcing the step-2 gate would ask the model to be
+insensitive to step-1 gradients that differ by fp32 reassociation: the zero-initialised fp32
+parameters (``hyper_connection.bias``, ``attn_sink``, ``hc_head_base``) take those last bits
+straight into their weights, and a tipped bf16 activation can flip a top-k routing or indexer
+decision. The un-forced step 2 is kept as an
 ungated diagnostic. Forcing hides a production write into the gradient storage between the end
 of ``finalize_model_grads`` and the optimizer step; a late asynchronous write would still break
 the precondition.
@@ -534,20 +538,93 @@ def fsdp_main_weight_slices(fsdp):
     return out
 
 
+def buffer_item_shard(buf, item_id):
+    """``((start, end), values)``: the part of item ``item_id`` in this rank's shard of a
+    sharded Megatron-FSDP buffer (or the virtual shard of an unsharded one), i.e. where this
+    rank's optimizer step writes it; the window within the flattened item is ``item_window`` on
+    the buffer's own indices, the values are read from ``get_shard_from_local_buffer`` (local)."""
+    from megatron.core.distributed.fsdp.src.megatron_fsdp.param_and_grad_buffer import (
+        DataParallelBuffer,
+    )
+
+    item = buf.item_index_map[item_id]
+    item_start = item.global_data_index - buf.bucket_index.global_data_index
+    index = buf.shard_bucket_index
+    start, end = item_window(item_start, item.size, index.bucket_data_index, index.size, True)
+    shard = DataParallelBuffer.get_shard_from_local_buffer(buf)
+    offset = item_start - index.bucket_data_index
+    return (start, end), shard[offset + start : offset + end].detach().clone()
+
+
+def fsdp_model_weight_slices(fsdp):
+    """{name: (window, values)} of the Megatron-FSDP compute weights this rank's optimizer step
+    installs (``copy_main_weights_to_model_weights``: main weight shard -> model weight buffer),
+    read right after the step: this rank's shard of each trainable parameter's model weight
+    buffer (``buffer_item_shard``), or the whole module parameter of a ``no_shard`` group,
+    which has no model weight buffer (local)."""
+    buffer = fsdp.param_and_grad_buffer
+    out = {}
+    for group in buffer.parameter_groups:
+        if not group.requires_grad or group.main_grad_buffer is None:
+            continue
+        wbuf = group.model_weight_buffer
+        for param in group.params:
+            name = buffer.param_to_name[param]
+            if wbuf is None:
+                values = _local(param).detach().reshape(-1).clone()
+                out[name] = ((0, values.numel()), values)
+            else:
+                out[name] = buffer_item_shard(wbuf, wbuf.param_idx[param])
+    return out
+
+
+def install_mismatches(installed, weights, main):
+    """Where the compute weights a Megatron-FSDP arm installed (``installed``:
+    ``fsdp_model_weight_slices``) differ from a DDP run's weights after the same step
+    (``weights``: full tensors by name, bf16 = the fp32 masters rounded) in the same windows
+    (local, ``mismatches``' format). Every name of the main weight slices (``main``) must be
+    installed in the window its optimizer parameter holds. Never raises on a mismatch: the
+    result is a test's to assert."""
+    found = {name: ("not installed",) for name in sorted(set(main) - set(installed))}
+    got, expected = {}, {}
+    for name, (window, values) in installed.items():
+        if name not in weights:
+            found[name] = ("no reference weight",)
+        elif name in main and main[name][0] != window:
+            found[name] = ("window", window, main[name][0])
+        else:
+            got[name] = values
+            expected[name] = weights[name].reshape(-1)[window[0] : window[1]].to(values.device)
+    found.update(mismatches(got, expected))
+    return found
+
+
+def install_record(record, weights):
+    """The install check of a Megatron-FSDP arm (collective: call it for every arm in the same
+    order on every rank): this rank's ``install_mismatches`` of ``record["installed"]`` against
+    ``weights`` (or the error reading them) and the largest count over the ranks."""
+    if record.get("installed") is None:
+        local = {"error": record.get("installed_error", "the installed weights were not read")}
+    else:
+        local = install_mismatches(record["installed"], weights, record["main"])
+    return dict(local=local, agreed=agreed(len(local)))
+
+
 def slice_mismatches(slices, full):
-    """Bitwise comparison (local, ``mismatches``' format) of ``slices``
+    """Exact comparison (local, ``mismatches``' format) of ``slices``
     (``fsdp_main_weight_slices``) with the same windows of ``full`` (full tensors by name)."""
     assert slices.keys() == full.keys(), sorted(set(slices) ^ set(full))[:8]
     got, expected = {}, {}
     for name, ((start, end), values) in slices.items():
         got[name] = values
-        expected[name] = full[name].reshape(-1)[start:end].to(values.device, values.dtype)
+        # No cast: a slice of another dtype is a mismatch, not a comparison of rounded values.
+        expected[name] = full[name].reshape(-1)[start:end].to(values.device)
     return mismatches(got, expected)
 
 
 def slice_relative_difference(slices, full):
     """The largest per-tensor relative norm difference of ``slices`` against the same windows of
-    ``full`` (local; a diagnostic where no bitwise equality is expected)."""
+    ``full`` (local; a diagnostic where no exact equality is expected)."""
     worst = 0.0
     for name, ((start, end), values) in slices.items():
         want = full[name].reshape(-1)[start:end].to(values.device, torch.float64)
@@ -557,7 +634,7 @@ def slice_relative_difference(slices, full):
 
 
 def fsdp_start_mismatches(record, reference):
-    """Where the state a Megatron-FSDP arm's step 2 starts from differs bitwise from a DDP
+    """Where the state a Megatron-FSDP arm's step 2 starts from differs from a DDP
     run's (local): the arm's fp32 main weight slices (``record["main"]``) against the run's fp32
     masters, and the persistent buffers (``record`` / ``reference["buffers"]``)."""
     found = slice_mismatches(record["main"], reference["masters"])
@@ -568,15 +645,17 @@ def fsdp_start_mismatches(record, reference):
 
 def fsdp_optimizer_grad_mismatches(fsdp, reference):
     """Local diagnostic of a forced Megatron-FSDP arm (``mismatches``' format): every optimizer
-    parameter's gradient (``decoupled_grad`` or ``grad``, its local shard) against the same
-    window of ``reference``, on the main gradient buffer's indices. A mismatch names a gradient
+    parameter's gradient, looked up as ``HybridDeviceOptimizer`` and the precision-aware
+    optimizer consume it (``decoupled_grad`` when the attribute exists, even when it is None,
+    else ``grad``; its local shard), against the same window of ``reference``, on the main
+    gradient buffer's indices. A missing gradient is a mismatch. A mismatch names a gradient
     the forcing did not reach (a copy of the buffer, not a view)."""
     got, expected = {}, {}
     for name, param, (start, end) in _fsdp_optimizer_windows(
         fsdp, lambda group: group.main_grad_buffer
     ):
-        grad = getattr(param, "decoupled_grad", None)
-        grad = param.grad if grad is None else grad
+        # hybrid_optimizer.py: getattr(param, "decoupled_grad", param.grad).
+        grad = param.decoupled_grad if hasattr(param, "decoupled_grad") else param.grad
         want = reference[name].reshape(-1)[start:end].float()
         if grad is None:
             got[name] = torch.full_like(want, float("nan"))
@@ -625,13 +704,17 @@ def persistent_buffers(model):
 
 
 def mismatches(got, expected):
-    """Bitwise comparison (local): ``{name: (differing elements, dtype, max abs difference)}``
-    of every tensor of ``expected`` that ``got`` does not equal exactly."""
+    """Exact comparison (local): ``{name: (differing elements, dtype, max abs difference)}``
+    of every tensor of ``expected`` that ``got`` does not equal exactly: a different dtype or
+    shape, or an element whose value differs (``torch.equal``: -0.0 equals +0.0, NaN equals
+    nothing). Not a comparison of bit patterns: the sign of a zero is not compared."""
     assert got.keys() == expected.keys(), sorted(set(got) ^ set(expected))[:8]
     found = {}
     for name, want in expected.items():
         have = got[name]
-        if have.shape != want.shape:
+        if have.dtype != want.dtype:
+            found[name] = ("dtype", str(have.dtype), str(want.dtype))
+        elif have.shape != want.shape:
             found[name] = ("shape", tuple(have.shape), tuple(want.shape))
         elif not torch.equal(have, want):
             diff = (have.double() - want.double()).abs()
@@ -661,7 +744,7 @@ def forcing_record(readback, start):
 
 def assert_teacher_forced(forcing, arm, what="the reference's"):
     """The precondition of a step-2 gate: the arm read the forced gradient back on every rank
-    and started step 2 from a state bitwise equal to ``what``."""
+    and started step 2 from a state exactly equal to ``what``."""
     assert forcing is not None, f"{arm} was not teacher-forced"
     assert forcing["readback"] == 0, (
         f"teacher forcing: {arm}'s reduced gradient read back after the forcing differs from "
@@ -669,7 +752,7 @@ def assert_teacher_forced(forcing, arm, what="the reference's"):
     )
     local = forcing["start"]
     assert forcing["agreed"] == 0, (
-        f"teacher-forcing precondition: {arm} starts step 2 from a state that differs bitwise "
+        f"teacher-forcing precondition: {arm} starts step 2 from a state that differs "
         f"from {what} in {len(local)} tensors on this rank ({forcing['agreed']} on the worst "
         "rank): its optimizer step on the forced step-1 gradient (or its parameter gather) did "
         "not reproduce the update",
@@ -774,6 +857,40 @@ def reduction_counts(calls, step):
     return hooks, uses, outer
 
 
+def reduction_problems(record, *, dense, expert, world, ep, instances, steps, rows=ROWS):
+    """The recorded Megatron-FSDP reductions of an accumulate-mode arm (``record``: ``calls``,
+    ``buckets`` = bucket id -> DP-Shard size, ``names``, ``expert_params``; ``dense`` /
+    ``expert``: its strategies, ``expert`` ``None`` for the dense one) against the expectation
+    from the layout and the configured strategies, every step: every bucket's DP-Shard size is
+    the layout's (``expected_dp_shard``); its gradient hooks reduce it ``[1, 1, 1]`` over the
+    microbatches when its strategy shards gradients over more than one rank
+    (``reduced_every_microbatch``), else ``[0, 0, 1]``; over DP-Outer ``[0, 0, 1]``; no per-use
+    reduction. Returns the problems, ``(kind, step, bucket id, ...)`` with kind ``"DP-Shard
+    size"``, ``"DP-Shard"``, ``"DP-Outer"`` or ``"per use"``."""
+    problems = []
+    last = [0] * (rows - 1) + [1]
+    for step in range(steps):
+        hooks, uses, outer = reduction_counts(record["calls"], step)
+        for bucket_id, shard_size in record["buckets"].items():
+            expert_bucket = bucket_is_expert(record, bucket_id)
+            strategy = (expert or dense) if expert_bucket else dense
+            layout_size = expected_dp_shard(world, ep, instances, expert_bucket)
+            if shard_size != layout_size:
+                problems.append(("DP-Shard size", step, bucket_id, shard_size, layout_size))
+            every = reduced_every_microbatch(strategy, layout_size)
+            expected = [1] * rows if every else last
+            got = [hooks[(m, bucket_id)] for m in range(rows)]
+            if got != expected:
+                problems.append(("DP-Shard", step, bucket_id, strategy, shard_size, got, expected))
+            got = [outer[(m, bucket_id)] for m in range(rows)]
+            if got != last:
+                problems.append(("DP-Outer", step, bucket_id, got))
+            got = [uses[(m, bucket_id)] for m in range(rows)]
+            if any(got):
+                problems.append(("per use", step, bucket_id, got))
+    return problems
+
+
 def observed_once_per_step(record, steps, rows=ROWS):
     """The parameter names (``record["names"]``: bucket id -> names) of every bucket that, in
     each of ``steps`` steps, was reduced by its gradient hook only in the last microbatch, never
@@ -796,7 +913,7 @@ def assert_per_backward_mutation(report, mutant_grads, arm_grads, fused, once):
     """A mutation of the per-backward reduction (accumulate mode off, a dropped per-use
     reduction, DP-Outer on every microbatch) must fail the gate on every fused core weight whose
     bucket is reduced every microbatch. It cannot reach one reduced once per step (``once``),
-    whose gradient must equal the same-config arm's bitwise. Returns those excluded names."""
+    whose gradient must equal the same-config arm's exactly. Returns those excluded names."""
     per_backward = [name for name in fused if name not in once]
     excluded = [name for name in fused if name in once]
     assert per_backward, (fused[:8], sorted(once)[:8])
