@@ -128,12 +128,29 @@ def test_argument_validation_runs_the_loop_fsdp_rules(monkeypatch):
         (dict(save="/checkpoints"), [guards.FSDP_CHECKPOINTING]),
         (dict(load="/checkpoints"), [guards.FSDP_CHECKPOINTING]),
         (dict(loop_sample_depth=True), [guards.FSDP_SAMPLED_DEPTHS]),
-        (dict(num_distributed_optimizer_instances=2), [guards.FSDP_HSDP]),
+        # HSDP needs a fixed depth (it passes at one, below).
+        (
+            dict(num_distributed_optimizer_instances=2, loop_sample_depth=True),
+            [guards.FSDP_SAMPLED_DEPTHS, guards.FSDP_HSDP],
+        ),
     ):
         args = _parsed(monkeypatch, **HYBRID_LOOP, **dict(FSDP_LOOP, **overrides))
         with pytest.raises(ValueError) as excinfo:
             _validate_loop_fsdp(args)
         assert _reported(excinfo) == rules, overrides
+    # HSDP (and HFSDP) at the hybrid loop's fixed depth.
+    for outer in ("no_shard", "optim"):
+        _validate_loop_fsdp(
+            _parsed(
+                monkeypatch,
+                **HYBRID_LOOP,
+                **dict(
+                    FSDP_LOOP,
+                    num_distributed_optimizer_instances=2,
+                    outer_dp_sharding_strategy=outer,
+                ),
+            )
+        )
     with pytest.raises(ValueError) as excinfo:
         _validate_loop_fsdp(_parsed(monkeypatch, **GPT_LOOP, **FSDP_LOOP))
     assert _reported(excinfo) == [guards.FSDP_GPT_LOOP]

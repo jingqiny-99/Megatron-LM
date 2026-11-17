@@ -215,8 +215,10 @@ _CONFIG_RULES = [
         guards.OTHER_RECOMPUTE,
         dict(recompute_granularity="selective", recompute_modules=["moe_act", "layernorm"]),
     ),
-    (guards.GTP_WEIGHT_REMAT, dict(gtp_weight_remat_size=2)),
-    (guards.GTP_WEIGHT_REMAT, dict(expert_gtp_weight_remat_size=2)),
+    # GTP is refused without a fixed depth only (test_gtp_is_allowed_at_a_fixed_depth).
+    (guards.GTP_WEIGHT_REMAT, dict(gtp_weight_remat_size=2, loop_sample_depth=True)),
+    (guards.GTP_WEIGHT_REMAT, dict(expert_gtp_weight_remat_size=2, loop_architecture="mor")),
+    (guards.GTP_WEIGHT_REMAT, dict(gtp_weight_remat_size=2, loop_schedule="rsbf")),
     (guards.WIDE_RESIDUAL, dict(wide_residual=object())),
     (
         guards.DSA_OVER_GQA,
@@ -228,13 +230,48 @@ _CONFIG_RULES = [
 @pytest.mark.parametrize(
     "rule,fields",
     _CONFIG_RULES,
-    ids=[f"{rule}-{'-'.join(fields)}" for rule, fields in _CONFIG_RULES],
+    ids=[f"{rule[:40]}-{'-'.join(fields)}" for rule, fields in _CONFIG_RULES],
 )
 def test_config_rule_is_reported_alone(rule, fields):
     config = _violating(_dense_config(), **fields)
     with pytest.raises(ValueError, match="Hybrid loop does not support") as excinfo:
         validate_hybrid_loop_config(config)
     assert _reported(excinfo) == [rule]
+
+
+def test_fixed_depth_loop():
+    """Fixed depth: Huginn, the standard schedule, exit 'fixed', no sampled depth. Truncated
+    BPTT and the untied core keep the per-step use count fixed."""
+    assert guards.fixed_depth_loop(_dense_config())
+    assert guards.fixed_depth_loop(_dsv4_config())
+    assert guards.fixed_depth_loop(_violating(_dense_config(), loop_bptt_iterations=2))
+    assert guards.fixed_depth_loop(_violating(_dense_config(), loop_untie_core=True))
+    for fields in (
+        dict(loop_architecture="mor"),
+        dict(loop_architecture="none"),
+        dict(loop_sample_depth=True),
+        dict(loop_exit_criterion="sampled"),
+        dict(loop_schedule="rsbf"),
+    ):
+        assert not guards.fixed_depth_loop(_violating(_dense_config(), **fields)), fields
+    # The argument namespace (duck-typed): absent fields take the defaults.
+    assert guards.fixed_depth_loop(SimpleNamespace(loop_architecture="huginn"))
+    assert not guards.fixed_depth_loop(SimpleNamespace())
+
+
+def test_gtp_is_allowed_at_a_fixed_depth():
+    """Module GTP (dense and expert weight remat) passes the config rules at a fixed depth,
+    also on the DSv4 loop and with truncated BPTT."""
+    for config in (_dense_config(), _dsv4_config()):
+        for fields in (
+            dict(gtp_weight_remat_size=2),
+            dict(expert_gtp_weight_remat_size=4),
+            dict(gtp_weight_remat_size=2, expert_gtp_weight_remat_size=2),
+            dict(gtp_weight_remat_size=2, loop_bptt_iterations=2),
+        ):
+            validate_hybrid_loop_config(_violating(config, **fields))
+    # Built through __post_init__ too (gtp_weight_remat_size reconciles the shard count).
+    validate_hybrid_loop_config(_dense_config(gtp_weight_remat_size=2))
 
 
 def test_valid_configs_pass_config_rules():
@@ -567,6 +604,14 @@ def test_dense_mask_with_dsv4_attention_on_sbhd_is_rejected():
 # ---------------------------------------------------------------------------------------------
 
 
+_NOT_FIXED_DEPTH = [
+    dict(loop_sample_depth=True),
+    dict(loop_architecture="mor"),
+    dict(loop_exit_criterion="sampled"),
+    dict(loop_schedule="rsbf"),
+]
+
+
 @pytest.mark.parametrize(
     "rule,ddp_fields",
     [
@@ -577,11 +622,24 @@ def test_dense_mask_with_dsv4_attention_on_sbhd_is_rejected():
         ),
     ],
 )
-def test_ddp_overlap_is_rejected_for_hybrid_loops(rule, ddp_fields):
+@pytest.mark.parametrize("depth_fields", _NOT_FIXED_DEPTH, ids=lambda f: "-".join(f))
+def test_ddp_overlap_is_rejected_without_a_fixed_depth(rule, ddp_fields, depth_fields):
     ddp_config = DistributedDataParallelConfig(**ddp_fields)
     with pytest.raises(ValueError) as excinfo:
-        validate_loop_ddp_config(_dense_config(), ddp_config)
+        validate_loop_ddp_config(_violating(_dense_config(), **depth_fields), ddp_config)
     assert _reported(excinfo) == [rule]
+
+
+def test_ddp_overlap_is_allowed_at_a_fixed_depth():
+    """Overlapped grad reduce and param gather at a fixed depth (the DSv4 loop, with GTP, with
+    truncated BPTT)."""
+    ddp_config = DistributedDataParallelConfig(
+        overlap_grad_reduce=True, use_distributed_optimizer=True, overlap_param_gather=True
+    )
+    validate_loop_ddp_config(_dense_config(), ddp_config)
+    validate_loop_ddp_config(_dsv4_config(), ddp_config)
+    validate_loop_ddp_config(_violating(_dense_config(), gtp_weight_remat_size=2), ddp_config)
+    validate_loop_ddp_config(_violating(_dense_config(), loop_bptt_iterations=2), ddp_config)
 
 
 def test_ddp_overlap_is_allowed_outside_hybrid_loops():
@@ -821,15 +879,26 @@ def model_parallel():
             dist.destroy_process_group()
 
 
-def test_ddp_wrap_rejects_overlap_for_a_hybrid_loop(model_parallel):
+def test_ddp_wrap_rejects_overlap_for_a_hybrid_loop_without_a_fixed_depth(model_parallel):
     module = torch.nn.Linear(8, 8, bias=False)
     if torch.cuda.is_available():
         module = module.cuda()
     with pytest.raises(ValueError) as excinfo:
         DistributedDataParallel(
-            _dense_config(), DistributedDataParallelConfig(overlap_grad_reduce=True), module
+            _dense_config(loop_sample_depth=True),
+            DistributedDataParallelConfig(overlap_grad_reduce=True),
+            module,
         )
     assert _reported(excinfo) == [guards.OVERLAP_GRAD_REDUCE]
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="DDP grad buffers live on CUDA")
+def test_ddp_wrap_keeps_overlap_for_a_fixed_depth_hybrid_loop(model_parallel):
+    module = torch.nn.Linear(8, 8, bias=False).cuda()
+    ddp = DistributedDataParallel(
+        _dense_config(), DistributedDataParallelConfig(overlap_grad_reduce=True), module
+    )
+    assert ddp.ddp_config.overlap_grad_reduce
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="DDP grad buffers live on CUDA")
@@ -1321,7 +1390,9 @@ _FSDP_RULES = [
     (guards.FSDP_SAMPLED_DEPTHS, dict(loop_exit_criterion="sampled"), {}),
     (guards.FSDP_MOR, dict(loop_architecture="mor"), {}),
     (guards.FSDP_ATTN_RES, dict(loop_carrier="attn_res"), {}),
-    (guards.FSDP_HSDP, {}, dict(num_distributed_optimizer_instances=2)),
+    # HSDP is refused without a fixed depth only (test_fsdp_hsdp_is_allowed_at_a_fixed_depth);
+    # the RSBF schedule is the variable depth no other Megatron-FSDP rule names.
+    (guards.FSDP_HSDP, dict(loop_schedule="rsbf"), dict(num_distributed_optimizer_instances=2)),
 ]
 _FSDP_RULE_NAMES = [
     guards.FSDP_GPT_LOOP,
@@ -1373,6 +1444,24 @@ def test_fsdp_rule_is_reported_alone(rule, fields, ddp_fields):
     with pytest.raises(ValueError) as excinfo:
         guards.validate_loop_fsdp_config(config, _fsdp_ddp_config(**ddp_fields))
     assert _fsdp_reported(excinfo) == [rule]
+
+
+def test_fsdp_hsdp_is_allowed_at_a_fixed_depth():
+    """HSDP (outer no_shard) and HFSDP (outer optim) at a fixed depth, through the wrapper's
+    configs and the argument namespace; with a sampled depth both rules are reported."""
+    for outer in ("no_shard", "optim"):
+        ddp_config = _fsdp_ddp_config(
+            num_distributed_optimizer_instances=2, outer_dp_sharding_strategy=outer
+        )
+        guards.validate_loop_fsdp_config(_dense_config(), ddp_config)
+        args = _args_namespace(_dense_config(), ddp_config)
+        guards.validate_loop_fsdp_config(args, args)
+    with pytest.raises(ValueError) as excinfo:
+        guards.validate_loop_fsdp_config(
+            _violating(_dense_config(), loop_sample_depth=True),
+            _fsdp_ddp_config(num_distributed_optimizer_instances=2),
+        )
+    assert _fsdp_reported(excinfo) == [guards.FSDP_SAMPLED_DEPTHS, guards.FSDP_HSDP]
 
 
 def test_fsdp_refuses_the_gpt_loop():
@@ -1496,3 +1585,50 @@ def test_row_depths_are_refused_on_a_megatron_fsdp_stack(model_parallel):
     with pytest.raises(ValueError) as excinfo:
         stack.set_loop_depths(depths)
     assert _fsdp_reported(excinfo) == [guards.FSDP_ROW_DEPTHS]
+
+
+# ---------------------------------------------------------------------------------------------
+# Module GTP shards on the stack (validate_loop_gtp_shards, validate_loop_row_depths)
+# ---------------------------------------------------------------------------------------------
+
+
+def _tag_as_module_gtp_shard(param):
+    """Mark ``param`` the way a GTP-wrapped layer's weight is marked (``GTPShardedParam``):
+    ``is_gtp_weight_remat`` and TE's ``is_distributed_weight``."""
+    param.is_gtp_weight_remat = True
+    param.is_distributed_weight = True
+
+
+def test_module_gtp_shards_need_a_fixed_depth(model_parallel):
+    """Layers are GTP-wrapped by their process groups, so the stack checks its parameters too
+    (the config's GTP sizes may say 1). A loop parameter store's grid shard (only
+    ``is_gtp_weight_remat``) is not a module-GTP shard."""
+    from tests.unit_tests.transformer.loop.hybrid_loop_utils import build_local_loop_stack
+
+    stack = build_local_loop_stack(_DENSE, 2, 2)
+    config = stack.config
+    assert not guards.has_module_gtp_shards(stack)
+    weight = next(stack.parameters())
+    weight.is_gtp_weight_remat = True  # a store grid shard's tag alone
+    assert not guards.has_module_gtp_shards(stack)
+    _tag_as_module_gtp_shard(weight)
+    assert guards.has_module_gtp_shards(stack)
+    guards.validate_loop_gtp_shards(config, stack)
+    for fields in _NOT_FIXED_DEPTH:
+        with pytest.raises(ValueError) as excinfo:
+            guards.validate_loop_gtp_shards(_violating(config, **fields), stack)
+        assert _reported(excinfo) == [guards.GTP_WEIGHT_REMAT], fields
+
+
+def test_row_depths_are_refused_on_a_module_gtp_stack(model_parallel):
+    """set_loop_depths raises on a stack holding module-GTP shards: the rounds it runs change
+    per step, and so would each shard's per-use grad-ready count."""
+    from tests.unit_tests.transformer.loop.hybrid_loop_utils import build_local_loop_stack
+
+    stack = build_local_loop_stack(_DENSE, 2, 2)
+    depths = torch.tensor([1, 2], device=next(stack.parameters()).device)
+    _tag_as_module_gtp_shard(next(stack.parameters()))
+    stack.set_loop_depths(None)
+    with pytest.raises(ValueError) as excinfo:
+        stack.set_loop_depths(depths)
+    assert _reported(excinfo) == [guards.GTP_ROW_DEPTHS]

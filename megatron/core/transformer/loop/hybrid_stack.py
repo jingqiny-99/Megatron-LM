@@ -87,12 +87,14 @@ from megatron.core.transformer.loop import flops
 from megatron.core.transformer.loop.guards import (
     LoopRoles,
     has_dsv4_attention,
+    has_module_gtp_shards,
     resolve_hybrid_loop_roles,
     round_sublayers,
     validate_hybrid_loop_config,
     validate_hybrid_loop_inputs,
     validate_loop_carrier,
     validate_loop_carrier_stack,
+    validate_loop_gtp_shards,
     validate_loop_mtp_pattern,
     validate_loop_row_depths,
     validate_loop_stack_construction,
@@ -225,6 +227,15 @@ class LoopHybridStack(HybridStack):
         # PP = 1 (guarded): the stack holds the whole main pattern, layer numbers are i + 1, and
         # without Shortcut MoE (guarded) self.layers is indexed by the physical sublayer.
         assert self._execution_layer_indices == list(range(len(self.layers)))
+        validate_loop_gtp_shards(config, self)
+        if has_module_gtp_shards(self):
+            # Module GTP at a fixed depth: a core weight is consumed once per round, in the
+            # forward and again in the recompute, which the static prefetch chains (built for
+            # one consume per pass) do not follow. Consumes check their prefetched buffers and
+            # gather on demand otherwise (process-global GTP setting, read at every consume).
+            from megatron.core.tensor_parallel.generalized_tensor_parallelism import GTP_CONFIG
+
+            GTP_CONFIG.verify_prefetched_gathers = True
         self.loop_roles: LoopRoles = resolve_hybrid_loop_roles(
             config, self.layer_type_list, hash_moe_layer_threshold
         )
@@ -363,9 +374,10 @@ class LoopHybridStack(HybridStack):
         uniform depth (no padding mask is added), so equal row depths equal uniform depth
         bitwise.
 
-        Raises ``ValueError`` on an untied core (``loop_untie_core``: a fixed-depth baseline)
-        and on a stack wrapped by Megatron-FSDP (``guards.FSDP_ROW_DEPTHS``: data-parallel
-        ranks would issue different parameter gathers).
+        Raises ``ValueError`` on an untied core (``loop_untie_core``: a fixed-depth baseline),
+        on a stack wrapped by Megatron-FSDP (``guards.FSDP_ROW_DEPTHS``: data-parallel ranks
+        would issue different parameter gathers) and on a stack holding module-GTP shards
+        (``guards.GTP_ROW_DEPTHS``: their per-use grad-ready count would change per step).
         """
         if depths is not None and self.config.loop_untie_core:
             raise ValueError("Untied loop baseline requires fixed-depth Huginn (set_loop_depths)")

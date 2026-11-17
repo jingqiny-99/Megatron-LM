@@ -22,6 +22,7 @@ Where each group runs:
   constructors; ``validate_loop_carrier_stack``: the loop stack constructors.
 * ``validate_loop_decoder``: ``HybridModel.__init__``, after the decoder is built.
 * ``validate_hybrid_loop_inputs``: the start of the loop stack's layer loop, every forward.
+* ``validate_loop_gtp_shards``: the loop stack's constructor, after its layers are built.
 * ``validate_loop_ddp_config``: ``DistributedDataParallel.__init__``.
 * ``validate_loop_fsdp_config`` (``"Loop with Megatron-FSDP does not support: ..."``): the
   Megatron-FSDP v1 wrapper's constructor (``FullyShardedDataParallel``) and argument validation;
@@ -57,8 +58,8 @@ if TYPE_CHECKING:
 
 # Rule names, as they appear in the error message.
 PIPE_IN_PATTERN = "'|' in hybrid_layer_pattern"
-OVERLAP_GRAD_REDUCE = "overlap_grad_reduce"
-OVERLAP_PARAM_GATHER = "overlap_param_gather"
+OVERLAP_GRAD_REDUCE = "overlap_grad_reduce without a fixed depth"
+OVERLAP_PARAM_GATHER = "overlap_param_gather without a fixed depth"
 DELAYED_FP8_SCALING = "delayed FP8 scaling"
 CUDA_GRAPHS = "cuda_graph_impl"
 MHC_RECOMPUTE = "mHC recompute"
@@ -83,7 +84,9 @@ UNTAPED_RECOMPUTE_ROUTING = (
 FP4 = "FP4"
 ACTIVATION_OFFLOAD = "activation offload"
 OTHER_RECOMPUTE = "activation recompute other than loop_recompute"
-GTP_WEIGHT_REMAT = "GTP weight remat"
+GTP_WEIGHT_REMAT = "GTP weight remat without a fixed depth"
+# Per-row depths (``LoopHybridStack.set_loop_depths``) on a stack holding GTP shards.
+GTP_ROW_DEPTHS = "per-row loop depths (set_loop_depths) with GTP weight remat"
 WIDE_RESIDUAL = "wide residual"
 DSA_OVER_GQA = (
     "DSA over GQA (experimental_attention_variant='dsa' without MLA: its indexer has no "
@@ -213,6 +216,23 @@ def is_hybrid_loop_config(config: Any) -> bool:
         getattr(config, "loop_architecture", "none") != "none"
         and getattr(config, "loop_prelude_sublayers", None) is not None
         and getattr(config, "loop_coda_sublayers", None) is not None
+    )
+
+
+def fixed_depth_loop(config: Any) -> bool:
+    """True for a Huginn loop that runs the same rounds on every sample of every step: the
+    standard schedule, ``loop_exit_criterion='fixed'`` and no ``loop_sample_depth`` (per-row
+    depths, ``LoopHybridStack.set_loop_depths``, are refused at runtime where they matter).
+
+    Every core weight is then used the same number of times in every microbatch (R times, or
+    the differentiated rounds under truncated BPTT), so a per-use count learned once holds for
+    every later step. MoR (a round with no token skips its sublayers), sampled depths and the
+    RSBF schedule (per-sample exit) are not fixed."""
+    return (
+        getattr(config, "loop_architecture", "none") == "huginn"
+        and getattr(config, "loop_exit_criterion", "fixed") == "fixed"
+        and not getattr(config, "loop_sample_depth", False)
+        and getattr(config, "loop_schedule", "standard") == "standard"
     )
 
 
@@ -352,10 +372,17 @@ def validate_hybrid_loop_config(config: "TransformerConfig") -> None:
                 module not in _LOOP_RULED_RECOMPUTE_MODULES for module in _recompute_modules(config)
             )
         ),
-        # GTP prefetches weights along a static next-weight chain, which a core revisited
-        # R times per microbatch breaks.
-        GTP_WEIGHT_REMAT: config.gtp_weight_remat_size > 1
-        or config.expert_gtp_weight_remat_size > 1,
+        # GTP gathers a weight before every use and reduce-scatters its gradient after every
+        # use. A core weight is used R times per microbatch: every reduce-scatter adds into the
+        # shard's main_grad (a weight's next reduce-scatter first finalizes its previous one),
+        # and the static prefetch chain is only a hint under the loop (the stack turns on
+        # GTP_CONFIG.verify_prefetched_gathers: a consume reads a prefetched buffer only if
+        # that buffer still holds this weight's last gather). DDP's grad-ready fires once per
+        # use, so the per-use count must be the same every step: fixed depth only.
+        GTP_WEIGHT_REMAT: (
+            config.gtp_weight_remat_size > 1 or config.expert_gtp_weight_remat_size > 1
+        )
+        and not fixed_depth_loop(config),
         # A second multi-stream residual scheme; the loop adapter is defined for mHC only.
         WIDE_RESIDUAL: config.wide_residual is not None,
         # DSGQACoreAttention takes no padding mask (padded / exited rows would train its
@@ -545,20 +572,34 @@ def validate_hybrid_loop_inputs(
 def validate_loop_ddp_config(
     config: "TransformerConfig", ddp_config: "DistributedDataParallelConfig"
 ) -> None:
-    """Reject DDP communication overlap for a hybrid loop (no-op for other configs).
+    """Reject DDP communication overlap for a hybrid loop without a fixed depth (no-op for
+    other configs).
 
-    Overlapped grad reduce starts a bucket's sync when the per-parameter grad-ready counts
-    reach those of the first batch; per-sample exit changes the number of core rounds per
-    step, so a sync would never start or would start before later rounds' gradients land.
-    Overlapped param gather waits on a bucket's all-gather at a module's first forward, which
-    a core module re-enters once per round. GPT loop configs (no role fields) are not
-    affected; their eager loop is tested with overlapped grad reduce.
+    Overlapped grad reduce starts a bucket's sync when the per-parameter grad-ready counts of
+    the last microbatch reach those of the first step (``_ParamAndGradBucketGroup.
+    register_grad_ready``). An autograd-hooked parameter is ready once per backward, after its
+    last use (its ``AccumulateGrad`` node waits for every use's gradient, also through the
+    loop's non-reentrant checkpoints); a GTP shard is ready once per use
+    (``_handle_megatron_grad_accum`` after each use's reduce-scatter). At a fixed depth
+    (``fixed_depth_loop``) both counts are the same every step, so a bucket's sync starts after
+    the last use of every parameter in it, and a count above the first step's raises in
+    ``register_grad_ready``. Per-sample exit changes the number of rounds per step, so a GTP
+    shard's sync would never start or would start before later rounds' gradients land.
+
+    Overlapped param gather waits on a bucket's all-gather in the first forward pre-hook of a
+    module owning one of its parameters; a core module re-entered in later rounds and in the
+    recompute finds the bucket published (``finish_param_sync`` is a no-op until the step's
+    ``finish_grad_sync``). Allowed with the grad-reduce rule.
+
+    GPT loop configs (no role fields) are not affected; their eager loop is tested with
+    overlapped grad reduce.
     """
     if not is_hybrid_loop_config(config):
         return
+    fixed = fixed_depth_loop(config)
     unsupported = {
-        OVERLAP_GRAD_REDUCE: ddp_config.overlap_grad_reduce,
-        OVERLAP_PARAM_GATHER: ddp_config.overlap_param_gather,
+        OVERLAP_GRAD_REDUCE: ddp_config.overlap_grad_reduce and not fixed,
+        OVERLAP_PARAM_GATHER: ddp_config.overlap_param_gather and not fixed,
     }
     _raise_if_any([name for name, value in unsupported.items() if value])
 
@@ -590,7 +631,7 @@ FSDP_SAMPLED_DEPTHS = "sampled loop depths (loop_sample_depth / loop_exit_criter
 FSDP_ROW_DEPTHS = "per-row loop depths (set_loop_depths)"
 FSDP_MOR = "MoR (loop_architecture='mor')"
 FSDP_ATTN_RES = "loop_carrier='attn_res'"
-FSDP_HSDP = "HSDP (num_distributed_optimizer_instances > 1)"
+FSDP_HSDP = "HSDP (num_distributed_optimizer_instances > 1) without a fixed depth"
 FSDP_CHECKPOINTING = (
     "checkpoint save or resume (--save / --pretrained-checkpoint / --load without --finetune "
     "--no-load-optim or with init_model_with_meta_device; only a model-only torch_dist load is "
@@ -628,13 +669,21 @@ def validate_loop_fsdp_config(config: Any, ddp_config: Any) -> None:
     module calls; the op fuser forces overwrites), sampled depths and per-row depths (ranks
     could run different numbers of rounds, i.e. different gather sequences, while the round
     count is agreed over TP x EP only; per-row depths are refused at runtime by
-    ``validate_loop_row_depths``), MoR and the attention-residual carrier, HSDP, and
-    checkpointing except a model-only load (Megatron-FSDP saves and loads ``fsdp_dtensor``,
+    ``validate_loop_row_depths``), MoR and the attention-residual carrier, HSDP without a fixed
+    depth, and checkpointing except a model-only load (Megatron-FSDP saves and loads ``fsdp_dtensor``,
     untested with the loop; a ``--load`` with ``--finetune --no-load-optim`` loads a torch_dist
     checkpoint's weights into the built model before the Megatron-FSDP wrap, in training's
     ``_build_loop_megatron_fsdp_models``, which needs materialized weights: no
     ``init_model_with_meta_device``). The GPT loop and Megatron-FSDP v2 are not supported.
     Collects every violation and raises one ``ValueError`` (``FSDP_PREFIX``).
+
+    HSDP / HFSDP (``num_distributed_optimizer_instances > 1``) at a fixed depth
+    (``fixed_depth_loop``): a gradient is reduced when the parameter's
+    ``register_post_accumulate_grad_hook`` fires, once per backward and after its last use
+    (autograd's ``AccumulateGrad`` waits for every use's gradient); the DP-Outer reduction
+    (all-reduce, or reduce-scatter for HFSDP) of a bucket group runs only in that reduction on
+    the last microbatch (``outer_fsdp_group_grad_reduce``), over the DP-Shard gradient shard
+    that has accumulated every microbatch's reduce-scatter: once per step, after the last use.
     """
     architecture = getattr(config, "loop_architecture", "none")
     if architecture == "none":
@@ -669,7 +718,8 @@ def validate_loop_fsdp_config(config: Any, ddp_config: Any) -> None:
         or getattr(config, "loop_exit_criterion", "fixed") == "sampled",
         FSDP_MOR: architecture == "mor",
         FSDP_ATTN_RES: getattr(config, "loop_carrier", "injection") == "attn_res",
-        FSDP_HSDP: getattr(ddp_config, "num_distributed_optimizer_instances", 1) > 1,
+        FSDP_HSDP: getattr(ddp_config, "num_distributed_optimizer_instances", 1) > 1
+        and not fixed_depth_loop(config),
         FSDP_CHECKPOINTING: any(
             getattr(ddp_config, name, None) for name in ("save", "pretrained_checkpoint")
         )
@@ -690,10 +740,36 @@ def validate_loop_row_depths(stack: Any) -> None:
     parameters Megatron-FSDP manages (``FSDP_ROW_DEPTHS``): the round count is agreed over
     TP x EP only, so data-parallel ranks could run different numbers of rounds and issue
     different parameter gathers. Megatron-FSDP marks every parameter it wraps
-    ``__fsdp_param__``."""
+    ``__fsdp_param__``.
+
+    Also rejects them on a stack holding GTP weight-remat shards (``GTP_ROW_DEPTHS``,
+    ``is_gtp_weight_remat``): the stack runs ``max(depths)`` rounds, which changes from step to
+    step, and a GTP shard is reduce-scattered and marked grad-ready once per use, so DDP's
+    per-use count would differ from the one learned in the first step."""
     param = next(stack.parameters(), None)
     if param is not None and getattr(param, "__fsdp_param__", False):
         _raise_fsdp_if_any([FSDP_ROW_DEPTHS])
+    if has_module_gtp_shards(stack):
+        _raise_if_any([GTP_ROW_DEPTHS])
+
+
+def has_module_gtp_shards(module: Any) -> bool:
+    """True if ``module`` holds module-GTP weight-remat shards: the ``GTPShardedParam`` weights
+    of GTP-wrapped layers (``is_gtp_weight_remat`` and TE's ``is_distributed_weight``). The
+    loop parameter store's grid shards carry only the first tag and are not counted."""
+    return any(
+        getattr(p, "is_gtp_weight_remat", False) and getattr(p, "is_distributed_weight", False)
+        for p in module.parameters()
+    )
+
+
+def validate_loop_gtp_shards(config: Any, stack: Any) -> None:
+    """Reject a loop stack built with module-GTP shards without a fixed depth
+    (``GTP_WEIGHT_REMAT``). Layers are GTP-wrapped by their process groups, so the shards can
+    exist while the config's ``gtp_weight_remat_size`` / ``expert_gtp_weight_remat_size`` (read
+    by ``validate_hybrid_loop_config``) are 1."""
+    if has_module_gtp_shards(stack) and not fixed_depth_loop(config):
+        _raise_if_any([GTP_WEIGHT_REMAT])
 
 
 # RSBF rule names (``validate_rsbf_config``), as they appear in the error message.
