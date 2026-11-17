@@ -695,7 +695,8 @@ def _validate_loop_fsdp(args):
     """A loop model with FSDP: the hybrid loop trains with Megatron-FSDP v1 under every rule of
     ``guards.validate_loop_fsdp_config`` (``--megatron-fsdp-accumulate-main-grad``, fp32 main
     and communication gradients, no persistent buffers / fine-grained gather / TE op fuser /
-    delayed wgrad / sampled depths / MoR / attention-residual carrier / HSDP / checkpointing
+    delayed wgrad / sampled depths / MoR / attention-residual carrier / HSDP or per-use
+    reduce-scatter without a fixed depth / checkpointing
     other than a model-only ``--load --finetune --no-load-optim``, which training runs before
     the Megatron-FSDP wrap); torch FSDP2, Megatron-FSDP v2 and the GPT loop are refused. A no-op
     without a loop."""
@@ -1709,6 +1710,27 @@ def validate_args(args, defaults={}):
                 "Meta device initialization (init_model_with_meta_device=True) is not "
                 "supported or necessary for the 'no_shard' / 0 sharding strategy."
             )
+
+        if args.megatron_fsdp_reduce_scatter_per_use:
+            # After the double-buffer normalization above. The DDP config repeats these checks
+            # for callers that build it directly.
+            assert (
+                args.megatron_fsdp_version == 1
+            ), "--megatron-fsdp-reduce-scatter-per-use requires --megatron-fsdp-version 1."
+            assert args.megatron_fsdp_accumulate_main_grad, (
+                "--megatron-fsdp-reduce-scatter-per-use requires "
+                "--megatron-fsdp-accumulate-main-grad (every use's reduce-scatter starts from a "
+                "zeroed bucket)."
+            )
+            assert sharding_strategies & {"optim_grads", "optim_grads_params"}, (
+                "--megatron-fsdp-reduce-scatter-per-use needs a gradient-sharding strategy "
+                "(optim_grads or optim_grads_params); without one it has no effect."
+            )
+            assert not args.fsdp_double_buffer, (
+                "--megatron-fsdp-reduce-scatter-per-use does not support persistent "
+                "communication buffers (--fsdp-double-buffer / --nccl-ub / "
+                "--megatron-fsdp-max-pool-double-buffer)."
+            )
     else:
         assert not args.megatron_fsdp_prefetch_recompute_forward_weights, (
             "--megatron-fsdp-prefetch-recompute-forward-weights requires " "--use-megatron-fsdp."
@@ -1719,6 +1741,9 @@ def validate_args(args, defaults={}):
         assert (
             not args.megatron_fsdp_accumulate_main_grad
         ), "--megatron-fsdp-accumulate-main-grad requires --use-megatron-fsdp."
+        assert (
+            not args.megatron_fsdp_reduce_scatter_per_use
+        ), "--megatron-fsdp-reduce-scatter-per-use requires --use-megatron-fsdp."
 
     if args.fsdp_manual_registration:
         assert (
@@ -6103,6 +6128,20 @@ def _add_experimental_args(parser):
             'unsharded gradient bucket (zeroed on its first fetch) instead of letting each use '
             'overwrite it, so a parameter used several times per microbatch (a loop core) '
             'keeps the sum of its uses. Required for a loop model with Megatron-FSDP.'
+        ),
+    )
+    group.add_argument(
+        '--megatron-fsdp-reduce-scatter-per-use',
+        action='store_true',
+        default=False,
+        dest='megatron_fsdp_reduce_scatter_per_use',
+        help=(
+            'If set, Megatron-FSDP v1 reduce-scatters a sharded gradient bucket after every '
+            'backward use of its FSDP unit into the sharded fp32 main gradient and frees the '
+            'unsharded bucket before the next use, instead of keeping it alive from the first '
+            'use to the last. One reduce-scatter per use (4x for a loop core run 4 times); the '
+            'DP-Outer (HSDP) reduction stays once per step. Requires '
+            '--megatron-fsdp-accumulate-main-grad and a gradient-sharding strategy.'
         ),
     )
     group.add_argument(

@@ -632,6 +632,10 @@ FSDP_ROW_DEPTHS = "per-row loop depths (set_loop_depths)"
 FSDP_MOR = "MoR (loop_architecture='mor')"
 FSDP_ATTN_RES = "loop_carrier='attn_res'"
 FSDP_HSDP = "HSDP (num_distributed_optimizer_instances > 1) without a fixed depth"
+FSDP_REDUCE_SCATTER_PER_USE = (
+    "megatron_fsdp_reduce_scatter_per_use without a fixed depth (a reduce-scatter per use: "
+    "every data-parallel rank must run the same rounds)"
+)
 FSDP_CHECKPOINTING = (
     "checkpoint save or resume (--save / --pretrained-checkpoint / --load without --finetune "
     "--no-load-optim or with init_model_with_meta_device; only a model-only torch_dist load is "
@@ -684,6 +688,13 @@ def validate_loop_fsdp_config(config: Any, ddp_config: Any) -> None:
     (all-reduce, or reduce-scatter for HFSDP) of a bucket group runs only in that reduction on
     the last microbatch (``outer_fsdp_group_grad_reduce``), over the DP-Shard gradient shard
     that has accumulated every microbatch's reduce-scatter: once per step, after the last use.
+
+    Per-use reduce-scatter mode (``megatron_fsdp_reduce_scatter_per_use``) at a fixed depth:
+    the unit's post-backward hook reduce-scatters its sharded buckets after every use (each
+    adds into the sharded main gradient) and frees them, so a core unit's unsharded bucket no
+    longer lives across the rounds; the hook-driven reduction after the last use stays the only
+    one with the DP-Outer reduction. Each use issues a collective, so every data-parallel rank
+    must run the same rounds: refused without a fixed depth (``FSDP_REDUCE_SCATTER_PER_USE``).
     """
     architecture = getattr(config, "loop_architecture", "none")
     if architecture == "none":
@@ -719,6 +730,10 @@ def validate_loop_fsdp_config(config: Any, ddp_config: Any) -> None:
         FSDP_MOR: architecture == "mor",
         FSDP_ATTN_RES: getattr(config, "loop_carrier", "injection") == "attn_res",
         FSDP_HSDP: getattr(ddp_config, "num_distributed_optimizer_instances", 1) > 1
+        and not fixed_depth_loop(config),
+        FSDP_REDUCE_SCATTER_PER_USE: bool(
+            getattr(ddp_config, "megatron_fsdp_reduce_scatter_per_use", False)
+        )
         and not fixed_depth_loop(config),
         FSDP_CHECKPOINTING: any(
             getattr(ddp_config, name, None) for name in ("save", "pretrained_checkpoint")

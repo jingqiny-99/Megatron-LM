@@ -102,6 +102,76 @@ def test_accumulate_flag_requires_megatron_fsdp(monkeypatch):
         validate_args(args)
 
 
+_MODEL_ARGS = dict(
+    num_layers=2,
+    hidden_size=128,
+    num_attention_heads=4,
+    max_position_embeddings=1024,
+    seq_length=1024,
+    micro_batch_size=1,
+    train_iters=1,
+    lr=1e-4,
+    tokenizer_type="NullTokenizer",
+    vocab_size=1024,
+)
+
+
+def test_per_use_flag_parses_and_reaches_the_ddp_config(monkeypatch):
+    assert _parsed(monkeypatch).megatron_fsdp_reduce_scatter_per_use is False
+    args = _parsed(
+        monkeypatch,
+        "--use-megatron-fsdp",
+        "--megatron-fsdp-accumulate-main-grad",
+        "--megatron-fsdp-reduce-scatter-per-use",
+        "--data-parallel-sharding-strategy",
+        "optim_grads_params",
+    )
+    assert args.megatron_fsdp_reduce_scatter_per_use is True
+    ddp_config = get_megatron_ddp_config(args, use_torch_fsdp2=False)
+    assert ddp_config.megatron_fsdp_reduce_scatter_per_use is True
+
+
+@pytest.mark.parametrize(
+    "flags,message",
+    [
+        (["--megatron-fsdp-reduce-scatter-per-use"], "requires --use-megatron-fsdp"),
+        (
+            ["--use-megatron-fsdp", "--megatron-fsdp-reduce-scatter-per-use"],
+            "requires --megatron-fsdp-accumulate-main-grad",
+        ),
+        (
+            [
+                "--use-megatron-fsdp",
+                "--megatron-fsdp-accumulate-main-grad",
+                "--megatron-fsdp-reduce-scatter-per-use",
+                "--data-parallel-sharding-strategy",
+                "optim",
+            ],
+            "needs a gradient-sharding strategy",
+        ),
+        (
+            [
+                "--use-megatron-fsdp",
+                "--megatron-fsdp-accumulate-main-grad",
+                "--megatron-fsdp-reduce-scatter-per-use",
+                "--data-parallel-sharding-strategy",
+                "optim_grads_params",
+                "--fsdp-double-buffer",
+            ],
+            "does not support persistent communication buffers",
+        ),
+    ],
+)
+def test_per_use_flag_requirements_at_argument_validation(monkeypatch, flags, message):
+    overrides = dict(_MODEL_ARGS)
+    if "--use-megatron-fsdp" in flags:
+        overrides["ckpt_format"] = "fsdp_dtensor"
+    monkeypatch.delenv("CUDA_DEVICE_MAX_CONNECTIONS", raising=False)
+    args = _parsed(monkeypatch, *flags, **overrides)
+    with pytest.raises(AssertionError, match=message):
+        validate_args(args)
+
+
 def test_argument_validation_runs_the_loop_fsdp_rules(monkeypatch):
     # Without a loop nothing is checked.
     _validate_loop_fsdp(_parsed(monkeypatch, use_megatron_fsdp=True))

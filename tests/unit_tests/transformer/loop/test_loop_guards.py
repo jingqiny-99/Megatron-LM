@@ -1393,6 +1393,12 @@ _FSDP_RULES = [
     # HSDP is refused without a fixed depth only (test_fsdp_hsdp_is_allowed_at_a_fixed_depth);
     # the RSBF schedule is the variable depth no other Megatron-FSDP rule names.
     (guards.FSDP_HSDP, dict(loop_schedule="rsbf"), dict(num_distributed_optimizer_instances=2)),
+    # Likewise per-use reduce-scatter (test_fsdp_reduce_scatter_per_use_needs_a_fixed_depth).
+    (
+        guards.FSDP_REDUCE_SCATTER_PER_USE,
+        dict(loop_schedule="rsbf"),
+        dict(megatron_fsdp_reduce_scatter_per_use=True),
+    ),
 ]
 _FSDP_RULE_NAMES = [
     guards.FSDP_GPT_LOOP,
@@ -1408,6 +1414,7 @@ _FSDP_RULE_NAMES = [
     guards.FSDP_MOR,
     guards.FSDP_ATTN_RES,
     guards.FSDP_HSDP,
+    guards.FSDP_REDUCE_SCATTER_PER_USE,
     guards.FSDP_CHECKPOINTING,
 ]
 
@@ -1462,6 +1469,28 @@ def test_fsdp_hsdp_is_allowed_at_a_fixed_depth():
             _fsdp_ddp_config(num_distributed_optimizer_instances=2),
         )
     assert _fsdp_reported(excinfo) == [guards.FSDP_SAMPLED_DEPTHS, guards.FSDP_HSDP]
+
+
+def test_fsdp_reduce_scatter_per_use_needs_a_fixed_depth():
+    """Per-use reduce-scatter mode (one collective per use of a unit) passes at a fixed depth,
+    alone and with HSDP, through the wrapper's configs and the argument namespace; with a
+    sampled depth or MoR the per-use rule is reported with the depth rule."""
+    for instances in (1, 2):
+        ddp_config = _fsdp_ddp_config(
+            megatron_fsdp_reduce_scatter_per_use=True, num_distributed_optimizer_instances=instances
+        )
+        guards.validate_loop_fsdp_config(_dense_config(), ddp_config)
+        guards.validate_loop_fsdp_config(_dsv4_config(), ddp_config)
+        args = _args_namespace(_dense_config(), ddp_config)
+        guards.validate_loop_fsdp_config(args, args)
+    ddp_config = _fsdp_ddp_config(megatron_fsdp_reduce_scatter_per_use=True)
+    for fields, depth_rule in (
+        (dict(loop_sample_depth=True), guards.FSDP_SAMPLED_DEPTHS),
+        (dict(loop_architecture="mor"), guards.FSDP_MOR),
+    ):
+        with pytest.raises(ValueError) as excinfo:
+            guards.validate_loop_fsdp_config(_violating(_dense_config(), **fields), ddp_config)
+        assert _fsdp_reported(excinfo) == [depth_rule, guards.FSDP_REDUCE_SCATTER_PER_USE]
 
 
 def test_fsdp_refuses_the_gpt_loop():
@@ -1567,6 +1596,82 @@ def test_accumulate_flag_requires_megatron_fsdp_v1():
     for fields in (dict(), dict(use_megatron_fsdp=True, megatron_fsdp_version=2)):
         with pytest.raises(ValueError, match="megatron_fsdp_accumulate_main_grad requires"):
             DistributedDataParallelConfig(megatron_fsdp_accumulate_main_grad=True, **fields)
+
+
+_PER_USE_DDP = dict(
+    use_megatron_fsdp=True,
+    data_parallel_sharding_strategy="optim_grads_params",
+    megatron_fsdp_accumulate_main_grad=True,
+    megatron_fsdp_reduce_scatter_per_use=True,
+)
+
+
+@pytest.mark.parametrize(
+    "fields,requirement",
+    [
+        (dict(use_megatron_fsdp=False), "use_megatron_fsdp with megatron_fsdp_version=1"),
+        (dict(megatron_fsdp_version=2), "use_megatron_fsdp with megatron_fsdp_version=1"),
+        (dict(megatron_fsdp_accumulate_main_grad=False), "megatron_fsdp_accumulate_main_grad"),
+        (dict(data_parallel_sharding_strategy="optim"), "a gradient-sharding strategy"),
+        (dict(data_parallel_sharding_strategy="no_shard"), "a gradient-sharding strategy"),
+        (dict(fsdp_double_buffer=True), "no persistent communication buffers"),
+        (dict(nccl_ub=True), "no persistent communication buffers"),
+        (dict(megatron_fsdp_max_pool_double_buffer=True), "no persistent communication buffers"),
+    ],
+)
+def test_reduce_scatter_per_use_flag_requirements(fields, requirement):
+    """The DDP config refuses per-use reduce-scatter mode without Megatron-FSDP v1, accumulate
+    mode or a gradient-sharding strategy, and with persistent communication buffers."""
+    if not fields.get("use_megatron_fsdp", True) or fields.get("megatron_fsdp_version") == 2:
+        # The accumulate flag would be refused first (it needs Megatron-FSDP v1 too).
+        fields = dict(fields, megatron_fsdp_accumulate_main_grad=False)
+    with pytest.raises(ValueError, match="megatron_fsdp_reduce_scatter_per_use requires") as e:
+        DistributedDataParallelConfig(**dict(_PER_USE_DDP, **fields))
+    assert requirement in str(e.value)
+
+
+def test_reduce_scatter_per_use_flag_accepts_sharded_gradients():
+    for dense, expert in (
+        ("optim_grads_params", None),
+        ("optim_grads", None),
+        ("optim", "optim_grads_params"),
+        ("no_shard", "optim_grads"),
+    ):
+        DistributedDataParallelConfig(
+            **dict(
+                _PER_USE_DDP,
+                data_parallel_sharding_strategy=dense,
+                expert_data_parallel_sharding_strategy=expert,
+                num_distributed_optimizer_instances=2,
+                outer_dp_sharding_strategy="no_shard",
+            )
+        )
+    # Megatron-FSDP's own config (used by MegatronFSDP without Megatron Core) checks the same.
+    from megatron.core.distributed.fsdp.src.megatron_fsdp.distributed_data_parallel_config import (
+        DistributedDataParallelConfig as FSDPConfig,
+    )
+
+    FSDPConfig(
+        data_parallel_sharding_strategy="optim_grads",
+        megatron_fsdp_accumulate_main_grad=True,
+        megatron_fsdp_reduce_scatter_per_use=True,
+    )
+    for fields in (
+        dict(megatron_fsdp_accumulate_main_grad=False),
+        dict(data_parallel_sharding_strategy="optim"),
+        dict(nccl_ub=True),
+    ):
+        with pytest.raises(ValueError, match="megatron_fsdp_reduce_scatter_per_use requires"):
+            FSDPConfig(
+                **dict(
+                    dict(
+                        data_parallel_sharding_strategy="optim_grads",
+                        megatron_fsdp_accumulate_main_grad=True,
+                        megatron_fsdp_reduce_scatter_per_use=True,
+                    ),
+                    **fields,
+                )
+            )
 
 
 def test_row_depths_are_refused_on_a_megatron_fsdp_stack(model_parallel):
