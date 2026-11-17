@@ -25,6 +25,42 @@ from torch.distributed.checkpoint.metadata import (
 from torch.distributed.checkpoint.planner import TensorWriteData, WriteItem, WriteItemType
 from torch.distributed.tensor.placement_types import Replicate, Shard, _StridedShard
 
+try:
+    from torch.distributed.tensor._dtensor_spec import DTensorSpec, TensorMeta
+except ImportError:  # older torch
+    from torch.distributed._tensor.placement_types import DTensorSpec, TensorMeta
+
+
+def dtensor_from_local_in_place(
+    local_tensor: torch.Tensor, device_mesh, placements, *, shape, stride, run_check: bool = False
+) -> DTensor:
+    """``DTensor.from_local`` that never moves ``local_tensor``.
+
+    ``DTensor.from_local`` copies a local tensor that is not on the mesh's device type to that
+    device. The checkpoint handlers re-wrap optimizer state as DTensors over views of it, so that
+    a load writes into the optimizer's own tensors; a CPU-offloaded optimizer
+    (``HybridDeviceOptimizer``) keeps that state on the host, and the copy would make the load
+    write into a temporary device tensor instead (and allocate device memory for it). Such a
+    local tensor is wrapped as it is, without ``run_check`` (whose collectives would run on the
+    mesh's device). A local tensor already on the mesh's device type, or a meta tensor, goes
+    through ``DTensor.from_local`` unchanged.
+    """
+    if local_tensor.is_meta or local_tensor.device.type == device_mesh.device_type:
+        return DTensor.from_local(
+            local_tensor,
+            device_mesh=device_mesh,
+            placements=placements,
+            run_check=run_check,
+            shape=shape,
+            stride=stride,
+        )
+    spec = DTensorSpec(
+        device_mesh,
+        tuple(placements),
+        tensor_meta=TensorMeta(torch.Size(shape), tuple(stride), local_tensor.dtype),
+    )
+    return DTensor(local_tensor, spec, requires_grad=local_tensor.requires_grad)
+
 
 def gather_and_compute_chunk_metadata(dtensor: DTensor) -> ChunkStorageMetadata:
     """
@@ -469,12 +505,13 @@ def split_dtensor(
         out_shape = list(dtensor.shape)
         out_shape[dim] = split_slice.stop - split_slice.start
 
-        new_dtensor = DTensor.from_local(
+        # In place: the split of a host (CPU-offloaded) optimizer state stays a view of it.
+        new_dtensor = dtensor_from_local_in_place(
             sliced_tensor,
+            dtensor.device_mesh,
+            dtensor.placements,
             shape=tuple(out_shape),
             stride=sliced_tensor.stride(),
-            placements=dtensor.placements,
-            device_mesh=dtensor.device_mesh,
         )
 
         if update_uneven_dtensor_chunk_meta:

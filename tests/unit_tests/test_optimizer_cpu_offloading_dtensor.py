@@ -479,3 +479,221 @@ def _reference_state(hdo, params, masters, reference):
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16], ids=["fp32", "bf16"])
 def test_reload_model_params_refreshes_the_host_copies(dtype):
     mp.spawn(_reload_model_params_worker, args=(_free_port(), dtype), nprocs=WORLD, join=True)
+
+
+# A fused SwiGLU linear_fc1 (W rows, then V rows) split unevenly over the ranks, so that one
+# rank holds the end of W and all of V, and a linear_fc2: (name, global shape, rows per rank).
+FC_LAYOUT = (
+    ("decoder.layers.0.mlp.linear_fc1.weight", (12, 3), (4, 8)),
+    ("decoder.layers.0.mlp.linear_fc2.weight", (3, 6), (2, 1)),
+)
+
+
+class _FsdpDistIndex:
+    """The parts of Megatron-FSDP's ``FSDPDistributedIndex`` that the checkpoint handlers read:
+    a DP-Shard mesh dimension and a one-rank TP dimension."""
+
+    tp_dim = "tp"
+    dp_shard_dim = "dp"
+    use_hybrid_fsdp = False
+
+    def __init__(self, mesh):
+        self.meshes = {"dp": mesh["dp"], "tp": mesh["tp"]}
+
+    def get_submesh(self, names, is_expert_parallel=False):
+        names = (names,) if isinstance(names, str) else tuple(names)
+        assert len(names) == 1, names
+        return self.meshes[names[0]]
+
+    def label_meshes(self, device_type):
+        """Relabel the meshes' device type. ``"cuda"`` makes them what they are on a GPU run,
+        where ``DTensor.from_local`` moves a host local tensor to the device."""
+        for mesh in self.meshes.values():
+            mesh._device_type = device_type
+
+
+class _FcModel(torch.nn.Module):
+    """What the handlers read from the Megatron-FSDP model: ``get_parameter`` (with or without
+    the wrapper's ``module.`` prefix) and ``config``."""
+
+    def __init__(self, params):
+        super().__init__()
+        self.config = None
+        self.by_name = params
+
+    def get_parameter(self, target):
+        return self.by_name[target[len("module.") :] if target.startswith("module.") else target]
+
+
+def _fc_params(dist_index, rank, dtype, seed):
+    """``(params by name, buffer)``: Megatron-FSDP-like DTensor parameters with uneven row
+    shards, ``megatron_fsdp_slice`` (this rank's flat range of the parameter) and
+    ``megatron_fsdp_dist_index``. Every local shard is a view of ``buffer``."""
+    from torch.distributed.tensor import DTensor, Shard
+
+    generator = torch.Generator().manual_seed(seed)
+    fulls = [torch.randn(shape, generator=generator).to(dtype) for _, shape, _ in FC_LAYOUT]
+    starts = [sum(rows[:rank]) for _, _, rows in FC_LAYOUT]
+    locals_ = [
+        full[start : start + rows[rank]]
+        for full, start, (_, _, rows) in zip(fulls, starts, FC_LAYOUT)
+    ]
+    buffer = torch.empty(sum(local.numel() for local in locals_), dtype=dtype)
+    params, offset = {}, 0
+    for (name, shape, _), full, start, local in zip(FC_LAYOUT, fulls, starts, locals_):
+        view = buffer[offset : offset + local.numel()].view(local.shape)
+        offset += local.numel()
+        view.copy_(local)
+        param = torch.nn.Parameter(
+            DTensor.from_local(
+                view,
+                dist_index.meshes["dp"],
+                [Shard(0)],
+                run_check=False,
+                shape=full.shape,
+                stride=full.stride(),
+            )
+        )
+        cols = shape[1]
+        param.megatron_fsdp_slice = slice(start * cols, (start + local.shape[0]) * cols)
+        param.megatron_fsdp_dist_index = dist_index
+        params[name] = param
+    return params, buffer
+
+
+def _fc_grads(step, rank, dtype):
+    generator = torch.Generator().manual_seed(2000 + step)
+    grads = []
+    for _, shape, rows in FC_LAYOUT:
+        full = torch.randn(shape, generator=generator).to(dtype)
+        start = sum(rows[:rank])
+        grads.append(full[start : start + rows[rank]])
+    return grads
+
+
+def _fc_step(hdo, params, step, rank, dtype):
+    hdo.zero_grad()
+    _set_grads(params, _fc_grads(step, rank, dtype))
+    hdo.step()
+
+
+def _storage_ptr(tensor):
+    return tensor.untyped_storage().data_ptr()
+
+
+def _fsdp_dtensor_state(model, by_name, hdo):
+    """What ``fsdp_dtensor`` checkpoints save and load (``preprocess_fsdp_dtensor_state_dict``
+    with ``--swiglu``): the model and the optimizer state with each fused ``linear_fc1`` split
+    into W and V. Also returns the unsplit optimizer state (the loaded optimizer gets it)."""
+    from megatron.core.distributed.fsdp.src.megatron_fsdp.uneven_dtensor import (
+        preprocess_state_dict_for_uneven_dtensor,
+    )
+    from megatron.core.transformer import fsdp_dtensor_checkpoint as fdc
+
+    raw = {f"module.{name}": hdo.state[param] for name, param in by_name.items()}
+    model_state, optimizer_state = fdc.handle_swiglu_in_state_dict(
+        model, dict(by_name), {"state": raw}
+    )
+    state = {"model": model_state, "optimizer": optimizer_state}
+    preprocess_state_dict_for_uneven_dtensor(state)
+    return state, raw
+
+
+def _swiglu_round_trip_worker(rank, port, checkpoint_dir, dtype):
+    import torch.distributed.checkpoint as dcp
+    from torch.distributed.device_mesh import init_device_mesh
+
+    from megatron.core.distributed.fsdp.src.megatron_fsdp.uneven_dtensor import split_dtensor
+    from megatron.core.transformer import fsdp_dtensor_checkpoint as fdc
+
+    store = dist.TCPStore("127.0.0.1", port, WORLD, rank == 0, timeout=STORE_TIMEOUT)
+    dist.init_process_group("gloo", rank=rank, world_size=WORLD, store=store, timeout=STORE_TIMEOUT)
+    _emulate_offload_device([])
+    # No expert parallelism (the handlers read it from parallel_state).
+    fdc.get_ep_layer_offset = lambda num_experts=None: 0
+    # validate_uneven_dtensor (the handlers' run_check) moves its own small check tensor with
+    # .cuda(); the host state under test would be moved by DTensor.from_local's .to("cuda").
+    torch.Tensor.cuda = lambda self, *args, **kwargs: self
+    try:
+        mesh = init_device_mesh("cpu", (WORLD, 1), mesh_dim_names=("dp", "tp"))
+        dist_index = _FsdpDistIndex(mesh)
+        by_name_a, _ = _fc_params(dist_index, rank, dtype, seed=0)
+        by_name_b, _ = _fc_params(dist_index, rank, dtype, seed=1)
+        params_a, params_b = list(by_name_a.values()), list(by_name_b.values())
+        hdo_a = _hdo(params_a, fused=True)
+        for step in range(2):
+            _fc_step(hdo_a, params_a, step, rank, dtype)
+        # The second optimizer's state is allocated by one step with zero gradients
+        # (DistributedOptimizer._init_optimizer_states_with_dummy_values).
+        hdo_b = _hdo(params_b, fused=True)
+        for param in params_b:
+            param.grad = torch.zeros_like(param)
+        hdo_b.step()
+        hdo_b.zero_grad()
+
+        # From here on the meshes are CUDA meshes, as on a GPU run, over host state.
+        dist_index.label_meshes("cuda")
+        fc1 = FC_LAYOUT[0][0]
+        saved, _ = _fsdp_dtensor_state(_FcModel(by_name_a), by_name_a, hdo_a)
+        # The split moments are views of the CPU optimizer's host tensors, not device copies.
+        for half in ("_w", "_v"):
+            for key in ("exp_avg", "exp_avg_sq"):
+                local = saved["optimizer"]["state"][f"module.{fc1}{half}"][key]._local_tensor
+                host = hdo_a.state[by_name_a[fc1]][key]._local_tensor
+                assert local.device.type == "cpu", (half, key, local.device)
+                assert _storage_ptr(local) == _storage_ptr(host), (half, key)
+        # The other fused-parameter splits (MLA down-projection, GDN) wrap in place as well.
+        exp_avg = hdo_a.state[by_name_a[fc1]]["exp_avg"]
+        sections = fdc.split_fused_fsdp_param(exp_avg, by_name_a[fc1], [6, 6])
+        sections += list(split_dtensor(exp_avg, [6, 6], dim=0))
+        for section in sections:
+            assert _storage_ptr(section._local_tensor) == _storage_ptr(exp_avg._local_tensor)
+        dcp.save(saved, checkpoint_id=checkpoint_dir)
+
+        loading, raw_b = _fsdp_dtensor_state(_FcModel(by_name_b), by_name_b, hdo_b)
+        with torch.no_grad():
+            dcp.load(loading, checkpoint_id=checkpoint_dir)
+        # As load_checkpoint does: the optimizer loads the unsplit (raw) state.
+        names = {param: f"module.{name}" for name, param in by_name_b.items()}
+        groups = [
+            {
+                **{k: v for k, v in group.items() if k != "params"},
+                "params": [names[param] for param in group["params"]],
+            }
+            for group in hdo_b.param_groups
+        ]
+        hdo_b.load_state_dict({"state": raw_b, "param_groups": groups})
+        dist_index.label_meshes("cpu")
+
+        for name in by_name_a:
+            param_a, param_b = by_name_a[name], by_name_b[name]
+            assert torch.equal(_local(param_a), _local(param_b)), name
+            assert torch.equal(
+                hdo_a.param_to_inner_param[param_a], hdo_b.param_to_inner_param[param_b]
+            ), name
+            for key in ("step", "exp_avg", "exp_avg_sq"):
+                value_a, value_b = hdo_a.state[param_a][key], hdo_b.state[param_b][key]
+                assert torch.equal(_local(value_a), _local(value_b)), (name, key)
+        # The next step of both optimizers matches bitwise.
+        _fc_step(hdo_a, params_a, 2, rank, dtype)
+        _fc_step(hdo_b, params_b, 2, rank, dtype)
+        for name in by_name_a:
+            assert torch.equal(_local(by_name_a[name]), _local(by_name_b[name])), name
+    finally:
+        dist.destroy_process_group()
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16], ids=["fp32", "bf16"])
+def test_swiglu_fsdp_dtensor_checkpoint_keeps_host_state_in_place(tmp_path, dtype):
+    """``fsdp_dtensor`` checkpoints split each fused SwiGLU ``linear_fc1``'s Adam moments into W
+    and V DTensors (``handle_swiglu_in_state_dict``). On a CUDA mesh the split must still alias
+    the CPU-offloaded optimizer's host tensors: ``DTensor.from_local`` would copy them to the
+    device, the load would land in that copy, and the optimizer would keep its dummy-step
+    moments. The meshes here are CPU (gloo) meshes relabelled as CUDA meshes; the round trip
+    restores weights, masters and moments bitwise."""
+    mp.spawn(
+        _swiglu_round_trip_worker,
+        args=(_free_port(), str(tmp_path / "checkpoint"), dtype),
+        nprocs=WORLD,
+        join=True,
+    )

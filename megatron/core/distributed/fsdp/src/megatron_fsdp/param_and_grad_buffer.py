@@ -34,7 +34,11 @@ from .mixed_precision import (
     is_float8tensor,
     is_te_min_version,
 )
-from .uneven_dtensor import update_uneven_dtensor_chunk_metadata, validate_uneven_dtensor
+from .uneven_dtensor import (
+    dtensor_from_local_in_place,
+    update_uneven_dtensor_chunk_metadata,
+    validate_uneven_dtensor,
+)
 from .utils import (
     _MODEL_PARALLEL_RNG_TRACKER_NAME,
     FSDPDistributedIndex,
@@ -5778,10 +5782,10 @@ def make_fsdp_dtensor(
             global_shape[tp_dim] *= tp_mesh.mesh.numel()
 
         # Construct TP-sharded DTensor using Megatron-style placement
-        param = DTensor.from_local(
-            local_tensor=local_tensor,
-            device_mesh=tp_mesh,
-            placements=placements,
+        param = dtensor_from_local_in_place(
+            local_tensor,
+            tp_mesh,
+            placements,
             run_check=run_check,
             shape=tuple(global_shape),
             stride=torch.empty(global_shape).stride(),
@@ -5798,11 +5802,13 @@ def make_fsdp_dtensor(
     else:
         local_shape = (-1,)
 
-    # Create the FSDP-compliant DTensor
-    fsdp_tensor = DTensor.from_local(
-        local_tensor=local_tensor.view(local_shape),
-        device_mesh=device_mesh,
-        placements=placements,
+    # Create the FSDP-compliant DTensor. A local tensor off the mesh's device (the host state of
+    # a CPU-offloaded optimizer, re-wrapped by the checkpoint handlers) stays where it is, so
+    # the DTensor still aliases it.
+    fsdp_tensor = dtensor_from_local_in_place(
+        local_tensor.view(local_shape),
+        device_mesh,
+        placements,
         run_check=False,
         shape=param.shape,
         stride=param.stride(),
