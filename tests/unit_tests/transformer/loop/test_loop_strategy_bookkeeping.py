@@ -7,12 +7,19 @@
   since its last consume. Driven through the consume orders a fixed-depth loop produces: the
   next round's first weight, a prefetch issued for the other direction, a shared buffer
   rewritten by another weight's gather.
+* DDP's overlapped grad-reduce trigger (``_ParamAndGradBucketGroup.register_grad_ready`` /
+  ``reset``), on a stand-in bucket group: the first batch records how often each parameter is
+  ready in the last microbatch (a GTP shard: once per use), later batches start the reduction
+  when every parameter reached its count, and a count above it raises instead of losing a use.
 
-The GPU test of the same path is ``test_loop_gtp_gpu.py``.
+The GPU tests of the same paths are ``test_loop_gtp_gpu.py`` and ``test_loop_ddp_overlap_gpu.py``.
 """
 
 from types import SimpleNamespace
 
+import pytest
+
+from megatron.core.distributed.param_and_grad_buffer import _ParamAndGradBucketGroup
 from megatron.core.tensor_parallel import generalized_tensor_parallelism as gtp
 
 # ---------------------------------------------------------------------------------------------
@@ -122,3 +129,97 @@ def test_verification_is_off_by_default_and_on_eager_uncaptured_chains_only(monk
     assert not gtp.GTPShardedParam._verify_gathers(graphed)
     capturing[0] = True  # a captured schedule replays without the host-side check
     assert not gtp.GTPShardedParam._verify_gathers(eager)
+
+
+# ---------------------------------------------------------------------------------------------
+# DDP grad-ready counts (overlap_grad_reduce)
+# ---------------------------------------------------------------------------------------------
+
+
+class _Param:
+    shape = (4, 4)
+
+
+def _bucket_group(params):
+    """A stand-in for ``_ParamAndGradBucketGroup`` with the state ``register_grad_ready`` and
+    ``reset`` use; ``starts`` counts the reductions started."""
+    group = SimpleNamespace(
+        ddp_config=SimpleNamespace(overlap_grad_reduce=True),
+        param_to_bucket={param: object() for param in params},
+        params=set(params),
+        golden_per_param_grad_ready_counts={},
+        per_param_grad_ready_counts={},
+        is_last_microbatch=True,
+        is_first_batch=True,
+        grad_reduce_finished=False,
+        starts=0,
+    )
+
+    def start_grad_sync(force_all_reduce=False):
+        group.starts += 1
+
+    group.start_grad_sync = start_grad_sync
+    return group
+
+
+def _ready(group, param, times=1):
+    for _ in range(times):
+        _ParamAndGradBucketGroup.register_grad_ready(group, param)
+
+
+def _first_batch(group, counts, microbatches=2):
+    """One batch of ``microbatches``: only the last one counts (``no_sync`` clears
+    ``is_last_microbatch`` for the others)."""
+    for microbatch in range(microbatches):
+        group.is_last_microbatch = microbatch == microbatches - 1
+        for param, count in counts.items():
+            _ready(group, param, count)
+    group.is_last_microbatch = True
+    _ParamAndGradBucketGroup.reset(group)
+
+
+def test_counts_are_recorded_from_the_first_batch_last_microbatch():
+    core, coda = _Param(), _Param()
+    group = _bucket_group([core, coda])
+    _first_batch(group, {core: 4, coda: 1})
+    assert group.golden_per_param_grad_ready_counts == {core: 4, coda: 1}
+    assert not group.is_first_batch and group.starts == 0
+
+
+def test_the_reduction_starts_after_the_last_use_of_every_parameter():
+    """A GTP core shard is ready once per round (4 per microbatch): the bucket group's reduction
+    starts only after its 4th use and the coda weight's one, never earlier."""
+    core, coda = _Param(), _Param()
+    group = _bucket_group([core, coda])
+    _first_batch(group, {core: 4, coda: 1})
+    group.is_last_microbatch = False  # an earlier microbatch of the batch: not counted
+    _ready(group, core, 4)
+    _ready(group, coda)
+    assert group.starts == 0 and group.per_param_grad_ready_counts == {}
+    group.is_last_microbatch = True
+    _ready(group, coda)
+    for use in range(1, 5):
+        assert group.starts == 0, use
+        _ready(group, core)
+    assert group.starts == 1
+
+
+def test_a_use_beyond_the_recorded_count_raises():
+    """More uses than in the first batch (a depth change) would miss the started reduction."""
+    core, coda = _Param(), _Param()
+    group = _bucket_group([core, coda])
+    _first_batch(group, {core: 4, coda: 1})
+    _ready(group, coda)
+    _ready(group, core, 4)
+    assert group.starts == 1
+    with pytest.raises(RuntimeError, match="more than the 4 times of the first batch"):
+        _ready(group, core)
+
+
+def test_a_use_beyond_the_count_raises_before_the_reduction_too():
+    core, coda = _Param(), _Param()
+    group = _bucket_group([core, coda])
+    _first_batch(group, {core: 1, coda: 1})
+    with pytest.raises(RuntimeError, match="became grad-ready 2 times"):
+        _ready(group, core, 2)
+    assert group.starts == 0

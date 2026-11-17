@@ -1020,6 +1020,20 @@ class _ParamAndGradBucketGroup:
             self.per_param_grad_ready_counts[param] += 1
             # If all params in bucket group have grads available, issue communication call.
             if not self.is_first_batch:
+                # More grad-ready calls than in the first batch (e.g. a weight used more often
+                # than then, ready once per use): the sync below either never starts, or
+                # started at the golden count and this use's gradient missed it. Fail here
+                # instead of at finish_grad_sync, or not at all.
+                if self.per_param_grad_ready_counts[
+                    param
+                ] > self.golden_per_param_grad_ready_counts.get(param, 0):
+                    raise RuntimeError(
+                        f"A parameter of shape {tuple(param.shape)} became grad-ready "
+                        f"{self.per_param_grad_ready_counts[param]} times in this batch's last "
+                        f"microbatch, more than the "
+                        f"{self.golden_per_param_grad_ready_counts.get(param, 0)} times of the "
+                        "first batch (overlap_grad_reduce needs the same count every batch)"
+                    )
                 if self.per_param_grad_ready_counts == self.golden_per_param_grad_ready_counts:
                     assert len(self.per_param_grad_ready_counts) == len(self.params)
                     self.start_grad_sync(force_all_reduce=force_all_reduce)
