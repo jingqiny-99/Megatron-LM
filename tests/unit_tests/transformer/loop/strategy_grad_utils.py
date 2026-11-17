@@ -155,12 +155,20 @@ def clone_state(model):
 def run_step(wrapped, model, rows, *, on_microbatch=None):
     """One training step over ``rows`` (microbatches of one row) through the no-pipelining
     schedule and ``finalize_model_grads``; returns the attached loss sums and per-row LM losses.
-    ``on_microbatch(index)`` runs before each microbatch's forward."""
+    ``on_microbatch(index)`` runs before each microbatch's forward.
+
+    The schedule's ``no_sync_func`` is set as ``megatron.training.training.train`` sets it
+    (``reduces_grads_during_backward``): the wrapper's ``no_sync`` when it reduces gradients from
+    its backward hooks (DDP or Megatron-FSDP with ``overlap_grad_reduce``, which Megatron-FSDP
+    turns on itself for the gradient-sharding strategies). Without it Megatron-FSDP never sees
+    the last microbatch, and its HSDP / HFSDP DP-Outer reduction never runs."""
     from megatron.core.distributed import finalize_model_grads
     from megatron.core.pipeline_parallel import get_forward_backward_func
     from megatron.core.transformer.moe.moe_logging import MoEMetricsTracker, set_moe_metrics_tracker
+    from megatron.training.training import reduces_grads_during_backward
 
     model.config.finalize_model_grads_func = finalize_model_grads
+    model.config.no_sync_func = wrapped.no_sync if reduces_grads_during_backward(wrapped) else None
     set_moe_metrics_tracker(MoEMetricsTracker())
     wrapped.zero_grad_buffer()
     recorder = mbs._Recorder()
