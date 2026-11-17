@@ -2038,7 +2038,10 @@ class TestGTPCaptureParamReadiness:
         assert ordinary._recompute_already_drained is False
         assert incoming._prefetch_handle is None
 
-    def test_drained_cross_graph_prefetch_still_waits_on_ag_event(self, monkeypatch):
+    # verify: GTP_CONFIG.verify_prefetched_gathers on an eager chain (_verify_gathers), with the
+    # prefetched buffers still current, so the consume keeps the prefetched path either way.
+    @pytest.mark.parametrize("verify", [False, True])
+    def test_drained_cross_graph_prefetch_still_waits_on_ag_event(self, monkeypatch, verify):
         class ExpectedEventWait(Exception):
             pass
 
@@ -2057,6 +2060,10 @@ class TestGTPCaptureParamReadiness:
                 "_weights": (),
                 "ag_event": FakeEvent(),
                 "_wait_param_gather": lambda self: calls.append("handle_wait"),
+                "_verify_gathers": lambda self: verify,
+                "_prefetched_buffers_current": lambda self, slot, consume=True: (
+                    calls.append(f"verify_{slot}") or True
+                ),
             },
         )()
         monkeypatch.setattr(gtp_module.GTP_CONFIG, "check_param_states", False)
@@ -2064,10 +2071,11 @@ class TestGTPCaptureParamReadiness:
         with pytest.raises(ExpectedEventWait):
             GTPShardedParam._get_prefetched_weight(param, fwd=True)
 
-        assert calls == ["event_wait"]
+        assert calls == (["verify_fwd"] if verify else []) + ["event_wait"]
         assert param._already_ag_drained is False
 
-    def test_drained_recompute_prefetch_still_waits_on_ag_event(self):
+    @pytest.mark.parametrize("verify", [False, True])
+    def test_drained_recompute_prefetch_still_waits_on_ag_event(self, verify):
         class ExpectedEventWait(Exception):
             pass
 
@@ -2086,13 +2094,17 @@ class TestGTPCaptureParamReadiness:
                 "_weights": (),
                 "_recompute_ag_event": FakeEvent(),
                 "_wait_recompute_param_gather": lambda self: calls.append("handle_wait"),
+                "_verify_gathers": lambda self: verify,
+                "_prefetched_buffers_current": lambda self, slot, consume=True: (
+                    calls.append(f"verify_{slot}") or True
+                ),
             },
         )()
 
         with pytest.raises(ExpectedEventWait):
             GTPShardedParam._get_recompute_prefetched_weight(param)
 
-        assert calls == ["event_wait"]
+        assert calls == (["verify_recompute"] if verify else []) + ["event_wait"]
         assert param._recompute_already_drained is False
 
     def test_warmup_exception_is_not_masked_by_leaked_handle(self):
