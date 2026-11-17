@@ -44,17 +44,24 @@ optimizer step, weight install, gradient-buffer reset, gathers and step 2.
   within 1e-6. Before step 2 is gated, the precondition: the forced gradient reads back on every
   rank, and the fp32 main weights the arm's optimizer produced (this rank's slice of each, by
   the test's own index arithmetic) and the persistent buffers equal ``ref``'s masters and
-  buffers bitwise.
+  buffers exactly.
+* The compute weights each arm's step-1 optimizer step installed (this rank's shard of every
+  model weight buffer, by the same arithmetic) equal ``ref``'s bf16 weights after that step
+  exactly. Its teeth: ``no_install`` (``hsdp`` forced, the install skipped) keeps the
+  precondition but fails this check and the step-2 gate.
 * Given the same step-1 gradient the un-forced ``hsdp`` path agrees at step 2: ``hsdp_unforced``
   (stepping on its own step-1 gradient) against ``ref_from_hsdp`` (``ref`` stepping on that
-  gradient), from bitwise-equal main weights. The un-forced step 2 against ``ref`` is printed
+  gradient), from exactly equal main weights. The un-forced step 2 against ``ref`` is printed
   (diagnostic, not gated).
 * The recorded reductions, every step: every bucket's DP-Shard size is the layout's (``W /
   2`` dense, ``W / (2 EP)`` expert); a bucket is reduced over DP-Shard once per microbatch (not
   once per use) when its strategy shards gradients over more than one rank, else once per step
   in the last microbatch (from the configured strategies, not from a production predicate); and
-  over DP-Outer exactly once per step, in the last microbatch. The checker rejects the
-  ``outer_each`` and ``outer_never`` records.
+  over DP-Outer exactly once per step, in the last microbatch. The checker
+  (``sgu.reduction_problems``) rejects the ``outer_each`` and ``outer_never`` records here (its
+  DP-Outer branch); its DP-Shard branch rejects synthetic records in
+  ``test_loop_strategy_bookkeeping.py`` (a ZeRO-1 bucket reduced every microbatch, a ZeRO-2/3
+  bucket over two ranks reduced once per step).
 * ``cpu_adam`` (the recipes' optimizer): ``hfsdp_recipe`` with Adam offloaded to the host
   (``optimizer_cpu_offload``, fraction 1.0, precision aware) builds and steps. Every leaf
   optimizer is a ``HybridDeviceOptimizer`` whose parameters are the Megatron-FSDP DTensors,
@@ -64,16 +71,16 @@ optimizer step, weight install, gradient-buffer reset, gathers and step 2.
   (the FSDP main weight) equals the host master, and the state is presented as DTensors over
   host tensors. Step 1's gradients pass the gate against a DDP run (``ref_adam``); the arm is
   then forced with ``ref_adam``'s step-1 gradient, which every optimizer parameter must hold
-  bitwise before the host step (the gradient the host Adam consumed); its step-2 losses are
+  exactly before the host step (the gradient the host Adam consumed); its step-2 losses are
   within 1e-3 of ``ref_adam``'s, stepped with the GPU Adam (a different update kernel, so no
-  bitwise start: the host masters' difference is printed), and closer to it than to the same
+  exact start: the host masters' difference is printed), and closer to it than to the same
   run with a learning rate of zero (the update happened).
 * ``cpu_adam`` checkpoint: the same optimizer on ``hfsdp_recipe`` (in ``Float16Module``, as in
   training), two steps on random gradients, an ``fsdp_dtensor`` save and a strict load into a
   fresh model and optimizer as save_checkpoint and load_checkpoint build them
   (``preprocess_fsdp_dtensor_state_dict``: the SwiGLU split of every ``linear_fc1``, the
   expert renames, the uneven-DTensor metadata). Every parameter's weight, host master,
-  moments and step are restored bitwise, and the moments stay on the host.
+  moments and step are restored exactly, and the moments stay on the host.
 * Teeth, each must fail (step 1): ``overwrite`` (accumulate mode off, the loop guard bypassed:
   each use overwrites the bucket, so the core's fused-wgrad weights keep one round);
   ``outer_each`` (the DP-Outer reduction on every microbatch: earlier microbatches' sums are
@@ -81,7 +88,7 @@ optimizer step, weight install, gradient-buffer reset, gathers and step 2.
   ``overwrite`` and ``outer_each`` act on per-backward reductions: they must fail every fused
   core weight whose bucket is reduced every microbatch, and leave those reduced once per step
   (the experts at the default EP; the set is derived from the layout and must equal the one
-  observed on the ``hsdp`` arm) bitwise equal to the ``hsdp`` arm's. ``outer_never`` must fail
+  observed on the ``hsdp`` arm) exactly equal to the ``hsdp`` arm's. ``outer_never`` must fail
   every fused core weight, the once-per-step ones included (there must be some at ``EP = W /
   2`` and none at ``EP = 1``).
 
@@ -277,7 +284,7 @@ class _HostAdamCheck:
     """Checks the CPU-offloaded Adam (``HybridDeviceOptimizer``) on the Megatron-FSDP v1
     parameters. At build: every leaf optimizer is one, every parameter is a DTensor offloaded
     to a plain host tensor of its local shard (no device optimizer). At every step, every
-    parameter with a gradient: the updated host master equals, bitwise, a reference CPU AdamW
+    parameter with a gradient: the updated host master equals, exactly, a reference CPU AdamW
     (the CPU optimizer's own param group) stepping a copy of the host master before the step
     with the gradient's local shard, and the parameter's local shard (the FSDP main weight)
     equals it; the state is presented as DTensors over host tensors."""
@@ -376,14 +383,15 @@ class _HostAdamCheck:
 
 def _run_ddp(state, steps=STEPS, forced=None, **optimizer_fields):
     """``steps`` steps of the DDP reference; returns ``[(step result, grads)]`` and a record:
-    the core's fused-wgrad weight names (``fused``), the fp32 masters after the step-1 update
-    (``masters``), the persistent buffers step 2 starts with (``buffers``) and, with ``forced``
-    (step-1 gradients to step on: the teacher forcing), the read-back count (``readback``)."""
+    the core's fused-wgrad weight names (``fused``), the fp32 masters and the model weights
+    (bf16: the masters rounded) after the step-1 update (``masters``, ``weights``), the
+    persistent buffers step 2 starts with (``buffers``) and, with ``forced`` (step-1 gradients
+    to step on: the teacher forcing), the read-back count (``readback``)."""
     model = sgu.build_model(state, expert_model_parallel_size=EP)
     ddp = _ddp(model)
     opt = sgu.optimizer(ddp, **optimizer_fields)
     out = []
-    info = dict(masters=None, buffers=None, readback=None)
+    info = dict(masters=None, weights=None, buffers=None, readback=None)
     for step in range(steps):
         opt.zero_grad()
         result = sgu.run_step(ddp, model, sgu.make_rows(step))
@@ -396,6 +404,7 @@ def _run_ddp(state, steps=STEPS, forced=None, **optimizer_fields):
                 )
             sgu.step_optimizer(opt)
             info["masters"] = sgu.float16_optimizer_masters(opt, model)
+            info["weights"] = {name: p.detach().clone() for name, p in model.named_parameters()}
             info["buffers"] = sgu.persistent_buffers(model)
     info["fused"] = sgu.fused_core_weights(model)
     del opt, ddp, model
@@ -414,15 +423,22 @@ def _run_fsdp(
     optimizer_fields=None,
     optimizer_check=None,
     forced=None,
+    skip_install=False,
 ):
     """``steps`` steps of one Megatron-FSDP arm; returns ``[(step result, grads)]`` and the
     record: the reductions (``calls``), the bucket layout (``sgu.fsdp_bucket_layout``: DP-Shard
     sizes under ``buckets``, names, expert flags), after the step-1 update this rank's fp32 main
-    weight slices (``main``) and the persistent buffers (``buffers``), and with ``forced``
-    (step-1 gradients to step on: the teacher forcing) the read-back count (``readback``) and the
-    optimizer parameters' gradients against ``forced`` (``optimizer_grads``, local). With
-    ``optimizer_check``, a class built on the optimizer: its ``summary()`` under
-    ``"optimizer_check"``."""
+    weight slices (``main``), its installed compute weight slices (``installed``, or the error
+    reading them under ``installed_error``) and the persistent buffers (``buffers``), and with
+    ``forced`` (step-1 gradients to step on: the teacher forcing) the read-back count
+    (``readback``) and the optimizer parameters' gradients against ``forced``
+    (``optimizer_grads``, local). With ``optimizer_check``, a class built on the optimizer: its
+    ``summary()`` under ``"optimizer_check"``. ``skip_install``: the mutation, the step-1
+    optimizer step does not install the updated main weights into the compute weights
+    (``copy_main_weights_to_model_weights`` a no-op)."""
+    from megatron.core.distributed.fsdp.src.megatron_fsdp.param_and_grad_buffer import (
+        ParamAndGradBuffer,
+    )
     from megatron.core.transformer.loop import guards
 
     original_guard = guards.validate_loop_fsdp_config
@@ -437,7 +453,8 @@ def _run_fsdp(
     opt = sgu.optimizer(fsdp, **(optimizer_fields or {}))
     check = optimizer_check(opt) if optimizer_check is not None else None
     out = []
-    record = dict(main=None, buffers=None, readback=None, optimizer_grads=None)
+    record = dict(main=None, installed=None, buffers=None, readback=None, optimizer_grads=None)
+    original_install = ParamAndGradBuffer.copy_main_weights_to_model_weights
     with _ReductionRecorder(outer=outer_override) as recorder:
         for step in range(steps):
             recorder.step = step
@@ -453,8 +470,17 @@ def _run_fsdp(
                         len(sgu.mismatches(sgu.fsdp_grads(fsdp), forced))
                     )
                     record["optimizer_grads"] = sgu.fsdp_optimizer_grad_mismatches(fsdp, forced)
-                sgu.step_optimizer(opt)
+                if skip_install:
+                    ParamAndGradBuffer.copy_main_weights_to_model_weights = lambda buffer: None
+                try:
+                    sgu.step_optimizer(opt)
+                finally:
+                    ParamAndGradBuffer.copy_main_weights_to_model_weights = original_install
                 record["main"] = sgu.fsdp_main_weight_slices(fsdp)
+                try:  # local reads only: an error is kept for the install test to report
+                    record["installed"] = sgu.fsdp_model_weight_slices(fsdp)
+                except Exception:  # pylint: disable=broad-except
+                    record["installed_error"] = traceback.format_exc()
                 record["buffers"] = sgu.persistent_buffers(model)
     layout = sgu.fsdp_bucket_layout(fsdp)
     fsdp.stop_communication()
@@ -529,7 +555,7 @@ def _cpu_adam_checkpoint_round_trip(state):
     a load into a fresh model and optimizer (strict: every key it asks for must be in the
     checkpoint), as load_checkpoint does it. The model is wrapped in ``Float16Module`` as in
     training, which gives the state dict keys the ``module.`` levels the checkpoint handlers
-    expect. Returns the parameters whose weight, host master, moments or step differ (bitwise)
+    expect. Returns the parameters whose weight, host master, moments or step differ at all
     from the saved run's, or whose moments are not on the host, the number of parameters
     checked and how many of them are SwiGLU ``linear_fc1`` weights (whose state the checkpoint
     splits into W and V)."""
@@ -636,6 +662,8 @@ def results():
     out["overwrite"] = _run_fsdp(state, "no_shard", accumulate=False, steps=1)
     out["outer_each"] = _run_fsdp(state, "no_shard", outer_override="each", steps=1)
     out["outer_never"] = _run_fsdp(state, "no_shard", outer_override="never", steps=1)
+    # Forced like hsdp, but the step-1 optimizer step installs nothing into the compute weights.
+    out["no_install"] = _run_fsdp(state, **ARMS["hsdp"], forced=forced, skip_install=True)
     # Un-forced: hsdp on its own step-1 gradient, and ref stepping on that same gradient.
     out["hsdp_unforced"] = _run_fsdp(state, **ARMS["hsdp"])
     out["ref_from_hsdp"], out["ref_from_hsdp_info"] = _run_ddp(
@@ -657,10 +685,11 @@ def results():
         out["cpu_adam_checkpoint"] = _cpu_adam_checkpoint_round_trip(state)
     except Exception:  # pylint: disable=broad-except
         out["cpu_adam_checkpoint_error"] = traceback.format_exc()
-    for arm in ARMS:
+    for arm in list(ARMS) + ["no_install"]:
         record = out[arm][1]
         start = sgu.fsdp_start_mismatches(record, out["ref_info"])
         record["forcing"] = sgu.forcing_record(record["readback"], start)
+        record["install"] = sgu.install_record(record, out["ref_info"]["weights"])
     record, info = out["ref_from_hsdp_info"], out["hsdp_unforced"][1]
     record["forcing"] = sgu.forcing_record(
         record["readback"], sgu.fsdp_start_mismatches(info, record)
@@ -681,10 +710,46 @@ def _name(text):
 def test_step_two_starts_from_the_reference_state(results, arm):
     """The teacher-forcing precondition: the forced gradient read back on every rank, and the
     arm's own optimizer step on it produced ``ref``'s fp32 masters (this rank's slices) and
-    buffers bitwise. On failure, ``optimizer_grads`` names gradients the forcing missed."""
+    buffers exactly. On failure, ``optimizer_grads`` names gradients the forcing missed."""
     record = results[arm][1]
     print(f"[{_name(arm)}] optimizer grads off the forced ones {record['optimizer_grads']}")
     sgu.assert_teacher_forced(record["forcing"], arm)
+
+
+@pytest.mark.parametrize("arm", list(ARMS))
+def test_step_two_runs_on_the_installed_reference_weights(results, arm):
+    """The compute weights the arm's step-1 optimizer step installed (this rank's shard of
+    every model weight buffer, read right after the step: ``sgu.fsdp_model_weight_slices``)
+    equal ``ref``'s model weights after the same step (the fp32 masters rounded to bf16)
+    exactly, on every rank. Kept out of the step-2 precondition so that a defect of this
+    reader does not hide the gates; the gathers of these shards are left to the step-2 gate."""
+    install = results[arm][1]["install"]
+    assert install["agreed"] == 0, (
+        f"{arm}: the installed compute weights differ from ref's in {len(install['local'])} "
+        f"tensors on this rank ({install['agreed']} on the worst rank)",
+        sorted(install["local"].items())[:8],
+    )
+
+
+def test_skipped_install_fails_the_install_check_and_the_step_two_gate(results):
+    """Teeth of the install check and of the step-2 gate on Megatron-FSDP's step-2-only path:
+    ``no_install`` (``hsdp`` forced, its step-1 optimizer step installing nothing into the
+    compute weights) starts from ``ref``'s main weights and buffers (the precondition holds),
+    the install check reports its stale compute weights on every rank, and its step-2
+    gradients fail the gate."""
+    record = results["no_install"][1]
+    sgu.assert_teacher_forced(record["forcing"], "no_install")
+    local = record["install"]["local"]
+    print(f"[{_name('no_install')}] install check: {len(local)} tensors differ", flush=True)
+    assert "error" not in local, local["error"]
+    assert local and record["install"]["agreed"] > 0, record["install"]
+    _, reference = results["ref"][1]
+    _, grads = results["no_install"][0][1]
+    report, failing = sgu.report_and_fail(
+        _name("no_install (mutation) step 2 vs ref"), grads, reference
+    )
+    assert failing, "the no_install mutation passed the step-2 gate: the test has no teeth"
+    print(f"[{_name('no_install')}] failing {len(failing)} of {len(report)}", flush=True)
 
 
 @pytest.mark.parametrize("arm", list(ARMS))
@@ -710,7 +775,7 @@ def test_losses_match_the_reference(results, arm):
 
 def test_step_two_agrees_given_the_same_step_one_gradient(results):
     """The un-forced path: ``hsdp_unforced`` steps on its own step-1 gradient and
-    ``ref_from_hsdp`` (``ref``) on that same gradient. From bitwise-equal fp32 main weights and
+    ``ref_from_hsdp`` (``ref``) on that same gradient. From exactly equal fp32 main weights and
     buffers, their step-2 gradients pass the gate and their losses are equal."""
     sgu.assert_teacher_forced(
         results["ref_from_hsdp_info"]["forcing"], "ref_from_hsdp", "hsdp_unforced's"
@@ -748,31 +813,11 @@ def test_report_unforced_step_two(results):
 
 
 def _reduction_problems(record, expert, steps):
-    """The recorded reductions of an arm (``expert``: its expert strategy, ``None`` for the
-    dense one) against the expectation from the layout and the configured strategies: every
-    bucket's DP-Shard size; its DP-Shard reductions per microbatch, ``[1, 1, 1]`` when the
-    bucket's strategy shards gradients over more than one rank, else ``[0, 0, 1]``; its DP-Outer
-    reductions ``[0, 0, 1]``. Returns the problems."""
-    problems = []
-    last = [0] * (sgu.ROWS - 1) + [1]
-    for step in range(steps):
-        hooks, uses, outer = sgu.reduction_counts(record["calls"], step)
-        assert not uses, uses  # no per-use mode here
-        for bucket_id, shard_size in record["buckets"].items():
-            expert_bucket = sgu.bucket_is_expert(record, bucket_id)
-            strategy = (expert or DENSE) if expert_bucket else DENSE
-            layout_size = sgu.expected_dp_shard(WORLD, EP, INSTANCES, expert_bucket)
-            if shard_size != layout_size:
-                problems.append(("DP-Shard size", step, bucket_id, shard_size, layout_size))
-            every = sgu.reduced_every_microbatch(strategy, layout_size)
-            expected = [1] * sgu.ROWS if every else last
-            got = [hooks[(m, bucket_id)] for m in range(sgu.ROWS)]
-            if got != expected:
-                problems.append(("DP-Shard", step, bucket_id, strategy, shard_size, got, expected))
-            got = [outer[(m, bucket_id)] for m in range(sgu.ROWS)]
-            if got != last:
-                problems.append(("DP-Outer", step, bucket_id, got))
-    return problems
+    """``sgu.reduction_problems`` of an arm of this file (``expert``: its expert strategy,
+    ``None`` for the dense one)."""
+    return sgu.reduction_problems(
+        record, dense=DENSE, expert=expert, world=WORLD, ep=EP, instances=INSTANCES, steps=steps
+    )
 
 
 @pytest.mark.parametrize("arm", list(ARMS))
@@ -799,9 +844,11 @@ def test_reductions_once_per_microbatch_and_outer_once_per_step(results, arm):
 
 @pytest.mark.parametrize("mutation", ["outer_each", "outer_never"])
 def test_reduction_checker_rejects_the_outer_mutations(results, mutation):
-    """The reductions checker has teeth: no DP-Outer reduction is a problem in every bucket, a
-    DP-Outer reduction on every microbatch in every bucket reduced every microbatch (a bucket
-    reduced once per step is reduced, over DP-Outer too, only in the last microbatch)."""
+    """The reductions checker's DP-Outer branch has teeth: no DP-Outer reduction is a problem in
+    every bucket, a DP-Outer reduction on every microbatch in every bucket reduced every
+    microbatch (a bucket reduced once per step is reduced, over DP-Outer too, only in the last
+    microbatch). The DP-Shard branch's teeth are CPU tests on synthetic records
+    (``test_reduction_problems_check_the_dp_shard_schedule``)."""
     _, record = results[mutation]
     problems = _reduction_problems(record, None, 1)
     print(f"[{_name(mutation)}] reduction problems {problems[:4]}", flush=True)
@@ -847,7 +894,7 @@ def test_cpu_offloaded_adam_steps_on_the_recipe_layout(results):
     report, failing = sgu.report_and_fail(_name("cpu_adam step 1 vs ref"), grads, reference)
     assert not failing, sgu.mbs.worst(report, failing)
     sgu.assert_losses_match(results["cpu_adam"][0][0][0], results["ref_adam"][0][0], _name("cpu"))
-    # Forced with ref_adam's step-1 gradient: every optimizer parameter held it bitwise.
+    # Forced with ref_adam's step-1 gradient: every optimizer parameter held it exactly.
     sgu.assert_teacher_forced(
         results["cpu_adam"][1]["forcing"], "cpu_adam", "ref_adam's step-1 gradient (consumed)"
     )
@@ -866,7 +913,7 @@ def test_cpu_offloaded_adam_steps_on_the_recipe_layout(results):
 def test_cpu_offloaded_adam_fsdp_dtensor_checkpoint_round_trip(results):
     """The recipes' optimizer through an ``fsdp_dtensor`` save and load on the recipes' layout
     (see ``_cpu_adam_checkpoint_round_trip``): weights, host masters, moments and steps are
-    restored bitwise and the moments stay on the host, SwiGLU ``linear_fc1`` included."""
+    restored exactly and the moments stay on the host, SwiGLU ``linear_fc1`` included."""
     if "cpu_adam_checkpoint_error" in results:
         pytest.fail(
             f"the cpu_adam checkpoint round trip raised:\n{results['cpu_adam_checkpoint_error']}",
@@ -903,7 +950,7 @@ def test_overwrite_mutation_fails_on_the_core_fused_weights(results):
     """Without accumulate mode each use overwrites the gradient bucket: every core weight whose
     weight gradient TE accumulates in place and whose bucket is reduced every microbatch keeps
     one round's gradient. A bucket reduced once per step accumulates in its persistent buffer
-    whatever the mode, so its weights must equal the ``hsdp`` arm's bitwise."""
+    whatever the mode, so its weights must equal the ``hsdp`` arm's exactly."""
     _, reference = results["ref"][0]
     _, grads = results["overwrite"][0][0]
     report, _ = sgu.report_and_fail(_name("overwrite (mutation) vs ref"), grads, reference)
