@@ -12,10 +12,10 @@ capture, E15), a tied weight's fused GEMM plus lookup against DDP's hook arithme
 the per-segment check of overwrite targets (unwritten, raw-consumed), and the
 ``DistributedWeight`` binding against fake TE 2.20 consumers routed through local copies of TE's
 dispatchers (a ``Linear``, which reads ``requires_grad`` from the stand-in, and a
-``LayerNormLinear``, which reads it from the materialized weight). The second part needs CUDA and Transformer
-Engine: TE linears and Megatron's fused local linear with rebound weights (forward, backward, wgrad
-accumulation), and the cast after the gather under FP8 block scaling / MXFP8 where the device
-supports it. Model parallelism (TP = 1) is initialized once for the module.
+``LayerNormLinear``, which reads it from the materialized weight). The second part needs CUDA
+and Transformer Engine: TE linears and Megatron's fused local linear with rebound weights
+(forward, backward, wgrad accumulation), and the cast after the gather under FP8 block scaling /
+MXFP8 where the device supports it. Model parallelism (TP = 1) is initialized once for the module.
 """
 
 import math
@@ -1034,18 +1034,31 @@ def test_distributed_weight_stand_in(dev, protocol_available):
 @pytest.mark.parametrize(
     "mode,fuse", [("overwrite", True), ("accumulate", True), ("accumulate", False)]
 )
-def test_distributed_weight_matches_the_data_binding(dev, protocol_available, mode, fuse, consumer):
+def test_distributed_weight_matches_the_data_binding(
+    dev, protocol_available, monkeypatch, mode, fuse, consumer
+):
     """LW / RSG (overwrite targets; fused wgrad only) and Resident (accumulator, microbatches).
 
     The reference is the data binding, whose consumer reads the compute ``Parameter`` and never
     calls ``materialize_*``. A ``LayerNormLinear`` reads ``requires_grad`` from the materialized
-    weight, so a materialized tensor without it would drop the wgrad under the DW binding.
+    weight, so a materialized tensor without it would drop the wgrad under the DW binding: the
+    DW binding's wgrad must reach ``finalize_group_grads`` once per backward (the data binding's
+    never does), besides the target regions agreeing.
     """
+    finalized = []
+    original_finalize = pb.RSBFDistributedWeight.finalize_group_grads
+
+    def counting_finalize(self, wgrads, nvtx_label=None):
+        finalized.append(self._store_tensor().name)
+        return original_finalize(self, wgrads, nvtx_label)
+
+    monkeypatch.setattr(pb.RSBFDistributedWeight, "finalize_group_grads", counting_finalize)
     a, b, ta, tb, full = _dw_pair(dev, fuse=fuse, cls=consumer)
     assert ta.grad_capture == tb.grad_capture == ("lazy" if fuse else "hook")
     assert ta.pad_length == 2  # R = 10 rows on z = 3
     targets = []
-    for mod, t in ((a, ta), (b, tb)):
+    for mod, t, finalizes in ((a, ta, 0), (b, tb, 1)):
+        finalized.clear()
         slot = _slot([t], dev)
         view = pb.tensor_view(slot, t)
         view.copy_(full)
@@ -1066,6 +1079,7 @@ def test_distributed_weight_matches_the_data_binding(dev, protocol_available, mo
             y.backward(g)
             dxs.append(x.grad)
             assert t.weight.grad is None and t.weight.grad_added_to_main_grad is False
+        assert len(finalized) == finalizes * steps, (t.binding, finalized)
         assert t.grad_written
         targets.append((region.clone(), dxs, target))
     (ra, dxa, _), (rb, dxb, target_b) = targets
