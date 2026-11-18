@@ -380,11 +380,18 @@ it** — a different collective over a different process group, so enable either
 
 **Behaviour notes**
 
-- **FP32 main grads need no flag.** Every GTP wgrad is reduce-scattered in `main_grad`'s dtype:
-  linears type it up front (`get_wgrad_tensor` / `grad_buffer`), and the embedding, whose
-  lookup gradient autograd returns in BF16, is widened into its padded FP32 send buffer by
-  `widen_wgrad_for_reduce_scatter` (one transient padded FP32 copy per use, in place of the BF16
-  pad copy). Without that a BF16 cross-rank sum would round before the FP32 `main_grad` sees it.
+- **The embedding with FP32 main grads needs no flag.** Its lookup gradient comes back from
+  autograd in BF16, so `widen_wgrad_for_reduce_scatter` copies it into a padded FP32 send buffer
+  before the reduce-scatter; otherwise a BF16 cross-rank sum would round before the FP32
+  `main_grad` sees it. Cost: one transient padded FP32 `vocab x hidden` buffer per use, live
+  alongside the BF16 lookup gradient. It replaces the BF16 pad copy only when the vocab dim is
+  padded (`pad_length > 0`); without padding (BF16 recipes pad only to the GTP degree) it is
+  extra memory, e.g. about 3.45 GiB per use for a 129280 x 7168 vocab, twice per microbatch
+  with one MTP layer. With this flag on (and the axis > 2, no symmetric pool) the embedding is
+  not widened: the FP32 sum at the receiver already avoids the BF16 partial sums.
+  Linears with fused wgrad accumulation type their wgrad from `main_grad` up front
+  (`get_wgrad_tensor` / TE's `grad_buffer`); without fused accumulation, TE linears still
+  reduce-scatter in the activation dtype, as does a foreign wgrad on a symmetric pool (§2.7).
 - **The mean stays a pre-scale.** Both paths apply `1/gtp_remat` to the wgrad before the
   collective (§3.2 table); under `calculate_per_token_loss` the axis SUMs and no factor
   applies either way.

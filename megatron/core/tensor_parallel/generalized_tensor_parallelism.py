@@ -2388,19 +2388,54 @@ class GTPShardedParam(torch.nn.Parameter):
             return buf[: self._unsharded_shape[0]]
         return _wgrad_pool_get(self._unsharded_shape, self.main_grad.dtype, self.device)
 
+    def _rs_uses_fp32_accumulation(self) -> bool:
+        """Whether this weight's reduce-scatter runs the fp32-accumulating all-to-all.
+
+        Skipped at group size <= 2 and on symm-registered groups. Shared by _reduce_scatter and
+        widen_wgrad_for_reduce_scatter, so the two cannot disagree on the path.
+        """
+        return (
+            GTP_CONFIG.reduce_scatter_with_fp32_accumulation
+            and self.group.size() > 2
+            and not uses_gtp_symm_pool(self.group, collective="rs")
+        )
+
+    def _finish_inflight_reduce_scatter(self) -> None:
+        """Finish (wait and add into main_grad) this weight's previous async reduce-scatter.
+
+        MTP feeds embedding and output_layer into more than one GEMM per forward, so they get
+        more than one backward. The previous reduce-scatter may still be running: starting
+        another would reuse this weight's ticket, i.e. the same output buffer, and overwrite the
+        one handle we track -- discarding that gradient with no error. No-op when none is
+        in flight.
+        """
+        if GTP_CONFIG.async_reduction and self._wgrad_rs_handle is not None:
+            self._wait_reduce_scatter(finalize_grad=True)
+            # Accounted for here, so the cascade must not skip the next one.
+            self._already_finalized = False
+
     def widen_wgrad_for_reduce_scatter(self, wgrad: torch.Tensor) -> torch.Tensor:
         """Copy a wgrad computed below main_grad's precision into main_grad's dtype.
 
         The GTP reduce-scatter then sums the ranks' contributions in that dtype, as it does for
-        every linear, whose wgrad is typed from main_grad up front via get_wgrad_tensor. This is
-        for callers that cannot do that: the embedding, whose lookup gradient autograd returns
-        in the weight dtype. A BF16 cross-rank sum would round before the FP32 main_grad ever
-        sees it, and the error grows with the GTP degree.
+        a linear whose wgrad is typed from main_grad up front (get_wgrad_tensor, or TE's
+        grad_buffer with fused wgrad accumulation). This is for callers that cannot do that: the
+        embedding, whose lookup gradient autograd returns in the weight dtype. A BF16 cross-rank
+        sum would round before the FP32 main_grad ever sees it, and the error grows with the GTP
+        degree.
 
-        Writes straight into the padded send buffer, so it costs one padded main_grad-dtype
-        wgrad in place of the padded copy _prepare_wgrad_reduce_scatter_inputs would make. The
-        buffer is a plain allocation (never in the wgrad pool) that is freed once the
-        reduce-scatter that consumes it has finished. Returns the logical (unpadded) view.
+        Memory: on the plain path this allocates one padded main_grad-dtype buffer per call
+        (vocab x hidden x 4 bytes for FP32), live together with the caller's BF16 wgrad, which
+        autograd holds until the backward returns. When the weight is padded (pad_length > 0) it
+        replaces the BF16 pad copy _prepare_wgrad_reduce_scatter_inputs would make; when it is
+        not (BF16 recipes pad only to the GTP degree), it is extra transient memory, freed once
+        the reduce-scatter that consumes it has finished. The buffer is a plain allocation, never
+        in the wgrad pool. Returns the logical (unpadded) view.
+
+        Returned unchanged (no copy) when the reduce-scatter already sums in main_grad's dtype or
+        FP32: BF16 main grads, a wgrad ring slot (its copy_ widens), or the fp32-accumulating
+        reduce-scatter (_rs_uses_fp32_accumulation: BF16 on the wire, an FP32 sum at the
+        receiver), where widening would only double the all-to-all bytes and its pooled scratch.
         """
         dtype = self.main_grad.dtype
         if wgrad.dtype == dtype:
@@ -2410,6 +2445,8 @@ class GTPShardedParam(torch.nn.Parameter):
             or getattr(self, "_gtp_eager_wgrad_ring_slot", None) is not None
         ):
             return wgrad  # the ring slot's copy_ in _prepare already widens into main_grad dtype
+        if self._rs_uses_fp32_accumulation():
+            return wgrad  # the receiver sums each rank's BF16 contribution in FP32
         if uses_gtp_symm_pool(self.group, collective="rs"):
             if self._wgrad_accum_buf is not None:
                 # get_wgrad_tensor would hand back the accumulation buffer, not a send slot.
@@ -2425,6 +2462,10 @@ class GTPShardedParam(torch.nn.Parameter):
                 f"[GTP] the widened wgrad of {self._debug_name} was never reduce-scattered: "
                 "the previous backward aborted between widening and its reduce-scatter."
             )
+        # A previous use's async reduce-scatter may still be reading its padded buffer: finish it
+        # before allocating the next one (wgrad_reduce_scatter would only do so after this call),
+        # so at most one padded main_grad-dtype buffer of this weight is live at a time.
+        self._finish_inflight_reduce_scatter()
         rows = self._unsharded_shape[0]
         padded = torch.empty(self._unsharded_shape_padded, dtype=dtype, device=wgrad.device)
         if self.pad_length:
@@ -2643,11 +2684,7 @@ class GTPShardedParam(torch.nn.Parameter):
         # fp32-accum all-to-all: skipped at size <= 2 and on symm-registered groups. Its shard
         # sum stays FP32 all the way into main_grad.add_, so a BF16 main_grad rounds once per
         # microbatch instead of once into a BF16 output and again on the add.
-        fp32_accumulation = (
-            GTP_CONFIG.reduce_scatter_with_fp32_accumulation
-            and self.group.size() > 2
-            and not uses_gtp_symm_pool(self.group, collective="rs")
-        )
+        fp32_accumulation = self._rs_uses_fp32_accumulation()
 
         if async_op:
             dtypes = [torch.float32 if fp32_accumulation else w.dtype for w in wgrads]
@@ -2839,14 +2876,8 @@ class GTPShardedParam(torch.nn.Parameter):
                 self._drain_next_w_reduce_scatter()
             return ret
 
-        # MTP feeds embedding and output_layer into more than one GEMM per forward, so they get
-        # more than one backward. The previous reduce-scatter may still be running: starting
-        # another would reuse this weight's ticket, i.e. the same output buffer, and overwrite
-        # the one handle we track -- discarding that gradient with no error. Finish it first.
-        if GTP_CONFIG.async_reduction and self._wgrad_rs_handle is not None:
-            self._wait_reduce_scatter(finalize_grad=True)
-            # Accounted for here, so the cascade below must not skip the next one.
-            self._already_finalized = False
+        # A weight with several backwards per forward (MTP): finish its previous RS first.
+        self._finish_inflight_reduce_scatter()
 
         if async_op is None:
             async_op = GTP_CONFIG.async_reduction and self.prev_w is not None
