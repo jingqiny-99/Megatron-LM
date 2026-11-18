@@ -443,9 +443,7 @@ def _worker_embedding_wgrad_rs_fp32(rank, world_size, port, degree, padded):
         align = GTP_CONFIG.pad_for_alignment * degree
         vocab, hidden = 2 * align - (3 if padded else 0), 32
         mod = nn.Module()
-        mod.weight = nn.Parameter(
-            torch.zeros(vocab, hidden, dtype=torch.bfloat16, device="cuda")
-        )
+        mod.weight = nn.Parameter(torch.zeros(vocab, hidden, dtype=torch.bfloat16, device="cuda"))
         wrap_module_params_gtp(mod, ["weight"], group)
         w = mod.weight
         assert isinstance(w, GTPShardedParam)

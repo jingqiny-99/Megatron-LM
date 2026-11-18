@@ -1039,9 +1039,9 @@ def test_precise_embedding_reference_refuses_other_layouts(layout):
     sgu.install_per_use_fp32_embedding(
         SimpleNamespace(embedding=SimpleNamespace(word_embeddings=embedding))
     )
-    attribute = dict(
-        tp="tp_group", gtp="gtp_remat_size", deterministic="deterministic_mode"
-    ).get(next(iter(layout)), "reduce_scatter_embeddings")
+    attribute = dict(tp="tp_group", gtp="gtp_remat_size", deterministic="deterministic_mode").get(
+        next(iter(layout)), "reduce_scatter_embeddings"
+    )
     value = _Group(2) if attribute == "tp_group" else next(iter(layout.values()))
     setattr(embedding, attribute, value)
     with pytest.raises(AssertionError, match="deterministic TP=1 lookup only"):
