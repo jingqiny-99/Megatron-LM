@@ -22,8 +22,8 @@ Two bindings exist:
 ``"distributed_weight"`` (TE >= 2.19, behind ``te_distributed_weight_available``)
     The module's weight becomes an ``RSBFDistributedWeight``: a shard-shaped tensor subclass
     implementing TE's ``DistributedWeight`` protocol. TE asks it for the full weight in the
-    forward and the backward (``materialize_group_for_*``: the bound region; no collective, the
-    store has already gathered) and hands it the wgrad (``finalize_group_grads``: written into or
+    forward and the backward (``materialize_group_for_*``: a grad-requiring alias of the bound
+    region; no collective, the store has already gathered) and hands it the wgrad (``finalize_group_grads``: written into or
     added to the gradient target). The stand-in itself holds no data (a shard-shaped placeholder).
 
 Gradients reach the target by one of three capture classes (``GradCapture``):
@@ -820,7 +820,8 @@ def _grad_hook(tensor: StoreTensor):
     ``zero_out_wgrad`` is still added (its fused consumer returned a zero dummy that autograd
     summed with the other consumers' gradients, e.g. a tied embedding's lookup), as DDP does
     (``distributed_data_parallel.py`` hook). A hook-path gradient into an overwrite target raises:
-    the target was not zeroed, and the weight has a consumer outside TE.
+    the target was not zeroed, and the weight has a consumer outside TE. A distributed-weight
+    stand-in reaching the hook with neither a gradient nor a finalize raises (a dropped wgrad).
     """
     ref = weakref.ref(tensor)
     name = tensor.name
@@ -831,6 +832,20 @@ def _grad_hook(tensor: StoreTensor):
         if fused:
             param.grad_added_to_main_grad = False
         grad = param.grad
+        if (
+            grad is None
+            and not fused
+            and store_tensor is not None
+            and store_tensor.binding == "distributed_weight"
+        ):
+            # Only TE consumes a distributed-weight stand-in, and TE either returns a gradient
+            # (Linear's dummy) or calls finalize_group_grads first (which flags the leader). Neither
+            # happening means the wgrad was dropped; marking the target written would ship its
+            # stale contents (an overwrite target) or a silent zero.
+            raise RuntimeError(
+                f"loop param store: {name} (distributed_weight binding) reached its gradient hook "
+                "with no weight gradient and no finalize_group_grads call"
+            )
         add = grad is not None and (
             not fused
             or (
@@ -960,9 +975,12 @@ class RSBFDistributedWeight(torch.Tensor):
 
     A shard-shaped tensor subclass requiring grad and implementing TE's ``DistributedWeight``
     protocol. It holds no data: it is backed by a shard-shaped placeholder (the store never reads
-    it, and TE 2.20 rebinds the weight to the materialized view before any data read, reading only
-    shape / dtype / device of the stand-in), so the DDP wrap that moves the canonical shard into
-    its param buffer does not touch it. The protocol methods never run a collective (the store's
+    it, and TE 2.20 rebinds the weight to the materialized tensor before any data read), so the
+    DDP wrap that moves the canonical shard into its param buffer does not touch it. TE Linear
+    reads ``requires_grad`` from the stand-in, but TE 2.19-2.20.x LayerNormLinear and legacy
+    GroupedLinear read it from the *materialized* tensor (whether to keep the GEMM input, compute
+    the wgrad and call ``finalize_group_grads``), so ``materialize_group_for_*`` returns a detached
+    alias of the bound region carrying the stand-in's ``requires_grad``, as GTP does. The protocol methods never run a collective (the store's
     executor-ordered schedule has already gathered and bound the unit), so they are graph-safe.
     ``_unsharded_shape`` is the logical shape (dev GTP's convention for logical-size readers).
     """
@@ -1005,13 +1023,24 @@ class RSBFDistributedWeight(torch.Tensor):
             raise RuntimeError("RSBFDistributedWeight without its store tensor")
         return tensor
 
+    def _materialized(self, tensor: StoreTensor) -> torch.Tensor:
+        """A detached alias of the bound region carrying the stand-in's ``requires_grad``.
+
+        Same storage, offset and strides (and version counter) as ``tensor.bound``, but a leaf of
+        its own, so the bound view the store binds and unbinds is never modified. TE 2.19-2.20.x
+        ``LayerNormLinear`` and legacy ``GroupedLinear`` read ``requires_grad`` from this tensor
+        (a ``False`` one silently skips the wgrad and ``finalize_group_grads``); GTP's materialize
+        keeps it the same way (``generalized_tensor_parallelism.py``).
+        """
+        return tensor.bound.detach().requires_grad_(self.requires_grad)
+
     def materialize_group_for_forward(self) -> torch.Tensor:
         """Protocol: the bound full weight for the forward GEMM (records its address)."""
         tensor = self._store_tensor()
         if tensor.bound is None:
             raise RuntimeError(f"loop param store: {tensor.name} is used unbound (forward)")
         tensor.forward_ptr = tensor.bound.data_ptr()
-        return tensor.bound
+        return self._materialized(tensor)
 
     def materialize_group_for_backward(self, nvtx_label: Optional[str] = None) -> torch.Tensor:
         """Protocol: the bound full weight for the backward GEMMs; must be the forward's region."""
@@ -1024,7 +1053,7 @@ class RSBFDistributedWeight(torch.Tensor):
                 f"loop param store: {tensor.name} was re-bound to a different region between its "
                 "forward and its backward (a re-gather must reuse the forward's slot)"
             )
-        return tensor.bound
+        return self._materialized(tensor)
 
     def grad_buffer(self) -> torch.Tensor:
         """Protocol: the buffer TE's fused wgrad GEMM writes (``accumulate=False``).
