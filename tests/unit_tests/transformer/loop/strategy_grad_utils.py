@@ -33,6 +33,17 @@ ungated diagnostic. Forcing hides a production write into the gradient storage b
 of ``finalize_model_grads`` and the optimizer step; a late asynchronous write would still break
 the precondition.
 
+Precise embedding reference (``install_per_use_fp32_embedding``, installed by
+``test_loop_gtp_gpu.py`` only). The model looks the embedding up twice per microbatch (the main
+input and the MTP input). In ``deterministic_mode`` the lookup is ``weight[ids]``, so autograd sums
+the two uses' BF16 gradients in BF16 before DDP adds the sum into the FP32 ``main_grad``: about
+1.7e-3 relative error on the embedding gradient (a CPU rounding model and real CPU autograd ops).
+GTP reduce-scatters each use's BF16 gradient on its own in FP32, which is exact up to FP32
+reassociation, so against that reference even an exact GTP embedding fails the 1e-3 gate. The
+installer makes the reference add each use's BF16 gradient (the same index backward the GTP arm
+runs) into the FP32 ``main_grad`` on its own, what non-deterministic DP's fused embedding wgrad
+does too. The gate is unchanged.
+
 Every helper that communicates is collective: all ranks call it in the same order.
 """
 
@@ -57,6 +68,7 @@ SEQ = 256
 VOCAB = 512
 NUM_EXPERTS = 8
 ROWS = 3  # per rank: three microbatches of one row (gradient accumulation across microbatches)
+MTP_LAYERS = 1  # the embedding and output_layer are each used 1 + MTP_LAYERS times per microbatch
 MIN_COSINE = 0.9999
 MAX_RELATIVE = 1e-3
 ZERO_FRACTION = 1e-6
@@ -123,7 +135,7 @@ def build_model(state=None, *, seed=1234, **overrides):
         enable_mhc_connections=True,
         mhc_num_residual_streams=4,
         mhc_sinkhorn_iterations=5,
-        mtp_num_layers=1,
+        mtp_num_layers=MTP_LAYERS,
         mtp_loss_scaling_factor=0.1,
         add_bias_linear=False,
         hidden_dropout=0.0,
@@ -766,6 +778,80 @@ def gtp_rows(full, rows, size, rank):
     padded = torch.zeros((rows * size, *full.shape[1:]), dtype=full.dtype, device=full.device)
     padded[: full.shape[0]].copy_(full)
     return padded[rank * rows : (rank + 1) * rows].clone()
+
+
+# ---------------------------------------------------------------------------------------------
+# Precise embedding reference (test_loop_gtp_gpu.py only; see the module docstring)
+# ---------------------------------------------------------------------------------------------
+
+
+class _PerUseFp32WeightGrad(torch.autograd.Function):
+    """Identity on a weight; its backward adds THIS use's gradient (in the weight's dtype) into
+    the FP32 ``main_grad`` on its own (an exact widening, one FP32 rounding), flags
+    ``grad_added_to_main_grad`` so DDP's hook adds nothing, and hands autograd a zero tensor
+    without storage (as ``EmbeddingWithGradAccumulationFusion`` does)."""
+
+    @staticmethod
+    def forward(ctx, weight):
+        ctx.weight = weight
+        return weight.view_as(weight)
+
+    @staticmethod
+    def backward(ctx, grad):
+        weight = ctx.weight
+        assert weight.main_grad.dtype == torch.float32, weight.main_grad.dtype
+        assert grad.dtype == weight.dtype, (grad.dtype, weight.dtype)
+        weight.main_grad.add_(grad)
+        weight.grad_added_to_main_grad = True
+        return torch._efficientzerotensor(weight.shape, dtype=weight.dtype, device=weight.device)
+
+
+def _assert_plain_lookup(module):
+    """The conditions under which ``VocabParallelEmbedding.forward`` is ``weight[ids]``: no
+    tensor-parallel split, no GTP, ``deterministic_mode`` and no reduce-scatter of the output."""
+    layout = dict(
+        tp=module.tp_group.size(),
+        gtp=getattr(module, "gtp_remat_size", 1),
+        deterministic=module.deterministic_mode,
+        reduce_scatter=module.reduce_scatter_embeddings,
+    )
+    assert layout == dict(tp=1, gtp=1, deterministic=True, reduce_scatter=False), (
+        "the per-use FP32 embedding reference replaces the deterministic TP=1 lookup only",
+        layout,
+    )
+
+
+def install_per_use_fp32_embedding(model):
+    """Make ``model``'s embedding lookups add each use's gradient into the FP32 ``main_grad`` on
+    its own (``_PerUseFp32WeightGrad``); returns a counter whose ``lookups`` counts the lookups
+    (both uses go through the same module: the main input and the MTP input).
+
+    Replaces ``model.embedding.word_embeddings.forward`` on that instance by ``weight[ids]``
+    through the per-use Function, which is the original forward's deterministic TP=1 branch, so
+    each use's gradient comes from the same index backward. Asserts the layout at install and on
+    every call, an untied weight (a tied one also gets the output layer's gradient through
+    ``.grad``, which the flag would make DDP skip), and on the first call that the output equals
+    the original forward's exactly."""
+    module = model.embedding.word_embeddings
+    _assert_plain_lookup(module)
+    assert not getattr(model, "share_embeddings_and_output_weights", False), "tied embedding"
+    assert not getattr(module.weight, "zero_out_wgrad", False), "zero_out_wgrad embedding"
+    original = module.forward
+    counter = SimpleNamespace(lookups=0, checked=False)
+
+    def forward(input_):
+        _assert_plain_lookup(module)
+        weight = module.weight
+        if not counter.checked:
+            with torch.no_grad():
+                expected = original(input_)
+                assert torch.equal(weight[input_], expected), "the lookup drifted from the original"
+            counter.checked = True
+        counter.lookups += 1
+        return _PerUseFp32WeightGrad.apply(weight)[input_]
+
+    module.forward = forward
+    return counter
 
 
 # ---------------------------------------------------------------------------------------------

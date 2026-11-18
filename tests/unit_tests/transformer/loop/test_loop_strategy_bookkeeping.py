@@ -23,6 +23,11 @@
   (``assert_per_backward_mutation``).
 * The GPU tests' optimizer (``strategy_grad_utils.SGD_AS_ADAM``): Adam that steps as SGD without
   momentum, since the distributed optimizer refuses SGD.
+* The GTP GPU test's precise embedding reference
+  (``strategy_grad_utils.install_per_use_fp32_embedding``): each lookup's BF16 gradient is added
+  into the FP32 ``main_grad`` on its own (bitwise the FP32 sum of the per-use gradients), DDP's
+  hook then adds nothing, and the plain deterministic lookup it replaces sums the uses in BF16
+  first (why the old reference is off); the installer refuses every other layout.
 
 The GPU tests of the same paths are ``test_loop_gtp_gpu.py``, ``test_loop_ddp_overlap_gpu.py``,
 ``test_loop_hsdp_gpu.py`` and ``test_loop_fsdp_per_use_gpu.py``.
@@ -898,3 +903,168 @@ def test_sgd_as_adam_steps_as_sgd_without_momentum():
         sgd.step()
         torch.testing.assert_close(adam_param.detach(), sgd_param.detach(), rtol=1e-6, atol=0.0)
         torch.testing.assert_close(adam_param.detach(), -0.1 * grad, rtol=1e-6, atol=0.0)
+
+
+# ---------------------------------------------------------------------------------------------
+# The GTP GPU test's precise embedding reference (strategy_grad_utils.install_per_use_fp32_embedding)
+# ---------------------------------------------------------------------------------------------
+
+
+class _Group:
+    def __init__(self, size):
+        self._size = size
+
+    def size(self):
+        return self._size
+
+
+class _Embedding(torch.nn.Module):
+    """A stand-in ``VocabParallelEmbedding``: its layout attributes and the deterministic TP=1
+    branch of its forward (``weight[ids]``)."""
+
+    def __init__(self, weight, *, tp=1, gtp=1, deterministic=True, reduce_scatter=False):
+        super().__init__()
+        self.weight = torch.nn.Parameter(weight.clone())
+        self.tp_group = _Group(tp)
+        self.gtp_remat_size = gtp
+        self.deterministic_mode = deterministic
+        self.reduce_scatter_embeddings = reduce_scatter
+
+    def forward(self, input_):
+        return self.weight[input_]
+
+
+def _ddp_like(weight):
+    """``main_grad`` and DDP's post-accumulate hook arithmetic (distributed_data_parallel.py):
+    ``.grad`` is added unless ``grad_added_to_main_grad``, then dropped. Returns the list of
+    ``(gradient, added)`` the hook saw."""
+    weight.main_grad = torch.zeros(weight.shape, dtype=torch.float32)
+    weight.grad_added_to_main_grad = False
+    seen = []
+
+    def hook(param):
+        added = param.grad is not None and not param.grad_added_to_main_grad
+        seen.append((param.grad, added))
+        if added:
+            param.main_grad.add_(param.grad.float())
+        param.grad = None
+
+    weight.register_post_accumulate_grad_hook(hook)
+    return seen
+
+
+def _two_use_main_grad(weight, ids, dys, *, precise):
+    """Two lookups (the main and the MTP input) through a stand-in model, then backward; returns
+    the FP32 ``main_grad``, the hook's gradients and the lookup counter (None if not precise)."""
+    from tests.unit_tests.transformer.loop import strategy_grad_utils as sgu
+
+    embedding = _Embedding(weight)
+    model = SimpleNamespace(embedding=SimpleNamespace(word_embeddings=embedding))
+    counter = sgu.install_per_use_fp32_embedding(model) if precise else None
+    seen = _ddp_like(embedding.weight)
+    loss = sum((embedding(i).float() * dy).sum() for i, dy in zip(ids, dys))
+    loss.backward()
+    return embedding.weight.main_grad.clone(), seen, counter
+
+
+def _per_use_fp32_sum(weight, ids, dys):
+    """The expectation, computed without the helper: each use's own autograd gradient (BF16, the
+    same index backward), widened, summed in FP32."""
+    leaf = weight.clone().requires_grad_(True)
+    total = torch.zeros(weight.shape, dtype=torch.float32)
+    for i, dy in zip(ids, dys):
+        (grad,) = torch.autograd.grad((leaf[i].float() * dy).sum(), leaf)
+        assert grad.dtype == torch.bfloat16
+        total += grad.float()
+    return total
+
+
+def _relative(a, b):
+    return ((a.double() - b.double()).norm() / b.double().norm()).item()
+
+
+def test_precise_embedding_reference_sums_each_use_in_fp32():
+    """Random rows, the MTP lookup on the shifted ids (the same rows, other positions): the
+    precise reference's ``main_grad`` is bitwise the FP32 sum of the per-use BF16 gradients, and
+    DDP's hook adds nothing. The plain lookup (autograd sums the uses in BF16 before the hook's
+    FP32 add) is more than the 1e-3 gate off: the reason the reference changed."""
+    generator = torch.Generator().manual_seed(0)
+    vocab, hidden, seq = 512, 512, 256
+    weight = torch.randn(vocab, hidden, generator=generator).to(torch.bfloat16)
+    tokens = torch.randint(0, vocab, (1, seq), generator=generator)
+    ids = [tokens, torch.roll(tokens, -1, dims=1)]
+    dys = [torch.randn(1, seq, hidden, generator=generator) * s for s in (1.0, 0.1)]
+    expected = _per_use_fp32_sum(weight, ids, dys)
+
+    got, seen, counter = _two_use_main_grad(weight, ids, dys, precise=True)
+    assert torch.equal(got, expected)
+    assert counter.lookups == 2 and counter.checked
+    # One hook call (both uses accumulate into one .grad): a zero tensor, flagged, not added.
+    assert len(seen) == 1, seen
+    grad, added = seen[0]
+    assert not added and not torch.count_nonzero(grad)
+
+    plain, _, _ = _two_use_main_grad(weight, ids, dys, precise=False)
+    assert _relative(plain, expected) > 1e-3, _relative(plain, expected)
+
+
+def test_precise_embedding_reference_keeps_a_bit_bf16_drops():
+    """Constructed: one row used twice with gradients 1.0 and 2**-9. Per use in FP32 the sum is
+    1.001953125; summed in BF16 first (7 fractional bits) it is 1.0."""
+    weight = torch.zeros(4, 1, dtype=torch.bfloat16)
+    ids = [torch.tensor([[1]]), torch.tensor([[1]])]
+    dys = [torch.tensor([[[1.0]]]), torch.tensor([[[2.0**-9]]])]
+    got, _, _ = _two_use_main_grad(weight, ids, dys, precise=True)
+    plain, _, _ = _two_use_main_grad(weight, ids, dys, precise=False)
+    assert got[1].item() == 1.0 + 2.0**-9
+    assert plain[1].item() == 1.0
+    assert torch.count_nonzero(got[[0, 2, 3]]) == 0
+
+
+@pytest.mark.parametrize(
+    "layout",
+    [dict(tp=2), dict(gtp=2), dict(deterministic=False), dict(reduce_scatter=True)],
+    ids=["tp2", "gtp2", "nondeterministic", "reduce_scatter"],
+)
+def test_precise_embedding_reference_refuses_other_layouts(layout):
+    """The installer replaces the deterministic TP=1, non-GTP lookup only: any other layout is
+    refused at install, and a layout changed after the install is refused at the call."""
+    from tests.unit_tests.transformer.loop import strategy_grad_utils as sgu
+
+    weight = torch.zeros(4, 2, dtype=torch.bfloat16)
+    model = SimpleNamespace(embedding=SimpleNamespace(word_embeddings=_Embedding(weight, **layout)))
+    with pytest.raises(AssertionError, match="deterministic TP=1 lookup only"):
+        sgu.install_per_use_fp32_embedding(model)
+    embedding = _Embedding(weight)
+    sgu.install_per_use_fp32_embedding(
+        SimpleNamespace(embedding=SimpleNamespace(word_embeddings=embedding))
+    )
+    attribute = dict(
+        tp="tp_group", gtp="gtp_remat_size", deterministic="deterministic_mode"
+    ).get(next(iter(layout)), "reduce_scatter_embeddings")
+    value = _Group(2) if attribute == "tp_group" else next(iter(layout.values()))
+    setattr(embedding, attribute, value)
+    with pytest.raises(AssertionError, match="deterministic TP=1 lookup only"):
+        embedding(torch.tensor([[0]]))
+
+
+def test_precise_embedding_reference_checks_the_original_forward():
+    """The first call compares the replacement with the original forward exactly; a tied weight
+    is refused (the output layer's ``.grad`` would be skipped by the flag)."""
+    from tests.unit_tests.transformer.loop import strategy_grad_utils as sgu
+
+    class _Shifted(_Embedding):
+        def forward(self, input_):
+            return self.weight[input_] + 1.0
+
+    weight = torch.zeros(4, 2, dtype=torch.bfloat16)
+    model = SimpleNamespace(embedding=SimpleNamespace(word_embeddings=_Shifted(weight)))
+    sgu.install_per_use_fp32_embedding(model)
+    with pytest.raises(AssertionError, match="drifted from the original"):
+        model.embedding.word_embeddings(torch.tensor([[0]]))
+    tied = SimpleNamespace(
+        embedding=SimpleNamespace(word_embeddings=_Embedding(weight)),
+        share_embeddings_and_output_weights=True,
+    )
+    with pytest.raises(AssertionError, match="tied embedding"):
+        sgu.install_per_use_fp32_embedding(tied)
