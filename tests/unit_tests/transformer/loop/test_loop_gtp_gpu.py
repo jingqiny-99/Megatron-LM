@@ -488,9 +488,9 @@ def results():
     out["gtp_overlap"] = _run_gtp(state, overlap=True, forced=forced)
     out["gtp_simple"] = _run_gtp(state, simple=True, forced=forced)
     out["noverify"] = _run_gtp(state, verify=False, forced=forced)
-    # The second backward use of every core GTP weight and of the embedding (its main lookup:
-    # the MTP lookup's backward runs first). An embedding gradient feeds no dgrad, so the core
-    # weights' mutation is unaffected.
+    # The second backward use of every core GTP weight and of the embedding (the main lookup if,
+    # as expected, the MTP lookup's backward runs first; either use's loss is far over the gate).
+    # An embedding gradient feeds no dgrad, so the core weights' mutation is unaffected.
     out["drop_rs"] = _run_gtp(state, drop_use=2, drop_embedding_use=2, steps=1)
     out["emb_bf16"] = _run_gtp(state, bf16_embedding=True, steps=1)
     # Un-forced: gtp on its own step-1 gradient, and ref stepping on that same gradient.
@@ -737,8 +737,8 @@ def _embedding_entry(arm, results):
 
 
 def test_dropped_embedding_use_fails_the_gate(results):
-    """The mutation ``drop_rs`` also zeroes the embedding's second backward use (its main lookup)
-    before the reduce-scatter: the embedding must fail the gate."""
+    """The mutation ``drop_rs`` also zeroes the embedding's second backward use before its
+    reduce-scatter (the printed use norms show which): the embedding must fail the gate."""
     entry = _embedding_entry("drop_rs", results)
     assert not entry["ok"], entry
 
