@@ -1373,6 +1373,8 @@ def _init_gtp_runtime_attrs(obj):
     obj._rs_a2a_bufs = None  # all-to-all scratch held by an in-flight fp32-accum RS
     # Symmetric wgrad slot
     obj._wgrad_symm_slot = None
+    # Padded send buffer widen_wgrad_for_reduce_scatter wrote into; consumed by _prepare.
+    obj._wgrad_padded_send = None
     # Padding
     obj.pad_length = 0
     # Debug
@@ -2386,6 +2388,51 @@ class GTPShardedParam(torch.nn.Parameter):
             return buf[: self._unsharded_shape[0]]
         return _wgrad_pool_get(self._unsharded_shape, self.main_grad.dtype, self.device)
 
+    def widen_wgrad_for_reduce_scatter(self, wgrad: torch.Tensor) -> torch.Tensor:
+        """Copy a wgrad computed below main_grad's precision into main_grad's dtype.
+
+        The GTP reduce-scatter then sums the ranks' contributions in that dtype, as it does for
+        every linear, whose wgrad is typed from main_grad up front via get_wgrad_tensor. This is
+        for callers that cannot do that: the embedding, whose lookup gradient autograd returns
+        in the weight dtype. A BF16 cross-rank sum would round before the FP32 main_grad ever
+        sees it, and the error grows with the GTP degree.
+
+        Writes straight into the padded send buffer, so it costs one padded main_grad-dtype
+        wgrad in place of the padded copy _prepare_wgrad_reduce_scatter_inputs would make. The
+        buffer is a plain allocation (never in the wgrad pool) that is freed once the
+        reduce-scatter that consumes it has finished. Returns the logical (unpadded) view.
+        """
+        dtype = self.main_grad.dtype
+        if wgrad.dtype == dtype:
+            return wgrad  # e.g. BF16 main grads: nothing to widen, path unchanged
+        if (
+            getattr(self, "_gtp_graph_wgrad_ring_slot", None) is not None
+            or getattr(self, "_gtp_eager_wgrad_ring_slot", None) is not None
+        ):
+            return wgrad  # the ring slot's copy_ in _prepare already widens into main_grad dtype
+        if uses_gtp_symm_pool(self.group, collective="rs"):
+            if self._wgrad_accum_buf is not None:
+                # get_wgrad_tensor would hand back the accumulation buffer, not a send slot.
+                raise RuntimeError(
+                    f"[GTP] cannot widen a wgrad of {self._debug_name} while its pre-RS "
+                    "accumulation window is open."
+                )
+            buf = self.get_wgrad_tensor()  # registered padded slot, logical view
+            buf.copy_(wgrad)
+            return buf
+        if self._wgrad_padded_send is not None:
+            raise RuntimeError(
+                f"[GTP] the widened wgrad of {self._debug_name} was never reduce-scattered: "
+                "the previous backward aborted between widening and its reduce-scatter."
+            )
+        rows = self._unsharded_shape[0]
+        padded = torch.empty(self._unsharded_shape_padded, dtype=dtype, device=wgrad.device)
+        if self.pad_length:
+            padded[rows:].zero_()
+        padded[:rows].copy_(wgrad)
+        self._wgrad_padded_send = padded
+        return padded[:rows]
+
     def register_ub_pool(self, pool: torch.cuda.MemPool) -> None:
         """Register the external pool backing this param's all-gather input on its group."""
         register_external_pool(pool, self.group)
@@ -2693,8 +2740,9 @@ class GTPShardedParam(torch.nn.Parameter):
 
         Ring slots are sent but never released (their addresses must stay stable across
         iterations); the wgrad that fed them is released instead. A symmetric send
-        buffer is both sent and released (ownership transfer). Plain wgrads are sent
-        as-is (padded by copy if needed) and released themselves.
+        buffer is both sent and released (ownership transfer). A wgrad that
+        widen_wgrad_for_reduce_scatter wrote into its padded send buffer sends and releases that
+        buffer. Plain wgrads are sent as-is (padded by copy if needed) and released themselves.
         """
         send_bufs = []
         release_bufs = []
@@ -2725,6 +2773,22 @@ class GTPShardedParam(torch.nn.Parameter):
 
                     send_bufs.append(symm_slot)
                     release_bufs.append(symm_slot)
+                    continue
+
+                # widen_wgrad_for_reduce_scatter already wrote this wgrad into a padded
+                # main_grad-dtype send buffer: send that buffer, no pad copy.
+                padded_send = weight._wgrad_padded_send
+                if padded_send is not None:
+                    weight._wgrad_padded_send = None
+                    if wgrad.data_ptr() != padded_send.data_ptr():
+                        raise RuntimeError(
+                            f"[GTP] {weight._debug_name}: the wgrad handed to the reduce-scatter "
+                            "is not a view of the buffer widen_wgrad_for_reduce_scatter filled."
+                        )
+                    send_bufs.append(padded_send)
+                    # Untagged: the pool put and the symmetric free are no-ops, so dropping the
+                    # reference after the reduce-scatter frees it.
+                    release_bufs.append(padded_send)
                     continue
 
                 release_bufs.append(wgrad)
@@ -3339,7 +3403,9 @@ class GTPEmbeddingWeight(torch.autograd.Function):
     def backward(ctx, grad_output):
         """Reduce-scatter the gradient back to this rank's vocab-dim shard."""
         (weight,) = ctx.saved_tensors
-        return weight.wgrad_reduce_scatter(grad_output)
+        # Autograd returns the lookup gradient in the weight dtype (BF16). Widen it to
+        # main_grad's dtype first, or the cross-rank sum rounds before FP32 main_grad sees it.
+        return weight.wgrad_reduce_scatter(weight.widen_wgrad_for_reduce_scatter(grad_output))
 
 
 def reset_gtp_state():

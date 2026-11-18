@@ -380,6 +380,11 @@ it** — a different collective over a different process group, so enable either
 
 **Behaviour notes**
 
+- **FP32 main grads need no flag.** Every GTP wgrad is reduce-scattered in `main_grad`'s dtype:
+  linears type it up front (`get_wgrad_tensor` / `grad_buffer`), and the embedding, whose
+  lookup gradient autograd returns in BF16, is widened into its padded FP32 send buffer by
+  `widen_wgrad_for_reduce_scatter` (one transient padded FP32 copy per use, in place of the BF16
+  pad copy). Without that a BF16 cross-rank sum would round before the FP32 `main_grad` sees it.
 - **The mean stays a pre-scale.** Both paths apply `1/gtp_remat` to the wgrad before the
   collective (§3.2 table); under `calculate_per_token_loss` the axis SUMs and no factor
   applies either way.
@@ -425,7 +430,8 @@ it** — a different collective over a different process group, so enable either
 - **Zero-copy producers.** Wgrads are written straight into the registered buffer — TE modules
   via the `DistributedWeight.grad_buffer` protocol, Megatron-native linears via an `out=` matmul
   (when the wgrad dtype matches `main_grad`). The untied embedding's wgrad is materialized by
-  `F.embedding`'s own backward and pays one copy into the buffer.
+  `F.embedding`'s own backward and pays one copy into the buffer (a `main_grad`-dtype slot, so
+  with FP32 main grads the copy also widens it).
 - **The pool never shrinks**, so it is permanently sized by the *peak* number of send buffers live
   at once. A weight with several backwards per iteration (MTP's repeated block) can reach its next
   wgrad while its previous send is still in flight, which would raise that peak for good — every
