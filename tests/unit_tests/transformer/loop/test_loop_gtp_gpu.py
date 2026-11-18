@@ -14,7 +14,11 @@ its step-1 gradient is read (and no GTP reduce-scatter is pending), every arm's 
 takes its reference's step-1 gradient (a GTP shard: its rows), and the arm runs its own
 optimizer step, parameter gather and step 2:
 
-* ``ref``: no GTP (``gtp_remat_size = 1``), DDP over the whole data-parallel group;
+* ``ref``: no GTP (``gtp_remat_size = 1``), DDP over the whole data-parallel group, with the
+  precise embedding reference (``strategy_grad_utils.install_per_use_fp32_embedding``): each of
+  the embedding's two lookups per microbatch (main and MTP input) adds its BF16 gradient into the
+  FP32 ``main_grad`` on its own. GTP reduce-scatters each use's gradient on its own in FP32; the
+  deterministic-mode lookup would instead sum the two uses in BF16 first, about 1.7e-3 off;
 * ``gtp``: dense and expert weight remat of degree ``G`` (``LOOP_GTP_DEGREE``, default the world
   size: 2 or 4), DDP with the distributed optimizer, prefetch and asynchronous reduce-scatter
   on (the defaults), ``GTP_CONFIG.verify_prefetched_gathers`` on (set by the loop stack);
@@ -45,12 +49,22 @@ core weight is used 4 times per microbatch, in the forward and again in the bloc
   against ``ref_from_gtp`` (``ref`` stepping on its step-1 gradient), from exactly equal
   weights. The un-forced step 2 against ``ref`` is printed (diagnostic).
 * Reduce-scatters per GTP weight (a dense weight, or a grouped expert projection's leading
-  weight) and microbatch: 4 for a core weight, 1 for a prelude or coda weight (one per use).
+  weight) and microbatch, one per backward use: 4 for a core weight, 1 for a prelude, coda or
+  MTP weight, 1 + ``MTP_LAYERS`` for the embedding and the output layer (main and MTP heads); a
+  GTP weight with no expected count fails. Per step, the output layer's accumulated wgrad (its
+  uses add into one buffer, flushed once per step) is reduce-scattered once more by its flush;
+  no other weight flushes. Under ``overlap_grad_reduce`` the recorded grad-ready counts: 4 for a
+  core weight, 1 for a prelude, coda or MTP weight, 2 for the embedding (one per use), 1 for the
+  output layer (one accumulated reduce-scatter).
+* The embedding's weight gradient reaches its reduce-scatter in FP32 (``main_grad``'s dtype) in
+  every arm and step; the reference counts ``ROWS x (1 + MTP_LAYERS)`` lookups per step.
 * The prefetch verification's decisions are printed: how many consumes found a prefetch handle
   whose buffer did not hold this consume's gather (they gathered on demand).
 * Teeth, must fail (step 1): ``drop_rs``, the second backward use's weight gradient of every
-  core GTP weight zeroed before its reduce-scatter (one round's reduce-scatter dropped): at
-  least 90% of the core GTP weights fail the gate.
+  core GTP weight and of the embedding zeroed before its reduce-scatter (one round's
+  reduce-scatter dropped, and one embedding use): at least 90% of the core GTP weights and the
+  embedding fail the gate. ``emb_bf16``, the embedding's gradient reduce-scattered in BF16 (not
+  widened: the path before the FP32 fix): the embedding fails the gate.
 
 Needs TransformerEngine >= 2.19 (GTP). Launch once per degree: ``torchrun --nproc-per-node 2 -m
 pytest -q tests/unit_tests/transformer/loop/test_loop_gtp_gpu.py`` and ``--nproc-per-node 4``
@@ -202,31 +216,63 @@ def _ddp(model, *, overlap=False, distributed_optimizer=True):
 
 
 class _Instrument:
-    """Counts the reduce-scatters of every GTP weight per microbatch (``GTPShardedParam.
-    wgrad_reduce_scatter``) and the prefetch verification's decisions (``_GatherLedger.take``);
-    ``drop_use`` zeroes that backward use's (1-based, per microbatch) weight gradient of every
-    weight in ``drop_ids`` before its reduce-scatter (the mutation)."""
+    """Counts, per GTP weight, its reduce-scatters per backward use and microbatch
+    (``GTPShardedParam.wgrad_reduce_scatter``; a call made inside ``flush_accumulated_wgrad`` is
+    the flush of an accumulated wgrad, counted per step in ``flush_rs`` and not as a use), the
+    dtypes the uses hand it (``dtypes``), the local norm of every use of the weights in
+    ``norm_ids`` (``norms``), and the prefetch verification's decisions (``_GatherLedger.take``).
 
-    def __init__(self, drop_ids=(), drop_use=None):
+    Mutations: ``drops`` ({id(weight): use}) zeroes that backward use's (1-based, per microbatch)
+    weight gradient before its reduce-scatter; the weights in ``bf16_ids`` are not widened to
+    ``main_grad``'s dtype before their reduce-scatter (``widen_wgrad_for_reduce_scatter`` is the
+    identity for them: the BF16 reduce-scatter of the path before the FP32 fix)."""
+
+    def __init__(self, drops=None, bf16_ids=(), norm_ids=()):
         from megatron.core.tensor_parallel import generalized_tensor_parallelism as gtp
 
         self.gtp = gtp
         self.original_rs = gtp.GTPShardedParam.wgrad_reduce_scatter
+        self.original_flush = gtp.GTPShardedParam.flush_accumulated_wgrad
+        self.original_widen = gtp.GTPShardedParam.widen_wgrad_for_reduce_scatter
         self.original_take = gtp._GATHER_LEDGER.take
         self.microbatch = -1
-        self.rs = collections.Counter()  # (microbatch, id(weight)) -> reduce-scatters
+        self.rs = collections.Counter()  # (microbatch, id(weight)) -> reduce-scatters (uses)
+        self.flush_rs = collections.Counter()  # id(weight) -> flush reduce-scatters
+        self.dtypes = collections.defaultdict(set)  # id(weight) -> dtypes of its uses' wgrads
+        self.norms = collections.defaultdict(list)  # id(weight) -> local norm of every use
         self.takes = collections.Counter()  # True / False
-        self.drop_ids = set(drop_ids)
-        self.drop_use = drop_use
+        self.drops = dict(drops or {})
+        self.bf16_ids = set(bf16_ids)
+        self.norm_ids = set(norm_ids)
+        self.flush_depth = 0
         instrument = self
 
         def counting_rs(weight, wgrad, *args, **kwargs):
+            if instrument.flush_depth:
+                instrument.flush_rs[id(weight)] += 1
+                return instrument.original_rs(weight, wgrad, *args, **kwargs)
             key = (instrument.microbatch, id(weight))
             instrument.rs[key] += 1
-            if id(weight) in instrument.drop_ids and instrument.rs[key] == instrument.drop_use:
-                for tensor in wgrad if isinstance(wgrad, (list, tuple)) else [wgrad]:
+            tensors = list(wgrad) if isinstance(wgrad, (list, tuple)) else [wgrad]
+            instrument.dtypes[id(weight)].update(tensor.dtype for tensor in tensors)
+            if id(weight) in instrument.norm_ids:
+                instrument.norms[id(weight)].append(float(tensors[0].float().norm()))
+            if instrument.drops.get(id(weight)) == instrument.rs[key]:
+                for tensor in tensors:
                     tensor.zero_()
             return instrument.original_rs(weight, wgrad, *args, **kwargs)
+
+        def counting_flush(weight, *args, **kwargs):
+            instrument.flush_depth += 1
+            try:
+                return instrument.original_flush(weight, *args, **kwargs)
+            finally:
+                instrument.flush_depth -= 1
+
+        def widen(weight, wgrad):
+            if id(weight) in instrument.bf16_ids:
+                return wgrad
+            return instrument.original_widen(weight, wgrad)
 
         def counting_take(weight, slot, buffer):
             current = instrument.original_take(weight, slot, buffer)
@@ -234,35 +280,61 @@ class _Instrument:
             return current
 
         self.counting_rs = counting_rs
+        self.counting_flush = counting_flush
+        self.widen = widen
         self.counting_take = counting_take
 
     def on_microbatch(self, index):
         self.microbatch = index
 
+    def step_record(self):
+        """This step's records; the use, flush, dtype and norm records are then cleared."""
+        record = dict(
+            rs=dict(self.rs),
+            flush_rs=dict(self.flush_rs),
+            dtypes={pid: set(dtypes) for pid, dtypes in self.dtypes.items()},
+            norms={pid: list(norms) for pid, norms in self.norms.items()},
+            takes=dict(self.takes),
+        )
+        for counter in (self.rs, self.flush_rs, self.dtypes, self.norms):
+            counter.clear()
+        return record
+
     def __enter__(self):
-        self.gtp.GTPShardedParam.wgrad_reduce_scatter = self.counting_rs
+        cls = self.gtp.GTPShardedParam
+        cls.wgrad_reduce_scatter = self.counting_rs
+        cls.flush_accumulated_wgrad = self.counting_flush
+        cls.widen_wgrad_for_reduce_scatter = self.widen
         self.gtp._GATHER_LEDGER.take = self.counting_take
         return self
 
     def __exit__(self, *exc):
-        self.gtp.GTPShardedParam.wgrad_reduce_scatter = self.original_rs
+        cls = self.gtp.GTPShardedParam
+        cls.wgrad_reduce_scatter = self.original_rs
+        cls.flush_accumulated_wgrad = self.original_flush
+        cls.widen_wgrad_for_reduce_scatter = self.original_widen
         del self.gtp._GATHER_LEDGER.take  # back to the class method
 
 
 def _run_reference(state, ep=1, forced=None):
-    """``STEPS`` steps without GTP; returns ``[(step result, grads)]`` and a record: the full
-    weights at the end of the last step (``weights``) and, with ``forced`` (step-1 gradients to step
-    on: the teacher forcing), the read-back count (``readback``)."""
+    """``STEPS`` steps without GTP, with the precise embedding reference
+    (``sgu.install_per_use_fp32_embedding``); returns ``[(step result, grads)]`` and a record: the
+    full weights at the end of the last step (``weights``), the embedding lookups per step that
+    went through the precise reference (``lookups``) and, with ``forced`` (step-1 gradients to
+    step on: the teacher forcing), the read-back count (``readback``)."""
     _initialize(1, ep=ep)
     model = sgu.build_model(state, expert_model_parallel_size=ep)
+    precise = sgu.install_per_use_fp32_embedding(model)
     ddp = _ddp(model, distributed_optimizer=False)
     opt = sgu.optimizer(ddp)
     out = []
-    info = dict(readback=None, pending=0)
+    info = dict(readback=None, pending=0, lookups=[])
     for step in range(STEPS):
         _restore_buffers(model, state)
         opt.zero_grad()
         result = sgu.run_step(ddp, model, sgu.make_rows(step))
+        info["lookups"].append(precise.lookups)
+        precise.lookups = 0
         out.append((result, sgu.ddp_grads(ddp, model)))
         if step + 1 < STEPS:
             if forced is not None:
@@ -284,14 +356,17 @@ def _run_gtp(
     simple=False,
     verify=True,
     drop_use=None,
+    drop_embedding_use=None,
+    bf16_embedding=False,
     expert_degree=None,
     ep=1,
     steps=STEPS,
     forced=None,
 ):
     """``steps`` steps of one GTP arm; returns ``[(step result, grads, record)]`` and the info:
-    the GTP names and consumers, the overlap's recorded counts, the weights at the end of the
-    last step (``weights``; GTP shards) with each GTP shard's layout (``layout``) and, with
+    the GTP names and consumers, the embedding's id (``emb_id``), the overlap's recorded counts,
+    the weights at the end of the last step (``weights``; GTP shards) with each GTP shard's
+    layout (``layout``) and, with
     ``forced`` (full step-1 gradients to step on: the teacher forcing), the GTP reduce-scatters
     still pending at the forcing (``pending``) and the read-back count (``readback``), both
     agreed over the ranks."""
@@ -331,24 +406,25 @@ def _run_gtp(
             if _is_gtp(p) and (not p.is_routed_expert or p.weight_list is not None)
         }
         core_ids = {pid for pid, name in gtp_names.items() if sgu.role(name)[0] == "core"}
-        instrument = _Instrument(drop_ids=core_ids & consumers, drop_use=drop_use)
+        emb = model.embedding.word_embeddings.weight
+        assert _is_gtp(emb) and id(emb) in consumers, "the embedding is not a GTP consumer"
+        drops = {pid: drop_use for pid in core_ids & consumers} if drop_use else {}
+        if drop_embedding_use:
+            drops[id(emb)] = drop_embedding_use
+        instrument = _Instrument(
+            drops=drops, bf16_ids={id(emb)} if bf16_embedding else (), norm_ids={id(emb)}
+        )
         out = []
         forcing = dict(pending=None, readback=None)
         with instrument:
             for step in range(steps):
                 _restore_buffers(model, state)
-                instrument.rs.clear()
                 opt.zero_grad()
                 result = sgu.run_step(
                     ddp, model, sgu.make_rows(step), on_microbatch=instrument.on_microbatch
                 )
-                out.append(
-                    (
-                        result,
-                        _full_grads(ddp, model),
-                        dict(rs=dict(instrument.rs), takes=dict(instrument.takes)),
-                    )
-                )
+                record = instrument.step_record()
+                out.append((result, _full_grads(ddp, model), record))
                 instrument.takes.clear()
                 if step + 1 < steps:
                     if forced is not None:
@@ -376,6 +452,7 @@ def _run_gtp(
         info = dict(
             gtp_names=gtp_names,
             consumers=consumers,
+            emb_id=id(emb),
             core_names=sorted(gtp_names[i] for i in core_ids),
             # Bucket groups holding a GTP shard: a group of its own per shard set would never
             # start before another group's last use.
@@ -411,7 +488,11 @@ def results():
     out["gtp_overlap"] = _run_gtp(state, overlap=True, forced=forced)
     out["gtp_simple"] = _run_gtp(state, simple=True, forced=forced)
     out["noverify"] = _run_gtp(state, verify=False, forced=forced)
-    out["drop_rs"] = _run_gtp(state, drop_use=2, steps=1)
+    # The second backward use of every core GTP weight and of the embedding (its main lookup:
+    # the MTP lookup's backward runs first). An embedding gradient feeds no dgrad, so the core
+    # weights' mutation is unaffected.
+    out["drop_rs"] = _run_gtp(state, drop_use=2, drop_embedding_use=2, steps=1)
+    out["emb_bf16"] = _run_gtp(state, bf16_embedding=True, steps=1)
     # Un-forced: gtp on its own step-1 gradient, and ref stepping on that same gradient.
     out["gtp_unforced"] = _run_gtp(state)
     out["ref_from_gtp"] = _run_reference(state, forced=out["gtp_unforced"][0][0][1])
@@ -519,26 +600,57 @@ def test_report_unforced_step_two(results):
         print(f"[{_name(f'{arm} step 2')}] losses rel {rel} (diagnostic)", flush=True)
 
 
+EMBEDDING = "embedding.word_embeddings.weight"
+OUTPUT_LAYER = "output_layer.weight"
+
+
+def _uses_per_microbatch(name):
+    """A GTP weight's backward uses per microbatch, from the model's structure: a core weight
+    once per round, a prelude, coda or MTP weight once, the embedding and the output layer once
+    for the main input / head and once per MTP layer. Raises for a weight it does not know."""
+    where = sgu.role(name)[0]
+    if where == "core":
+        return sgu.ROUNDS
+    if where in ("prelude", "coda", "mtp"):
+        return 1
+    if name in (EMBEDDING, OUTPUT_LAYER):
+        return 1 + sgu.MTP_LAYERS
+    raise AssertionError(f"no expected use count for the GTP weight {name}")
+
+
+def _grad_ready_per_microbatch(name):
+    """A GTP weight's recorded grad-ready count under overlap_grad_reduce: one per reduce-scatter
+    of a use, except the output layer, whose uses add into one buffer reduce-scattered once (the
+    accumulation of a weight with several backwards). Raises for a weight it does not know."""
+    if name == OUTPUT_LAYER:
+        return 1
+    return _uses_per_microbatch(name)
+
+
 @pytest.mark.parametrize("arm", ARMS)
 def test_one_reduce_scatter_per_use(results, arm):
-    """Every core GTP weight is reduce-scattered 4 times per microbatch, every prelude and coda
-    GTP weight once."""
+    """Every GTP weight is reduce-scattered once per backward use and microbatch
+    (``_uses_per_microbatch``); per step, the output layer's accumulated wgrad is flushed by one
+    more reduce-scatter and no other weight flushes."""
     steps, info = results[arm]
     names = {pid: name for pid, name in info["gtp_names"].items() if pid in info["consumers"]}
+    assert EMBEDDING in names.values() and OUTPUT_LAYER in names.values(), sorted(names.values())
     for step, (_, _, record) in enumerate(steps):
         for microbatch in range(sgu.ROWS):
             for pid, name in names.items():
-                where = sgu.role(name)[0]
-                if where not in ("core", "prelude", "coda"):
-                    continue
-                expected = sgu.ROUNDS if where == "core" else 1
+                expected = _uses_per_microbatch(name)
                 got = record["rs"].get((microbatch, pid), 0)
                 assert got == expected, (arm, step, microbatch, name, got)
+        for pid, name in names.items():
+            expected = 1 if name == OUTPUT_LAYER else 0
+            got = record["flush_rs"].get(pid, 0)
+            assert got == expected, (arm, step, "flush", name, got)
 
 
 def test_overlap_counts_one_grad_ready_per_use(results):
-    """Under overlap_grad_reduce a GTP shard is grad-ready once per use: the recorded count of
-    every core GTP weight is 4, of every prelude and coda GTP weight 1."""
+    """Under overlap_grad_reduce a GTP shard is grad-ready once per reduce-scatter
+    (``_grad_ready_per_microbatch``): 4 for a core weight, 1 for a prelude, coda or MTP weight, 2
+    for the embedding, 1 for the output layer."""
     _, info = results["gtp_overlap"]
     golden = info["golden"]
     print(
@@ -549,12 +661,9 @@ def test_overlap_counts_one_grad_ready_per_use(results):
     assert golden
     # Several groups: one can start its reduction while another's shards still have uses.
     assert info["gtp_groups"] > 1, info["gtp_groups"]
+    assert EMBEDDING in golden and OUTPUT_LAYER in golden, sorted(golden)[:8]
     for name, count in golden.items():
-        where = sgu.role(name)[0]
-        if where == "core":
-            assert count == sgu.ROUNDS, (name, count)
-        elif where in ("prelude", "coda"):
-            assert count == 1, (name, count)
+        assert count == _grad_ready_per_microbatch(name), (name, count)
 
 
 def test_gtp_ep_arm_keeps_experts_out_of_gtp(results):
@@ -592,3 +701,58 @@ def test_dropped_reduce_scatter_fails_the_gate(results):
     assert len(caught) >= MIN_FAILING_CORE_FRACTION * len(core), sgu.mbs.worst(
         report, [name for name in core if report[name]["ok"]]
     )
+
+
+def test_reference_sums_embedding_uses_in_fp32(results):
+    """Every reference run took every embedding lookup through the precise per-use FP32
+    reference: ``ROWS x (1 + MTP_LAYERS)`` per step (main and MTP input of every microbatch)."""
+    expected = sgu.ROWS * (1 + sgu.MTP_LAYERS)
+    for arm in ["ref", "ref_from_gtp"] + (["ref_ep"] if RUN_GTP_EP else []):
+        assert results[arm][1]["lookups"] == [expected] * STEPS, (arm, results[arm][1]["lookups"])
+
+
+@pytest.mark.parametrize("arm", ARMS)
+def test_embedding_gradient_reduce_scatters_in_fp32(results, arm):
+    """The embedding's BF16 lookup gradient is widened to ``main_grad``'s FP32 before every one
+    of its reduce-scatters, in every step."""
+    steps, info = results[arm]
+    for step, (_, _, record) in enumerate(steps):
+        got = record["dtypes"].get(info["emb_id"])
+        assert got == {torch.float32}, (arm, step, got)
+
+
+def _embedding_entry(arm, results):
+    """The gate's entry for the embedding of mutation ``arm`` (step 1) against ``ref``; prints the
+    embedding's local use norms."""
+    _, reference = results["ref"][0][0]
+    _, grads, record = results[arm][0][0]
+    norms = record["norms"].get(results[arm][1]["emb_id"])
+    print(f"[{_name(arm)}] embedding use norms (local, backward order) {norms}", flush=True)
+    report, _ = sgu.report_and_fail(
+        _name(f"{arm} (mutation) embedding vs ref"),
+        {EMBEDDING: grads[EMBEDDING]},
+        {EMBEDDING: reference[EMBEDDING]},
+    )
+    return report[EMBEDDING]
+
+
+def test_dropped_embedding_use_fails_the_gate(results):
+    """The mutation ``drop_rs`` also zeroes the embedding's second backward use (its main lookup)
+    before the reduce-scatter: the embedding must fail the gate."""
+    entry = _embedding_entry("drop_rs", results)
+    assert not entry["ok"], entry
+
+
+def test_bf16_embedding_reduce_scatter_fails_the_gate(results):
+    """The mutation ``emb_bf16``: the embedding's gradient reduce-scattered in BF16 (the path
+    before the FP32 fix). It must reach the embedding (BF16 recorded, a gradient that differs
+    from ``gtp``'s) and fail the gate against the precise reference."""
+    steps, info = results["emb_bf16"]
+    _, mutant, record = steps[0]
+    got = record["dtypes"].get(info["emb_id"])
+    assert got == {torch.bfloat16}, got
+    _, fixed, _ = results["gtp"][0][0]
+    reached = sgu.mismatches({EMBEDDING: mutant[EMBEDDING]}, {EMBEDDING: fixed[EMBEDDING]})
+    assert reached, "the BF16 mutation did not change the embedding gradient"
+    entry = _embedding_entry("emb_bf16", results)
+    assert not entry["ok"], entry
