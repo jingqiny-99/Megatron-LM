@@ -10,8 +10,9 @@ autograd Functions mimicking TE (lazy ``main_grad``, E4) and Megatron's fused li
 capture, E15), a tied weight's fused GEMM plus lookup against DDP's hook arithmetic
 (``zero_out_wgrad``), overwrite / zeroing / pad tails, the use counter (recompute included) and
 the per-segment check of overwrite targets (unwritten, raw-consumed), and the
-``DistributedWeight`` binding against a fake TE 2.20 consumer routed through local copies of TE's
-dispatchers. The second part needs CUDA and Transformer
+``DistributedWeight`` binding against fake TE 2.20 consumers routed through local copies of TE's
+dispatchers (a ``Linear``, which reads ``requires_grad`` from the stand-in, and a
+``LayerNormLinear``, which reads it from the materialized weight). The second part needs CUDA and Transformer
 Engine: TE linears and Megatron's fused local linear with rebound weights (forward, backward, wgrad
 accumulation), and the cast after the gather under FP8 block scaling / MXFP8 where the device
 supports it. Model parallelism (TP = 1) is initialized once for the module.
@@ -167,6 +168,80 @@ class FakeTELinear(nn.Module):
 
     def forward(self, x):
         return FakeTELinearFn.apply(x, self.weight, self.fuse_wgrad_accumulation)
+
+
+class FakeTELayerNormLinearFn(torch.autograd.Function):
+    """TE 2.19-2.20.x ``_LayerNormLinear``'s weight contract, in torch; the norm is the identity.
+
+    Unlike ``_Linear`` it reads ``requires_grad`` from the *materialized* weight
+    (layernorm_linear.py of TE 2.20.2: :329 rebind, :427 the wgrad input is freed when the weight
+    needs no grad, :539 ``ctx.requires_wgrad``, :542-557 the fused-wgrad origin and
+    ``main_grad_func``, :565 the strong reference). The backward computes the wgrad (and calls
+    ``finalize_weight_grads`` for a distributed weight) only if ``ctx.requires_wgrad``, and returns
+    TE's dummy or None (:1174-1188).
+    """
+
+    @staticmethod
+    def forward(ctx, inp, weight, fuse_wgrad):
+        origin = weight
+        dist = _is_dw(origin)
+        if dist:
+            weight = _te_materialize_weight_for_forward(origin)[0]
+        ln_out = inp
+        out = ln_out @ weight.t()
+        if not weight.requires_grad:
+            ln_out = None
+        ctx.save_for_backward(inp, origin)
+        ctx.ln_out = ln_out
+        ctx.dist_weight = origin if dist else None
+        ctx.requires_wgrad = weight.requires_grad
+        ctx.fuse = bool(fuse_wgrad)
+        if fuse_wgrad and weight.requires_grad:
+            ctx.origin_ref = weakref.ref(weight)  # the materialized object
+            ctx.overwrite = bool(getattr(weight, "overwrite_main_grad", False))
+            ctx.main_grad_func = origin.grad_buffer if dist else (lambda: weight.main_grad)
+        ctx.weight = weight
+        return out
+
+    @staticmethod
+    def backward(ctx, grad_out):
+        _, saved = ctx.saved_tensors
+        dist = ctx.dist_weight is not None
+        mat = _te_materialize_weight_for_backward(ctx.dist_weight)[0] if dist else saved
+        dgrad = grad_out @ mat
+        wgrad = None
+        if ctx.requires_wgrad:
+            origin = None
+            if ctx.fuse:
+                origin = ctx.origin_ref()
+                assert origin is not None, "weight was removed while fuse_wgrad_accumulation=True"
+                main_grad = ctx.main_grad_func()
+                if not dist:
+                    origin.main_grad = main_grad
+                if dist or ctx.overwrite:
+                    main_grad.copy_(_wgrad(grad_out, ctx.ln_out))
+                else:
+                    main_grad.add_(_wgrad(grad_out, ctx.ln_out))
+                wgrad = main_grad
+            else:
+                g2 = grad_out.reshape(-1, grad_out.shape[-1])
+                wgrad = g2.t() @ ctx.ln_out.reshape(-1, ctx.ln_out.shape[-1])
+            if dist:
+                wgrad = _te_finalize_weight_grads(ctx.dist_weight, [wgrad])[0]
+            if ctx.fuse:
+                if hasattr(origin, "grad_added_to_main_grad"):
+                    origin.grad_added_to_main_grad = True
+                    wgrad = _te_dummy_wgrad(origin, getattr(origin, "zero_out_wgrad", False))
+                else:
+                    wgrad = None
+        return dgrad, wgrad, None
+
+
+class FakeTELayerNormLinear(FakeTELinear):
+    """A TE-like LayerNormLinear (identity norm): ``FakeTELayerNormLinearFn``."""
+
+    def forward(self, x):
+        return FakeTELayerNormLinearFn.apply(x, self.weight, self.fuse_wgrad_accumulation)
 
 
 class FakeMegatronFusedFn(torch.autograd.Function):
@@ -881,11 +956,11 @@ def protocol_available(monkeypatch):
     monkeypatch.setattr(pb, "distributed_weight_unavailable_reason", lambda: None)
 
 
-def _dw_pair(dev, *, fuse, z=3, dtype=torch.float32, rows=OUT_F):
+def _dw_pair(dev, *, fuse, z=3, dtype=torch.float32, rows=OUT_F, cls=FakeTELinear):
     """Two identical fake TE linears: one under the data binding, one under the DW binding."""
     torch.manual_seed(3)
-    a = FakeTELinear(IN_F, rows, fuse=fuse, dtype=dtype, device=dev)
-    b = FakeTELinear(IN_F, rows, fuse=fuse, dtype=dtype, device=dev)
+    a = cls(IN_F, rows, fuse=fuse, dtype=dtype, device=dev)
+    b = cls(IN_F, rows, fuse=fuse, dtype=dtype, device=dev)
     with torch.no_grad():
         b.weight.copy_(a.weight)
     a.weight.qkv_layout = "sbhd"  # an init-time attribute the stand-in must carry
@@ -954,11 +1029,19 @@ def test_distributed_weight_stand_in(dev, protocol_available):
 
 
 @pytest.mark.parametrize(
+    "consumer", [FakeTELinear, FakeTELayerNormLinear], ids=["linear", "layernorm_linear"]
+)
+@pytest.mark.parametrize(
     "mode,fuse", [("overwrite", True), ("accumulate", True), ("accumulate", False)]
 )
-def test_distributed_weight_matches_the_data_binding(dev, protocol_available, mode, fuse):
-    """LW / RSG (overwrite targets; fused wgrad only) and Resident (accumulator, microbatches)."""
-    a, b, ta, tb, full = _dw_pair(dev, fuse=fuse)
+def test_distributed_weight_matches_the_data_binding(dev, protocol_available, mode, fuse, consumer):
+    """LW / RSG (overwrite targets; fused wgrad only) and Resident (accumulator, microbatches).
+
+    The reference is the data binding, whose consumer reads the compute ``Parameter`` and never
+    calls ``materialize_*``. A ``LayerNormLinear`` reads ``requires_grad`` from the materialized
+    weight, so a materialized tensor without it would drop the wgrad under the DW binding.
+    """
+    a, b, ta, tb, full = _dw_pair(dev, fuse=fuse, cls=consumer)
     assert ta.grad_capture == tb.grad_capture == ("lazy" if fuse else "hook")
     assert ta.pad_length == 2  # R = 10 rows on z = 3
     targets = []
@@ -983,6 +1066,7 @@ def test_distributed_weight_matches_the_data_binding(dev, protocol_available, mo
             y.backward(g)
             dxs.append(x.grad)
             assert t.weight.grad is None and t.weight.grad_added_to_main_grad is False
+        assert t.grad_written
         targets.append((region.clone(), dxs, target))
     (ra, dxa, _), (rb, dxb, target_b) = targets
     for da, db in zip(dxa, dxb):
@@ -1031,6 +1115,68 @@ def test_distributed_weight_grad_buffer_and_finalize_contract(dev, protocol_avai
     (dummy,) = _te_finalize_weight_grads(w, [buf])
     assert torch.equal(dummy, torch.zeros_like(dummy))
     w.grad_added_to_main_grad = False
+
+
+def test_distributed_weight_materializes_a_grad_requiring_alias(dev, protocol_available):
+    """``materialize_*`` hand TE a leaf alias of the bound region with the stand-in's
+    ``requires_grad`` (what GTP's materialize keeps); the store's bound view is left alone."""
+    _, b, _, tb, full = _dw_pair(dev, fuse=True)
+    w = b.weight
+    slot = _slot([tb], dev)
+    view = pb.tensor_view(slot, tb)
+    view.copy_(full)
+    pb.bind_weight(tb, view)
+    assert not view.requires_grad
+    for mat in (w.materialize_group_for_forward(), w.materialize_group_for_backward()):
+        assert type(mat) is torch.Tensor and mat.is_leaf
+        assert mat.requires_grad == w.requires_grad
+        assert mat.requires_grad  # trainable stand-in
+        assert mat.data_ptr() == view.data_ptr()
+        assert mat.shape == view.shape and mat.stride() == view.stride()
+        assert torch.equal(mat.detach(), full)
+    assert tb.bound is view and not view.requires_grad
+    # The alias tracks later writes into the slot (same storage), as the bound view does.
+    with torch.no_grad():
+        view.add_(1.0)
+    assert torch.equal(w.materialize_group_for_forward().detach(), full + 1.0)
+    # A frozen stand-in materializes a frozen alias (GTP parity).
+    w.requires_grad_(False)
+    assert not w.materialize_group_for_forward().requires_grad
+    assert not w.materialize_group_for_backward().requires_grad
+
+
+class _DropWgradFn(torch.autograd.Function):
+    """A consumer that materializes a distributed weight and returns no weight gradient."""
+
+    @staticmethod
+    def forward(ctx, inp, weight):
+        mat = _te_materialize_weight_for_forward(weight)[0]
+        ctx.save_for_backward(mat.detach())
+        return inp @ mat.t()
+
+    @staticmethod
+    def backward(ctx, grad_out):
+        (mat,) = ctx.saved_tensors
+        return grad_out @ mat, None
+
+
+@pytest.mark.parametrize("mode", ["overwrite", "accumulate"])
+def test_distributed_weight_dropped_wgrad_raises(dev, protocol_available, mode):
+    """No gradient and no ``finalize_group_grads`` reaching a DW stand-in is a dropped wgrad.
+
+    Marking the target written instead would reduce-scatter its stale contents (an overwrite
+    target is not zeroed by ``check_segment_grads`` once written) or a silent zero.
+    """
+    _, b, _, tb, full = _dw_pair(dev, fuse=True)
+    slot = _slot([tb], dev)
+    pb.tensor_view(slot, tb).copy_(full)
+    pb.bind_weight(tb, pb.tensor_view(slot, tb))
+    pb.set_overwrite(tb, mode == "overwrite")
+    pb.bind_grad(tb, _scratch(tb, dev, fill=7.0), zero=(mode == "accumulate"))
+    y = _DropWgradFn.apply(torch.randn(2, IN_F, device=dev, requires_grad=True), b.weight)
+    with pytest.raises(RuntimeError, match="no weight gradient and no finalize_group_grads"):
+        y.sum().backward()
+    assert not tb.grad_written
 
 
 def test_te_version_survives_a_failing_import(monkeypatch):
