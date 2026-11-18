@@ -23,8 +23,9 @@ Two bindings exist:
     The module's weight becomes an ``RSBFDistributedWeight``: a shard-shaped tensor subclass
     implementing TE's ``DistributedWeight`` protocol. TE asks it for the full weight in the
     forward and the backward (``materialize_group_for_*``: a grad-requiring alias of the bound
-    region; no collective, the store has already gathered) and hands it the wgrad (``finalize_group_grads``: written into or
-    added to the gradient target). The stand-in itself holds no data (a shard-shaped placeholder).
+    region; no collective, the store has already gathered) and hands it the wgrad
+    (``finalize_group_grads``: written into or added to the gradient target). The stand-in itself
+    holds no data (a shard-shaped placeholder).
 
 Gradients reach the target by one of three capture classes (``GradCapture``):
 
@@ -980,8 +981,9 @@ class RSBFDistributedWeight(torch.Tensor):
     reads ``requires_grad`` from the stand-in, but TE 2.19-2.20.x LayerNormLinear and legacy
     GroupedLinear read it from the *materialized* tensor (whether to keep the GEMM input, compute
     the wgrad and call ``finalize_group_grads``), so ``materialize_group_for_*`` returns a detached
-    alias of the bound region carrying the stand-in's ``requires_grad``, as GTP does. The protocol methods never run a collective (the store's
-    executor-ordered schedule has already gathered and bound the unit), so they are graph-safe.
+    alias of the bound region carrying the stand-in's ``requires_grad``, as GTP does. The protocol
+    methods never run a collective (the store's executor-ordered schedule has already gathered and
+    bound the unit), so they are graph-safe.
     ``_unsharded_shape`` is the logical shape (dev GTP's convention for logical-size readers).
     """
 
