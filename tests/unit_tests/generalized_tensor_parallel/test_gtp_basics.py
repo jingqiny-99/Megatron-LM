@@ -14,6 +14,9 @@ Test groups
 - TestLinearGTP / TestLayerNormLinearGTP / TestGroupedLinearGTP - single-layer fwd/bwd
 - TestGTPPrefetchChain       - linked-list next_w/prev_w wiring
 - TestGTPWgradRS             - wgrad reduce-scatter shape + multi-layer deferred path
+- TestGTPWgradRSDtype        - Megatron linear: the wgrad RS runs in main_grad's dtype
+- TestGTPEmbeddingWgradRSDtype - embedding (two uses, aligned and padded): its BF16 lookup
+                                gradient is reduce-scattered in FP32 main_grad's dtype, exactly
 - TestGTPMicrobatches        - output consistency across microbatches
 - TestMXFP8LinearGTP         - Linear + MXFP8 recipe: quantized shard setup, fwd/bwd, padding
 - TestGTPGroupSizeOne        - wrap_module_params_gtp no-op when gtp_remat_group.size()==1
@@ -397,6 +400,96 @@ class TestGTPWgradRSDtype:
     def test_wgrad_rs_follows_main_grad_dtype(self):
         _requires_multi_gpu(4)
         _run_distributed(_worker_wgrad_rs_dtype, 4)
+
+
+# ---------------------------------------------------------------------------
+# Embedding: its lookup gradient is reduce-scattered in main_grad's dtype too
+# ---------------------------------------------------------------------------
+
+
+def _worker_embedding_wgrad_rs_fp32(rank, world_size, port, degree, padded):
+    """With an FP32 main_grad, the embedding's gtp_remat reduce-scatter must sum in FP32.
+
+    Autograd hands GTPEmbeddingWeight.backward the lookup gradient in the weight dtype (BF16),
+    so unlike the linears (see _worker_wgrad_rs_dtype) nothing types it from main_grad: a BF16
+    cross-rank sum rounds before main_grad sees it. The values are chosen so that rounding is
+    visible exactly: GTP rank 0 contributes 1.0 per element and every other GTP rank 2**-8. All
+    are exact in BF16, but their mean (1 + (d-1) 2**-8) / d needs 8 fractional bits and BF16
+    has 7, so any reduction with a BF16 partial sum or output misses it (d=2 gives 0.5, d=4
+    0.25 or 0.25390625), while an FP32 sum is exact in any order. Two uses per forward, like
+    the main and MTP lookups, each reduce-scatter on their own.
+    """
+    import torch.nn.functional as F
+
+    from megatron.core.tensor_parallel.generalized_tensor_parallelism import (
+        GTP_CONFIG,
+        GTPEmbeddingWeight,
+    )
+
+    groups = [dist.new_group(list(range(s, s + degree))) for s in range(0, world_size, degree)]
+    group = groups[rank // degree]
+    g = group.rank()
+
+    saved_per_token = GTP_CONFIG.calculate_per_token_loss
+    original_rs = gtp_module.reduce_scatter_along_first_dim
+    wire = []
+
+    def spy_rs(tensor, *args, **kwargs):
+        wire.append(tensor.dtype)
+        return original_rs(tensor, *args, **kwargs)
+
+    try:
+        GTP_CONFIG.calculate_per_token_loss = False  # mean RS: the 1/degree prescale runs too
+        align = GTP_CONFIG.pad_for_alignment * degree
+        vocab, hidden = 2 * align - (3 if padded else 0), 32
+        mod = nn.Module()
+        mod.weight = nn.Parameter(
+            torch.zeros(vocab, hidden, dtype=torch.bfloat16, device="cuda")
+        )
+        wrap_module_params_gtp(mod, ["weight"], group)
+        w = mod.weight
+        assert isinstance(w, GTPShardedParam)
+        w._need_weight_prefetch = False  # as VocabParallelEmbedding (layers.py) sets it
+        assert (w.pad_length > 0) == padded, (w.pad_length, padded)
+        w.main_grad = torch.zeros(w.shape, dtype=torch.float32, device="cuda")
+
+        # Poison the caching allocator's block of the padded send size, so an unzeroed pad
+        # tail on the last rank shows up as NaN instead of the zeros a fresh block may hold.
+        poison = torch.full(w._unsharded_shape_padded, float("nan"), device="cuda")
+        del poison
+
+        gtp_module.reduce_scatter_along_first_dim = spy_rs
+        val = 1.0 if g == 0 else 2.0**-8
+        ids = torch.arange(vocab, device="cuda")
+        loss = sum((F.embedding(ids, GTPEmbeddingWeight.apply(w)) * val).sum() for _ in range(2))
+        loss.backward()
+    finally:
+        gtp_module.reduce_scatter_along_first_dim = original_rs
+        GTP_CONFIG.calculate_per_token_loss = saved_per_token
+
+    # Chain head (as the real embedding is): the reduce-scatter is sync, accumulated inline.
+    assert w.prev_w is None
+    assert wire == [torch.float32, torch.float32], (
+        f"embedding reduce-scatter sent {wire} with an FP32 main_grad; each of the two uses must "
+        f"reduce-scatter once, in FP32"
+    )
+    rows = w.shape[0]
+    global_row = g * rows + torch.arange(rows, device="cuda")
+    per_use = (1.0 + (degree - 1) * 2.0**-8) / degree  # exact in FP32
+    expected = torch.where(global_row < vocab, 2 * per_use, 0.0).unsqueeze(1).expand(rows, hidden)
+    assert torch.equal(w.main_grad, expected), (
+        f"GTP rank {g} of degree {degree}: embedding main_grad differs from the exact FP32 sum "
+        f"(real-row value {2 * per_use!r}, pad rows 0); got values "
+        f"{torch.unique(w.main_grad).tolist()}"
+    )
+
+
+class TestGTPEmbeddingWgradRSDtype:
+    @pytest.mark.parametrize("padded", [False, True], ids=["aligned", "padded"])
+    @pytest.mark.parametrize("degree", [2, 4], ids=["degree2", "degree4"])
+    def test_embedding_rs_sums_in_main_grad_dtype(self, degree, padded):
+        _requires_multi_gpu(4)
+        _run_distributed(_worker_embedding_wgrad_rs_fp32, 4, degree, padded)
 
 
 # ---------------------------------------------------------------------------
