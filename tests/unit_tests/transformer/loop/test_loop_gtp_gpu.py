@@ -57,7 +57,9 @@ core weight is used 4 times per microbatch, in the forward and again in the bloc
   core weight, 1 for a prelude, coda or MTP weight, 2 for the embedding (one per use), 1 for the
   output layer (one accumulated reduce-scatter).
 * The embedding's weight gradient reaches its reduce-scatter in FP32 (``main_grad``'s dtype) in
-  every arm and step; the reference counts ``ROWS x (1 + MTP_LAYERS)`` lookups per step.
+  every arm and step; the reference counts ``ROWS x (1 + MTP_LAYERS)`` lookups per step. The
+  reason for the precise reference, measured: ``ref_plain`` (the plain lookup, step 1) fails
+  the gate against ``ref`` on the embedding, and on no other parameter.
 * The prefetch verification's decisions are printed: how many consumes found a prefetch handle
   whose buffer did not hold this consume's gather (they gathered on demand).
 * Teeth, must fail (step 1): ``drop_rs``, the second backward use's weight gradient of every
@@ -316,27 +318,29 @@ class _Instrument:
         del self.gtp._GATHER_LEDGER.take  # back to the class method
 
 
-def _run_reference(state, ep=1, forced=None):
-    """``STEPS`` steps without GTP, with the precise embedding reference
-    (``sgu.install_per_use_fp32_embedding``); returns ``[(step result, grads)]`` and a record: the
-    full weights at the end of the last step (``weights``), the embedding lookups per step that
-    went through the precise reference (``lookups``) and, with ``forced`` (step-1 gradients to
-    step on: the teacher forcing), the read-back count (``readback``)."""
+def _run_reference(state, ep=1, forced=None, precise=True, steps=STEPS):
+    """``steps`` steps without GTP, with the precise embedding reference
+    (``sgu.install_per_use_fp32_embedding``; ``precise=False``: the plain deterministic lookup,
+    whose autograd sums the two uses in BF16); returns ``[(step result, grads)]`` and a record:
+    the full weights at the end of the last step (``weights``), the embedding lookups per step
+    that went through the precise reference (``lookups``) and, with ``forced`` (step-1 gradients
+    to step on: the teacher forcing), the read-back count (``readback``)."""
     _initialize(1, ep=ep)
     model = sgu.build_model(state, expert_model_parallel_size=ep)
-    precise = sgu.install_per_use_fp32_embedding(model)
+    counter = sgu.install_per_use_fp32_embedding(model) if precise else None
     ddp = _ddp(model, distributed_optimizer=False)
     opt = sgu.optimizer(ddp)
     out = []
     info = dict(readback=None, pending=0, lookups=[])
-    for step in range(STEPS):
+    for step in range(steps):
         _restore_buffers(model, state)
         opt.zero_grad()
         result = sgu.run_step(ddp, model, sgu.make_rows(step))
-        info["lookups"].append(precise.lookups)
-        precise.lookups = 0
+        if counter is not None:
+            info["lookups"].append(counter.lookups)
+            counter.lookups = 0
         out.append((result, sgu.ddp_grads(ddp, model)))
-        if step + 1 < STEPS:
+        if step + 1 < steps:
             if forced is not None:
                 sgu.force_main_grads(model, forced)
                 info["readback"] = sgu.agreed(
@@ -411,8 +415,13 @@ def _run_gtp(
         drops = {pid: drop_use for pid in core_ids & consumers} if drop_use else {}
         if drop_embedding_use:
             drops[id(emb)] = drop_embedding_use
+        # The embedding's use norms are printed by the mutation tests only; reading one syncs
+        # the host mid-backward, so the gated arms keep their timing.
+        mutated = bool(drop_embedding_use or bf16_embedding)
         instrument = _Instrument(
-            drops=drops, bf16_ids={id(emb)} if bf16_embedding else (), norm_ids={id(emb)}
+            drops=drops,
+            bf16_ids={id(emb)} if bf16_embedding else (),
+            norm_ids={id(emb)} if mutated else (),
         )
         out = []
         forcing = dict(pending=None, readback=None)
@@ -483,6 +492,8 @@ def results():
     state = sgu.clone_state(sgu.build_model())
     out = {}
     out["ref"] = _run_reference(state)
+    # Diagnostic: the plain lookup's reference (the two uses summed in BF16), one step.
+    out["ref_plain"] = _run_reference(state, precise=False, steps=1)
     forced = out["ref"][0][0][1]
     out["gtp"] = _run_gtp(state, forced=forced)
     out["gtp_overlap"] = _run_gtp(state, overlap=True, forced=forced)
@@ -701,6 +712,18 @@ def test_dropped_reduce_scatter_fails_the_gate(results):
     assert len(caught) >= MIN_FAILING_CORE_FRACTION * len(core), sgu.mbs.worst(
         report, [name for name in core if report[name]["ok"]]
     )
+
+
+def test_plain_reference_is_off_by_more_than_the_gate(results):
+    """Why ``ref`` takes the precise embedding reference, measured on this model: the plain
+    deterministic lookup (autograd sums the main and MTP uses' BF16 gradients in BF16 before
+    the FP32 ``main_grad``) puts the embedding's step-1 gradient outside the gate against
+    ``ref``, while every other gradient passes it (only the lookup's backward differs)."""
+    _, precise = results["ref"][0][0]
+    _, plain = results["ref_plain"][0][0]
+    report, failing = sgu.report_and_fail(_name("ref_plain (diagnostic) vs ref"), plain, precise)
+    print(f"[{_name('ref_plain')}] embedding {report[EMBEDDING]}", flush=True)
+    assert failing == [EMBEDDING], sgu.mbs.worst(report, failing or [EMBEDDING])
 
 
 def test_reference_sums_embedding_uses_in_fp32(results):

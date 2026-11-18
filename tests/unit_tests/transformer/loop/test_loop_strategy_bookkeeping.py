@@ -906,7 +906,8 @@ def test_sgd_as_adam_steps_as_sgd_without_momentum():
 
 
 # ---------------------------------------------------------------------------------------------
-# The GTP GPU test's precise embedding reference (strategy_grad_utils.install_per_use_fp32_embedding)
+# The GTP GPU test's precise embedding reference
+# (strategy_grad_utils.install_per_use_fp32_embedding)
 # ---------------------------------------------------------------------------------------------
 
 
