@@ -914,6 +914,7 @@ def test_cpu_offloaded_adam_steps_on_the_recipe_layout(results):
     assert max(to_adam.values()) < max(to_frozen.values()), (to_adam, to_frozen)
 
 
+@pytest.mark.launch_on_gb200
 def test_cpu_offloaded_adam_fsdp_dtensor_checkpoint_round_trip(results):
     """The recipes' optimizer through an ``fsdp_dtensor`` save and load on the recipes' layout
     (see ``_cpu_adam_checkpoint_round_trip``): weights, host masters, moments and steps are
