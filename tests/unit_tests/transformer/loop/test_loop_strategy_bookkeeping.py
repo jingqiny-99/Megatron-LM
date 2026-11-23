@@ -937,14 +937,16 @@ class _Embedding(torch.nn.Module):
 
 def _ddp_like(weight):
     """``main_grad`` and DDP's post-accumulate hook arithmetic (distributed_data_parallel.py):
-    ``.grad`` is added unless ``grad_added_to_main_grad``, then dropped. Returns the list of
+    ``.grad`` is added when required by the fused-gradient and MTP flags, then dropped. Returns the list of
     ``(gradient, added)`` the hook saw."""
     weight.main_grad = torch.zeros(weight.shape, dtype=torch.float32)
     weight.grad_added_to_main_grad = False
     seen = []
 
     def hook(param):
-        added = param.grad is not None and not param.grad_added_to_main_grad
+        added = param.grad is not None and (
+            not param.grad_added_to_main_grad or getattr(param, "zero_out_wgrad", False)
+        )
         seen.append((param.grad, added))
         if added:
             param.main_grad.add_(param.grad.float())
@@ -954,12 +956,13 @@ def _ddp_like(weight):
     return seen
 
 
-def _two_use_main_grad(weight, ids, dys, *, precise):
+def _two_use_main_grad(weight, ids, dys, *, precise, zero_out_wgrad=False):
     """Two lookups (the main and the MTP input) through a stand-in model, then backward; returns
     the FP32 ``main_grad``, the hook's gradients and the lookup counter (None if not precise)."""
     from tests.unit_tests.transformer.loop import strategy_grad_utils as sgu
 
     embedding = _Embedding(weight)
+    embedding.weight.zero_out_wgrad = zero_out_wgrad
     model = SimpleNamespace(embedding=SimpleNamespace(word_embeddings=embedding))
     counter = sgu.install_per_use_fp32_embedding(model) if precise else None
     seen = _ddp_like(embedding.weight)
@@ -984,7 +987,8 @@ def _relative(a, b):
     return ((a.double() - b.double()).norm() / b.double().norm()).item()
 
 
-def test_precise_embedding_reference_sums_each_use_in_fp32():
+@pytest.mark.parametrize("zero_out_wgrad", [False, True], ids=["plain", "mtp"])
+def test_precise_embedding_reference_sums_each_use_in_fp32(zero_out_wgrad):
     """Random rows, the MTP lookup on the shifted ids (the same rows, other positions): the
     precise reference's ``main_grad`` is bitwise the FP32 sum of the per-use BF16 gradients, and
     DDP's hook adds nothing. The plain lookup (autograd sums the uses in BF16 before the hook's
@@ -997,13 +1001,15 @@ def test_precise_embedding_reference_sums_each_use_in_fp32():
     dys = [torch.randn(1, seq, hidden, generator=generator) * s for s in (1.0, 0.1)]
     expected = _per_use_fp32_sum(weight, ids, dys)
 
-    got, seen, counter = _two_use_main_grad(weight, ids, dys, precise=True)
+    got, seen, counter = _two_use_main_grad(
+        weight, ids, dys, precise=True, zero_out_wgrad=zero_out_wgrad
+    )
     assert torch.equal(got, expected)
     assert counter.lookups == 2 and counter.checked
-    # One hook call (both uses accumulate into one .grad): a zero tensor, flagged, not added.
+    # MTP causes DDP to add the placeholder. It must contribute exactly zero.
     assert len(seen) == 1, seen
     grad, added = seen[0]
-    assert not added and not torch.count_nonzero(grad)
+    assert added == zero_out_wgrad and not torch.count_nonzero(grad)
 
     plain, _, _ = _two_use_main_grad(weight, ids, dys, precise=False)
     assert _relative(plain, expected) > 1e-3, _relative(plain, expected)

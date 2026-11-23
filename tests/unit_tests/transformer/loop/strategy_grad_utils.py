@@ -788,8 +788,8 @@ def gtp_rows(full, rows, size, rank):
 class _PerUseFp32WeightGrad(torch.autograd.Function):
     """Identity on a weight; its backward adds THIS use's gradient (in the weight's dtype) into
     the FP32 ``main_grad`` on its own (an exact widening, one FP32 rounding), flags
-    ``grad_added_to_main_grad`` so DDP's hook adds nothing, and hands autograd a zero tensor
-    without storage (as ``EmbeddingWithGradAccumulationFusion`` does)."""
+    ``grad_added_to_main_grad``, and returns a zero placeholder. With PP=1 and MTP, DDP
+    adds the placeholder because the input embedding has ``zero_out_wgrad`` set."""
 
     @staticmethod
     def forward(ctx, weight):
@@ -835,7 +835,6 @@ def install_per_use_fp32_embedding(model):
     module = model.embedding.word_embeddings
     _assert_plain_lookup(module)
     assert not getattr(model, "share_embeddings_and_output_weights", False), "tied embedding"
-    assert not getattr(module.weight, "zero_out_wgrad", False), "zero_out_wgrad embedding"
     original = module.forward
     counter = SimpleNamespace(lookups=0, checked=False)
 
