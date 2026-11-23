@@ -507,6 +507,7 @@ def _fsdp_dtensor_state(fsdp, opt, is_loading):
     optimizers' ``load_state_dict``)."""
     from types import SimpleNamespace
 
+    from megatron.core.utils import unwrap_model
     from megatron.training.checkpointing import preprocess_fsdp_dtensor_state_dict
 
     leaves = _leaf_optimizers(opt)
@@ -517,10 +518,13 @@ def _fsdp_dtensor_state(fsdp, opt, is_loading):
     args = SimpleNamespace(
         swiglu=bool(fsdp.config.gated_linear_unit), num_experts=fsdp.config.num_moe_experts
     )
+    # save_checkpoint and load_checkpoint unwrap the adapter before building the state
+    # dict and resolving its SwiGLU parameters through the inner MegatronFSDP.
+    model = unwrap_model(fsdp)
     state = preprocess_fsdp_dtensor_state_dict(
         args,
-        {"model": fsdp.state_dict_for_save_checkpoint(), "optimizer": {"state": optimizer_state}},
-        fsdp,
+        {"model": model.state_dict_for_save_checkpoint(), "optimizer": {"state": optimizer_state}},
+        model,
     )
     return state, leaves, raws
 
