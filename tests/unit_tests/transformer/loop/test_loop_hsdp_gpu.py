@@ -507,6 +507,7 @@ def _fsdp_dtensor_state(fsdp, opt, is_loading):
     optimizers' ``load_state_dict``)."""
     from types import SimpleNamespace
 
+    from megatron.core.utils import unwrap_model
     from megatron.training.checkpointing import preprocess_fsdp_dtensor_state_dict
 
     leaves = _leaf_optimizers(opt)
@@ -517,10 +518,13 @@ def _fsdp_dtensor_state(fsdp, opt, is_loading):
     args = SimpleNamespace(
         swiglu=bool(fsdp.config.gated_linear_unit), num_experts=fsdp.config.num_moe_experts
     )
+    # save_checkpoint and load_checkpoint unwrap the adapter before building the state
+    # dict and resolving its SwiGLU parameters through the inner MegatronFSDP.
+    model = unwrap_model(fsdp)
     state = preprocess_fsdp_dtensor_state_dict(
         args,
-        {"model": fsdp.state_dict_for_save_checkpoint(), "optimizer": {"state": optimizer_state}},
-        fsdp,
+        {"model": model.state_dict_for_save_checkpoint(), "optimizer": {"state": optimizer_state}},
+        model,
     )
     return state, leaves, raws
 
@@ -645,14 +649,19 @@ ARMS = {
 
 
 @pytest.fixture(scope="module")
-def results():
+def initial_state():
+    return sgu.clone_state(sgu.build_model(expert_model_parallel_size=EP))
+
+
+@pytest.fixture(scope="module")
+def results(initial_state):
     """Every arm, run once from the same weights and rows; the arms take ``ref``'s step-1
     gradient before their optimizer step (teacher forcing). The ``cpu_adam`` smoke arm runs
     last, and an error of it (raised identically on every rank, e.g. while building the
     optimizer) is kept for its own test to raise: it does not take the gated arms and the
     mutations down with it. The preconditions are agreed over the ranks at the end (in a fixed
     order) and asserted by the tests."""
-    state = sgu.clone_state(sgu.build_model(expert_model_parallel_size=EP))
+    state = initial_state
     out = {}
     out["ref"], out["ref_info"] = _run_ddp(state)
     out["fused_core_weights"] = out["ref_info"]["fused"]
@@ -681,10 +690,6 @@ def results():
         )
     except Exception:  # pylint: disable=broad-except
         out["cpu_adam_error"] = traceback.format_exc()
-    try:
-        out["cpu_adam_checkpoint"] = _cpu_adam_checkpoint_round_trip(state)
-    except Exception:  # pylint: disable=broad-except
-        out["cpu_adam_checkpoint_error"] = traceback.format_exc()
     for arm in list(ARMS) + ["no_install"]:
         record = out[arm][1]
         start = sgu.fsdp_start_mismatches(record, out["ref_info"])
@@ -910,16 +915,12 @@ def test_cpu_offloaded_adam_steps_on_the_recipe_layout(results):
     assert max(to_adam.values()) < max(to_frozen.values()), (to_adam, to_frozen)
 
 
-def test_cpu_offloaded_adam_fsdp_dtensor_checkpoint_round_trip(results):
+@pytest.mark.launch_on_gb200
+def test_cpu_offloaded_adam_fsdp_dtensor_checkpoint_round_trip(initial_state):
     """The recipes' optimizer through an ``fsdp_dtensor`` save and load on the recipes' layout
     (see ``_cpu_adam_checkpoint_round_trip``): weights, host masters, moments and steps are
     restored exactly and the moments stay on the host, SwiGLU ``linear_fc1`` included."""
-    if "cpu_adam_checkpoint_error" in results:
-        pytest.fail(
-            f"the cpu_adam checkpoint round trip raised:\n{results['cpu_adam_checkpoint_error']}",
-            pytrace=False,
-        )
-    record = results["cpu_adam_checkpoint"]
+    record = _cpu_adam_checkpoint_round_trip(initial_state)
     print(
         f"[{_name('cpu_adam checkpoint')}] checked {record['checked']} (linear_fc1 "
         f"{record['fc1']}), problems {len(record['problems'])}",
