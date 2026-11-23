@@ -2,12 +2,19 @@
 
 import dataclasses
 import os
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
 import torch
 from torch.utils._pytree import tree_flatten, tree_unflatten
 
+from megatron.core.transformer.experimental_attention_variant.dsa_logging import (
+    DSAIndexerLossLoggingHelper,
+)
+from megatron.core.transformer.loop_transformer_block import recompute_context
+from megatron.core.transformer.moe.moe_logging import MoEMetricsTracker, get_moe_metrics_tracker
+from megatron.core.transformer.moe.moe_utils import MoEAuxLossAutoScaler
 from tests.unit_tests.transformer.loop import test_loop_rsbf_executor as spec
 from tests.unit_tests.transformer.loop.test_loop_rsbf_executor import (
     _model_parallel,
@@ -69,7 +76,93 @@ class _CorePair(torch.nn.Module):
         for i, t in zip(self.positions, args):
             flat[i] = t
         ctx = dataclasses.replace(self.ctx, **tree_unflatten(flat, self.layout))
-        return self.invoke(hidden, self.start, self.end, ctx, "rsbf/core-pair")
+        # The executor normally supplies this scope around a recomputation. TE calls this
+        # module outside the executor during capture, so the graph must establish it itself.
+        with recompute_context("rsbf/core-pair/phase=recompute"):
+            return self.invoke(hidden, self.start, self.end, ctx, "rsbf/core-pair")
+
+
+def test_pair_preserves_auxiliary_derivative_without_counting_recomputation():
+    """TE invokes the pair outside the executor during capture; recomputation semantics apply."""
+
+    @dataclasses.dataclass
+    class Context:
+        scale: float
+
+    tracker = MoEMetricsTracker()
+
+    def run(hidden, first, last, ctx, label):
+        auxiliary_loss = ctx.scale * hidden.square().sum()
+        tracker.record("aux", auxiliary_loss, layer_number=1, num_layers=1)
+        return MoEAuxLossAutoScaler.apply(hidden, auxiliary_loss)
+
+    ctx = Context(3.0)
+    stack = SimpleNamespace(layers=[torch.nn.Identity()], _run_range=run)
+    x = torch.tensor([2.0], requires_grad=True)
+    pair = _CorePair(stack, ctx, 0, 1)
+    with patch.object(MoEAuxLossAutoScaler, "main_loss_backward_scale", torch.tensor(1.0)):
+        pair(x).sum().backward()
+    assert not tracker._metrics
+    assert torch.equal(x.grad, torch.tensor([13.0]))
+
+
+def _statistics_buffers(model):
+    """Strongly hold the tracked storage to check that capture and replay leave it untouched."""
+    buffers = {
+        f"moe/{name}/{field}": buf
+        for name, entry in get_moe_metrics_tracker()._metrics.items()
+        for field, buf in (("values", entry.values), ("round_values", entry.round_values))
+        if buf is not None
+    }
+    buffers.update(
+        {
+            f"dsa/{name}": value
+            for name, value in DSAIndexerLossLoggingHelper.tracker.items()
+            if torch.is_tensor(value)
+        }
+    )
+    buffers.update(
+        {
+            f"expert_counts/{name}": module.local_tokens_per_expert
+            for name, module in model.named_modules()
+            if getattr(module, "local_tokens_per_expert", None) is not None
+        }
+    )
+    return buffers
+
+
+def _capture_core_pair(actual, x, ctx):
+    from transformer_engine.pytorch import make_graphed_callables
+
+    from megatron.core.transformer import cuda_graphs
+    from megatron.core.transformer.moe.paged_stash import paged_stash_te_graph_capture
+
+    start, end = actual.decoder.loop_roles.core_start, actual.decoder.loop_roles.core_end
+    pair = _CorePair(actual.decoder, ctx, start, end)
+    args = pair.args(x, ctx)
+    static = tuple(v.detach().clone().requires_grad_(v.requires_grad) for v in args)
+    print("RSBF_PAIR: capture", [(tuple(v.shape), str(v.dtype)) for v in static], flush=True)
+    stats_buffers = _statistics_buffers(actual)
+    assert any(name.startswith("moe/") for name in stats_buffers)
+    before_capture = {name: value.clone() for name, value in stats_buffers.items()}
+    cuda_graphs._set_capture_start()
+    try:
+        with paged_stash_te_graph_capture(False, order=[1, -1], config=actual.config):
+            replay = make_graphed_callables(
+                pair,
+                static,
+                allow_unused_input=True,
+                retain_graph_in_backward=False,
+                pool=torch.cuda.graph_pool_handle(),
+                clone_param_grads_on_return=True,
+                fp8_enabled=False,
+            )
+    finally:
+        cuda_graphs._set_capture_end()
+    assert all(torch.equal(value, before_capture[name]) for name, value in stats_buffers.items())
+    print("RSBF_PAIR: capture preserved", len(stats_buffers), "statistic buffers", flush=True)
+    print("RSBF_PAIR: CUDA capture complete", flush=True)
+    return pair, replay, stats_buffers, before_capture
 
 
 @pytest.mark.skipif(
@@ -78,15 +171,12 @@ class _CorePair(torch.nn.Module):
 )
 def test_single_core_pair_matches_two_training_updates(hybrid, deterministic_algorithms):
     """Compare the real core pair's recomputations, losses, accumulated gradients and updates."""
-    from megatron.core.transformer import cuda_graphs
     from tests.unit_tests.transformer.loop import pair_capture as pc
-    from megatron.core.transformer.moe.paged_stash import paged_stash_te_graph_capture
 
     if not (
         pc.hybridep_available(0) and pc.op_fuser_grouped_mlp_available() and pc._te_min("2.19.0")
     ):
         pytest.skip("needs Blackwell HybridEP and TE grouped experts with graph gradient copy-out")
-    from transformer_engine.pytorch import make_graphed_callables
 
     criterion = spec.PrescribedDepthCriterion({0: 1, 1: 2})
     seq = 256
@@ -110,25 +200,7 @@ def test_single_core_pair_matches_two_training_updates(hybrid, deterministic_alg
         assert len(captured_input) == 1
         print("RSBF_PAIR: eager schedule and observed pair complete", flush=True)
         x, ctx = captured_input[0]
-        pair = _CorePair(actual.decoder, ctx, start, end)
-        args = pair.args(x, ctx)
-        static = tuple(v.detach().clone().requires_grad_(v.requires_grad) for v in args)
-        print("RSBF_PAIR: capture", [(tuple(v.shape), str(v.dtype)) for v in static], flush=True)
-        cuda_graphs._set_capture_start()
-        try:
-            with paged_stash_te_graph_capture(False, order=[1, -1], config=actual.config):
-                replay = make_graphed_callables(
-                    pair,
-                    static,
-                    allow_unused_input=True,
-                    retain_graph_in_backward=False,
-                    pool=torch.cuda.graph_pool_handle(),
-                    clone_param_grads_on_return=True,
-                    fp8_enabled=False,
-                )
-        finally:
-            cuda_graphs._set_capture_end()
-        print("RSBF_PAIR: CUDA capture complete", flush=True)
+        pair, replay, stats_buffers, before_capture = _capture_core_pair(actual, x, ctx)
         pc.copy_model_state(eager, actual)
         actual.zero_grad(set_to_none=True)
         overlapping_grad_checks = [0]
@@ -159,6 +231,11 @@ def test_single_core_pair_matches_two_training_updates(hybrid, deterministic_alg
                     opt.zero_grad(set_to_none=True)
                     losses.append(_train_step(m, hybrid, batches, criterion, it))
                 spec._assert_losses_equal(*losses)
+                # Each schedule entry installs its own tracker. The capture-time MoE tracker
+                # stays live as a sentinel and must receive no writes from a replay.
+                for name, buf in stats_buffers.items():
+                    if name.startswith("moe/"):
+                        assert torch.equal(buf, before_capture[name]), name
                 compared = 0
                 for (name, p), (other, q) in zip(
                     eager.named_parameters(), actual.named_parameters()
