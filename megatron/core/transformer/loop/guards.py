@@ -716,6 +716,10 @@ def validate_rsbf_config(config: "TransformerConfig") -> None:
             else config.loop_depth_probs is not None
         ),
         RSBF_MIN_ROUNDS: not 1 <= config.loop_min_rounds <= config.loop_iterations,
+        "adapter graph without a shared injection adapter": getattr(
+            config, "loop_rsbf_graph_adapter", False
+        )
+        and (config.loop_carrier != "injection" or config.loop_untie_core),
         RSBF_WAVES: config.loop_rsbf_waves < 1,
         # A tp_dp_cp all-reduce on every grad-mode router call (ranks with different depths
         # would issue different counts) and a running average advanced by every forward.

@@ -472,6 +472,7 @@ LAYOUT_NEUTRAL_LOOP_ARGS: FrozenSet[str] = frozenset(
         "loop_planner",
         "loop_resume_changes",
         "loop_exit_histogram_path",
+        "loop_rsbf_graph_adapter",
         "loop_carrier_diagnostics",
         "loop_carrier_diagnostics_path",
         "loop_carrier_diagnostics_segments",

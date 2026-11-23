@@ -217,6 +217,10 @@ class TransformerConfig(ModelParallelConfig):
     loop_rsbf_block_stride core sublayers, default 1). All forms give the same gradients; they
     trade recompute work against live activation memory."""
 
+    loop_rsbf_graph_adapter: bool = False
+    """Capture the shared injection adapter's differentiable RSBF calls in private CUDA graphs.
+    The sweep and the rest of the model run normally. Intended for fixed-geometry training."""
+
     loop_rsbf_block_stride: Optional[int] = None
     """RSBF: the block length of the 'block' and 'nested' item forms, in core sublayers (symbols
     of the core part of the hybrid pattern, so one attention + MLP layer is 2). Required for
@@ -2469,6 +2473,7 @@ class TransformerConfig(ModelParallelConfig):
                     ("loop_rsbf_tail_item_moves", not self.loop_rsbf_tail_item_moves),
                     ("loop_rsbf_over_budget", self.loop_rsbf_over_budget != "raise"),
                     ("loop_rsbf_item_form", self.loop_rsbf_item_form != "whole_round"),
+                    ("loop_rsbf_graph_adapter", self.loop_rsbf_graph_adapter),
                     ("loop_rsbf_block_stride", self.loop_rsbf_block_stride is not None),
                     (
                         "loop_rsbf_coda_recompute_mla_up_proj",

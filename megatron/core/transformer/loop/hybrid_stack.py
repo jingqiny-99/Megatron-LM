@@ -216,7 +216,10 @@ class LoopHybridStack(HybridStack):
         elif config.loop_architecture == "huginn":
 
             def adapter():
-                linear = nn.Linear(
+                from megatron.core.transformer.loop.adapter_graph import RSBFAdapterLinear
+
+                cls = RSBFAdapterLinear if config.loop_rsbf_graph_adapter else nn.Linear
+                linear = cls(
                     2 * hidden, hidden, bias=False, dtype=loop_dtype, device=loop_device
                 )
                 config.init_method(linear.weight)
@@ -673,17 +676,20 @@ class LoopHybridStack(HybridStack):
         """The loop norm of round ``step`` (its own norm on an untied core)."""
         return self.loop_norms[step] if self.config.loop_untie_core else self.loop_norm
 
-    def _adapt(self, state, injection, step=0):
+    def _adapt(self, state, injection, step=0, *, rsbf_graph=None):
         """The ``[h, 2h]`` adapter on ``[state, injection]``, stream by stream (inside the loop
         parameter store's adapter visit when a store is installed): the shared adapter, or
         round ``step``'s own on an untied core."""
         hook = self._loop_store_hook
         adapter = self.loop_adapters[step] if self.config.loop_untie_core else self.loop_adapter
+        kwargs = {} if rsbf_graph is None else {"rsbf_graph": rsbf_graph}
         with nullcontext() if hook is None else hook.visit("adapter"):
             if self.loop_num_streams == 1:
-                return adapter(torch.cat((state, injection), -1))
+                return adapter(torch.cat((state, injection), -1), **kwargs)
             split = (*state.shape[:-1], self.loop_num_streams, self.config.hidden_size)
-            adapted = adapter(torch.cat((state.reshape(split), injection.reshape(split)), -1))
+            adapted = adapter(
+                torch.cat((state.reshape(split), injection.reshape(split)), -1), **kwargs
+            )
             return adapted.reshape(state.shape)
 
     def _huginn(self, embedding, ctx, label, depths=None):

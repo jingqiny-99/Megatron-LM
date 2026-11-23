@@ -1203,31 +1203,9 @@ def test_dsv4_training_schedule_with_graphed_core_adapter(
     seq = 256
     depths = (1, 2)
     with _hadamard_fallback():
-        eager, graphed = _dsv4_model(), _dsv4_model()
+        eager, graphed = _dsv4_model(), _dsv4_model(loop_rsbf_graph_adapter=True)
         graphed.load_state_dict(eager.state_dict())
         adapter = graphed.decoder.loop_adapter
-        eager_forward = adapter.forward
-        example = adapter.weight.new_zeros(
-            (seq, 1, graphed.decoder.loop_num_streams, adapter.in_features), requires_grad=True
-        )
-        captured = torch.cuda.make_graphed_callables(adapter, (example,)).forward
-
-        def adapter_forward(value):
-            # Sweep inputs are detached. Its activation is not retained for a backward.
-            if not value.requires_grad:
-                return eager_forward(value)
-            return captured(value).clone()
-
-        monkeypatch.setattr(adapter, "forward", adapter_forward)
-        weight_grad_slots = set()
-
-        def owned_weight_grad(grad):
-            # A graphed backward returns the same static weight-gradient slot each time.
-            # AccumulateGrad can retain its first input when optimizer.zero_grad set grad to None.
-            weight_grad_slots.add(grad.untyped_storage().data_ptr())
-            return grad.clone()
-
-        adapter.weight.register_hook(owned_weight_grad)
         submissions = {}
         replay = torch.cuda.CUDAGraph.replay
 
@@ -1265,8 +1243,6 @@ def test_dsv4_training_schedule_with_graphed_core_adapter(
                 if reference.grad is not None:
                     assert torch.equal(reference.grad, actual.grad), name
             assert adapter.weight.grad is not None and adapter.weight.grad.abs().sum().item() > 0
-            assert len(weight_grad_slots) == 1
-            assert adapter.weight.grad.untyped_storage().data_ptr() not in weight_grad_slots
             for optimizer in optimizers:
                 optimizer.step()
             assert torch.equal(eager.decoder.loop_adapter.weight, adapter.weight)

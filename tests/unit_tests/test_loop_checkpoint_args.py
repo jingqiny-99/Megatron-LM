@@ -514,6 +514,7 @@ LOOP_ARGUMENT_RESUME_CLASSES = {
     "loop_depth_seed": "refused",
     "loop_exit_criterion": "refused",
     "loop_exit_histogram_path": "silent",
+    "loop_rsbf_graph_adapter": "silent",
     "loop_iterations": "refused",
     "loop_min_rounds": "refused",
     "loop_param_store_binding": "note",

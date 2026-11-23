@@ -323,13 +323,16 @@ class CoreRound:
     PORTS = CORE_PORTS
 
     def __init__(self, program: LoopProgram):
+        from megatron.core.transformer.loop.adapter_graph import AdapterGraphs
+
         self.program = program
+        self.adapter_graph = AdapterGraphs() if program.config.loop_rsbf_graph_adapter else None
 
     def prologue(self, round_input: Optional[Tensor], injection: Tensor) -> Tensor:
         """``loop_adapter([s_{r-1}, e])`` stream by stream; ``s_0 = 0`` when ``round_input``
         is None (r = 1)."""
         state = torch.zeros_like(injection) if round_input is None else round_input
-        return self.program.stack._adapt(state, injection)
+        return self.program.stack._adapt(state, injection, rsbf_graph=self.adapter_graph)
 
     def layers(
         self,

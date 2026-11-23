@@ -786,6 +786,9 @@ class LoopRSBFExecutor:
             self.store.reset()
         self.stats = ExecutorStats(split_pairs=self._split_pairs)
         program.reset_counters()
+        adapter_graph = program.core.adapter_graph
+        if adapter_graph is not None:
+            adapter_graph.step_forwards = 0
         device = self.device
         dispatcher = self._setup_domain()
         num_eus, eu = dispatcher.num_eus, dispatcher.eu
@@ -856,6 +859,13 @@ class LoopRSBFExecutor:
                 self._n_tok_local,
                 pg_collection=self.pg_collection,
                 force_all_reduce=force_all_reduce,
+            )
+        if adapter_graph is not None and eu == 0:
+            logger.info(
+                "RSBF adapter graph iteration %d: %d forward replays on EU 0, %d cached geometries",
+                iteration,
+                adapter_graph.step_forwards,
+                len(adapter_graph.graphs),
             )
         return reports
 
