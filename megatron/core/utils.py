@@ -1316,6 +1316,7 @@ def make_tp_sharded_tensor_for_checkpoint(
             new_offsets.append((prepend_axis_num, dp_rank, dp_size))
 
     gtp_pad_length = 0  # overwritten below for GTP params
+    gtp_remat_size = 1
 
     # GTP: a GTP param additionally shards out_features (axis 0) by 1/gtp_remat. Layer that
     # split onto TP offset — mirrors make_sharded_tensors_for_checkpoint_with_gtp_remat so direct
@@ -1381,6 +1382,8 @@ def make_tp_sharded_tensor_for_checkpoint(
     # Plain attribute (not a ShardedTensor field, so DCP never serializes it): global_shape minus
     # this gives the true unpadded dim0. Read later by grant_shape_mismatch_for_gtp_padding.
     sharded_tensor.gtp_pad_length = gtp_pad_length
+    # Fused FC1 uses this to recover the TP-local gate/up split after weight dequantization.
+    sharded_tensor.gtp_size = gtp_remat_size
     return sharded_tensor
 
 

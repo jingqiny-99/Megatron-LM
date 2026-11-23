@@ -722,6 +722,13 @@ Because the offsets reconstruct the global shape, the checkpoint is independent 
 >
 > On **load**, the split factory's `merge_fn` is wrapped to invert this: it cats the chunks back to the unpadded TP-local width, re-pads with zeros up to `gtp_remat_local_size · gtp_remat_size`, and slices by the GTP_remat rank — mirroring `_gtp_slice_one_param` so the tensor lands in the live shard's layout. `gtp_remat_size == 1` skips both the gather and the pad/slice.
 
+**SwiGLU FC1.** GTP slices the TP-local concatenation of gate and up weights along rows.
+The checkpoint factory maps each slice into the global gate and up halves separately, including
+slices that cross the split. It excludes alignment padding from the checkpoint and restores it
+as zero rows. This mapping also applies when gate and up use separate checkpoint keys.
+Older GTP writers split each physical FC1 shard into artificial gate and up halves. Such
+checkpoints need the original shard layout to recover the intended FC1 values.
+
 **Optimizer state.** The distributed optimizer's master/moment `ShardedObject`s are keyed by `dp_group_idx`. Under GTP_remat/EGTP_remat each peer owns a *different* master shard (the optimizer shards over the gtp_remat/egtp_remat-**excluded** replicate group), so the index is taken from the gtp_remat/egtp_remat-**merged** model-parallel group (`mp_group` for dense, `expt_tp_pp_with_egtp_remat_group` for expert) — giving every peer a distinct key while replicate-group ranks remain true replicas under that key.
 
 **Pre-save forced param-sync.** Before a save (and around any `disable_forward_pre_hook(param_sync=True)`, e.g. pre-eval), the training loop force-syncs DDP params. `force_param_sync` / `disable_forward_pre_hook` first call `optimizer.prepare_model_params_for_param_sync()`, which copies the FP32 masters into the DDP param buffer, so the sync's `_post_param_sync` copy-back re-quantizes each native-FP8 weight — GTP_remat shards included — from up-to-date masters instead of stale grad scratch under `--reuse-grad-buf-for-mxfp8-param-ag`. The copy-back therefore writes the correct MXFP8 shard, so the forced sync leaves GTP_remat's self-gathered weight intact and does not perturb the next iteration's loss — no GTP-specific preservation is needed.
