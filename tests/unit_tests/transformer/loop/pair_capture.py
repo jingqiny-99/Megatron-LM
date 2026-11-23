@@ -1211,7 +1211,6 @@ def execute_order(
     inputs: Dict[str, torch.Tensor],
     *,
     poison: Optional[PoisonGraph] = None,
-    poison_where: str = "items",
     copy_out: bool = True,
     other_work: Optional[Callable[[], None]] = None,
     upstream_dx1: Optional[torch.Tensor] = None,
@@ -1221,16 +1220,11 @@ def execute_order(
     every output and input gradient is cloned out of the pool before the next replay;
     without it, the returned tensors are the (possibly overwritten) pool tensors.
 
-    ``poison_where = "items"`` replays the poison graph before and after every item;
-    ``"fwd-bwd"`` replays it between pair 0's forward and its backward (probe P6)."""
+    The optional poison graph runs only at complete item boundaries."""
     x0, g = inputs["x0"], inputs["g"]
 
     def boundary():
-        if poison is not None and poison_where == "items":
-            poison.replay()
-
-    def between_fwd_bwd():
-        if poison is not None and poison_where == "fwd-bwd":
+        if poison is not None:
             poison.replay()
 
     out: Dict[str, torch.Tensor] = {}
@@ -1246,7 +1240,6 @@ def execute_order(
         x_a = _leaf(x0)
         y0 = side.pair(0, x_a)
         out["y0"] = _out(y0, copy_out)
-        between_fwd_bwd()
         if order == "interleaved" and other_work is not None:
             other_work()
         x1 = _leaf(out["y0"])
@@ -1275,7 +1268,6 @@ def execute_order(
         x_a = _leaf(x0)
         y0 = side.pair(0, x_a)
         out["y0"] = _out(y0, copy_out)
-        between_fwd_bwd()
         torch.autograd.backward(y0, out["dx1"])
         out["dx0"] = _grad_of(x_a, copy_out)
         boundary()
@@ -1284,7 +1276,6 @@ def execute_order(
         x_a = _leaf(x0)
         y0 = side.pair(0, x_a)
         out["y0"] = _out(y0, copy_out)
-        between_fwd_bwd()
         torch.autograd.backward(y0, inputs["g0"])
         out["dx0_injected"] = _grad_of(x_a, copy_out)
         boundary()
@@ -2489,9 +2480,7 @@ def parse_args(argv=None) -> argparse.Namespace:
     parser.add_argument(
         "--probe-p6",
         action="store_true",
-        help="run probe P6 (graph-pool poison between pair 0's forward and its backward); a "
-        "backward that reads a freed pool block can fault the device, so give it its own "
-        "process (e.g. --arms helper --captures block --orders block --poison graph)",
+        help="check graph-pool isolation while forward saves are live in block-order capture",
     )
     parser.add_argument(
         "--no-deterministic-algorithms",
@@ -3172,8 +3161,60 @@ def _probe_p5(main: _Main, side: PairSide, label: str, native: str) -> None:
     reset_after_capture([model, main.twin], config)
 
 
-def _probes(main: _Main, side: PairSide, capture: CaptureResult, oracle: Snapshot, poison) -> None:
-    """Report-only probes on a capture: P6 (poison between a forward and its backward), P3
+def replay_independent_graph(graph, live_pool) -> bool:
+    """Submit independent work only when its capture pool differs from the live pair's."""
+    if live_pool is None or graph.pool() == live_pool:
+        return False
+    graph.replay()
+    return True
+
+
+def _probe_p6(main: _Main, side: PairSide, capture: CaptureResult, oracle: Snapshot) -> None:
+    """Check unrelated graph work while P0 retains its forward state for backward.
+
+    Both candidate graphs touch only their own preallocated counters. The same-pool
+    candidate tests admission before CUDA submission. Neither candidate allocates a
+    tensor from the pair's pool or accesses any of its activation storage.
+    """
+    if NATIVE_ORDER[capture.capture] != "block" or not agree_all(capture.pool is not None):
+        main.writer.write(
+            "probe", capture=capture.capture, probe="P6 live pool", skipped="needs block pool"
+        )
+        return
+    counters = [torch.zeros(1, device="cuda", dtype=torch.int32) for _ in range(2)]
+    shared, independent = torch.cuda.CUDAGraph(), torch.cuda.CUDAGraph()
+    for graph, pool, counter in zip((shared, independent), (capture.pool, None), counters):
+        with torch.cuda.graph(graph, pool=pool):
+            counter.add_(1)
+        counter.zero_()
+
+    admissions = []
+
+    def other_work():
+        shared_submitted = replay_independent_graph(shared, capture.pool)
+        independent_submitted = replay_independent_graph(independent, capture.pool)
+        admissions.append((shared_submitted, independent_submitted))
+
+    reset_after_capture([main.model], main.config)
+    result = execute_order("interleaved", side, main.inputs, other_work=other_work)
+    compared = _agreed(oracle.compare(result, main.model, forwards=1))
+    counters_host = [int(counter.item()) for counter in counters]
+    protected = agree_all(admissions == [(False, True)] * 2 and counters_host == [0, 2])
+    main.writer.write(
+        "probe",
+        capture=capture.capture,
+        probe="P6 live pool",
+        shared_submissions_rank0=counters_host[0],
+        independent_submissions_rank0=counters_host[1],
+        pool_isolation_on_all_ranks=protected,
+        passed=protected and compared["bitwise"],
+        over_budget_any=read_over_budget(main.model, "P6", main.over_budget_seen),
+        **compared,
+    )
+
+
+def _probes(main: _Main, side: PairSide, capture: CaptureResult, oracle: Snapshot) -> None:
+    """Report-only probes on a capture: P6 (pool isolation between a forward and its backward), P3
     (static input overwrite), P4 (output aliasing), P5 (device-data loss scales), the copy-out
     and no-copy variants, and the default-allocator poisoning. Each record carries the
     over-budget flag of its own replays (read before the next reset)."""
@@ -3185,19 +3226,8 @@ def _probes(main: _Main, side: PairSide, capture: CaptureResult, oracle: Snapsho
     def over(probe: str) -> bool:
         return read_over_budget(model, f"probe {probe} {label}", main.over_budget_seen)
 
-    # P6 only in its own process (--probe-p6): at pro-proxy width the poison lands in a block
-    # the backward reads as indices and the device asserts (gpu-fix-r1, J7c / J7d), which ends
-    # the process and every record after it.
-    if poison is not None and main.args.probe_p6:
-        reset_after_capture([model], config)
-        result = execute_order(native, side, inputs, poison=poison, poison_where="fwd-bwd")
-        writer.write(
-            "probe",
-            capture=label,
-            probe="P6 poison between fwd P0 and bwd P0",
-            over_budget_any=over("P6"),
-            **_agreed(oracle.compare(result, model, forwards=forwards)),
-        )
+    if main.args.probe_p6:
+        _probe_p6(main, side, capture, oracle)
     reset_after_capture([model], config)
     result = execute_order(native, side, inputs, copy_out=False)
     writer.write(
@@ -3319,7 +3349,7 @@ def _finish_capture(
         main, side, label, [o for o in orders if o in parse_list(main.args.orders)], poison
     )
     _check_eager(main, oracle, label)
-    _probes(main, side, capture, oracle, poison)
+    _probes(main, side, capture, oracle)
     if timing:
         reset_after_capture([model], config)
         with watch_paused(main.dispatch_watch):

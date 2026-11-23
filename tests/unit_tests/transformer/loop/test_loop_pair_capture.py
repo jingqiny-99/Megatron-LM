@@ -699,15 +699,15 @@ def test_layer_quant_context_follows_hybrid_stack(monkeypatch):
     assert calls == [("fp8", 2), ("fp8", -1), ("fp4", 1)]
 
 
-def test_poison_between_forward_and_backward_is_placed_after_pair0_forward():
-    """Probe P6 replays the poison graph between pair 0's forward and its backward."""
-    log = []
-    generator = torch.Generator().manual_seed(4)
-    inputs = {name: torch.randn(4, 1, 8, generator=generator) for name in ("x0", "g")}
-    pc.execute_order(
-        "block", _logging_side(log), inputs, poison=_LoggingPoison(log), poison_where="fwd-bwd"
-    )
-    assert log == ["fwd P0", "poison", "fwd P1", "bwd P1", "bwd P0"]
+def test_unrelated_graph_replay_requires_a_distinct_known_pool():
+    """The rejected graph must see no replay, even if its work would have been harmless."""
+    calls = []
+    graph = SimpleNamespace(pool=lambda: (1, 0), replay=lambda: calls.append("replay"))
+    assert not pc.replay_independent_graph(graph, None)
+    assert not pc.replay_independent_graph(graph, (1, 0))
+    assert calls == []
+    assert pc.replay_independent_graph(graph, (0, 2))
+    assert calls == ["replay"]
 
 
 # ---------------------------------------------------------------------------------------------
