@@ -2723,7 +2723,8 @@ def aux_scale_verdict(
     ``aux_component_max`` = max |g(1) - g(0)| (0 when the replay ignores the scale: then the
     linearity error is 0 too, so linearity alone proves nothing); ``aux_component_rel_err`` =
     max |g(2) - g(0) - 2 (g(1) - g(0))| / ``aux_component_max``; ``aux_vs_eager_rel_err`` =
-    max |aux(graph) - aux(eager)| / max |aux(eager)| (NaN when eager has no aux component);
+    max |aux(graph) - aux(eager)| / max |aux(eager)|; zero/zero contributes no error and
+    nonzero/zero fails on that rank;
     ``bitwise_vs_eager`` = every scale's main_grads equal eager's."""
     names = sorted(graph[1.0])
     aux_max = eager_max = linear = vs_eager = 0.0
@@ -2731,20 +2732,44 @@ def aux_scale_verdict(
         aux1 = graph[1.0][name] - graph[0.0][name]
         aux2 = graph[2.0][name] - graph[0.0][name]
         eager1 = eager[1.0][name] - eager[0.0][name]
-        aux_max = max(aux_max, aux1.abs().max().item())
-        eager_max = max(eager_max, eager1.abs().max().item())
-        linear = max(linear, (aux2 - 2 * aux1).abs().max().item())
-        vs_eager = max(vs_eager, (aux1 - eager1).abs().max().item())
+        aux_max = nan_max(aux_max, aux1.abs().max().item())
+        eager_max = nan_max(eager_max, eager1.abs().max().item())
+        linear = nan_max(linear, (aux2 - 2 * aux1).abs().max().item())
+        vs_eager = nan_max(vs_eager, (aux1 - eager1).abs().max().item())
     bitwise = all(
         torch.equal(graph[scale][name], eager[scale][name]) for scale in graph for name in names
     )
+
+    def relative(error, reference):
+        if reference == 0:
+            return 0.0 if error == 0 else float("inf")
+        return error / reference
+
     return dict(
         aux_component_max=aux_max,
         eager_aux_component_max=eager_max,
-        aux_component_rel_err=(linear / aux_max) if aux_max > 0 else float("nan"),
-        aux_vs_eager_rel_err=(vs_eager / eager_max) if eager_max > 0 else float("nan"),
+        aux_component_rel_err=relative(linear, aux_max),
+        aux_vs_eager_rel_err=relative(vs_eager, eager_max),
         bitwise_vs_eager=bitwise,
         params=len(names),
+    )
+
+
+AUX_SCALE_MAX_FIELDS = (
+    "aux_component_max",
+    "eager_aux_component_max",
+    "aux_component_rel_err",
+    "aux_vs_eager_rel_err",
+)
+
+
+def aggregate_aux_scales(per_rank):
+    """Retain the worst rank's relative errors and expose the signal on every rank."""
+    return dict(
+        **{field: nan_max(*(rank[field] for rank in per_rank)) for field in AUX_SCALE_MAX_FIELDS},
+        bitwise_vs_eager=all(rank["bitwise_vs_eager"] for rank in per_rank),
+        params=per_rank[0]["params"],
+        by_rank=per_rank,
     )
 
 
@@ -2752,8 +2777,10 @@ def aux_scale_ok(verdict: Dict[str, Any]) -> Optional[bool]:
     """P5 pass: the scale reaches the replay (a non-zero aux component), the replayed component
     equals eager's (bitwise, or within :data:`P5_REL_TOL`) and is linear in the scale. None
     when eager itself shows no aux component (the probe cannot decide)."""
+    if not all(math.isfinite(verdict[key]) for key in AUX_SCALE_MAX_FIELDS):
+        return False
     if not verdict["eager_aux_component_max"] > 0:
-        return None
+        return False if verdict["aux_component_max"] > 0 else None
     if not verdict["aux_component_max"] > 0:
         return False
     close = verdict["bitwise_vs_eager"] or verdict["aux_vs_eager_rel_err"] <= P5_REL_TOL
@@ -3141,14 +3168,7 @@ def _probe_p5(main: _Main, side: PairSide, label: str, native: str) -> None:
             )
         scaler.set_loss_scale(torch.ones(1, device="cuda"))
         local = aux_scale_verdict(graph, eager)
-        agreed = dict(
-            local,
-            aux_component_max=max_over_ranks(local["aux_component_max"]),
-            eager_aux_component_max=max_over_ranks(local["eager_aux_component_max"]),
-            aux_component_rel_err=max_over_ranks(local["aux_component_rel_err"]),
-            aux_vs_eager_rel_err=max_over_ranks(local["aux_vs_eager_rel_err"]),
-            bitwise_vs_eager=agree_all(local["bitwise_vs_eager"]),
-        )
+        agreed = aggregate_aux_scales(gather_objects(local))
         writer.write(
             "probe",
             capture=label,

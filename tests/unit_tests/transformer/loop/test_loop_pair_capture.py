@@ -541,6 +541,27 @@ def test_p5_fails_when_the_replay_ignores_the_loss_scale():
     assert pc.aux_scale_ok(pc.aux_scale_verdict(flat, flat)) is None
 
 
+def test_p5_preserves_worst_rank_and_distinguishes_missing_signal():
+    def samples(values):
+        return {float(i): _grads({"weight": [v]}) for i, v in enumerate(values)}
+
+    def verdict(rows):
+        return pc.aux_scale_ok(
+            pc.aggregate_aux_scales(
+                [pc.aux_scale_verdict(samples(graph), samples(eager)) for graph, eager in rows]
+            )
+        )
+
+    zero, signal = [0.0, 0.0, 0.0], [0.0, 1.0, 2.0]
+    assert verdict([(zero, zero), (signal, signal)]) is True
+    assert verdict([(zero, zero), (zero, zero)]) is None
+    assert verdict([(signal, zero), (signal, signal)]) is False
+    assert verdict([([0.0, 0.0, 1.0], zero), (signal, signal)]) is False
+    assert (
+        verdict([([0.0, 1.0, 2.06], signal), ([0.0, 100.0, 200.0], [0.0, 100.0, 200.0])]) is False
+    )
+
+
 def test_failure_record_reports_the_innermost_cause():
     """Review B3: ``torch.cuda.graph.__exit__`` raises from ``capture_end`` while the failing
     op's exception is only its ``__context__``; the record names the inner one as the cause."""
