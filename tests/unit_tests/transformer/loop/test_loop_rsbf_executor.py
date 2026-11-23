@@ -1194,6 +1194,86 @@ def _expert_bias_counts(model):
 
 
 @gpu
+def test_dsv4_training_schedule_with_graphed_core_adapter(
+    hybrid, deterministic_algorithms, monkeypatch
+):
+    """Run the real forward/backward schedule with a private graph for the recurrent adapter."""
+    if torch.distributed.get_world_size() != 1:
+        pytest.skip("single-execution-unit graph integration test")
+    seq = 256
+    depths = (1, 2)
+    with _hadamard_fallback():
+        eager, graphed = _dsv4_model(), _dsv4_model()
+        graphed.load_state_dict(eager.state_dict())
+        adapter = graphed.decoder.loop_adapter
+        eager_forward = adapter.forward
+        example = adapter.weight.new_zeros(
+            (seq, 1, graphed.decoder.loop_num_streams, adapter.in_features), requires_grad=True
+        )
+        captured = torch.cuda.make_graphed_callables(adapter, (example,)).forward
+
+        def adapter_forward(value):
+            # Sweep inputs are detached. Its activation is not retained for a backward.
+            if not value.requires_grad:
+                return eager_forward(value)
+            return captured(value).clone()
+
+        monkeypatch.setattr(adapter, "forward", adapter_forward)
+        weight_grad_slots = set()
+
+        def owned_weight_grad(grad):
+            # A graphed backward returns the same static weight-gradient slot each time.
+            # AccumulateGrad can retain its first input when optimizer.zero_grad set grad to None.
+            weight_grad_slots.add(grad.untyped_storage().data_ptr())
+            return grad.clone()
+
+        adapter.weight.register_hook(owned_weight_grad)
+        submissions = {}
+        replay = torch.cuda.CUDAGraph.replay
+
+        def counted_replay(graph):
+            submissions[graph] = submissions.get(graph, 0) + 1
+            return replay(graph)
+
+        monkeypatch.setattr(torch.cuda.CUDAGraph, "replay", counted_replay)
+        optimizers = [torch.optim.SGD(model.parameters(), lr=0.1) for model in (eager, graphed)]
+        criterion = PrescribedDepthCriterion(dict(enumerate(depths)))
+        for iteration in range(2):
+            batches = _batches(len(depths), seq=seq, seed=iteration + 17, dev=torch.device("cuda"))
+            losses = []
+            for model, optimizer in zip((eager, graphed), optimizers):
+                set_moe_metrics_tracker(MoEMetricsTracker())
+                optimizer.zero_grad(set_to_none=True)
+                fwd, iterator = _forward_step_func(model, hybrid, batches)
+                reports = forward_backward_loop_rsbf(
+                    iteration=iteration,
+                    exit_criterion=criterion,
+                    **_schedule_kwargs(model, fwd, iterator, len(batches), seq_length=seq),
+                )
+                losses.append(_lm_losses(reports))
+                stats = get_loop_rsbf_schedule().cached_executor(model).stats
+                assert [stats.depths[SampleKey(i, iteration)] for i in range(len(depths))] == list(
+                    depths
+                )
+                assert sum(kind == "core" for kind, _, _ in stats.item_order) == sum(depths)
+            _assert_losses_equal(*losses)
+            for (name, reference), (other_name, actual) in zip(
+                eager.named_parameters(), graphed.named_parameters()
+            ):
+                assert other_name == name
+                assert (reference.grad is None) == (actual.grad is None), name
+                if reference.grad is not None:
+                    assert torch.equal(reference.grad, actual.grad), name
+            assert adapter.weight.grad is not None and adapter.weight.grad.abs().sum().item() > 0
+            assert len(weight_grad_slots) == 1
+            assert adapter.weight.grad.untyped_storage().data_ptr() not in weight_grad_slots
+            for optimizer in optimizers:
+                optimizer.step()
+            assert torch.equal(eager.decoder.loop_adapter.weight, adapter.weight)
+            assert sorted(submissions.values()) == [sum(depths) * (iteration + 1)] * 2
+
+
+@gpu
 @pytest.mark.parametrize("fill", ["drain", "sample_order"])
 def test_dsv4_rsbf_equals_the_eager_reference(hybrid, deterministic_algorithms, fill):
     """S1 / S2: DSv4-like 'WECEHE/WE' in bf16, deterministic env, prescribed depths
