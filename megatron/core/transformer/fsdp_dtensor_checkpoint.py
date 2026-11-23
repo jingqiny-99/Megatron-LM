@@ -51,6 +51,59 @@ from megatron.core.transformer.transformer_layer import TransformerLayer
 from megatron.core.utils import get_attr_wrapped_model
 
 
+def add_empty_shard_state(param_to_fqn, state_by_fqn):
+    """Add checkpoint-only moment tensors for empty shards omitted by the optimizer.
+
+    Uneven-DTensor preprocessing needs matching state keys on every rank of
+    a parameter's mesh. Gather the keys within each dense or expert-DP mesh.
+    """
+    local_keys = {
+        fqn: {key: value.dtype for key, value in state.items() if isinstance(value, DTensor)}
+        for fqn, state in state_by_fqn.items()
+    }
+    parameters_by_mesh = {}
+    for param in param_to_fqn:
+        if isinstance(param, DTensor):
+            parameters_by_mesh.setdefault(param.device_mesh, []).append(param)
+
+    # Keep collectives on overlapping dense and expert-DP meshes in a common order.
+    for mesh in sorted(
+        parameters_by_mesh, key=lambda mesh: (tuple(mesh.mesh.flatten().tolist()), mesh.shape)
+    ):
+        parameters = parameters_by_mesh[mesh]
+        fqns = {param_to_fqn[param] for param in parameters}
+        mesh_keys = {fqn: local_keys[fqn] for fqn in fqns if fqn in local_keys}
+        sharded_dims = sorted(
+            {
+                axis
+                for param in parameters
+                for axis, placement in enumerate(param.placements)
+                if isinstance(placement, Shard) and mesh.size(axis) > 1
+            }
+        )
+        for axis in sharded_dims:
+            group = mesh.get_group(axis)
+            gathered = [None] * torch.distributed.get_world_size(group)
+            torch.distributed.all_gather_object(gathered, mesh_keys, group=group)
+            mesh_keys = {fqn: keys for rank in gathered for fqn, keys in rank.items()}
+        for param in parameters:
+            fqn = param_to_fqn[param]
+            if fqn not in state_by_fqn and fqn in mesh_keys:
+                local = param.to_local()
+                if local.numel():
+                    raise ValueError(f"Missing optimizer state for nonempty shard {fqn}")
+                state_by_fqn[fqn] = {
+                    key: DTensor.from_local(
+                        local.new_empty(local.shape, dtype=dtype),
+                        param.device_mesh,
+                        param.placements,
+                        run_check=False,
+                        shape=param.shape,
+                        stride=param.stride(),
+                    )
+                    for key, dtype in mesh_keys[fqn].items()
+                }
+
 def _strip_wrapper_prefixes(path):
     """Strip DDP/FSDP wrapper prefixes (module., model.) from a module or state dict path."""
     parts = path.split('.')

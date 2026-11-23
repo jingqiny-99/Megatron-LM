@@ -62,7 +62,10 @@ from ..fp8_utils import (
     quantize_param_shard,
 )
 from ..full_cuda_graph import FullIterationGradCopy
-from ..transformer.fsdp_dtensor_checkpoint import handle_experts_in_state_dict
+from ..transformer.fsdp_dtensor_checkpoint import (
+    add_empty_shard_state,
+    handle_experts_in_state_dict,
+)
 from ..transformer.module import MegatronModule
 from .grad_scaler import MegatronGradScaler
 from .optimizer import (
@@ -1132,6 +1135,13 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                     state_dict["param_to_group_meta"], self.optimizer.param_groups
                 )
                 del state_dict["param_to_group_meta"]
+            if isinstance(self.optimizer, HybridDeviceOptimizer):
+                # Empty-shard placeholders participate in checkpoint metadata collectives.
+                # They have no underlying Adam state and must not seed the host optimizer.
+                for group in self.optimizer.param_groups:
+                    for param in group["params"]:
+                        if hasattr(param, "to_local") and param.to_local().numel() == 0:
+                            state_dict["state"].pop(self._param_name(param), None)
             self.optimizer.load_state_dict(state_dict)
             return
 
@@ -1909,6 +1919,17 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             (self._param_name(k) if isinstance(k, torch.Tensor) else k): v
             for k, v in self.state.items()
         }
+
+        if isinstance(self.optimizer, HybridDeviceOptimizer):
+            # Adam initializes moments only on ranks with a nonempty local gradient.
+            # DCP's fused-parameter handlers also visit the ranks owning empty shards.
+            named = {
+                param: self._param_name(param)
+                for group in self.optimizer.param_groups
+                for param in group["params"]
+            }
+            add_empty_shard_state(named, packed_state)
+            packed_state = dict(sorted(packed_state.items()))
 
         state_dict = {"state": packed_state, "param_to_group_meta": param_to_group_meta}
         return state_dict

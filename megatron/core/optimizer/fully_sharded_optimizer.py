@@ -5,8 +5,7 @@
 from typing import Any, Callable, List, Optional, override
 
 import torch
-from torch.distributed.device_mesh import DeviceMesh
-from torch.distributed.tensor import DTensor, Shard
+from torch.distributed.tensor import DTensor
 
 from ..config_logger import has_config_logger_enabled, log_config_to_disk
 from ..dist_checkpointing.mapping import ShardedStateDict
@@ -14,7 +13,10 @@ from ..distributed.fsdp.src.megatron_fsdp.experimental import init_optimizer_sta
 from ..distributed.fsdp.src.megatron_fsdp.experimental.parameter_group import (
     sync_model_weights_from_main_weights,
 )
-from ..transformer.fsdp_dtensor_checkpoint import get_global_unique_param_name
+from ..transformer.fsdp_dtensor_checkpoint import (
+    add_empty_shard_state,
+    get_global_unique_param_name,
+)
 from ..transformer.module import MegatronModule
 from ..utils import is_te_min_version
 from .grad_scaler import MegatronGradScaler
@@ -161,46 +163,6 @@ class FullyShardedOptimizer(MixedPrecisionOptimizer):
             for param in group["params"]
         }
 
-    def _add_empty_shard_state(self, state_by_fqn: dict[str, Any]) -> None:
-        """Add checkpoint placeholders for empty shards omitted by TE < 2.18.
-
-        Uneven-DTensor preprocessing needs matching state keys on every rank of
-        a parameter's mesh. Gather the keys within each dense or expert-DP mesh.
-        """
-        local_keys = {
-            fqn: sorted(key for key, value in state.items() if isinstance(value, DTensor))
-            for fqn, state in state_by_fqn.items()
-        }
-        parameters_by_mesh: dict[DeviceMesh, list[DTensor]] = {}
-        for param in self._param_to_fqn:
-            if isinstance(param, DTensor):
-                parameters_by_mesh.setdefault(param.device_mesh, []).append(param)
-
-        # Keep collectives on overlapping dense and expert-DP meshes in a common order.
-        for mesh in sorted(
-            parameters_by_mesh, key=lambda mesh: (tuple(mesh.mesh.flatten().tolist()), mesh.shape)
-        ):
-            parameters = parameters_by_mesh[mesh]
-            fqns = {self._param_to_fqn[param] for param in parameters}
-            mesh_keys = {fqn: local_keys[fqn] for fqn in fqns if fqn in local_keys}
-            sharded_dims = sorted(
-                {
-                    axis
-                    for param in parameters
-                    for axis, placement in enumerate(param.placements)
-                    if isinstance(placement, Shard) and mesh.size(axis) > 1
-                }
-            )
-            for axis in sharded_dims:
-                group = mesh.get_group(axis)
-                gathered: list[Any] = [None] * torch.distributed.get_world_size(group)
-                torch.distributed.all_gather_object(gathered, mesh_keys, group=group)
-                mesh_keys = {fqn: keys for rank in gathered for fqn, keys in rank.items()}
-            for param in parameters:
-                fqn = self._param_to_fqn[param]
-                if fqn not in state_by_fqn and fqn in mesh_keys:
-                    state_by_fqn[fqn] = {key: torch.zeros_like(param) for key in mesh_keys[fqn]}
-
     def _param_groups_from_group_meta(
         self, param_to_group_meta: dict[str, Any]
     ) -> list[dict[str, Any]]:
@@ -296,7 +258,7 @@ class FullyShardedOptimizer(MixedPrecisionOptimizer):
             for param, param_state in self.optimizer.state.items()
         }
         if not is_te_min_version("2.18.0"):
-            self._add_empty_shard_state(state_by_fqn)
+            add_empty_shard_state(self._param_to_fqn, state_by_fqn)
         return {"state": state_by_fqn, "param_to_group_meta": self._param_to_group_meta()}
 
     @override
