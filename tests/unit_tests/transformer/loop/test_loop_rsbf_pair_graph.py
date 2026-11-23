@@ -131,7 +131,7 @@ def _statistics_buffers(model):
     return buffers
 
 
-def _capture_core_pair(actual, x, ctx):
+def _capture_core_pair(actual, x, ctx, request):
     from transformer_engine.pytorch import make_graphed_callables
 
     from megatron.core.transformer import cuda_graphs
@@ -159,6 +159,14 @@ def _capture_core_pair(actual, x, ctx):
             )
     finally:
         cuda_graphs._set_capture_end()
+
+    def release_graph():
+        # NCCL communicators used by captured collectives must outlive the CUDA graph.
+        # TE retains the graph in its callable, including through Python reference cycles.
+        torch.cuda.synchronize()
+        replay.reset()
+
+    request.addfinalizer(release_graph)
     assert all(torch.equal(value, before_capture[name]) for name, value in stats_buffers.items())
     print("RSBF_PAIR: capture preserved", len(stats_buffers), "statistic buffers", flush=True)
     print("RSBF_PAIR: CUDA capture complete", flush=True)
@@ -169,7 +177,7 @@ def _capture_core_pair(actual, x, ctx):
     not torch.cuda.is_available() or int(os.environ.get("WORLD_SIZE", "1")) != 1,
     reason="one CUDA execution unit",
 )
-def test_single_core_pair_matches_two_training_updates(hybrid, deterministic_algorithms):
+def test_single_core_pair_matches_two_training_updates(hybrid, deterministic_algorithms, request):
     """Compare the real core pair's recomputations, losses, accumulated gradients and updates."""
     from tests.unit_tests.transformer.loop import pair_capture as pc
 
@@ -200,7 +208,7 @@ def test_single_core_pair_matches_two_training_updates(hybrid, deterministic_alg
         assert len(captured_input) == 1
         print("RSBF_PAIR: eager schedule and observed pair complete", flush=True)
         x, ctx = captured_input[0]
-        pair, replay, stats_buffers, before_capture = _capture_core_pair(actual, x, ctx)
+        pair, replay, stats_buffers, before_capture = _capture_core_pair(actual, x, ctx, request)
         pc.copy_model_state(eager, actual)
         actual.zero_grad(set_to_none=True)
         overlapping_grad_checks = [0]

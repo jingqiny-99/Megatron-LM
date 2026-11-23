@@ -78,7 +78,7 @@ def _step(model, batches, criterion, pg):
 
 
 @pytest.mark.skipif(not native.EP_GPU or native.WORLD != 4, reason="four CUDA execution units")
-def test_all_real_pair_with_mixed_eager_nulls(deterministic):
+def test_all_real_pair_with_mixed_eager_nulls(deterministic, request):
     if not (
         native._hybridep_available()
         and pair_capture.op_fuser_grouped_mlp_available()
@@ -109,7 +109,9 @@ def test_all_real_pair_with_mixed_eager_nulls(deterministic):
         with _all_real_pairs(actual, observe, Counter()):
             _step(actual, batch(5), criterion, pg)
         assert len(sample) == 1
-        pair, replay, capture_buffers, initial = _capture_core_pair(actual, *sample[0])
+        pair, replay, capture_buffers, initial = _capture_core_pair(
+            actual, *sample[0], request=request
+        )
         pair_capture.copy_model_state(eager, actual)
 
         def apply(hidden, ctx):
