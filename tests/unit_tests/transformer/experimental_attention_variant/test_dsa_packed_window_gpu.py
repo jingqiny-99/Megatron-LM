@@ -38,8 +38,9 @@ def _geometry(rank):
     return tuple(torch.cat(x) for x in (positions, starts, valid))
 
 
-def _step(model, cfg, layout, group, *, compact):
+def _step(model, cfg, layout, group, *, compact, shard_source=False):
     cfg.loop_compact_packed_window = compact
+    cfg.loop_shard_packed_sparse_kv = shard_source
     model.zero_grad(set_to_none=True)
     dsa.DSAIndexerLossLoggingHelper.clean_loss_in_tracker()
     rank = group.rank()
@@ -138,14 +139,35 @@ def _step(model, cfg, layout, group, *, compact):
                 visit.finish_source()
         assert gather.call_count == (len(model) if compact else 0)
     assert selector_count == [True]
+    source_storages = []
     for j, mod in enumerate(model):
         result["indices", j] = bank[mod, "dsa_topk"]
+        source = bank[mod, "dsa_latent"]
+        source_storages.append((source.size(0), source.untyped_storage().nbytes()))
+        stored_local = source if shard_source else source.index_select(0, pos)
+        assert torch.equal(stored_local, inputs[0, j, "key"])
+
+    def local_source_adjoint(value):
+        if shard_source:
+            return value.detach().clone()
+        reduced = value.detach().clone()
+        torch.distributed.all_reduce(reduced, group=group)
+        return reduced.index_select(0, pos)
+
     # Only rank zero backpropagates this boundary query. Its preceding W-1 values
     # belong to rank one, so a positive gradient there exercises remote halo backward.
     boundary = (pos == 1152).view(-1, 1, 1)
-    remote = torch.autograd.grad(
-        outputs[1, 0], inputs[1, 0, "key"], grads[1, 0] * boundary, retain_graph=True
-    )[0]
+    remote, source_partial = torch.autograd.grad(
+        outputs[1, 0],
+        (inputs[1, 0, "key"], bank[model[0], "dsa_latent"]),
+        grads[1, 0] * boundary,
+        retain_graph=True,
+    )
+    source_remote = local_source_adjoint(source_partial)
+    # Only rank zero issued this query, whose sparse teacher includes keys from rank one.
+    if rank == 1:
+        assert source_remote.float().norm() > 0
+    result["remote_source"] = source_remote
     if rank == 1:
         halo_rows = (pos >= 1152 - (WINDOW - 1)) & (pos < 1152)
         assert remote[halo_rows].float().norm() > 0 and torch.count_nonzero(remote[~halo_rows]) == 0
@@ -156,16 +178,16 @@ def _step(model, cfg, layout, group, *, compact):
         )
         if lap == 1:
             for j, mod in enumerate(model):
-                result["consumer_to_source", j] = bank[mod, "dsa_latent"].grad.detach().clone()
+                result["consumer_to_source", j] = local_source_adjoint(bank[mod, "dsa_latent"].grad)
     for key, x in inputs.items():
         result["input_grad", key] = x.grad
     for name, p in model.named_parameters():
         result["param_grad", name] = p.grad
     result["loss"] = dsa.DSAIndexerLossLoggingHelper.tracker["values"].detach().clone()
-    return result, bytes_by_layer
+    return result, bytes_by_layer, source_storages
 
 
-def test_packed_cp2_halo_matches_global_bank_outputs_support_and_gradients():
+def _compare_packed_banks(*, shard_source):
     kernels._skip_if_cudnn_dsa_unavailable(2)
     layout = layer._Layout(2, 2, False, 1024, REAL_LENGTHS[:2], 4, 128)
     layer._initialize_model_parallel(layout)
@@ -194,10 +216,24 @@ def test_packed_cp2_halo_matches_global_bank_outputs_support_and_gradients():
             .cuda()
             .train()
         )
-        baseline, old = _step(model, config, layout, groups.cp, compact=False)
-        actual, new = _step(model, config, layout, groups.cp, compact=True)
-        assert len(old) == len(new) == 4
-        assert all(r == PHYSICAL[-1] and x < r and y < b for (r, b), (x, y) in zip(old, new))
+        baseline, old, global_source = _step(model, config, layout, groups.cp, compact=shard_source)
+        actual, new, candidate_source = _step(
+            model, config, layout, groups.cp, compact=True, shard_source=shard_source
+        )
+        assert len(old) == len(new) == len(global_source) == len(candidate_source) == 4
+        if shard_source:
+            assert old == new
+            for (rows, full_bytes), (local_rows, local_bytes) in zip(
+                global_source, candidate_source, strict=True
+            ):
+                assert rows == PHYSICAL[-1] == local_rows * groups.cp.size()
+                assert full_bytes == local_bytes * groups.cp.size()
+        else:
+            assert global_source == candidate_source
+            assert all(
+                r == PHYSICAL[-1] and x < r and y < b
+                for (r, b), (x, y) in zip(old, new, strict=True)
+            )
         assert baseline.keys() == actual.keys()
         for key, ref in baseline.items():
             val = actual[key]
@@ -212,8 +248,16 @@ def test_packed_cp2_halo_matches_global_bank_outputs_support_and_gradients():
                 assert error.max() <= layer._PRODUCTION_PEAK * ref.abs().max(), key
         print(
             f"CP {groups.cp.rank()} R2 current rows / actual joint KV storage bytes "
-            f"{old[0]} -> {new[0]}, {len(actual)} checked tensors"
+            f"{old[0]} -> {new[0]}, R1 stored rows/bytes {global_source[0]} -> {candidate_source[0]}, {len(actual)} checked tensors"
         )
     finally:
         dsa.DSAIndexerLossLoggingHelper.clean_loss_in_tracker()
         Utils.destroy_model_parallel()
+
+
+def test_packed_cp2_halo_matches_global_bank_outputs_support_and_gradients():
+    _compare_packed_banks(shard_source=False)
+
+
+def test_packed_cp2_local_source_matches_global_and_routes_remote_dkv():
+    _compare_packed_banks(shard_source=True)
