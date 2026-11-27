@@ -3,9 +3,11 @@
 
 from __future__ import annotations
 
+from dataclasses import fields
 from typing import TYPE_CHECKING, NamedTuple
 
 import torch
+from torch.utils import _pytree
 
 from megatron.core.transformer.moe.megakernel.parameter_bridge import (
     finish_weight_gradient as _finish_weight_gradient,
@@ -74,6 +76,29 @@ class _MoKWeightArguments(NamedTuple):
             shared_fc1, routed_fc1, intermediate_size
         )
         return cls(shared_gate, shared_up, shared_fc2, routed_gate, routed_up, routed_fc2)
+
+
+class _MoKCallSpec(NamedTuple):
+    """Rebuild the native per-call records without keeping their CUDA buffers alive."""
+
+    schedule_type: type
+    activation_type: type
+    structure: _pytree.TreeSpec
+
+    @classmethod
+    def pack(cls, schedule, activation):
+        # MoK exposes tensor-valued dataclasses. MXFP8 activation fields can be
+        # (payload, scale) pairs. Preserve field order, views and the native record types.
+        records = tuple(
+            tuple(getattr(record, field.name) for field in fields(record))
+            for record in (schedule, activation)
+        )
+        tensors, structure = _pytree.tree_flatten(records)
+        return cls(type(schedule), type(activation), structure), tensors
+
+    def unpack(self, tensors):
+        schedule, activation = _pytree.tree_unflatten(tensors, self.structure)
+        return self.schedule_type(*schedule), self.activation_type(*activation)
 
 
 class _MoKAutograd(torch.autograd.Function):
@@ -158,11 +183,16 @@ class _MoKAutograd(torch.autograd.Function):
 
         ctx.module = module
         ctx.workspace = workspace
-        ctx.schedule = schedule
-        ctx.forward_context = forward_context
+        call_tensors = ()
+        if module.checkpoint_forward_context:
+            ctx.call_spec, call_tensors = _MoKCallSpec.pack(schedule, forward_context)
+        else:
+            ctx.schedule = schedule
+            ctx.forward_context = forward_context
         ctx.routed_weight_views = native_views
         ctx.save_for_backward(
-            x, router_weights, shared_output_gate_weight, *routed_parameters, shared_fc1, shared_fc2
+            x, router_weights, shared_output_gate_weight, *routed_parameters, shared_fc1, shared_fc2,
+            *call_tensors,
         )
         return output
 
@@ -171,8 +201,12 @@ class _MoKAutograd(torch.autograd.Function):
         """Run MOK backward and return gradients for its autograd inputs."""
         from mok import functional
 
-        x, router_weights, shared_output_gate_weight, *parameters = ctx.saved_tensors
+        saved = ctx.saved_tensors
         num_routed_parameters = len(ctx.module.autograd_routed_parameters)
+        # Three inputs, all routed weights and both shared weights precede the
+        # optional MoK schedule and activation records.
+        call_start = num_routed_parameters + 5
+        x, router_weights, shared_output_gate_weight, *parameters = saved[:call_start]
         shared_fc1, shared_fc2 = parameters[num_routed_parameters:]
         fc1_weight_view, fc2_weight_view = ctx.routed_weight_views
         layout = ctx.module.virtual_layout
@@ -211,11 +245,15 @@ class _MoKAutograd(torch.autograd.Function):
                     ctx.module.shared_output_gate_weight
                 ),
             }
+        if ctx.module.checkpoint_forward_context:
+            schedule, forward_context = ctx.call_spec.unpack(saved[call_start:])
+        else:
+            schedule, forward_context = ctx.schedule, ctx.forward_context
         d_x, d_router_weights, *_ = functional.backward(
             ctx.module.mok_config,
             ctx.workspace,
-            ctx.schedule,
-            ctx.forward_context,
+            schedule,
+            forward_context,
             grad_output.contiguous(),
             x,
             router_weights,

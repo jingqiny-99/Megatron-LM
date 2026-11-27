@@ -1713,6 +1713,10 @@ class TransformerConfig(ModelParallelConfig):
     moe_token_dispatcher_type and moe_flex_dispatcher_backend do not select its transport.
     """
 
+    moe_mok_checkpoint_forward_context: bool = False
+    """Register MoK's per-call schedule and activation tensors with autograd so that an
+    enclosing activation checkpoint can release them and restore them from its replay."""
+
     moe_megakernel_backend_config: Optional[dict] = None
     """MCore-managed common options and backend-specific options for moe_megakernel_backend.
 
@@ -5257,6 +5261,8 @@ class TransformerConfig(ModelParallelConfig):
                 "moe_megakernel_backend must be None or 'mok', got "
                 f"{self.moe_megakernel_backend!r}"
             )
+        if self.moe_mok_checkpoint_forward_context and self.moe_megakernel_backend != "mok":
+            raise ValueError("moe_mok_checkpoint_forward_context requires the MoK megakernel")
         if self.moe_megakernel_backend is None and self.moe_megakernel_backend_config:
             raise ValueError(
                 "moe_megakernel_backend_config requires moe_megakernel_backend to be set"

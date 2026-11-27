@@ -40,6 +40,7 @@ class MoKMegakernel(MegakernelBackend):
     """Execute MOK using trainable parameters owned by native MCore modules."""
 
     virtual_layout: MoKVirtualLayout | None = None
+    checkpoint_forward_context: bool = False
 
     def __init__(
         self,
@@ -84,6 +85,7 @@ class MoKMegakernel(MegakernelBackend):
                 f"size, got routed={self.intermediate_size}, "
                 f"shared={shared_intermediate_size}"
             )
+        self.checkpoint_forward_context = getattr(config, "moe_mok_checkpoint_forward_context", False)
         self.topk = config.moe_router_topk
         self.swiglu_limit = config.activation_func_clamp_value
         self.situ_beta = (

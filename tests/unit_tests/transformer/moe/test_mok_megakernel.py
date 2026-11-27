@@ -853,3 +853,58 @@ def test_runtime_requires_output_gate_main_grad(monkeypatch):
     functional.backward = lambda *args, **kwargs: pytest.fail("invalid main_grad reached MOK")
     with pytest.raises(RuntimeError, match="DDP to assign param.main_grad"):
         mok_runtime._MoKAutograd.backward(ctx, torch.ones_like(x))
+
+
+@pytest.mark.parametrize("register", [False, True])
+def test_checkpoint_releases_mok_call_activations_and_preserves_views(monkeypatch, register):
+    from dataclasses import dataclass
+    import weakref
+
+    from torch.utils.checkpoint import checkpoint
+
+    @dataclass(frozen=True)
+    class Schedule:
+        route: torch.Tensor
+        offsets: torch.Tensor
+
+    @dataclass(frozen=True)
+    class Activation:
+        routed: tuple
+        shared: torch.Tensor
+
+    module, _, functional = _mock_backend(monkeypatch, gated=False)
+    module.checkpoint_forward_context = register
+    monkeypatch.setattr(module, "quantized_routed_weights", lambda: (object(), object()))
+    for weight in module.parameters():
+        weight.main_grad = torch.zeros_like(weight, dtype=torch.float32)
+    workspace = object()
+    private = []
+    functional.get_workspace = lambda *args, **kwargs: workspace
+    functional.build_schedule = lambda ws, cfg, ids, **kwargs: Schedule(ids, ids + 1)
+    def forward(cfg, ws, schedule, x, routes, *args, **kwargs):
+        shared = x + 1
+        scale = routes + 3
+        activation = Activation((shared[:, :1], scale), shared)
+        private.append((weakref.ref(shared), weakref.ref(scale), weakref.ref(schedule.offsets)))
+        return x * 2, activation
+
+    def backward(cfg, ws, schedule, activation, d_out, x, routes, *args, **kwargs):
+        assert ws is workspace
+        assert isinstance(schedule, Schedule) and isinstance(activation, Activation)
+        assert activation.routed[0].untyped_storage().data_ptr() == activation.shared.untyped_storage().data_ptr()
+        torch.testing.assert_close(activation.shared, x + 1)
+        torch.testing.assert_close(activation.routed[1], routes + 3)
+        torch.testing.assert_close(schedule.offsets, schedule.route + 1)
+        return 2 * d_out, torch.ones_like(routes)
+
+    functional.forward, functional.backward = forward, backward
+    x = torch.arange(32, dtype=torch.bfloat16).reshape(4, 8).requires_grad_()
+    routes = torch.full((4, 2), 0.5, requires_grad=True)
+    ids = torch.arange(8, dtype=torch.int32).reshape(4, 2)
+    output = checkpoint(module._apply_compact, x, routes, ids, use_reentrant=False)
+    assert len(private) == 1
+    assert [ref() is None for ref in private[0]] == [register] * 3
+    output.sum().backward()
+    assert len(private) == 2
+    torch.testing.assert_close(x.grad, torch.full_like(x, 2))
+    torch.testing.assert_close(routes.grad, torch.ones_like(routes))
