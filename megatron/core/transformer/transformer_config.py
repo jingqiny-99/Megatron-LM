@@ -854,7 +854,12 @@ class TransformerConfig(ModelParallelConfig):
     ``dsa_indexer_scorer_backend='cudnn'`` (over pools instead of tokens)."""
 
     dsa_cudnn_topk_scratch_gib: float = 2.0
-    """Per-launch scratch budget, in GiB, of the cuDNN radix top-k of the DSA indexer.
+    """Per-launch workspace budget in GiB for DSA indexer selection.
+
+    The packed DeepGEMM scorer also limits its BF16 score slab to this budget, accounting for
+    the 1024-byte row stride. It uses at least one aligned 128-query group when multiple slabs
+    are required. Each query still scores its full visible key range. DeepSelect reads the slab
+    in place. If cuDNN handles selection, its scratch can coexist with the slab.
 
     Each cuDNN top-k launch allocates a transient int32 scratch of ``rows x 2 x cols`` (twice
     the FP32 scores of its rows), and the indexer runs the top-k in row chunks sized to this

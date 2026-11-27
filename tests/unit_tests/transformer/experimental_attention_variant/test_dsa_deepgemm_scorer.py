@@ -874,6 +874,28 @@ def test_row_chunks_respect_the_te_mxfp8_cast_limit(monkeypatch, heads):
     assert all(start % 128 == 0 for start, _end in chunks)
 
 
+@pytest.mark.parametrize(
+    "n_rows,width,budget,expected_first",
+    [
+        (65536, 1048576, 8 << 30, 4096),
+        (65536, 1048577, 8 << 30, 3968),
+        (8192, 131072, 8 << 30, 8192),
+        (1025, 4097, 1024, 128),
+    ],
+)
+def test_deepgemm_score_slab_bounds_physical_stride(n_rows, width, budget, expected_first):
+    rows = dsa_cudnn_kernels._deepgemm_row_chunks(
+        n_rows, HEADS, score_width=width, scratch_bytes=budget
+    )
+    assert rows[0] == (0, expected_first)
+    assert rows[-1][1] == n_rows
+    assert all(left[1] == right[0] for left, right in zip(rows, rows[1:]))
+    physical_bytes = ((2 * width + 1023) // 1024) * 1024
+    for start, end in rows:
+        assert start % 128 == 0
+        assert (end - start) * physical_bytes <= max(budget, 128 * physical_bytes)
+
+
 @pytest.mark.parametrize("cp_size, cp_rank", [(1, 0), (2, 1)])
 def test_q_is_quantized_per_row_chunk_and_k_once(dg, monkeypatch, cp_size, cp_rank):
     q, k, w, layout = _case((300, 84, 132), cp_size, cp_rank, seed=83)

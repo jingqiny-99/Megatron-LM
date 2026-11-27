@@ -316,9 +316,9 @@ class IndexerScorerOptions:
             MXFP8 scorer. It changes only which kernel selects: the selected scores returned
             for the indexer loss follow ``precision`` (recomputed from the BF16 Q/K/weights
             for ``'mxfp8'``, :func:`_selected_scores_for_indexer_loss`) whichever ran.
-        topk_scratch_bytes: Per-launch int32 scratch budget of every cuDNN top-k the indexer
-            runs, in bytes (``dsa_cudnn_topk_scratch_gib``); ``None`` uses
-            ``_TOPK_WRAPPER_MAX_SCRATCH_BYTES``. See :func:`_topk_wrapper_chunk_rows`.
+        topk_scratch_bytes: Budget for a DeepGEMM BF16 score slab and, separately, a cuDNN
+            top-k scratch allocation. DeepSelect reads the slab in place. The budget in bytes
+            comes from ``dsa_cudnn_topk_scratch_gib``; None uses ``_TOPK_WRAPPER_MAX_SCRATCH_BYTES``.
     """
 
     skip_masked_score_fill: bool = False
@@ -2138,22 +2138,33 @@ def _deepgemm_packed_thd_logits(
     )
 
 
-def _deepgemm_row_chunks(n_rows: int, num_heads: int) -> list[tuple[int, int]]:
-    """Row ranges of at most one DeepGEMM call and one TE MXFP8 cast of Q each.
+def _deepgemm_row_chunks(
+    n_rows: int,
+    num_heads: int,
+    *,
+    score_width: int = 0,
+    scratch_bytes: Optional[int] = None,
+) -> list[tuple[int, int]]:
+    """Partition independent queries by kernel limits and physical BF16 score bytes.
 
-    DeepGEMM takes at most :func:`dsa_deepgemm_scorer.max_rows_per_call` rows per call
-    (116208 with 32 heads, 58104 with 64) and TE's cast at most
-    :data:`_TE_MXFP8_CAST_MAX_ROWS` // ``num_heads`` (131070, 65535); the smaller one bounds
-    a chunk. One range when the rows fit, else ranges starting at multiples of
-    :data:`_DEEPGEMM_CHUNK_ROW_ALIGNMENT`, which keeps every row slice of Q, its scales, the
-    weights and ``ks``/``ke`` 16-byte aligned for DeepGEMM's TMA descriptors.
+    A slab covers every candidate key for each query. DeepGEMM pads the BF16
+    score row stride to 1024 bytes. Chunk starts use 128-row alignment for the
+    TE and DeepGEMM inputs. One aligned group is the minimum for long inputs.
+    DeepSelect reads the scores in place. A cuDNN selection fallback has its
+    own bounded scratch allocation, which can coexist with the score slab.
     """
+    alignment = _DEEPGEMM_CHUNK_ROW_ALIGNMENT
     limit = min(
         dsa_deepgemm_scorer.max_rows_per_call(num_heads), _TE_MXFP8_CAST_MAX_ROWS // num_heads
     )
+    if score_width:
+        score_alignment = dsa_deepgemm_scorer.LOGITS_ROW_ALIGNMENT_BYTES
+        row_bytes = ((2 * score_width + score_alignment - 1) // score_alignment) * score_alignment
+        budget = _TOPK_WRAPPER_MAX_SCRATCH_BYTES if scratch_bytes is None else scratch_bytes
+        limit = min(limit, max(alignment, budget // row_bytes))
     if n_rows <= limit:
         return [(0, n_rows)]
-    step = limit // _DEEPGEMM_CHUNK_ROW_ALIGNMENT * _DEEPGEMM_CHUNK_ROW_ALIGNMENT
+    step = limit // alignment * alignment
     return [(start, min(start + step, n_rows)) for start in range(0, n_rows, step)]
 
 
@@ -2217,11 +2228,9 @@ def _indexer_topk_packed_thd_deepgemm(
     an indices-only call (a checkpoint's first call) and a call that keeps the scores (its
     replay) run the identical top-k invocation on bitwise-identical logits; the values only
     mark non-finite selections for the caller. Each call's top-k backend is chosen once
-    (:func:`_deepgemm_logits_topk`). Calls of more rows than one DeepGEMM call or one TE
-    MXFP8 cast of Q takes (:func:`_deepgemm_row_chunks`, never reached by the 4096 or 16384
-    rows per rank of 128K CP32 or 1M CP64 calls) are quantized, scored and selected in row
-    chunks; rows are independent in all three, so only the outputs are copied together. K is
-    quantized once for all chunks.
+    (:func:`_deepgemm_logits_topk`). Query rows are quantized, scored, and selected in slabs
+    within the configured score budget and the TE and DeepGEMM kernel limits. Only the
+    selected outputs survive each slab. K is quantized once for all query slabs.
 
     Returns global top-k indices ``(1, sq, min(topk_k, max_score_k))`` and, when
     ``return_topk_scores``, the selected BF16 logits in the same slots (both unpadded).
@@ -2247,7 +2256,9 @@ def _indexer_topk_packed_thd_deepgemm(
         if not return_topk_scores:
             return every_key_indices, None
 
-    chunks = _deepgemm_row_chunks(sq, q_bshd.size(2))
+    chunks = _deepgemm_row_chunks(
+        sq, q_bshd.size(2), score_width=width, scratch_bytes=scorer_options.topk_scratch_bytes
+    )
     k_fp8, k_scale = _deepgemm_quantized_k(k_bshd)
     w = w_bsh[0].contiguous()
     local_indices: Optional[Tensor] = None
