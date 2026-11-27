@@ -499,6 +499,7 @@ trained indexer, seven-depth MTP objective and distributed Muon enabled.
 | Variant | Updates | MoK macrobatch | Checkpointed visits on each stage |
 | --- | ---: | ---: | --- |
 | `4k_mok16k_recompute` | 32 | 16,384 | Prelude, first core visit, coda |
+| `64k_mok40k_stage_tuned` | 32 | 40,960 | Varies per PP stage (see below) |
 | `64k_mok40k_recompute` | 32 | 40,960 | Prelude, first core visit, coda |
 | `64k_mok16k` | 16 | 16,384 | Prelude |
 | `128k_mok16k_recompute` | 32 | 16,384 | Prelude, both core visits, coda |
@@ -508,3 +509,8 @@ Pass the variant to the same launcher, for example
 and updates 13–16 for the shorter `64k_mok16k` run. The matched frozen-indexer
 control uses `--variant 64k_mok16k_frozen_indexer`. It keeps first-pass top-k
 selection and sets the indexer training loss coefficient to zero.
+
+The stage-tuned variant uses
+`Cnnn/CCnn/CCnC/CCnn/CCnn/Cnnn/CCnC` in PP rank order.
+The four positions correspond to prelude, first core visit, second core
+visit and coda. `C` checkpoints a visit and `n` retains its activations.

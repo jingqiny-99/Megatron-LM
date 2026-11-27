@@ -250,6 +250,8 @@ ARGS:
   dsa_indexer_reuse_checkpoint_topk: null
   no_overlap_p2p_communication: true
 VARIANTS:
+  64k_mok40k_stage_tuned:
+    loop_ring_recompute_plan: Cnnn/CCnn/CCnC/CCnn/CCnn/Cnnn/CCnC
   64k_mok40k_recompute:
     loop_ring_recompute_plan: &checkpoint_pre_core_coda CCnC/CCnC/CCnC/CCnC/CCnC/CCnC/CCnC
   64k_mok16k: &source_64k_mok16k
