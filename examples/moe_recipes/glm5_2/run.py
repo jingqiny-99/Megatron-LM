@@ -86,7 +86,14 @@ def main() -> None:
             parser.error('This recipe does not score the DSA indexer with DeepGEMM.')
         command = [sys.executable, '-c', _PREWARM_DEEPGEMM, str(arguments['dsa_indexer_n_heads'])]
     else:
-        command = [sys.executable, str(root / 'pretrain_gpt.py'), *_arguments(arguments)]
+        entrypoint = recipe.get('ENTRYPOINT', 'pretrain_gpt.py')
+        if entrypoint not in {'pretrain_gpt.py', 'pretrain_hybrid.py'}:
+            parser.error(f'Unsupported training entry point {entrypoint!r}.')
+        command = [sys.executable, str(root / entrypoint), *_arguments(arguments)]
+        if entrypoint == 'pretrain_hybrid.py' and (project := os.environ.get('WANDB_PROJECT')):
+            command.extend(['--wandb-project', project])
+            name = os.environ.get('WANDB_NAME', options.recipe.stem)
+            command.extend(['--wandb-exp-name', name])
 
     if options.dry_run:
         exports = [f'{name}={value}' for name, value in overrides.items()]

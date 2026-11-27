@@ -167,3 +167,79 @@ class TestParallelMLPWithGLU:
         with caplog.at_level(logging.WARNING):
             fc1_factory.merge_fn(loaded_state_dict)
             assert "CUDA OutOfMemoryError encountered during tensors merging" in caplog.text
+
+
+@pytest.mark.parametrize("singleton", [False, True])
+@pytest.mark.parametrize("tp_size,gtp_size,half,rows", [(2, 4, 8, 4), (2, 3, 6, 4), (2, 4, 3, 4)])
+def test_gtp_swiglu_checkpoint_rows(tp_size, gtp_size, half, rows, singleton):
+    """Every canonical row is written once; each physical shard restores only its own W/V."""
+    width = 3
+    full = torch.arange(2 * tp_size * half * width).view(-1, width)
+    gate, up = full.chunk(2)
+    expected = {"fc1_w": gate, "fc1_v": up} if singleton else {"fc1": full}
+    restored = {k: torch.full_like(v, -1) for k, v in expected.items()}
+    counts = {k: torch.zeros_like(v) for k, v in expected.items()}
+    for tp in range(tp_size):
+        logical = torch.cat([gate.chunk(tp_size)[tp], up.chunk(tp_size)[tp]])
+        physical = torch.zeros(gtp_size * rows, width, dtype=full.dtype)
+        physical[: logical.shape[0]] = logical
+        for gtp, local in enumerate(physical.chunk(gtp_size)):
+            offsets = ((0, 1, 3),)
+            entry = ShardedTensor.from_rank_offsets(
+                "fc1",
+                local,
+                *offsets,
+                (1, tp * gtp_size + gtp, tp_size * gtp_size),
+                prepend_axis_num=1,
+            )
+            entry.gtp_size = gtp_size
+            entry.gtp_pad_length = gtp_size * rows - 2 * half
+            factory = apply_swiglu_sharded_factory(entry, offsets, singleton)
+            loaded = []
+            for piece in factory.build():
+                start = piece.global_offset[1]
+                end = start + piece.data.shape[0]
+                assert piece.global_offset[0] == 1
+                assert piece.global_shape == (3, *expected[piece.key].shape)
+                restored[piece.key][start:end].copy_(piece.data)
+                counts[piece.key][start:end] += 1
+                loaded.append(expected[piece.key][start:end].clone())
+            torch.testing.assert_close(factory.merge_fn(loaded), local, rtol=0, atol=0)
+    for key in expected:
+        assert counts[key].eq(1).all()
+        torch.testing.assert_close(restored[key], expected[key], rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("half", [4, 3, 1])
+def test_gtp_swiglu_torch_dist_roundtrip(tmp_path_dist_ckpt, half):
+    """DP -> contiguous GTP weight -> DP using the real distributed checkpoint backend."""
+    Utils.initialize_model_parallel(1, 1)
+    try:
+        rank, size = Utils.rank, Utils.world_size
+        dense = torch.arange(4 * half, device="cuda").reshape(2 * half, 2)
+        rows = (2 * half + size - 1) // size
+        pad = size * rows - 2 * half
+        physical = torch.cat([dense, dense.new_zeros((pad, 2))])
+        local = physical.chunk(size)[rank]
+        with (
+            TempNamedDir(tmp_path_dist_ckpt / "swiglu_dp") as dp_dir,
+            TempNamedDir(tmp_path_dist_ckpt / "swiglu_gtp") as gtp_dir,
+        ):
+
+            def plain(tensor):
+                return {"fc1": ShardedTensor.from_rank_offsets("fc1", tensor, replica_id=rank)}
+
+            def sharded(tensor):
+                entry = ShardedTensor.from_rank_offsets("fc1", tensor, (0, rank, size))
+                entry.gtp_size = size
+                entry.gtp_pad_length = pad
+                return {"fc1": apply_swiglu_sharded_factory(entry, ())}
+
+            save(plain(dense), dp_dir)
+            from_dp = load(sharded(torch.empty_like(local)), dp_dir)["fc1"]
+            torch.testing.assert_close(from_dp, local, rtol=0, atol=0)
+            save(sharded(from_dp), gtp_dir)
+            from_gtp = load(plain(torch.empty_like(dense)), gtp_dir)["fc1"]
+            torch.testing.assert_close(from_gtp, dense, rtol=0, atol=0)
+    finally:
+        Utils.destroy_model_parallel()

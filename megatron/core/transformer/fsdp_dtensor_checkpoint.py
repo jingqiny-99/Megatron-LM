@@ -51,12 +51,76 @@ from megatron.core.transformer.transformer_layer import TransformerLayer
 from megatron.core.utils import get_attr_wrapped_model
 
 
+def add_empty_shard_state(param_to_fqn, state_by_fqn):
+    """Add checkpoint-only moment tensors for empty shards omitted by the optimizer.
+
+    Uneven-DTensor preprocessing needs matching state keys on every rank of
+    a parameter's mesh. Gather the keys within each dense or expert-DP mesh.
+    """
+    local_keys = {
+        fqn: {key: value.dtype for key, value in state.items() if isinstance(value, DTensor)}
+        for fqn, state in state_by_fqn.items()
+    }
+    parameters_by_mesh = {}
+    for param in param_to_fqn:
+        if isinstance(param, DTensor):
+            parameters_by_mesh.setdefault(param.device_mesh, []).append(param)
+
+    # Keep collectives on overlapping dense and expert-DP meshes in a common order.
+    for mesh in sorted(
+        parameters_by_mesh, key=lambda mesh: (tuple(mesh.mesh.flatten().tolist()), mesh.shape)
+    ):
+        parameters = parameters_by_mesh[mesh]
+        fqns = {param_to_fqn[param] for param in parameters}
+        mesh_keys = {fqn: local_keys[fqn] for fqn in fqns if fqn in local_keys}
+        sharded_dims = sorted(
+            {
+                axis
+                for param in parameters
+                for axis, placement in enumerate(param.placements)
+                if isinstance(placement, Shard) and mesh.size(axis) > 1
+            }
+        )
+        for axis in sharded_dims:
+            group = mesh.get_group(axis)
+            gathered = [None] * torch.distributed.get_world_size(group)
+            torch.distributed.all_gather_object(gathered, mesh_keys, group=group)
+            mesh_keys = {fqn: keys for rank in gathered for fqn, keys in rank.items()}
+        for param in parameters:
+            fqn = param_to_fqn[param]
+            if fqn not in state_by_fqn and fqn in mesh_keys:
+                local = param.to_local()
+                if local.numel():
+                    raise ValueError(f"Missing optimizer state for nonempty shard {fqn}")
+                state_by_fqn[fqn] = {
+                    key: DTensor.from_local(
+                        local.new_empty(local.shape, dtype=dtype),
+                        param.device_mesh,
+                        param.placements,
+                        run_check=False,
+                        shape=param.shape,
+                        stride=param.stride(),
+                    )
+                    for key, dtype in mesh_keys[fqn].items()
+                }
+
 def _strip_wrapper_prefixes(path):
     """Strip DDP/FSDP wrapper prefixes (module., model.) from a module or state dict path."""
     parts = path.split('.')
     while parts and parts[0] in ('module', 'model'):
         parts = parts[1:]
     return '.'.join(parts)
+
+
+def _split_optimizer_state_keys(param_state):
+    """The per-element optimizer state of a fused parameter that its handler splits with it:
+    Adam's moments and, when present, ``master_param`` (the fp32 host master that the
+    CPU-offloaded ``HybridDeviceOptimizer`` keeps for a lower-precision parameter). A key left
+    unsplit would be saved with the fused layout under every section's key."""
+    keys = ["exp_avg", "exp_avg_sq"]
+    if "master_param" in param_state:
+        keys.append("master_param")
+    return keys
 
 
 def _intersect_slice(s1, s2):
@@ -402,7 +466,7 @@ def handle_swiglu_in_state_dict(model, model_state_dict, optimizer_state_dict):
                     continue
                 new_opt_state_dict[f"{key}_w"] = opt_state_dict[key].copy()
                 new_opt_state_dict[f"{key}_v"] = opt_state_dict[key].copy()
-                for subkey in ["exp_avg", "exp_avg_sq"]:
+                for subkey in _split_optimizer_state_keys(opt_state_dict[key]):
                     dist_param = model.get_parameter(
                         expert_param_local_key(key[len("module.") :], num_experts)
                     )
@@ -649,7 +713,7 @@ def handle_gdn_in_state_dict(
                     continue
                 for sub_name in names:
                     new_opt_state[f"{key}.{sub_name}"] = opt_state[key].copy()
-                for subkey in ["exp_avg", "exp_avg_sq"]:
+                for subkey in _split_optimizer_state_keys(opt_state[key]):
                     dist_param = model.get_parameter(key[len("module.") :])
                     sub_tensors = split_gdn_fused(opt_state[key][subkey], dist_param, sizes, dim)
                     for sub_name, tensor in zip(names, sub_tensors):
@@ -872,7 +936,7 @@ def handle_mla_down_proj_in_state_dict(model, model_state_dict, optimizer_state_
             for new_key in new_keys:
                 new_optimizer_state[new_key] = optimizer_state[key].copy()
             dist_param = model.get_parameter(key[len("module.") :])
-            for subkey in ["exp_avg", "exp_avg_sq"]:
+            for subkey in _split_optimizer_state_keys(optimizer_state[key]):
                 sections = split_fused_fsdp_param(
                     optimizer_state[key][subkey], dist_param, split_sizes
                 )

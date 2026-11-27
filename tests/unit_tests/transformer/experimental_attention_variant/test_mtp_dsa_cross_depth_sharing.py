@@ -1147,7 +1147,7 @@ def test_mtp_block_preserves_legacy_layer_signature_when_sharing_is_disabled(sha
 def test_cross_depth_sharing_rejects_hybrid_mtp_pattern():
     config = _make_config()
 
-    with pytest.raises(ValueError, match="GPT MTP path only"):
+    with pytest.raises(ValueError, match="Hybrid repeated MTP sharing requires a /DE depth"):
         MultiTokenPredictionLayer(
             config=config,
             submodules=SimpleNamespace(mtp_model_layer=None),
@@ -1159,7 +1159,7 @@ def test_cross_depth_sharing_rejects_hybrid_mtp_pattern():
 def test_cross_depth_sharing_rejects_hybrid_mtp_config_list():
     config = _make_config()
 
-    with pytest.raises(ValueError, match="GPT MTP path only, not hybrid MTP layers"):
+    with pytest.raises(ValueError, match="Hybrid repeated MTP sharing requires a /DE depth"):
         MultiTokenPredictionLayer(
             config=config,
             submodules=SimpleNamespace(mtp_model_layer=None),

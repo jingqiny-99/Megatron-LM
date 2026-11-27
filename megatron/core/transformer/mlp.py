@@ -489,6 +489,87 @@ class MLP(MegatronModule):
         )
 
 
+def _gtp_swiglu_sharded_factory(entry, singleton_local_shards):
+    """Map contiguous GTP slices of TP-local [W_tp; V_tp] into global [W; V]."""
+    axis = entry.prepend_axis_num
+    rows = entry.local_shape[0]
+    gtp_size = entry.gtp_size
+    tp_size = entry.axis_fragmentations[axis] // gtp_size
+    tp_rank, gtp_rank = divmod(entry.global_offset[axis] // rows, gtp_size)
+    logical_rows = rows * gtp_size - entry.gtp_pad_length
+    if logical_rows % 2:
+        raise ValueError(f"{entry.key}: SwiGLU FC1 requires equally sized gate and up halves")
+    half = logical_rows // 2
+    start = gtp_rank * rows
+    valid_rows = max(0, min(rows, logical_rows - start))
+    regular = entry.gtp_pad_length == 0 and half % rows == 0
+
+    @torch.no_grad()
+    def build(key, t, replica_id, flattened_range):
+        if flattened_range is not None:
+            raise ValueError(f"{key}: ShardedTensor.flattened_range is not supported")
+        shape = list(entry.global_shape)
+        shape[axis] = tp_size * half * (1 if singleton_local_shards else 2)
+        pieces = []
+        for part, suffix in enumerate(("_w", "_v")):
+            first = max(start, part * half)
+            last = min(start + valid_rows, (part + 1) * half)
+            if first >= last:
+                continue
+            view = t.narrow(0, first - start, last - first)
+            offset = list(entry.global_offset)
+            offset[axis] = tp_rank * half + first - part * half
+            if not singleton_local_shards:
+                offset[axis] += part * tp_size * half
+            fragments = None
+            if regular:
+                fragments = list(entry.axis_fragmentations)
+                fragments[axis] = shape[axis] // rows
+                fragments = tuple(fragments)
+            pieces.append(
+                ShardedTensor(
+                    key + suffix if singleton_local_shards else key,
+                    view,
+                    view.dtype,
+                    tuple(view.shape),
+                    tuple(shape),
+                    tuple(offset),
+                    fragments,
+                    replica_id=replica_id,
+                    prepend_axis_num=axis,
+                )
+            )
+        if not pieces:
+            # An alignment-only rank participates in load, but owns no checkpoint rows.
+            view = t[:0]
+            offset = list(entry.global_offset)
+            offset[axis] = shape[axis]
+            pieces.append(
+                ShardedTensor(
+                    key + "_v" if singleton_local_shards else key,
+                    view,
+                    view.dtype,
+                    tuple(view.shape),
+                    tuple(shape),
+                    tuple(offset),
+                    None,
+                    replica_id=1,
+                    prepend_axis_num=axis,
+                )
+            )
+        return pieces
+
+    @torch.no_grad()
+    def merge(pieces):
+        if valid_rows == rows and len(pieces) == 1:
+            return pieces[0]
+        if valid_rows < rows:
+            pieces = [*pieces, pieces[0].new_zeros((rows - valid_rows, *entry.local_shape[1:]))]
+        return cat_with_oom_fallback(pieces)
+
+    return ShardedTensorFactory(entry.key, entry.data, build, merge, entry.replica_id)
+
+
 # pylint: disable=missing-function-docstring
 def apply_swiglu_sharded_factory(
     original_sh_ten,
@@ -497,6 +578,9 @@ def apply_swiglu_sharded_factory(
     tp_group: torch.distributed.ProcessGroup | None = None,
     dp_group: torch.distributed.ProcessGroup | None = None,
 ):
+    if getattr(original_sh_ten, "gtp_size", 1) > 1:
+        return _gtp_swiglu_sharded_factory(original_sh_ten, singleton_local_shards)
+
     # We must split the tensor into 2 parts, each sharded separately.
     # This requires a ShardedTensorFactory which `chunk`s during saving
     # and `cat`s during loading

@@ -2718,6 +2718,7 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
         # Runtime groups belong to MCore layout conversion and CP binding, not TE's forward API.
         self.kept_packed_seq_params.difference_update({"cp_group", "local_cp_size", "tp_cp_group"})
         self.kept_packed_seq_params.discard("zigzag_cp_min_chunk_size")
+        self.kept_packed_seq_params.discard("rotary_position_ids")
 
         if get_te_version() < PkgVersion("2.2.0"):
             self.kept_packed_seq_params.discard("pad_between_seqs")

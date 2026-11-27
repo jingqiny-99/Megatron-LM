@@ -16,7 +16,7 @@ from megatron.rank_log_setup import suppress_duplicate_logs_off_rank0
 suppress_duplicate_logs_off_rank0()
 
 from functools import lru_cache, partial
-from typing import Optional
+from typing import Any, Optional
 
 import torch
 
@@ -30,6 +30,12 @@ from megatron.core.package_info import __version__ as mcore_version
 from megatron.core.parallel_state import get_context_parallel_group
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.rerun_state_machine import get_rerun_state_machine
+from megatron.core.transformer.loop.reporting import loop_metric_report
+from megatron.core.transformer.loop.rsbf_executor import (
+    RSBF_BATCH_FUNC_ATTR,
+    RSBF_LOSS_VALIDATOR_ATTR,
+    LoopMicrobatch,
+)
 from megatron.core.transformer.multi_token_prediction import (
     mtp_on_this_rank as mtp_on_this_rank_func,
 )
@@ -55,7 +61,7 @@ from megatron.training.argument_utils import (  # noqa: F401  (core_gpt_dataset_
     hybrid_config_from_args,
     pretrain_cfg_container_from_args,
 )
-from megatron.training.arguments import parse_and_validate_args
+from megatron.training.arguments import check_sbhd_packing_indexer_loss, parse_and_validate_args
 from megatron.training.datasets.providers import build_gpt_datasets, is_dataset_built_on_rank
 from megatron.training.global_vars import get_run_config, set_run_config
 from megatron.training.training import (
@@ -96,6 +102,15 @@ BATCH_KEYS = [
     "position_ids",
     "tokens",
 ]
+
+
+def _needs_padding_mask(args) -> bool:
+    """Whether every batch carries a batch-first padding mask on every PP stage: the varlen
+    SBHD validation path and SBHD document packing (row-tail padding)."""
+    return (
+        getattr(args, "use_varlen_dataset", False)
+        and getattr(args, "varlen_sbhd_validation", False)
+    ) or getattr(args, "sbhd_document_packing", False)
 
 
 def get_batch(data_iterator, vp_stage=None, pg_collection: Optional[ProcessGroupCollection] = None):
@@ -151,9 +166,7 @@ def get_batch(data_iterator, vp_stage=None, pg_collection: Optional[ProcessGroup
     # and dev's tests/unit_tests/data/test_get_batch.py::
     # test_hybrid_sbhd_validation_broadcasts_padding_mask_on_all_pp_stages still asserts
     # the behaviour, so the caller was the only side that lost it.
-    needs_padding_mask = getattr(args, "use_varlen_dataset", False) and getattr(
-        args, "varlen_sbhd_validation", False
-    )
+    needs_padding_mask = _needs_padding_mask(args)
     # Use the caller's pipeline group when it is given, so a model on its own grid places MTP by
     # the same group the model uses (GPTModel/HybridModel read pg_collection.pp).
     pp_group = pg_collection.pp if pg_collection is not None else None
@@ -283,43 +296,14 @@ def _build_cached_logits_loss_func(
     )
 
 
-def loss_func(
-    loss_mask: torch.Tensor, output_tensor: torch.Tensor, model: Optional[HybridModel] = None
-):
-    """Loss function.
+def validate_loss(loss: torch.Tensor) -> None:
+    """The rerun-state-machine checks of a local loss: NaN and Inf (fatal, with
+    ``check_for_nan_in_loss_and_grad``) and spiky loss (non-fatal, with ``check_for_spiky_loss``).
 
-    Args:
-        loss_mask (torch.Tensor): Used to mask out some portions of the loss
-        output_tensor (torch.Tensor): The tensor with the losses
-
-    Returns:
-        the loss scalar for this micro-batch
-        the number of non-padded tokens in this microbatch
-        a dict containing reporting metrics on the loss and number of tokens across
-            the data parallel ranks
+    ``loss_func`` runs them per microbatch; the loop RSBF schedule runs them once per step on
+    the step's summed loss divided by its microbatch count (the mean per-microbatch sum, a
+    host tensor, so the checks add no device sync).
     """
-    args = get_args()
-    if args.logits_load_dir is not None:
-        # Offline knowledge distillation loss using cached teacher log-probabilities.
-        loss_func_cached_logits = _build_cached_logits_loss_func(
-            logprobs_dir=args.logits_load_dir,
-            decode_threads=args.logits_load_decode_threads,
-            msc_prefetch_depth=args.logits_load_msc_prefetch_depth,
-            kd_loss_alpha=args.logits_load_kd_loss_alpha,
-            ignore_errors=args.logits_load_ignore_errors,
-            ignore_hash=args.logits_load_ignore_hash,
-        )
-        loss, num_tokens, report = loss_func_cached_logits(loss_mask, output_tensor, model=model)
-    elif has_nvidia_modelopt and getattr(args, 'modelopt_enabled', False):  # [ModelOpt]
-        loss, num_tokens, report = loss_func_modelopt(loss_mask, output_tensor, model=model)
-    else:
-        losses = output_tensor.view(-1).float()
-        loss_mask = loss_mask.view(-1).float()
-        loss = torch.sum(losses * loss_mask)
-
-        num_tokens = loss_mask.sum().clone().detach().to(torch.int)
-        report = {'lm loss': torch.cat([loss.clone().detach().view(1), num_tokens.view(1)])}
-
     # Check individual rank losses are not NaN prior to DP all-reduce.
     rerun_state_machine = get_rerun_state_machine()
     cfg = get_run_config()
@@ -352,6 +336,78 @@ def loss_func(
             fatal=False,
         )
 
+
+def loss_func(
+    loss_mask: torch.Tensor,
+    output_tensor: torch.Tensor,
+    model: Optional[HybridModel] = None,
+    loop_losses=None,
+    loop_metrics=None,
+    validate: bool = True,
+    loop_metric_populations=None,
+):
+    """Loss function.
+
+    Args:
+        loss_mask (torch.Tensor): Used to mask out some portions of the loss
+        output_tensor (torch.Tensor): The tensor with the losses
+        model (HybridModel, optional): The model (can be wrapped)
+        loop_losses (dict, optional): Auxiliary losses of a loop decoder for this microbatch
+            (MoR router losses), added per token.
+        loop_metrics (dict, optional): Loop decoder metrics for this microbatch (depth,
+            token layers, FLOPs per token), each reported as ``[value summed over its
+            population, population size]`` (``megatron/core/transformer/loop/reporting.py``),
+            so the logged value is the per-token mean in the eager and RSBF schedules alike.
+        validate (bool): Run the rerun-state-machine checks (NaN / Inf / spiky loss,
+            ``validate_loss``) on this loss. The loop RSBF schedule passes False and validates
+            the step once instead (no host sync per sample; see ``validate_loss``).
+        loop_metric_populations (dict, optional): The loop decoder's population size of each
+            metric not defined over the issued tokens (MoR metrics: valid tokens).
+
+    Returns:
+        the loss scalar for this micro-batch
+        the number of non-padded tokens in this microbatch
+        a dict containing reporting metrics on the loss and number of tokens across
+            the data parallel ranks
+    """
+    args = get_args()
+    if args.logits_load_dir is not None:
+        # Offline knowledge distillation loss using cached teacher log-probabilities.
+        loss_func_cached_logits = _build_cached_logits_loss_func(
+            logprobs_dir=args.logits_load_dir,
+            decode_threads=args.logits_load_decode_threads,
+            msc_prefetch_depth=args.logits_load_msc_prefetch_depth,
+            kd_loss_alpha=args.logits_load_kd_loss_alpha,
+            ignore_errors=args.logits_load_ignore_errors,
+            ignore_hash=args.logits_load_ignore_hash,
+        )
+        loss, num_tokens, report = loss_func_cached_logits(loss_mask, output_tensor, model=model)
+    elif has_nvidia_modelopt and getattr(args, 'modelopt_enabled', False):  # [ModelOpt]
+        loss, num_tokens, report = loss_func_modelopt(loss_mask, output_tensor, model=model)
+    else:
+        losses = output_tensor.view(-1).float()
+        loss_mask = loss_mask.view(-1).float()
+        loss = torch.sum(losses * loss_mask)
+
+        num_tokens = loss_mask.sum().clone().detach().to(torch.int)
+        report = {'lm loss': torch.cat([loss.clone().detach().view(1), num_tokens.view(1)])}
+
+    # Capture these tensors with the forward's loss closure, so another
+    # microbatch cannot overwrite its depth-router objective.
+    for name, auxiliary in (loop_losses or {}).items():
+        loss = loss + num_tokens * auxiliary
+        report[name] = torch.stack((auxiliary.detach() * num_tokens, num_tokens))
+    # Loop metrics: [value summed over the metric's population, population size] (the
+    # per-token loss tensor has one element per issued token).
+    report.update(
+        loop_metric_report(
+            loop_metrics, issued_tokens=output_tensor.numel(), populations=loop_metric_populations
+        )
+    )
+
+    if validate:
+        validate_loss(loss)
+
     return loss, num_tokens, report
 
 
@@ -362,6 +418,7 @@ def forward_step(data_iterator, model: HybridModel):
         data_iterator : Input data iterator
         model (HybridModel): The Hybrid Model
     """
+    args = get_args()
     timers = get_timers()
 
     # Get the batch.
@@ -433,7 +490,102 @@ def forward_step(data_iterator, model: HybridModel):
         )
 
     # [ModelOpt]: model is needed to access ModelOpt distillation losses
-    return output_tensor, partial(loss_func, loss_mask, model=model)
+    decoder = _loop_metrics_decoder(model, args)
+    return output_tensor, partial(
+        loss_func,
+        loss_mask,
+        model=model,
+        loop_losses=getattr(decoder, "loop_losses", None),
+        loop_metrics=getattr(decoder, "loop_metrics", None),
+        loop_metric_populations=getattr(decoder, "loop_metric_populations", None),
+    )
+
+
+def _loop_metrics_decoder(model, args):
+    """The decoder whose ``loop_losses`` / ``loop_metrics`` / ``loop_metric_populations`` the
+    loss function reads: a loop decoder, or a non-loop decoder with
+    ``--loop-carrier-diagnostics-segments`` (its boundary hooks fill ``loop_metrics``,
+    megatron/training/loop_diagnostics.py); None otherwise."""
+    if (
+        getattr(args, "loop_architecture", "none") != "none"
+        or getattr(args, "loop_carrier_diagnostics_segments", None) is not None
+    ):
+        return get_attr_wrapped_model(model, "decoder")
+    return None
+
+
+def loop_rsbf_batch(data_iterator, model: HybridModel) -> LoopMicrobatch:
+    """One microbatch for the loop RSBF schedule (``loop_schedule='rsbf'``): the batch of
+    ``forward_step`` without the model call.
+
+    The schedule runs the model as per-sample cells and calls the returned ``loss_func`` once
+    per sample with that sample's ``loss_mask`` and per-token loss. The loss function does not
+    validate (no host sync per sample); the schedule runs ``validate_loss`` once per step on
+    the mean per-microbatch loss sum (``forward_step.loop_rsbf_validate_loss``).
+
+    Args:
+        data_iterator: Input data iterator
+        model (HybridModel): The Hybrid Model (can be wrapped)
+    """
+    args = get_args()
+    timers = get_timers()
+    if getattr(args, "logits_load_dir", None) is not None:
+        # The cached-logit reader pairs logits with microbatches by call order; RSBF calls the
+        # loss function per sample in backward-item order.
+        raise ValueError("loop_schedule='rsbf' does not support --logits-load-dir")
+    if has_nvidia_modelopt and getattr(args, "modelopt_enabled", False):
+        raise ValueError("loop_schedule='rsbf' does not support ModelOpt losses")
+
+    timers('batch-generator', log_level=2).start()
+    with stimer(bdata=True):
+        vp_stage = get_attr_wrapped_model(model, "vp_stage")
+        cp_batch = get_batch(data_iterator, vp_stage)
+        batch = cp_batch.get_batch()
+        if cp_batch.get_packed_seq_params() is not None or batch.get("cu_seqlens") is not None:
+            raise ValueError(
+                "loop_schedule='rsbf' does not support packed (THD) input; it runs SBHD rows"
+            )
+        microbatch = LoopMicrobatch(
+            tokens=batch.get("tokens"),
+            position_ids=batch.get("position_ids"),
+            labels=batch.get("labels"),
+            loss_mask=batch.get("loss_mask"),
+            attention_mask=batch.get("attention_mask"),
+            padding_mask=batch.get("padding_mask"),
+            # No loop_losses / loop_metrics: the schedule reports per-sample records.
+            loss_func=partial(loss_func, model=model, validate=False),
+            # The keys loss_func(validate=False) reports without cached logits / ModelOpt
+            # (both rejected above): a sample's loss record is packed by them across EUs.
+            report_keys=("lm loss",),
+        )
+    timers('batch-generator').stop()
+    return microbatch
+
+
+# The loop RSBF schedule's hooks (precedent: train_valid_test_datasets_provider.is_distributed):
+# the batch without the model call, and the once-per-step loss validation.
+setattr(forward_step, RSBF_BATCH_FUNC_ATTR, loop_rsbf_batch)
+setattr(forward_step, RSBF_LOSS_VALIDATOR_ATTR, validate_loss)
+
+
+def _check_sbhd_packing_model_config(args: Any) -> None:
+    """Backstop of the argument-time packing checks on the built model config (its resolved
+    attention variant, loop architecture, DSA kernel backend, recomputation and MTP depth):
+    with SBHD document packing no indexer loss may see the row-tail padding (a plain DSA
+    indexer loss, a loop-less DSv4 one outside the HybridStack row mask (full recompute, MTP,
+    CUDA graphs), or one on the fused kernels, which have no row mask)."""
+    if not getattr(args, "sbhd_document_packing", False):
+        return
+    config = get_run_config().model.transformer
+    check_sbhd_packing_indexer_loss(
+        config.experimental_attention_variant,
+        config.dsa_indexer_loss_coeff,
+        config.loop_architecture,
+        config.dsa_kernel_backend,
+        recompute_granularity=config.recompute_granularity,
+        mtp_num_layers=config.mtp_num_layers,
+        cuda_graph_impl=getattr(config, "cuda_graph_impl", None),
+    )
 
 
 def train_valid_test_datasets_provider(train_val_test_num_samples, vp_stage=None):
@@ -443,6 +595,7 @@ def train_valid_test_datasets_provider(train_val_test_num_samples, vp_stage=None
     ``pretrain_gpt.py`` and ``pretrain_hybrid_flex.py``, called with the shared rank
     predicate.
     """
+    _check_sbhd_packing_model_config(get_args())
     return build_gpt_datasets(
         train_val_test_num_samples, vp_stage, built_on_rank=is_dataset_built_on_rank
     )

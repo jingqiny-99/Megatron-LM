@@ -69,6 +69,16 @@ from megatron.training.argument_utils import (
 )
 from megatron.training.config import CheckpointConfig, PretrainConfigContainer, TokenizerConfig
 from megatron.training.global_vars import get_run_config, get_tokenizer, get_train_state
+from megatron.training.loop_checkpoint import (
+    LOOP_RESUME_KEY,
+    check_loop_load_format,
+    check_loop_optimizer_resharding,
+    check_loop_resume_state,
+    check_loop_save_format,
+    check_loop_sharded_state_dict,
+    loop_model_state_dicts,
+    loop_resume_state,
+)
 from megatron.training.utils.checkpoint_utils import (
     file_exists,
     get_checkpoint_train_state_filename,
@@ -888,6 +898,9 @@ def save_checkpoint(
             )
 
     ckpt_format = save_format if ckpt_type == CheckpointType.GLOBAL else 'torch'
+    # The loop parameter store's canonical shards are saved only by a global torch_dist
+    # checkpoint (argument validation refuses the other formats first; a no-op without a store).
+    check_loop_save_format(model, ckpt_format=ckpt_format, local=ckpt_type == CheckpointType.LOCAL)
     print_rank_0(
         f'[{datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")}] saving checkpoint '
         f'at iteration {iteration:7d} to {save_dir} in {ckpt_format} format'
@@ -1029,10 +1042,24 @@ def save_checkpoint(
                 save=save_root,
                 verify_integrity=verify_integrity,
             )
+        # Hybrid loop models: every parameter and persistent buffer has an entry (first save of
+        # the process; a no-op for other models).
+        check_loop_sharded_state_dict(
+            model,
+            when="save",
+            sharded_state_dict=loop_model_state_dicts(state_dict, model),
+            context=checkpointing_context,
+        )
 
         validate_glu_checkpoint_backend(args, ckpt_format=ckpt_format)
         state_dict = prepare_glu_checkpoint_for_save(state_dict, args)
         state_dict['num_floating_point_operations_so_far'] = num_floating_point_operations_so_far
+        # Hybrid loop models: the derived loop state of the checkpoint (common state; with the
+        # loop parameter store a collective over the world, reached by every rank of the
+        # torch_dist save). None for other models.
+        loop_resume = loop_resume_state(args, model, optimizer)
+        if loop_resume is not None:
+            state_dict[LOOP_RESUME_KEY] = loop_resume
         if ckpt_type == CheckpointType.GLOBAL and ckpt_format == 'torch_dist':
             if not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0:
                 # TODO Handle non-empty directories (e.g., after a crash during saving).
@@ -3124,6 +3151,17 @@ def load_checkpoint(
         and 'args' in state_dict
     ):
         ckpt_args = state_dict.get('args') or types.SimpleNamespace()
+        if restore_training_state and not args.finetune:
+            # The RSBF loop planner's Adam to Grace must match the saved optimizer state's
+            # layout (checked before the optimizer state dict is built for loading).
+            from megatron.training.loop_rsbf_planning import check_resume_offload
+
+            check_resume_offload(args, ckpt_args)
+            # Hybrid loop models: numerics-relevant loop argument / role / pattern / plan
+            # changes stop the resume (a no-op for other models).
+            check_loop_resume_state(
+                args, model, state_dict, restore_training_state=restore_training_state
+            )
 
     # What the checkpoint holds, read before the load template is built: the saved checkpoint
     # section when the checkpoint has one, the saved arguments otherwise.
@@ -3155,6 +3193,10 @@ def load_checkpoint(
         else (None, False)
     )
     gpt_compat_load_optim = gpt_compat_load_optim and not release and restore_training_state
+    if gpt_compat_layer_maps is not None:
+        # Message 11 before the maps rewrite the store's row-shard factories (a no-op without a
+        # loop parameter store).
+        check_loop_load_format(model, ckpt_format=ckpt_format, load_optim=False, gpt_compat=True)
 
     def validate_glu_layout(checkpoint_state, is_release):
         validate_glu_checkpoint_backend(
@@ -3303,6 +3345,15 @@ def load_checkpoint(
                         f' {sharded_sd_metadata["distrib_optim_sharding_type"]}.'
                         f' Please use `--ckpt-fully-parallel-save` flag during checkpoint saving.'
                     )
+                # The loop parameter store: a bucket-space optimizer state must have this
+                # run's bucket layout (a no-op without a store).
+                check_loop_optimizer_resharding(
+                    args,
+                    model,
+                    optimizer,
+                    state_dict.get(LOOP_RESUME_KEY),
+                    sharded_sd_metadata['distrib_optim_sharding_type'],
+                )
 
                 # Check if fully parallel load is compatible with sharding type
                 if (
@@ -3398,6 +3449,13 @@ def load_checkpoint(
                 rerun_state=gen_sd_rerun_state,
                 ckpt_format=load_format,
             )
+        # Hybrid loop models: a template entry missing here would be hidden by the strict=False
+        # retry of the model load below (a no-op for other models).
+        check_loop_sharded_state_dict(
+            model,
+            when="load",
+            sharded_state_dict=loop_model_state_dicts(load_kwargs['sharded_state_dict'], model),
+        )
 
         if gpt_compat_layer_maps is not None:
             from megatron.core.dist_checkpointing.gpt_checkpoint_interop import (
@@ -3539,6 +3597,17 @@ def load_checkpoint(
         # Iteration and num_floating_point_operations_so_far default to 0.
         return 0, 0
 
+    # The loop parameter store loads torch_dist checkpoints, and the weights only of a legacy
+    # one (a no-op without a store).
+    check_loop_load_format(
+        model,
+        ckpt_format=ckpt_format,
+        load_optim=bool(
+            restore_training_state and not release and not args.finetune and not args.no_load_optim
+        ),
+        gpt_compat=gpt_compat_layer_maps is not None,
+    )
+
     # Legacy checkpoints are first read here. Convert the state dict itself so
     # --load-main-params-from-ckpt observes the same rows as model.load_state_dict.
     if not checkpoint_config_read:
@@ -3609,6 +3678,14 @@ def load_checkpoint(
             check_training_state=restore_training_state,
             ckpt_format=load_format,
         )
+        if restore_training_state:
+            # Legacy formats read the args only here (before the optimizer state is loaded).
+            from megatron.training.loop_rsbf_planning import check_resume_offload
+
+            check_resume_offload(args, checkpoint_args)
+            check_loop_resume_state(
+                args, model, state_dict, restore_training_state=restore_training_state
+            )
 
     current_train_state = get_train_state()
     if restore_training_state and current_train_state is not None:

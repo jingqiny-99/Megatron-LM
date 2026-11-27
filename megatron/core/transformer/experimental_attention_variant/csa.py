@@ -63,9 +63,14 @@ from megatron.core.transformer.experimental_attention_variant.dsa import (
 from megatron.core.transformer.experimental_attention_variant.dsa_kernels import (
     use_fused_dsa_kernels,
 )
+from megatron.core.transformer.experimental_attention_variant.dsa_masking import (
+    indexer_loss_padding_mask_in_scope,
+    indexer_loss_query_valid_rows,
+)
 from megatron.core.transformer.experimental_attention_variant.dsv4_layer_config import (
     get_compact_indexer_workspace_registry,
 )
+from megatron.core.transformer.loop.cross_loop_kv import CrossLoopPass, current_cross_loop_pass
 from megatron.core.transformer.module import MegatronModule, mark_keep_in_fp32
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.transformer_config import TransformerConfig
@@ -2564,7 +2569,7 @@ class CompressedSparseAttention(MegatronModule):
         return workspace
 
     def _build_kv_full(
-        self, kv: torch.Tensor, x: torch.Tensor
+        self, kv: torch.Tensor, x: torch.Tensor, kv_scope: Optional[CrossLoopPass] = None
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], int]:
         """Concatenate original KV with compressed KV (if applicable).
 
@@ -2573,20 +2578,21 @@ class CompressedSparseAttention(MegatronModule):
             compressed_kv: [n_compressed, b, v_head_dim] or None.
             n_compressed:  number of compressed positions (0 when unused).
         """
-        if self.compressor is not None and self.compress_ratio > 1:
-            compressed_kv = self.compressor(x)
-            if compressed_kv is not None:
-                kv_full = torch.cat([kv, compressed_kv], dim=0)
-                n_compressed = compressed_kv.size(0)
-            else:
-                kv_full = kv
-                compressed_kv = None
-                n_compressed = 0
+        if self.compressor is None or self.compress_ratio <= 1:
+            return kv, None, 0
+        if kv_scope is not None and kv.size(0) < self.compress_ratio:
+            # No complete group in any pass of this microbatch.
+            return kv, None, 0
+        if kv_scope is not None and not kv_scope.is_source:
+            compressed_kv = kv_scope.read(self, "compressed_kv")
         else:
-            kv_full = kv
-            compressed_kv = None
-            n_compressed = 0
-        return kv_full, compressed_kv, n_compressed
+            compressed_kv = self.compressor(x)
+            if compressed_kv is None:
+                return kv, None, 0
+            if kv_scope is not None:
+                kv_scope.publish(self, "compressed_kv", compressed_kv)
+        # The local window always uses the current layer invocation's projected KV.
+        return torch.cat([kv, compressed_kv], dim=0), compressed_kv, compressed_kv.size(0)
 
     def _forward_unfused_csa(
         self,
@@ -2599,8 +2605,13 @@ class CompressedSparseAttention(MegatronModule):
         offset: int,
         window_idxs: torch.Tensor,
         packed_seq_params: Optional[PackedSeqParams],
+        query_valid_rows: Optional[torch.Tensor] = None,
+        index_scope: Optional[CrossLoopPass] = None,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         """PyTorch fallback path (no fused kernels).
+
+        ``query_valid_rows`` (``[b, sq]`` bool, None = every row) excludes the other query
+        rows from the indexer loss and its gradient (``indexer_loss_padding_mask``).
 
         Returns ``(output, indexer_loss)``.
         """
@@ -2609,7 +2620,10 @@ class CompressedSparseAttention(MegatronModule):
 
         if self.compress_ratio > 1 and n_compressed > 0:
             nvtx_range_push("compressed_indices")
-            if self.indexer is not None:
+            if self.indexer is not None and index_scope is not None and not index_scope.is_source:
+                selected = index_scope.read(self, "indices")
+                compress_topk_idxs = torch.where(selected >= 0, selected + offset, -1)
+            elif self.indexer is not None:
                 x_det = x.detach()
                 qr_det = qr.detach()
 
@@ -2646,7 +2660,7 @@ class CompressedSparseAttention(MegatronModule):
                         None,
                         None,
                         None,
-                        None,
+                        query_valid_rows,
                         self.config.calculate_per_token_loss,
                         True,
                         non_compressed_lse,
@@ -2666,9 +2680,13 @@ class CompressedSparseAttention(MegatronModule):
                     self.compress_ratio, sq, str(x.device)
                 )
                 valid = (topk_indices_compressed >= 0) & (topk_indices_compressed < n_valid_per_pos)
-                compress_topk_idxs = torch.where(
-                    valid, topk_indices_compressed + offset, torch.tensor(-1, device=x.device)
-                )
+                # A Python scalar, not torch.tensor(-1, device=...): the latter is a pageable
+                # host-to-device copy, which CUDA graph capture rejects.
+                compress_topk_idxs = torch.where(valid, topk_indices_compressed + offset, -1)
+                if index_scope is not None:
+                    # Native Top-K may select masked slots when a causal prefix is short.
+                    selected = torch.where(valid, topk_indices_compressed.int(), -1)
+                    index_scope.publish(self, "indices", selected)
             else:
                 compress_topk_idxs = get_compress_topk_idxs(
                     self.compress_ratio, b, sq, offset, query.device
@@ -2735,10 +2753,9 @@ class CompressedSparseAttention(MegatronModule):
         window_idxs: torch.Tensor,
         packed_seq_params: Optional[PackedSeqParams],
         out_rope: Optional[OutputRopeParams] = None,
+        index_scope: Optional[CrossLoopPass] = None,
     ) -> torch.Tensor:
         """Path C: separate indexer forward (no loss) + fused sparse attn (compact)."""
-        b = query.size(1)
-
         nvtx_range_push("compressed_indices")
         x_det = x.detach()
         qr_det = qr.detach()
@@ -2759,6 +2776,24 @@ class CompressedSparseAttention(MegatronModule):
             precision=self.config.dsa_indexer_precision,
             deterministic=self.config.deterministic_mode,
         )
+        if index_scope is not None:
+            index_scope.publish(self, "indices", topk_indices_cmp)
+        nvtx_range_pop("compressed_indices")
+        return self._forward_fused_selected_indices(
+            query, kv_full, offset, window_idxs, topk_indices_cmp, out_rope
+        )
+
+    def _forward_fused_selected_indices(
+        self,
+        query: torch.Tensor,
+        kv_full: torch.Tensor,
+        offset: int,
+        window_idxs: torch.Tensor,
+        topk_indices_cmp: torch.Tensor,
+        out_rope: Optional[OutputRopeParams] = None,
+    ) -> torch.Tensor:
+        """Attend to this pass's window plus the selected local compressed rows."""
+        nvtx_range_push("compressed_indices")
         compress_topk_idxs = torch.where(topk_indices_cmp >= 0, topk_indices_cmp + offset, -1)
         # Same lowering as ``FusedCSAIndexerSparseAttnFunc.forward`` (the
         # grad-enabled path): compressed ids, then window ids, globalized and
@@ -2766,7 +2801,7 @@ class CompressedSparseAttention(MegatronModule):
         # forward-only pass reproduces the training forward only if it hands
         # the kernel the same id sequence.
         flat_idxs, flat_tlen = build_flat_topk_idxs(
-            compress_topk_idxs, window_idxs, batch_size=b, compact=True
+            compress_topk_idxs, window_idxs, batch_size=query.size(1), compact=True
         )
         nvtx_range_pop("compressed_indices")
 
@@ -2796,6 +2831,7 @@ class CompressedSparseAttention(MegatronModule):
         window_idxs: torch.Tensor,
         packed_seq_params: Optional[PackedSeqParams],
         out_rope: Optional[OutputRopeParams] = None,
+        index_scope: Optional[CrossLoopPass] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Path B: fused indexer (with loss) + fused sparse attn.
 
@@ -2823,7 +2859,7 @@ class CompressedSparseAttention(MegatronModule):
         )
 
         nvtx_range_push("sparse_attn_kernel")
-        output, indexer_loss = fused_csa_indexer_sparse_attn(
+        result = fused_csa_indexer_sparse_attn(
             query,
             kv_full,
             self.attn_sink.float(),
@@ -2844,7 +2880,13 @@ class CompressedSparseAttention(MegatronModule):
             deterministic=self.config.deterministic_mode,
             cuda_graph=self.config.cuda_graph_impl != "none",
             out_rope=out_rope,
+            return_indices=index_scope is not None,
         )
+        if index_scope is not None:
+            output, indexer_loss, selected = result
+            index_scope.publish(self, "indices", selected)
+        else:
+            output, indexer_loss = result
         nvtx_range_pop("sparse_attn_kernel")
 
         if indexer_loss_coeff > 0:
@@ -2900,6 +2942,13 @@ class CompressedSparseAttention(MegatronModule):
                 "CompressedSparseAttention query head count must match the unsharded "
                 f"attention sink ({self.n_local_heads}), got {query.size(-2)}."
             )
+        loop_pass = current_cross_loop_pass()
+        if loop_pass is not None and is_thd:
+            raise ValueError("Cross-loop sparse KV and index reuse require SBHD attention.")
+        kv_scope = loop_pass if getattr(self.config, "loop_reuse_sparse_kv", False) else None
+        # A shared sparse bank keeps the producer's selected positions. Index-only
+        # reuse is also supported, with a freshly compressed bank on each pass.
+        index_scope = loop_pass if getattr(self.config, "loop_reuse_indexer", False) else kv_scope
         nvtx_range_push("compressed_sparse_attn")
 
         _orig_cp_group = self.pg_collection.cp
@@ -2929,7 +2978,7 @@ class CompressedSparseAttention(MegatronModule):
         sq, b, np, hn = query.size()
 
         kv = key.squeeze(-2)  # [sq, b, 1, v_head_dim] -> [sq, b, v_head_dim]
-        kv_full, compressed_kv, n_compressed = self._build_kv_full(kv, x)
+        kv_full, compressed_kv, n_compressed = self._build_kv_full(kv, x, kv_scope=kv_scope)
         offset = sq  # compressed indices start after original positions
         window_idxs = get_window_topk_idxs(self.window_size, b, sq, query.device)
 
@@ -2958,8 +3007,30 @@ class CompressedSparseAttention(MegatronModule):
                 offset,
                 window_idxs,
                 packed_seq_params,
+                # The padded rows of an enclosing loop stack (None outside one).
+                query_valid_rows=indexer_loss_query_valid_rows(b, sq, query.device),
+                index_scope=index_scope,
+            )
+        elif has_indexer_compressed and index_scope is not None and not index_scope.is_source:
+            output = self._forward_fused_selected_indices(
+                query,
+                kv_full,
+                offset,
+                window_idxs,
+                index_scope.read(self, "indices"),
+                fused_out_rope,
             )
         elif has_indexer_compressed and self.training and torch.is_grad_enabled():
+            if (self.config.dsa_indexer_loss_coeff or 0.0) > 0 and (
+                indexer_loss_padding_mask_in_scope() is not None
+            ):
+                # A host check on the scope (no device read): the fused SBHD kernel has no
+                # row mask, so padded rows would train the indexer.
+                raise NotImplementedError(
+                    "indexer-loss row mask on the fused SBHD CSA path (a padding mask is in "
+                    "scope, e.g. a loop stack with padded or exited rows); use "
+                    "dsa_kernel_backend='none' or no padding"
+                )
             output, indexer_loss = self._forward_fused_indexer_training(
                 query,
                 x,
@@ -2970,6 +3041,7 @@ class CompressedSparseAttention(MegatronModule):
                 window_idxs,
                 packed_seq_params,
                 out_rope=fused_out_rope,
+                index_scope=index_scope,
             )
         elif has_indexer_compressed:
             output = self._forward_fused_indexer_inference(
@@ -2982,6 +3054,7 @@ class CompressedSparseAttention(MegatronModule):
                 window_idxs,
                 packed_seq_params,
                 out_rope=fused_out_rope,
+                index_scope=index_scope,
             )
         else:
             output = self._forward_fused_no_indexer(

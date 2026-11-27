@@ -289,7 +289,12 @@ class GPTModel(LanguageModule, GraphableMegatronModule):
         self.rotary_pos_emb_cache = {}
 
         # Transformer.
-        self.decoder = TransformerBlock(
+        decoder_type = TransformerBlock
+        if self.config.loop_architecture != "none":
+            from megatron.core.transformer.loop_transformer_block import LoopTransformerBlock
+
+            decoder_type = LoopTransformerBlock
+        self.decoder = decoder_type(
             config=self.config,
             spec=transformer_layer_spec,
             pre_process=self.pre_process,
@@ -300,6 +305,8 @@ class GPTModel(LanguageModule, GraphableMegatronModule):
         )
         if hasattr(self, 'cudagraph_manager') and hasattr(self.decoder, 'cudagraph_manager'):
             del self.decoder.cudagraph_manager
+        if self.config.loop_architecture != "none":
+            self.decoder.loop_vocab_size = vocab_size
 
         if self.mtp_process:
             self.mtp = MultiTokenPredictionBlock(

@@ -1274,8 +1274,11 @@ def consume_vision_model_flops_stats(
     return (total_patches / dedup, attention_seqlen_squared_sum / dedup, merged_tokens / dedup)
 
 
-def _num_hybrid_dsa_indexer_layers(hybrid_layer_pattern, num_layers, skip_topk_offset, topk_freq):
-    """Count DSA indexer executions at actual main and nested-MTP layer numbers."""
+def _num_hybrid_dsa_indexer_layers(
+    hybrid_layer_pattern, num_layers, skip_topk_offset, topk_freq, main_layer_numbers=None
+):
+    """Count DSA indexer executions at actual main and nested-MTP layer numbers (the main
+    layers restricted to ``main_layer_numbers`` when given: ``loop_metric_layer_numbers``)."""
     from megatron.core.models.hybrid.hybrid_layer_allocation import Symbols, parse_hybrid_pattern
 
     parsed = parse_hybrid_pattern(hybrid_layer_pattern)
@@ -1289,6 +1292,7 @@ def _num_hybrid_dsa_indexer_layers(hybrid_layer_pattern, num_layers, skip_topk_o
     count = sum(
         is_indexer(layer_type, layer_number)
         for layer_number, layer_type in enumerate(main_pattern, start=1)
+        if main_layer_numbers is None or layer_number in main_layer_numbers
     )
     if parsed.mtp_pattern is not None:
         indexers_per_mtp_depth = sum(
@@ -1641,6 +1645,7 @@ def num_floating_point_operations(
     vision_seqlen_squared_sum_in_batch=None,
     vision_merged_tokens_in_batch=None,
     vision_args=None,
+    loop_flops_in_batch=None,
 ):
     """Compute the number of floating-point operations for one global batch.
 
@@ -1680,6 +1685,9 @@ def num_floating_point_operations(
             ``validate_vision_flops_metadata`` validated (``count_vision_model_flops``
             and the ``vision_*`` fields). ``None`` excludes the vision encoder.
     """
+    if loop_flops_in_batch is not None:
+        return loop_flops_in_batch
+
     from megatron.core.activations import situlu
     from megatron.training.vocab_utils import model_vocab_size
 
@@ -4212,6 +4220,15 @@ def get_model(
     if has_nvidia_modelopt:
         maybe_enable_modelopt(args, checkpoint=cfg.checkpoint)
 
+    # The loop parameter store (z > 1) uses the GTP-remat grid as a grid only: the model is
+    # built with the gtp axes of its collection nulled (no module attaches GTPShardedParam),
+    # the store is installed below before the DDP wrap, and DDP gets the full collection.
+    model_pg_collection = pg_collection
+    if getattr(args, "loop_param_store_shard_size", 1) > 1:
+        from megatron.training.loop_param_store_setup import loop_model_pg_collection
+
+        model_pg_collection = loop_model_pg_collection(pg_collection)
+
     # Build model.
     def build_model():
         if (
@@ -4245,7 +4262,7 @@ def get_model(
                 pre_process=pre_process,
                 post_process=post_process,
                 config=config,
-                pg_collection=pg_collection,
+                pg_collection=model_pg_collection,
             )
             model.model_type = model_type
         return model
@@ -4288,6 +4305,11 @@ def get_model(
             ),
             flush=True,
         )
+        from megatron.training.models.dist_utils import logical_num_params_message
+
+        logical_message = logical_num_params_message(model, model_pg_collection)
+        if logical_message is not None:
+            print(logical_message, flush=True)
 
     # GPU allocation.
     # For FSDP2, we don't allocate GPU memory here. We allocate GPU memory
@@ -4327,6 +4349,11 @@ def get_model(
     #               the amax_history back.
     # After TE2.x: Below function is an empty function and does nothing.
     correct_amax_history_if_needed(model)
+
+    if model_pg_collection is not pg_collection:
+        from megatron.training.loop_param_store_setup import install_loop_param_store
+
+        install_loop_param_store(model, args, pg_collection)
 
     if wrap_with_ddp:
         if isinstance(ddp_config, TorchFullyShardedDataParallelConfig):
@@ -4442,6 +4469,179 @@ def _reduce_sum_across_data_parallel_group(
     return None if value.item() == 0.0 else value.item()
 
 
+def _build_loop_param_store_models(builder, cfg, args, pg_collection, wrap_with_ddp):
+    """The config-container model build with the loop parameter store: the builder's chunks
+    built with the gtp axes of the collection nulled and wrapped for mixed precision (no DDP),
+    the store installed, then the DDP wrap over the full collection (the replicate group)."""
+    from megatron.training.loop_param_store_setup import (
+        install_loop_param_store,
+        loop_model_pg_collection,
+    )
+    from megatron.training.models.dist_utils import _ddp_wrap
+
+    if pg_collection is None:
+        pg_collection = ProcessGroupCollection.use_mpu_process_groups()
+    model = builder.build_distributed_models(
+        pg_collection=loop_model_pg_collection(pg_collection),
+        ddp_config=cfg.ddp,
+        overlap_param_gather_with_optimizer_step=cfg.optimizer.overlap_param_gather_with_optimizer_step,
+        use_megatron_fsdp=cfg.ddp.use_megatron_fsdp,
+        use_torch_fsdp2=isinstance(cfg.ddp, TorchFullyShardedDataParallelConfig),
+        wrap_with_ddp=False,
+        data_parallel_random_init=cfg.rng.data_parallel_random_init,
+        use_layer_wise_distributed_optimizer=cfg.optimizer.use_layer_wise_distributed_optimizer,
+    )
+    install_loop_param_store(model, args, pg_collection)
+    if not wrap_with_ddp:
+        return model
+    return _ddp_wrap(
+        model,
+        cfg.rng.data_parallel_random_init,
+        cfg.ddp,
+        cfg.optimizer.overlap_param_gather_with_optimizer_step,
+        use_megatron_fsdp=cfg.ddp.use_megatron_fsdp,
+        use_torch_fsdp2=isinstance(cfg.ddp, TorchFullyShardedDataParallelConfig),
+        pg_collection=pg_collection,
+        use_layer_wise_distributed_optimizer=cfg.optimizer.use_layer_wise_distributed_optimizer,
+    )
+
+
+def _loads_loop_model_before_megatron_fsdp_wrap(args) -> bool:
+    """A loop model on Megatron-FSDP with ``--load``: the checkpoint's weights are loaded into
+    the built chunks before the Megatron-FSDP wrap (``_build_loop_megatron_fsdp_models``)."""
+    return (
+        getattr(args, "loop_architecture", "none") != "none"
+        and bool(getattr(args, "use_megatron_fsdp", False))
+        and args.load is not None
+        and not args.moe_use_upcycling
+    )
+
+
+def _load_loop_model_before_megatron_fsdp_wrap(model, args, checkpointing_context=None):
+    """Load a torch_dist checkpoint's weights into the built chunks of a loop model that trains
+    on Megatron-FSDP, before the Megatron-FSDP wrap. Returns ``load_checkpoint``'s (iteration,
+    floating-point operations so far).
+
+    Megatron-FSDP saves and loads ``fsdp_dtensor`` checkpoints (``--ckpt-format fsdp_dtensor`` is
+    required with it), whose model state is the wrapper's sharded parameters; a torch_dist
+    checkpoint cannot be loaded into the wrapped model. The loop's Megatron-FSDP rules admit a
+    model-only load (``--finetune --no-load-optim``, ``guards.FSDP_CHECKPOINTING``), so the weights
+    are loaded here into the chunks as built and wrapped for mixed precision, through
+    ``load_checkpoint``'s torch_dist path with the run's checkpoint policy and an explicit
+    ``ckpt_format="torch_dist"`` for the call: the sharded state dict, ``--dist-ckpt-strictness``, the
+    sharding-integrity validation and the log lines of a DDP run's load. The Megatron-FSDP wrap
+    then copies the loaded weights into its buffers, its fp32 main weights from the loaded bf16
+    weights (what ``reload_model_params`` gives the distributed optimizer after a model-only
+    load; under Megatron-FSDP that call is a no-op). Training's own load after the wrap is
+    skipped (``setup_model_and_optimizer``).
+    """
+    # pylint: disable=import-outside-toplevel
+    from megatron.training.checkpointing import CheckpointType, _load_base_checkpoint
+
+    _, checkpoint_name, _, ckpt_type = _load_base_checkpoint(args.load, args, rank0=True)
+    if ckpt_type not in (None, CheckpointType.GLOBAL):
+        raise RuntimeError(
+            f"A loop model on Megatron-FSDP loads model weights from a torch_dist checkpoint "
+            f"only (before the Megatron-FSDP wrap); {checkpoint_name} is {ckpt_type}"
+        )
+    print_rank_0(
+        " > loop model on Megatron-FSDP: loading the model weights of a torch_dist "
+        "checkpoint before the Megatron-FSDP wrap"
+    )
+    pgc = getattr(unwrap_model(model)[0], "pg_collection", None)
+    return load_checkpoint(
+        model,
+        None,
+        None,
+        checkpointing_context=checkpointing_context,
+        restore_training_state=True,
+        record_finetune=True,
+        ckpt_format="torch_dist",
+        tp_group=pgc.tp if pgc is not None else None,
+        pp_group=pgc.pp if pgc is not None else None,
+        dp_cp_group=getattr(pgc, "dp_cp_gtp_remat", None),
+        dp_group=pgc.dp if pgc is not None else None,
+        expt_dp_group=pgc.expt_dp if pgc is not None else None,
+        rng_state_key_prefix=getattr(unwrap_model(model)[0], "rng_state_key_prefix", ""),
+    )
+
+
+def _build_loop_megatron_fsdp_models(
+    builder, cfg, args, pg_collection, wrap_with_ddp, checkpointing_context
+):
+    """The config-container model build of a loop model on Megatron-FSDP with ``--load``: the
+    builder's chunks built and wrapped for mixed precision (no data-parallel wrapper), the
+    checkpoint's weights loaded into them (``_load_loop_model_before_megatron_fsdp_wrap``), then
+    the Megatron-FSDP wrap. Returns the chunks and the load's (iteration, floating-point
+    operations so far)."""
+    from megatron.training.models.dist_utils import _ddp_wrap
+
+    if pg_collection is None:
+        pg_collection = ProcessGroupCollection.use_mpu_process_groups()
+    model = builder.build_distributed_models(
+        pg_collection=pg_collection,
+        ddp_config=cfg.ddp,
+        overlap_param_gather_with_optimizer_step=cfg.optimizer.overlap_param_gather_with_optimizer_step,
+        use_megatron_fsdp=cfg.ddp.use_megatron_fsdp,
+        use_torch_fsdp2=isinstance(cfg.ddp, TorchFullyShardedDataParallelConfig),
+        wrap_with_ddp=False,
+        data_parallel_random_init=cfg.rng.data_parallel_random_init,
+        use_layer_wise_distributed_optimizer=cfg.optimizer.use_layer_wise_distributed_optimizer,
+    )
+    loaded = _load_loop_model_before_megatron_fsdp_wrap(model, args, checkpointing_context)
+    if wrap_with_ddp:
+        model = _ddp_wrap(
+            model,
+            cfg.rng.data_parallel_random_init,
+            cfg.ddp,
+            cfg.optimizer.overlap_param_gather_with_optimizer_step,
+            use_megatron_fsdp=cfg.ddp.use_megatron_fsdp,
+            use_torch_fsdp2=isinstance(cfg.ddp, TorchFullyShardedDataParallelConfig),
+            pg_collection=pg_collection,
+            use_layer_wise_distributed_optimizer=cfg.optimizer.use_layer_wise_distributed_optimizer,
+        )
+    return model, loaded
+
+
+def loop_optimizer_param_group_lines(model, config, config_overrides):
+    """The optimizer's parameter groups of ``model`` (chunks) as log lines: per group its
+    weight-decay and LR multipliers, the expert flag, the numbers of parameters and elements,
+    a digest of the member names and the names themselves, wrapper prefixes (``module.``)
+    stripped, so runs under different data-parallel wrappers (DDP, Megatron-FSDP) can be diffed
+    (the DSv4 Flash loop experiment's G2 checks the optimizer's parameter-group membership).
+
+    The groups are recomputed by the optimizer's own grouping (``_get_param_groups`` over every
+    chunk, ``config_overrides`` as given to ``get_megatron_optimizer``; None: its standard
+    overrides), which gathers the group keys over the default process group: every rank calls
+    this. Element counts are global for Megatron-FSDP's sharded (DTensor) parameters.
+    """
+    # pylint: disable=import-outside-toplevel
+    import hashlib
+    import re
+
+    from megatron.core.optimizer import _get_param_groups, get_standard_config_overrides
+
+    if config_overrides is None:
+        config_overrides = get_standard_config_overrides(config)
+    groups = _get_param_groups(model, config, config_overrides)
+    names = {}
+    for chunk in model:
+        for name, param in chunk.named_parameters():
+            names.setdefault(id(param), re.sub(r"^(module\.)+", "", name))
+    lines = []
+    for index, group in enumerate(groups):
+        members = sorted(names[id(param)] for param in group["params"])
+        digest = hashlib.sha256("\n".join(members).encode()).hexdigest()[:16]
+        lines.append(
+            f" > optimizer parameter group {index}: wd_mult {group['wd_mult']}, "
+            f"lr_mult {group['lr_mult']}, is_expert_parallel {group['is_expert_parallel']}, "
+            f"parameters {len(members)}, elements {sum(p.numel() for p in group['params'])}, "
+            f"names sha256 {digest}"
+        )
+        lines.append(f" > optimizer parameter group {index} names: {' '.join(members)}")
+    return lines
+
+
 def setup_model_and_optimizer(
     model_type,
     model_provider_func=None,
@@ -4473,6 +4673,10 @@ def setup_model_and_optimizer(
         model_provider_func is None and cfg_container is not None and isinstance(cfg.model, ModelConfig)
     )
 
+    # A loop model on Megatron-FSDP loads its weights before the wrap (the load's iteration and
+    # floating-point operations, set by _build_model_wrapper); training's load below is skipped.
+    loaded_before_wrap = []
+
     def _build_model_wrapper(wrap_with_ddp: bool, transformer_config=None):
         if use_model_builder:
             from megatron.training.utils import start_memory_history_recording
@@ -4491,6 +4695,18 @@ def setup_model_and_optimizer(
                 freeze_base_model_for_mtp=cfg.model.transformer.freeze_base_model_for_mtp,
             )
 
+            if getattr(args, "loop_param_store_shard_size", 1) > 1:
+                return _build_loop_param_store_models(
+                    builder, cfg, args, pg_collection, wrap_with_ddp
+                )
+
+            if _loads_loop_model_before_megatron_fsdp_wrap(args):
+                model, loaded = _build_loop_megatron_fsdp_models(
+                    builder, cfg, args, pg_collection, wrap_with_ddp, checkpointing_context
+                )
+                loaded_before_wrap.append(loaded)
+                return model
+
             return builder.build_distributed_models(
                 pg_collection=pg_collection,
                 ddp_config=cfg.ddp,
@@ -4505,6 +4721,11 @@ def setup_model_and_optimizer(
             assert (
                 model_provider_func is not None
             ), "Must provide a model config via config_container or a model_provider_func."
+            if _loads_loop_model_before_megatron_fsdp_wrap(args):
+                raise NotImplementedError(
+                    "A loop model on Megatron-FSDP loads a checkpoint only on the config-container "
+                    "build path (its weights are loaded before the Megatron-FSDP wrap)"
+                )
             return get_model(
                 model_provider_func,
                 model_type,
@@ -4545,6 +4766,40 @@ def setup_model_and_optimizer(
 
     model = _build_model_wrapper(wrap_with_ddp)
     unwrapped_model = unwrap_model(model)
+
+    # Loop parameter store: its residency modes (explicit or auto) before the planner's report
+    # reads them; under --loop-planner apply the planner sets them instead.
+    if getattr(args, "loop_param_store_shard_size", 1) > 1:
+        from megatron.training.loop_param_store_setup import configure_loop_param_store
+
+        configure_loop_param_store(args, model)
+
+    # RSBF loop planner: plans (and in apply mode sets) the item form, stride, waves, D42 and
+    # Adam to Grace on the built model's config and args, before the optimizer config is read
+    # (with the store also its dense layout and the moves E / M).
+    if getattr(args, "loop_planner", "off") != "off":
+        from megatron.training.loop_rsbf_planning import plan_loop_rsbf
+
+        plan = plan_loop_rsbf(args, model, apply=args.loop_planner == "apply")
+        if args.loop_planner == "apply" and plan is not None and plan.optimizer_offload:
+            cfg.optimizer.optimizer_cpu_offload = args.optimizer_cpu_offload
+            cfg.optimizer.optimizer_offload_fraction = args.optimizer_offload_fraction
+
+    # Hybrid loop checkpoints: every parameter and persistent buffer has a sharded entry, checked
+    # here so a chained job fails at setup, not at its first save (a no-op for other models).
+    if (getattr(args, "save", None) or getattr(args, "load", None)) and getattr(
+        args, "ckpt_format", None
+    ) == "torch_dist":
+        from megatron.training.loop_checkpoint import check_loop_sharded_state_dict
+
+        check_loop_sharded_state_dict(model, when="setup")
+
+    # Hybrid loop models: the unique-parameter census (every chunk of every pipeline rank counted
+    # once; a pipeline all-reduce on every rank), printed by rank 0 (a no-op for other models).
+    if getattr(args, "loop_schedule", "standard") == "ring":
+        from megatron.training.loop_ring_report import log_loop_param_census
+
+        log_loop_param_census(model, args)
 
     # Register default GTP prefetch chains and finalize capture scopes after DDP wrap, before the
     # first forward. Placed here (not in get_model) so it also covers the config-container
@@ -4611,6 +4866,10 @@ def setup_model_and_optimizer(
             dump_param_to_param_group_map=args.dump_param_to_param_group_map,
         )
         opt_param_scheduler = get_optimizer_param_scheduler(optimizer)
+        if getattr(args, "loop_architecture", "none") != "none":
+            # Loop models: the optimizer's parameter groups, comparable across wrappers.
+            for line in loop_optimizer_param_group_lines(model, optim_cfg, optim_cfg_overrides):
+                print_rank_0(line)
 
     one_logger and one_logger.log_metrics(
         {"app_build_optimzer_finish_time": one_logger_utils.get_timestamp_in_ms()}
@@ -4690,7 +4949,18 @@ def setup_model_and_optimizer(
             optimizer.reload_model_params()
         print_rank_0(f'Upcycled checkpoint saved to {cfg.checkpoint.save}')
 
-    if (
+    if loaded_before_wrap:
+        # A loop model on Megatron-FSDP: its weights were loaded before the wrap
+        # (_load_loop_model_before_megatron_fsdp_wrap, model only); no second load.
+        train_state.iteration, train_state.num_floating_point_operations_so_far = (
+            loaded_before_wrap[0]
+        )
+        train_state.resume_iteration = train_state.iteration
+        train_state.resume_num_floating_point_operations = (
+            train_state.num_floating_point_operations_so_far
+        )
+        update_num_microbatches(consumed_samples=train_state.consumed_train_samples, verbose=True)
+    elif (
         cfg.checkpoint.load is not None or cfg.checkpoint.pretrained_checkpoint is not None
     ) and not args.moe_use_upcycling:
         one_logger and one_logger.log_metrics(
@@ -4826,6 +5096,18 @@ def setup_model_and_optimizer(
     # per step. Establish its PP-agreed capacity before the first forward/capture.
     if (getattr(args, "dsa_indexer_loss_coeff", None) or 0.0) > 0:
         initialize_dsa_metric_tracker(unwrapped_model, pg_collection)
+
+    # --loop-param-checksums: the loaded (or initial) weights of a hybrid loop model, one line per
+    # tensor keyed by its PP = 1 name, and with an optimizer every parameter's optimizer group
+    # (collectives on every rank; printed by rank 0).
+    if getattr(args, "loop_param_checksums", False):
+        from megatron.training.loop_ring_report import (
+            log_loop_optimizer_groups,
+            log_loop_param_checksums,
+        )
+
+        log_loop_param_checksums(model)
+        log_loop_optimizer_groups(model, optimizer)
 
     return model, optimizer, opt_param_scheduler
 
@@ -5089,11 +5371,20 @@ def train_step(
         checkpoint.save_dgrads_interval is not None
         and (iteration + 1) % checkpoint.save_dgrads_interval == 0
     )
+    online_decoder = None
+    if (getattr(args, "loop_exit_criterion", None) == "online"
+            and args.loop_schedule == "standard"):
+        from megatron.training.loop_checkpoint import loop_hybrid_model
+
+        online_decoder = loop_hybrid_model(model).decoder
     while rerun_state_machine.should_run_forward_backward(rerun_data_iterator):
         # Sequence statistics are attempt-scoped: a retried forward/backward replaces, not
         # adds to, the statistics of the superseded attempt, and nothing accumulated outside
         # train_step (e.g. by evaluation forwards) reaches this iteration's consumer.
         reset_seqlen_stats_in_iteration()
+        if online_decoder is not None:
+            # Drop abandoned attempts before the rerun's first real microbatch.
+            online_decoder.take_online_exit_records()
         # Start D2H before zeroing gradients. In the MXFP8 staging path, updated masters
         # remain readable until their delayed D2H after the main-param copy below.
         if chunked_optimizer_state_offload and not pre_forward_param_sync_before_master_offload:
@@ -5495,7 +5786,12 @@ def _get_indexer_logging_layer_counts(model_config) -> tuple[int, int | None]:
         parsed_pattern = parse_hybrid_pattern(model_config.hybrid_layer_pattern)
         mtp_pattern_layers = len(parsed_pattern.mtp_pattern or "")
         tracker_layers = transformer_cfg.num_layers + mtp_pattern_layers
-        main_indexers = sum(ratio == 4 for ratio in ratios[: transformer_cfg.num_layers])
+        metric_layers = loop_metric_layer_numbers(transformer_cfg, model_config.hybrid_layer_pattern)
+        if metric_layers is None:
+            main_indexers = sum(ratio == 4 for ratio in ratios[: transformer_cfg.num_layers])
+        else:
+            # An untied core counts the core once (loop_metric_layer_numbers).
+            main_indexers = sum(ratios[n - 1] == 4 for n in metric_layers)
         mtp_indexers_per_depth = sum(
             ratio == 4 for ratio in ratios[transformer_cfg.num_layers : tracker_layers]
         )
@@ -5505,6 +5801,17 @@ def _get_indexer_logging_layer_counts(model_config) -> tuple[int, int | None]:
         indexer_layers = sum(ratio == 4 for ratio in ratios[:tracker_layers])
 
     return tracker_layers, 0 if transformer_cfg.csa_dense_mode else indexer_layers
+
+
+def metric_data_parallel_group(pg_collection):
+    """The data-parallel group a per-rank metric is averaged over: every rank holding distinct
+    microbatches. Under the GTP-remat grid (the loop parameter store's shard axis) that is
+    ``dp_gtp_remat`` (replicate ``dp`` x ``gtp_remat``); ``pg_collection.dp`` is then only the
+    replicate group. Without the grid (the two have the same size) ``dp``, as before."""
+    full = getattr(pg_collection, "dp_gtp_remat", None)
+    if full is not None and get_pg_size(full) != get_pg_size(pg_collection.dp):
+        return full
+    return pg_collection.dp
 
 
 def training_log(
@@ -5634,6 +5941,15 @@ def training_log(
     if learning_rate is None and args.freeze_all_layers:
         learning_rate = 0.0
     # Tensorboard values.
+    if (
+        (writer or wandb_writer)
+        and getattr(args, "_loop_exit_counts", None)
+        and cfg.logger.tensorboard_log_interval
+        and iteration % cfg.logger.tensorboard_log_interval == 0
+    ):
+        from megatron.training.loop_rsbf_planning import log_loop_exit_histogram
+
+        log_loop_exit_histogram(args, iteration, writer, wandb_writer)
     if writer and (iteration % cfg.logger.tensorboard_log_interval == 0):
         if wandb_writer:
             wandb_writer.log({'samples vs steps': train_state.consumed_train_samples}, iteration)
@@ -5706,6 +6022,10 @@ def training_log(
                 "mem-max-allocated-bytes", mem_stats["allocated_bytes.all.peak"], iteration
             )
             writer.add_scalar("mem-allocated-count", mem_stats["allocation.all.current"], iteration)
+        if getattr(args, "_loop_carrier_diagnostics", None):
+            from megatron.training.loop_diagnostics import log_loop_carrier_diagnostics
+
+            log_loop_carrier_diagnostics(args, iteration, writer, wandb_writer)
         model_config = (
             get_model_config(model[0]) if model else getattr(cfg.model, 'transformer', None)
         )
@@ -5740,7 +6060,7 @@ def training_log(
             parsed_pattern = parse_hybrid_pattern(cfg.model.hybrid_layer_pattern)
             main_pattern = parsed_pattern.main_pattern or ""
             mtp_pattern = parsed_pattern.mtp_pattern or ""
-            main_moe_layers = main_pattern.count(Symbols.MOE)
+            main_moe_layers = _hybrid_metric_moe_layers(args, main_pattern)
             # Hybrid hash counts select leading MoE positions, excluding MTP.
             num_hash_layers = min(main_moe_layers, max(cfg.model.transformer.moe_num_hash_layers, 0))
             mtp_moe_layers_per_depth = mtp_pattern.count(Symbols.MOE)
@@ -5788,6 +6108,7 @@ def training_log(
             num_hash_layers=num_hash_layers,
             pg_collection=pg_collection,
             total_loss_dict=total_loss_dict,
+            loop_rounds=loop_metric_rounds(args),
         )
 
     # Log MTP metrics.
@@ -5831,7 +6152,11 @@ def training_log(
         dynamic_cp_parent_group = None
         if dsa_metric_pg_collection is not None:
             pp_group = dsa_metric_pg_collection.pp
-            dp_group = dsa_metric_pg_collection.dp
+            dp_group = (
+                dsa_metric_pg_collection.dp
+                if dsa_transformer_cfg.dynamic_context_parallel
+                else metric_data_parallel_group(dsa_metric_pg_collection)
+            )
         if dsa_transformer_cfg.dynamic_context_parallel:
             if dsa_metric_pg_collection is not None:
                 dynamic_cp_parent_group = dsa_metric_pg_collection.dp_cp
@@ -5857,6 +6182,7 @@ def training_log(
                 dsa_transformer_cfg.num_layers,
                 dsa_transformer_cfg.dsa_indexer_skip_topk_offset,
                 dsa_transformer_cfg.dsa_indexer_topk_freq,
+                main_layer_numbers=loop_metric_layer_numbers(args),
             )
         else:
             num_indexer_layers = _num_dsa_indexer_layers(
@@ -5891,6 +6217,7 @@ def training_log(
             configured_cp_size=dsa_transformer_cfg.context_parallel_size,
             pp_group=pp_group,
             dp_group=dp_group,
+            loop_rounds=loop_metric_rounds(args),
         )
 
     # Dump memory snapshot and print metrics to stdout.
@@ -5910,17 +6237,30 @@ def training_log(
         elapsed_time_per_iteration = elapsed_time / total_iterations
         llm_world_size = cfg.get_model_world_size()
 
-        throughput = num_floating_point_operations(
-            cfg.model,
-            batch_size,
-            sequence_length=args.decoder_seq_length if args.decoder_seq_length is not None else args.seq_length,
-            seqlen_squared_sum_in_batch=seqlen_squared_sum_in_batch,
-            total_real_tokens_in_batch=total_real_tokens_in_batch,
-            vision_total_tokens_in_batch=vision_total_tokens_in_batch,
-            vision_seqlen_squared_sum_in_batch=vision_seqlen_squared_sum_in_batch,
-            vision_merged_tokens_in_batch=vision_merged_tokens_in_batch,
-            vision_args=args,
-        ) / (elapsed_time_per_iteration * 10**12 * llm_world_size)
+        if getattr(args, "loop_architecture", "none") != "none":
+            # Loop work varies per iteration (sampled depth, token-choice MoR).
+            # Average the FLOPs over the same interval as the time, rather than
+            # pairing the last iteration's work with the interval-average time.
+            loop_flops_per_iteration = (
+                getattr(args, "_loop_flops_in_log_interval", 0.0) / total_iterations
+            )
+            if should_reset:
+                args._loop_flops_in_log_interval = 0.0
+            throughput = loop_flops_per_iteration / (
+                elapsed_time_per_iteration * 10**12 * llm_world_size
+            )
+        else:
+            throughput = num_floating_point_operations(
+                cfg.model,
+                batch_size,
+                sequence_length=args.decoder_seq_length if args.decoder_seq_length is not None else args.seq_length,
+                seqlen_squared_sum_in_batch=seqlen_squared_sum_in_batch,
+                total_real_tokens_in_batch=total_real_tokens_in_batch,
+                vision_total_tokens_in_batch=vision_total_tokens_in_batch,
+                vision_seqlen_squared_sum_in_batch=vision_seqlen_squared_sum_in_batch,
+                vision_merged_tokens_in_batch=vision_merged_tokens_in_batch,
+                vision_args=args,
+            ) / (elapsed_time_per_iteration * 10**12 * llm_world_size)
 
         one_logger_utils.track_e2e_metrics(cfg.logger.log_throughput, throughput)
 
@@ -6001,6 +6341,11 @@ def training_log(
                     total_loss_dict[key] = torch.tensor([0.0], dtype=torch.float, device='cuda')
         if cfg.model.transformer.num_moe_experts is not None and moe_log_string:
             log_string += moe_log_string
+        if getattr(args, "_loop_exit_counts_interval", None) is not None:
+            # The log interval's exit-depth histogram (RSBF), reset with the interval.
+            from megatron.training.loop_rsbf_planning import loop_exit_histogram_log_string
+
+            log_string += loop_exit_histogram_log_string(args, reset=should_reset)
         log_string += f' loss scale: {loss_scale:.1f} |'
         if grad_norm is not None:
             log_string += f' grad norm: {grad_norm:.3f} |'
@@ -6074,15 +6419,21 @@ def training_log(
             # Report memory after optimizer state has been initialized.
             if torch.distributed.get_rank() == 0:
                 num_microbatches = get_num_microbatches()
-                report_theoretical_memory(
-                    cfg,
-                    sequence_length=args.seq_length,
-                    micro_batch_size=cfg.train.micro_batch_size,
-                    data_parallel_size=cfg.get_data_parallel_size(),
-                    world_size=safe_get_world_size(),
-                    num_microbatches=num_microbatches,
-                    verbose=True,
-                )
+                if getattr(args, "loop_architecture", "none") == "none":
+                    report_theoretical_memory(
+                        cfg,
+                        sequence_length=args.seq_length,
+                        micro_batch_size=cfg.train.micro_batch_size,
+                        data_parallel_size=cfg.get_data_parallel_size(),
+                        world_size=safe_get_world_size(),
+                        num_microbatches=num_microbatches,
+                        verbose=True,
+                    )
+                else:
+                    print_rank_0(
+                        "Static-depth theoretical memory is unavailable for loop models; "
+                        "measured CUDA peaks follow."
+                    )
             report_memory(
                 f'(after {iteration} iterations)',
                 process_group=pg_collection.dp if pg_collection is not None else None,
@@ -6688,6 +7039,201 @@ def _resolve_thd_static_batch_pg_collection(pg_collection, model_pg_collection=N
     return pg_collection
 
 
+def loop_metric_rounds(args) -> Optional[int]:
+    """The round count of a Huginn hybrid loop (``loop_iterations``), whose MoE and
+    indexer-loss trackers also log per-round bins (filled by the loop stack and the RSBF sweep
+    inside ``forward_statistics_round``); None for every other model, including a MoR hybrid
+    loop (its stack does not bin rounds, so its round keys would all read zero). The condition
+    depends on the config only, so every rank issues the same metric collectives."""
+    from megatron.core.transformer.loop.guards import is_hybrid_loop_config
+
+    if is_hybrid_loop_config(args) and args.loop_architecture == "huginn":
+        return args.loop_iterations
+    return None
+
+
+def _hybrid_metric_moe_layers(args, main_pattern: str) -> int:
+    """MoE layers of a hybrid main pattern that the MoE tracker's ``num_moe_layers`` counts:
+    every ``E``, or those at ``loop_metric_layer_numbers`` (an untied core counts its core
+    once)."""
+    from megatron.core.models.hybrid.hybrid_layer_allocation import Symbols
+
+    metric_layers = loop_metric_layer_numbers(args)
+    if metric_layers is None:
+        return main_pattern.count(Symbols.MOE)
+    return sum(main_pattern[n - 1] == Symbols.MOE for n in metric_layers)
+
+
+def loop_metric_layer_numbers(args, hybrid_layer_pattern=None) -> Optional[list[int]]:
+    """The main-stack layer numbers (1-based) whose layers the loss-metric normalizers count
+    (``num_moe_layers`` of the MoE tracker, ``num_indexer_layers`` of the indexer-loss
+    tracker), or None for every main layer.
+
+    An untied core (``loop_untie_core``, the carrier ablation's plain-inject) holds its R rounds
+    as R physical core segments. Its counts take the prelude, the first segment and the coda:
+    the layers a tied loop of the same shape counts, so every tracker key (``"{name}"`` and
+    ``"{name} round {r}"``) reads the same as the tied loop's for the same per-execution
+    values. Counting all R segments would scale them by (P + C + Cd) / (P + R C + Cd). The
+    argument guards (UNTIED_CORE_SEGMENTS, no ``|`` in a loop pattern) hold already."""
+    from megatron.core.models.hybrid.hybrid_layer_allocation import Symbols, parse_hybrid_pattern
+    from megatron.core.transformer.loop.guards import is_hybrid_loop_config
+
+    if not (getattr(args, "loop_untie_core", False) and is_hybrid_loop_config(args)):
+        return None
+    if hybrid_layer_pattern is None:
+        hybrid_layer_pattern = args.hybrid_layer_pattern
+    main = (parse_hybrid_pattern(hybrid_layer_pattern).main_pattern or "").replace(
+        Symbols.PIPE, ""
+    )
+    prelude, coda = args.loop_prelude_sublayers, args.loop_coda_sublayers
+    segment = (len(main) - prelude - coda) // args.loop_iterations
+    return list(range(1, prelude + segment + 1)) + list(range(len(main) - coda + 1, len(main) + 1))
+
+
+def get_loop_rsbf_forward_backward_func(config, args):
+    """The loop RSBF schedule when the model config opts in (``loop_schedule='rsbf'``), else
+    None.
+
+    The RSBF schedule (``forward_backward_loop_rsbf``) replaces the standard schedule for
+    training steps only; ``evaluate()`` keeps the standard one. Under a static per-rank MoE
+    budget (``moe_expert_rank_capacity_factor``) ``train()`` does not wrap the RSBF schedule in
+    ``PagedStashRunner``: the executor reads and reduces the over-budget flags itself
+    (``loop_rsbf_over_budget``). Rejected here:
+
+    * the full-iteration CUDA graph wrapper of ``train()`` (the loop guards reject CUDA graphs);
+    * sharded data parallelism except fixed-depth, owner-only BF16 MoK with Megatron-FSDP
+      v1 optimizer and gradient sharding. Only the lockstep schedule issues the same per-cell
+      collectives on every DP rank. The executor also checks the concrete wrapper;
+    * the debug-save hooks of ``train_step`` (activations, dgrads, tokens per expert): they
+      would also record the executor's replays (the sweep, then the recompute of every
+      backward item).
+    """
+    if getattr(config, "loop_schedule", "standard") != "rsbf":
+        return None
+    from megatron.core.transformer.loop.guards import lockstep_rsbf_mok_zero2
+
+    debug_saves = (
+        "save_activations_interval",
+        "save_dgrads_interval",
+        "save_tokens_per_expert_interval",
+    )
+    unsupported = [
+        name
+        for name, applies in (
+            ("cuda_graph_impl=full_iteration", args.cuda_graph_impl == "full_iteration"),
+            (
+                "use_megatron_fsdp",
+                getattr(args, "use_megatron_fsdp", False) and not lockstep_rsbf_mok_zero2(config, args),
+            ),
+            ("use_torch_fsdp2", getattr(args, "use_torch_fsdp2", False)),
+            *((name, getattr(args, name, None) is not None) for name in debug_saves),
+        )
+        if applies
+    ]
+    if unsupported:
+        raise ValueError(f"loop_schedule='rsbf' does not support {', '.join(unsupported)}")
+    from megatron.core.transformer.loop.rsbf_executor import get_loop_rsbf_schedule
+
+    return get_loop_rsbf_schedule()
+
+
+def get_loop_ring_forward_backward_func(config, args):
+    """The loop ring schedule when the model config opts in (``loop_schedule='ring'``), else
+    None.
+
+    The ring schedule (``megatron/core/transformer/loop/ring_pp.py``, ``LoopRingSchedule``) runs
+    Megatron's interleaved schedule over the R x k round views of the stage's physical chunks;
+    ``train()`` and ``evaluate()`` both use it (evaluation runs it forward-only). Rejected here:
+
+    * full-iteration CUDA graphs except for a fixed GLM ring with at least one warmup step;
+    * sharded data parallelism (Megatron FSDP, torch FSDP2): the schedule's chunks are the
+      parameterless round views, and a sharded wrapper would gather and reduce once per round;
+    * the debug-save hooks of ``train_step`` (activations, dgrads, tokens per expert): they
+      would also record every round view's call and every recompute replay;
+    * ``defer_embedding_wgrad_compute`` (also a config rule): the deferred output-layer wgrad is
+      finished on the schedule's model chunks, the round views.
+
+    The iteration wgrad dump (``--save-wgrads-interval``, the main grads after finalize) stays:
+    ``force_all_reduce`` passes through to the finalize of the physical chunks.
+    """
+    if getattr(config, "loop_schedule", "standard") != "ring":
+        return None
+    from megatron.core.transformer.loop.guards import fixed_glm_ring
+
+    full_graph = args.cuda_graph_impl == "full_iteration"
+    debug_saves = (
+        "save_activations_interval",
+        "save_dgrads_interval",
+        "save_tokens_per_expert_interval",
+    )
+    unsupported = [
+        name
+        for name, applies in (
+            ("cuda_graph_impl=full_iteration", full_graph and not fixed_glm_ring(config)),
+            (
+                "cuda_graph_warmup_steps=0 (run the ring schedule once before graph capture)",
+                full_graph and getattr(config, "cuda_graph_warmup_steps", 0) < 1,
+            ),
+            ("use_megatron_fsdp", getattr(args, "use_megatron_fsdp", False)),
+            ("use_torch_fsdp2", getattr(args, "use_torch_fsdp2", False)),
+            *((name, getattr(args, name, None) is not None) for name in debug_saves),
+            (
+                "defer_embedding_wgrad_compute",
+                bool(getattr(config, "defer_embedding_wgrad_compute", False))
+                or bool(getattr(args, "defer_embedding_wgrad_compute", False)),
+            ),
+        )
+        if applies
+    ]
+    if unsupported:
+        raise ValueError(f"loop_schedule='ring' does not support {', '.join(unsupported)}")
+    from megatron.core.transformer.loop.ring_pp import get_loop_ring_schedule
+
+    return get_loop_ring_schedule()
+
+
+def loop_rsbf_status_group(args):
+    """The Gloo data-parallel group for the multi-EU RSBF status exchange, or None without
+    data parallelism or without Gloo process groups (known-depth criteria, the only ones the
+    config builds, never exchange status). With the loop parameter store the grid disables
+    dev's Gloo groups: a loop-owned Gloo group over the full data-parallel ranks."""
+    if not (torch.distributed.is_initialized() and mpu.model_parallel_is_initialized()):
+        return None
+    if getattr(args, "loop_param_store_shard_size", 1) > 1:
+        from megatron.training.loop_param_store_setup import loop_rsbf_status_gloo_group
+
+        return loop_rsbf_status_gloo_group(args)
+    if mpu.get_data_parallel_world_size() <= 1 or not getattr(
+        args, "use_gloo_process_groups", True
+    ):
+        return None
+    return mpu.get_data_parallel_group_gloo(with_context_parallel=False)
+
+
+def reduces_grads_during_backward(model_chunk) -> bool:
+    """Whether ``model_chunk`` reduces gradients from its backward hooks, so the schedule must
+    wrap every microbatch but the last in its ``no_sync()`` (``config.no_sync_func``).
+
+    MFSDP v2 always reduces gradients during backward -- that is how FSDP shards them -- and
+    defers only the DP-outer axis to the last microbatch, so it needs no_sync_func to know which
+    backward that is. Without it every backward finalizes that axis, the accumulation buffer is
+    dropped, and only the last microbatch's gradient survives.
+
+    DDP and MFSDP v1 reduce during backward when their ``ddp_config.overlap_grad_reduce`` is on.
+    That is the wrapper's config, not ``args.overlap_grad_reduce``: MFSDP v1 turns it on itself
+    for the gradient-sharding strategies (``optim_grads`` / ``optim_grads_params``,
+    ``MegatronFSDP.__init__``). There it reduces over DP-Outer (HSDP / HFSDP) only in the
+    backward it sees as the last microbatch's (``is_last_microbatch``, set by ``no_sync()``
+    on exit), so without no_sync_func the DP-Outer reduction never runs and every instance
+    steps on its own instance's gradient sum.
+    """
+    if isinstance(model_chunk, FullyShardedDataParallelV2):
+        return True
+    if isinstance(model_chunk, (FullyShardedDataParallelV1, DDP)):
+        return bool(model_chunk.ddp_config.overlap_grad_reduce)
+    return False
+
+
 def train(
     forward_step_func,
     model,
@@ -6805,6 +7351,9 @@ def train(
 
     # Tracking loss.
     total_loss_dict = {}
+    if getattr(args, "loop_architecture", "none") != "none":
+        # Loop FLOPs share the log interval of total_loss_dict; start it empty too.
+        args._loop_flops_in_log_interval = 0.0
 
     # Iterations.
     iteration = train_state.iteration
@@ -6833,15 +7382,7 @@ def train(
     # Setup some training config params.
     config.grad_scale_func = optimizer.scale_loss if optimizer is not None else None
     config.timers = timers
-    # MFSDP v2 always reduces gradients during backward -- that is how FSDP shards them --
-    # and defers only the DP-outer axis to the last microbatch, so it needs no_sync_func to
-    # know which backward that is. Without it every backward finalizes that axis, the
-    # accumulation buffer is dropped, and only the last microbatch's gradient survives.
-    # DDP and MFSDP v1 instead reduce during backward only when overlap_grad_reduce is on,
-    # so without that flag there is nothing for no_sync to suppress.
-    if isinstance(model[0], FullyShardedDataParallelV2) or (
-        isinstance(model[0], (FullyShardedDataParallelV1, DDP)) and cfg.ddp.overlap_grad_reduce
-    ):
+    if reduces_grads_during_backward(model[0]):
         assert config.no_sync_func is None, (
             'When overlap_grad_reduce is True, config.no_sync_func must be None; '
             'a custom no_sync_func is not supported when overlapping grad-reduce'
@@ -6925,6 +7466,19 @@ def train(
     eval_iterations = 0
     # Wrap forward_backward_func for Full iteration CUDA graph
     forward_backward_func = get_forward_backward_func(schedule_pg_collection=pg_collection)
+    # Hybrid loop with per-sample exit: training steps run through the RSBF executor (the
+    # wrappers below cannot apply; the helper checks).
+    loop_rsbf_schedule = get_loop_rsbf_forward_backward_func(config, args)
+    if loop_rsbf_schedule is not None:
+        forward_backward_func = loop_rsbf_schedule
+        # Data-parallel ranks are the executor's EUs; online exit criteria and plan checks
+        # exchange over a Gloo group of the same ranks.
+        loop_rsbf_schedule.configure(status_group=loop_rsbf_status_group(args))
+    # Hybrid loop over pipeline stages: the interleaved schedule over the round views (the
+    # wrappers below cannot apply; the helper and the ring config rules check).
+    loop_ring_schedule = get_loop_ring_forward_backward_func(config, args)
+    if loop_ring_schedule is not None:
+        forward_backward_func = loop_ring_schedule
     if cfg.model.transformer.cuda_graph_impl == "full_iteration":
         thd_batch_preparation_fn = None
         if args.sequence_packing_scheduler is not None:
@@ -6949,7 +7503,7 @@ def train(
             require_global_static_metadata_consensus=config.cuda_graph_static_dynamic_cp,
         )
     # Wrap forward_backward_func for overflow handling with moe_expert_rank_capacity_factor
-    if cfg.model.transformer.moe_expert_rank_capacity_factor is not None:
+    if cfg.model.transformer.moe_expert_rank_capacity_factor is not None and loop_rsbf_schedule is None:
         copy_main_params = (
             cfg.optimizer.reuse_grad_buf_for_mxfp8_param_ag and cfg.optimizer.overlap_param_gather
         )
@@ -7302,6 +7856,11 @@ def train(
                         and tensor_metric_observer.has_due_metrics(iteration)
                     )
                 )
+                if loop_rsbf_schedule is not None:
+                    # Sampled depths are keyed by (seed, iteration, global sample index).
+                    loop_rsbf_schedule.set_iteration(iteration)
+                if loop_ring_schedule is not None:
+                    loop_ring_schedule.set_iteration(iteration)
                 (
                     loss_dict,
                     skipped_iter,
@@ -7454,6 +8013,44 @@ def train(
             vision_seqlen_squared_sum_in_batch,
             vision_merged_tokens_in_batch,
         ) = consume_vision_model_flops_stats(getattr(args, "count_vision_model_flops", False))
+        if getattr(args, "loop_architecture", "none") != "none":
+            args._loop_flops_in_batch = (
+                batch_size
+                * args.seq_length
+                * sum(
+                    float(loss_dict.get(f"loop {phase} flops per token", 0.0))
+                    for phase in ("forward", "backward", "recompute")
+                )
+            )
+            # training_log divides by the interval's iteration count and resets this.
+            args._loop_flops_in_log_interval = (
+                getattr(args, "_loop_flops_in_log_interval", 0.0) + args._loop_flops_in_batch
+            )
+        if loop_rsbf_schedule is not None:
+            # The step's realized exit-depth histogram (host data of every rank, no sync):
+            # args attributes for training_log, and the JSONL line of the cost-model reruns.
+            from megatron.training.loop_rsbf_planning import record_loop_exit_histogram
+
+            record_loop_exit_histogram(args, loop_rsbf_schedule, model, iteration)
+        elif (getattr(args, "loop_exit_criterion", None) == "online"
+              and args.loop_schedule == "standard"):
+            from megatron.training.loop_online_standard import record_online_step
+
+            record_online_step(
+                args, model, iteration, train_state.consumed_train_samples - iteration_sequences,
+                iteration_sequences,
+            )
+        if loop_ring_schedule is not None:
+            # G1 every step (the step's own round counters, reduced by the schedule) and, at
+            # log steps, the max-over-ranks memory line (a collective on every rank).
+            from megatron.training.loop_ring_report import log_loop_ring_step
+
+            log_loop_ring_step(args, loop_ring_schedule, iteration)
+        if getattr(args, "loop_carrier_diagnostics", "off") == "full":
+            # Every rank, every step; collects at the TensorBoard interval (a DP collective).
+            from megatron.training.loop_diagnostics import record_loop_carrier_diagnostics
+
+            record_loop_carrier_diagnostics(args, model, iteration)
         num_floating_point_operations_in_batch = num_floating_point_operations(
             cfg.model,
             batch_size,
@@ -7464,6 +8061,7 @@ def train(
             vision_seqlen_squared_sum_in_batch=vision_seqlen_squared_sum_in_batch,
             vision_merged_tokens_in_batch=vision_merged_tokens_in_batch,
             vision_args=args,
+            loop_flops_in_batch=getattr(args, "_loop_flops_in_batch", None),
         )
         num_floating_point_operations_since_last_log_event += num_floating_point_operations_in_batch
         train_state.num_floating_point_operations_so_far += num_floating_point_operations_in_batch
@@ -7774,6 +8372,13 @@ def evaluate(
     for model_module in model:
         model_module.eval()
 
+    # Loop parameter store: the Resident / sharded-grads compute copies are stale after an
+    # optimizer step; the evaluation's eager visits gather the Layer-window units.
+    if getattr(args, "loop_param_store_shard_size", 1) > 1:
+        from megatron.training.loop_param_store_setup import refresh_loop_param_store
+
+        refresh_loop_param_store(model)
+
     # Disable result validation during evaluation
     rerun_state_machine = get_rerun_state_machine()
     rerun_mode = rerun_state_machine.get_mode()
@@ -7798,6 +8403,10 @@ def evaluate(
     # average a 1/gtp_remat subsample of the eval batch (768 sequences read, 12 averaged at
     # dp=6/gtp_remat=64) while consumed_valid_samples still books the full eval_batch_size.
     eval_dp_cp_group = getattr(eval_pgc, 'dp_cp_gtp_remat', None) or eval_pgc.dp_cp
+    # Hybrid loop over pipeline stages: the ring schedule, forward-only.
+    loop_ring_schedule = get_loop_ring_forward_backward_func(config, args)
+    if loop_ring_schedule is not None:
+        forward_backward_func = loop_ring_schedule
     if (
         cfg.model.transformer.cuda_graph_impl == "full_iteration"
         and args.sequence_packing_scheduler is None
@@ -8078,8 +8687,10 @@ def evaluate_and_print_results(
         string = f' validation{suffix} loss at {prefix} | '
         for key in total_loss_dict:
             string += '{} value: {:.6E} | '.format(key, total_loss_dict[key].item())
-            ppl = math.exp(min(20, total_loss_dict[key].item()))
-            string += '{} PPL: {:.6E} | '.format(key, ppl)
+            is_loop_metric = key.startswith(("loop ", "depth "))
+            if not is_loop_metric:
+                ppl = math.exp(min(20, total_loss_dict[key].item()))
+                string += '{} PPL: {:.6E} | '.format(key, ppl)
             if writer:
                 writer.add_scalar(
                     '{} validation{}'.format(key, suffix), total_loss_dict[key].item(), iteration
@@ -8089,7 +8700,7 @@ def evaluate_and_print_results(
                     total_loss_dict[key].item(),
                     train_state.consumed_train_samples,
                 )
-                if cfg.logger.log_validation_ppl_to_tensorboard:
+                if cfg.logger.log_validation_ppl_to_tensorboard and not is_loop_metric:
                     writer.add_scalar('{} validation{} ppl'.format(key, suffix), ppl, iteration)
                     writer.add_scalar(
                         '{} validation{} ppl vs samples'.format(key, suffix),

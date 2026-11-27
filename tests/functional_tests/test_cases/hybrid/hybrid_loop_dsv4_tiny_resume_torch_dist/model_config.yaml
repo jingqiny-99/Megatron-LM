@@ -1,0 +1,106 @@
+# Checkpoint-resume regression of the eager hybrid loop (LoopHybridStack, M3c): the DSV4-TINY
+# loop rung in the carrier ablation's loop-entry shape (plain looped residual with the Huginn
+# entry injection; no mHC, no MTP, no hash routing), prelude HE, core HECEHECE x 4 rounds,
+# coda HECE, 8 experts at EP = 8, mock data, deterministic settings. The ckpt-resume flow trains,
+# saves at the save interval, resumes in a fresh process and compares the resumed steps.
+# No --exit-on-missing-checkpoint here: the flow's first run starts from an empty load
+# directory (the toolkit chains, scripts/loop_ckpt_chain.sh, set it on every resume).
+ENV_VARS:
+  CUDA_DEVICE_MAX_CONNECTIONS: 1
+  NVTE_ALLOW_NONDETERMINISTIC_ALGO: 0
+  NCCL_ALGO: Ring
+  NCCL_EP_HT_EM_AG_SCAN_MODE: 1
+  CUBLAS_WORKSPACE_CONFIG: :4096:8
+MODEL_ARGS:
+  --spec: "[megatron.core.transformer.loop.hybrid_specs loop_hybrid_dsv4_stack_spec]"
+  --hybrid-layer-pattern: HEHECEHECEHECE
+  --loop-architecture: huginn
+  --loop-prelude-sublayers: 2
+  --loop-coda-sublayers: 4
+  --loop-iterations: 4
+  --hidden-size: 512
+  --num-attention-heads: 8
+  --multi-latent-attention: true
+  --q-lora-rank: 192
+  --kv-lora-rank: 64
+  --qk-head-dim: 16
+  --qk-pos-emb-head-dim: 8
+  --v-head-dim: 16
+  --disable-bias-linear: true
+  --experimental-attention-variant: dsv4_hybrid
+  --dsa-indexer-n-heads: 64
+  --dsa-indexer-head-dim: 128
+  --dsa-indexer-topk: 512
+  --dsa-indexer-loss-coeff: 0.01
+  --dsa-indexer-use-sparse-loss: true
+  --csa-window-size: 128
+  --csa-compress-rotary-base: 40000
+  --dsa-kernel-backend: none
+  --num-experts: 8
+  --expert-model-parallel-size: 8
+  --expert-tensor-parallel-size: 1
+  --moe-router-topk: 2
+  --moe-token-dispatcher-type: alltoall
+  --moe-grouped-gemm: true
+  --moe-router-dtype: fp32
+  --moe-router-load-balancing-type: seq_aux_loss
+  --moe-aux-loss-coeff: 1.0e-4
+  --moe-router-score-function: sqrtsoftplus
+  --moe-router-enable-expert-bias: true
+  --moe-router-bias-update-rate: 1.0e-3
+  --log-params-norm: true
+  --log-num-zeros-in-grad: true
+  --log-timers-to-tensorboard: true
+  --tensorboard-dir: ${TENSORBOARD_PATH}
+  --micro-batch-size: 1
+  --global-batch-size: 32
+  --seq-length: 1024
+  --mock-data: true
+  --no-create-attention-mask-in-dataloader: true
+  --calculate-per-token-loss: true
+  --tokenizer-type: NullTokenizer
+  --vocab-size: 100352
+  --position-embedding-type: rope
+  --max-position-embeddings: 1024
+  --normalization: RMSNorm
+  --norm-epsilon: 1.0e-6
+  --swiglu: true
+  --attention-dropout: 0.0
+  --hidden-dropout: 0.0
+  --train-iters: 50
+  --timing-log-level: 0
+  --lr-decay-iters: 320000
+  --save: ${CHECKPOINT_SAVE_PATH}
+  --load: ${CHECKPOINT_LOAD_PATH}
+  --split: 949,50,1
+  --distributed-backend: nccl
+  --lr: 0.00015
+  --lr-decay-style: cosine
+  --min-lr: 1.0e-5
+  --weight-decay: 1e-2
+  --clip-grad: 1.0
+  --lr-warmup-fraction: .01
+  --log-interval: 1
+  --save-interval: 25
+  --eval-interval: 1000
+  --eval-iters: 10
+  --transformer-impl: transformer_engine
+  --tensor-model-parallel-size: 1
+  --pipeline-model-parallel-size: 1
+  --use-distributed-optimizer: true
+  --untie-embeddings-and-output-weights: true
+  --deterministic-mode: true
+  --no-gradient-accumulation-fusion: true
+  --attention-softmax-in-fp32: true
+  --use-checkpoint-opt_param-scheduler: true
+  --use-mcore-models: true
+  --ckpt-format: torch_dist
+  --data-cache-path: ${DATA_CACHE_PATH}
+  --bf16: true
+  --attention-backend: unfused
+  --enable-experimental: true
+  --log-memory-to-tensorboard: true
+TEST_TYPE: ckpt-resume
+METRICS:
+  - "lm loss"
+  - "num-zeros"

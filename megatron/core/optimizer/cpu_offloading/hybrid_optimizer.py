@@ -1,8 +1,87 @@
 # Copyright (c) 2025, NVIDIA CORPORATION and Alibaba PAI. All rights reserved.
+import dataclasses
 from collections import defaultdict
+from itertools import chain
 from typing import Dict
 
 import torch
+
+try:
+    from torch.distributed.tensor import DTensor
+except ImportError:  # torch < 2.5
+    try:
+        from torch.distributed._tensor import DTensor
+    except ImportError:
+        DTensor = None
+
+
+def _is_dtensor(tensor) -> bool:
+    return DTensor is not None and isinstance(tensor, DTensor)
+
+
+def _local_data(tensor: torch.Tensor) -> torch.Tensor:
+    """The storage the optimizer reads and writes, outside autograd: ``tensor.data`` of a plain
+    tensor, and this rank's local shard (``to_local()``) of a DTensor, e.g. a Megatron-FSDP v1
+    parameter or gradient, whose local shard is a view of the FSDP main weight / gradient
+    buffer. Writes to the returned tensor land in that storage."""
+    if _is_dtensor(tensor):
+        with torch.no_grad():
+            return tensor.to_local().detach()
+    return tensor.data
+
+
+def _is_device_tensor(tensor: torch.Tensor) -> bool:
+    """Whether ``tensor`` (a DTensor: its local shard) lives on the accelerator, i.e. is a
+    candidate for offloading. The CPU unit tests substitute this to offload CPU tensors."""
+    return _local_data(tensor).is_cuda
+
+
+# Pinned host buffers are carved out of slabs of at least this many bytes (a power of two).
+_HOST_SLAB_BYTES = 1 << 28
+# Every buffer starts at a multiple of this many bytes of its slab.
+_HOST_ALIGN_BYTES = 64
+
+
+def _empty_pinned_bytes(nbytes: int) -> torch.Tensor:
+    """An uninitialized pinned host buffer of ``nbytes`` bytes (substituted by the CPU unit
+    tests, where there is no CUDA host allocator)."""
+    return torch.empty(nbytes, dtype=torch.uint8, pin_memory=True)
+
+
+class _HostBufferPool:
+    """Host tensors for the offloaded parameters' copies and gradients.
+
+    torch's pinned-memory allocator (``CachingHostAllocator``) rounds every allocation up to
+    the next power of two, so one pinned tensor per parameter shard can cost up to twice its
+    size. Pinned tensors are instead carved, first fit, out of power-of-two slabs of at least
+    ``_HOST_SLAB_BYTES``: the allocator adds nothing, and the only waste is the slabs' unused
+    tails. The pool never frees a slab. Unpinned tensors are plain allocations (no rounding).
+    """
+
+    def __init__(self, pin: bool):
+        self.pin = pin
+        self.slabs = []  # pinned uint8 slabs
+        self.used = []  # bytes handed out of each slab
+
+    def empty(self, shape, dtype: torch.dtype) -> torch.Tensor:
+        """An uninitialized host tensor of ``shape`` and ``dtype``."""
+        shape = torch.Size(shape)
+        nbytes = shape.numel() * torch.empty((), dtype=dtype).element_size()
+        if not self.pin or nbytes == 0:
+            return torch.empty(shape, dtype=dtype, device="cpu")
+        size = -(-nbytes // _HOST_ALIGN_BYTES) * _HOST_ALIGN_BYTES
+        for index, slab in enumerate(self.slabs):
+            if slab.numel() - self.used[index] >= size:
+                break
+        else:
+            index = len(self.slabs)
+            self.slabs.append(
+                _empty_pinned_bytes(max(_HOST_SLAB_BYTES, 1 << (size - 1).bit_length()))
+            )
+            self.used.append(0)
+        start = self.used[index]
+        self.used[index] = start + size
+        return self.slabs[index][start : start + nbytes].view(dtype).view(shape)
 
 
 def _param_generator(cpu_optimizer):
@@ -40,6 +119,19 @@ class HybridDeviceOptimizer(torch.optim.Optimizer):
         This optimizer is particularly useful in scenarios where memory
         constraints are present or when leveraging both CPU and GPU resources
         can lead to performance improvements.
+
+    DTensor parameters (Megatron-FSDP v1, whose optimizer parameters are DTensors over this
+    rank's shard of the main weight buffer): an offloaded DTensor parameter's host copy is a
+    plain tensor holding this rank's local shard (``to_local()``); the gradient's local shard is
+    copied device to host, and the updated host shard is copied back into the parameter's local
+    shard. A DTensor itself is never cloned or pinned. The offload decision counts a
+    parameter's global ``numel()``, so every rank offloads the same parameters.
+    ``self.state`` presents an offloaded DTensor parameter's per-element state (and, for a
+    parameter of lower precision than fp32, ``master_param``) as DTensors with the parameter's
+    mesh and placements over the host tensors the CPU optimizer steps (no copy), so a DTensor
+    checkpoint (``fsdp_dtensor``) saves them sharded like the parameter and loads them in place;
+    ``load_state_dict`` keeps them on the host. An fp32 parameter (a Megatron-FSDP main weight)
+    is its own master and gets no ``master_param``.
     """
 
     def __init__(
@@ -76,6 +168,11 @@ class HybridDeviceOptimizer(torch.optim.Optimizer):
         self.overlap_cpu_optimizer_d2h_h2d = overlap_cpu_optimizer_d2h_h2d
         self.param_update_in_fp32 = param_update_in_fp32
         self.sub_optimizer_kwargs = kwargs
+        # Host copies of the offloaded parameters and their gradient buffers.
+        self._host_param_pool = _HostBufferPool(pin_cpu_params)
+        self._host_grad_pool = _HostBufferPool(pin_cpu_grads)
+        self.gpu_params_map_cpu_copy = {}
+        self.cpu_copy_map_grad: Dict[torch.Tensor, torch.Tensor] = {}
 
         self._init_sub_optimizers()
         self._register_load_state_dict_hooks()
@@ -108,13 +205,32 @@ class HybridDeviceOptimizer(torch.optim.Optimizer):
 
                 param.requires_grad = False
                 if param not in self.cpu_copy_map_grad:
-                    self.cpu_copy_map_grad[param] = torch.empty(
-                        param.shape, dtype=param.dtype, pin_memory=self.pin_cpu_grads, device="cpu"
+                    self.cpu_copy_map_grad[param] = self._host_grad_pool.empty(
+                        param.shape, param.dtype
                     )
 
                 param.grad = self.cpu_copy_map_grad[param]
-                self.cpu_copy_map_grad[param].data.copy_(grad, non_blocking=True)
+                # A DTensor gradient (Megatron-FSDP): copy this rank's local shard.
+                self.cpu_copy_map_grad[param].data.copy_(_local_data(grad), non_blocking=True)
             self._cpu_optimizer_map_data_event[optimizer] = self._d2h_stream.record_event()
+
+    def _set_gpu_optimizer_decoupled_grads(self):
+        """Hand the device optimizer the gradients of the parameters it steps directly (not
+        through an fp32 copy) that are kept in ``decoupled_grad``: the device optimizer is
+        built without ``use_decoupled_grad`` and reads ``.grad``, while Megatron-FSDP (with the
+        precision-aware optimizer that CPU offload requires) sets only ``decoupled_grad``.
+        Without this those parameters were never updated at an offload fraction below 1."""
+        for param in _param_generator(self.gpu_optimizer):
+            if param in self.fp32_param_to_orig_param:
+                # An fp32 copy: its gradient was set by _set_sub_optimizer_grads.
+                continue
+            decoupled_grad = getattr(param, "decoupled_grad", None)
+            if decoupled_grad is not None:
+                param.grad = (
+                    decoupled_grad
+                    if decoupled_grad.dtype == param.dtype
+                    else decoupled_grad.to(param.dtype)
+                )
 
     def _register_param_copy_back_gpu_hook(self):
         def param_copy_back_gpu_hook_closure():
@@ -123,7 +239,8 @@ class HybridDeviceOptimizer(torch.optim.Optimizer):
                 with torch.cuda.stream(self._h2d_stream):
                     for param in _param_generator(optimizer):
                         gpu_param = self.cpu_copys_map_gpu_param[param]
-                        gpu_param.data.copy_(param.data, non_blocking=True)
+                        # A DTensor parameter: into this rank's local shard.
+                        _local_data(gpu_param).copy_(param.data, non_blocking=True)
                 self._h2d_stream.record_event().wait(torch.cuda.current_stream())
 
             return param_copy_back_gpu_hook
@@ -167,6 +284,7 @@ class HybridDeviceOptimizer(torch.optim.Optimizer):
 
         # Step the sub-optimizers.
         if self.gpu_optimizer:
+            self._set_gpu_optimizer_decoupled_grads()
             self.gpu_optimizer.step(closure)
 
         for cpu_optimizer in self.cpu_optimizers:
@@ -180,14 +298,20 @@ class HybridDeviceOptimizer(torch.optim.Optimizer):
         #   in param_groups.
         self._sync_sub_optimizers_state_to_hdo()
 
-    def _init_sub_optimizers(self):
+    def _init_sub_optimizers(self, reuse_host_copies: bool = False):
+        """(Re)build the sub-optimizers. ``reuse_host_copies`` (after a load): an offloaded
+        parameter keeps its host copy and its host gradient buffer, refreshed from the
+        parameter (or, by ``_update_fp32_params_by_new_state``, from a loaded master), instead
+        of pinning new ones while the old ones are still referenced (the pool never frees)."""
+        reuse = dict(self.gpu_params_map_cpu_copy) if reuse_host_copies else {}
+        host_grads = self.cpu_copy_map_grad if reuse_host_copies else {}
         (
             self.cpu_param_groups,
             self.gpu_param_groups,
             self.gpu_params_map_cpu_copy,
             self.cpu_copys_map_gpu_param,
             self.param_to_fp32_param,
-        ) = self._get_sub_optimizer_param_groups(self.offload_fraction)
+        ) = self._get_sub_optimizer_param_groups(self.offload_fraction, reuse)
         self.param_to_inner_param = {}
         self.inner_param_to_orig_param = {}
         for group in self.param_groups:
@@ -201,6 +325,15 @@ class HybridDeviceOptimizer(torch.optim.Optimizer):
                 self.param_to_inner_param[param] = inner_param
                 self.inner_param_to_orig_param[inner_param] = param
         self.fp32_param_to_orig_param = {v: k for k, v in self.param_to_fp32_param.items()}
+        # Offloaded DTensor parameters: the CPU optimizer steps a plain host tensor (the local
+        # shard, ``param_to_inner_param``), and ``self.state`` presents its state as DTensors.
+        self.offloaded_dtensor_params = {
+            param for param in self.gpu_params_map_cpu_copy if _is_dtensor(param)
+        }
+        self._dtensor_state_specs = {}
+        # (parameter, state key) -> (host tensor, its DTensor view), rebuilt only when the host
+        # tensor changes (the first step, a load).
+        self._dtensor_state_views = {}
 
         self.cpu_optimizers = []
         if self.overlap_cpu_optimizer_d2h_h2d:
@@ -215,7 +348,9 @@ class HybridDeviceOptimizer(torch.optim.Optimizer):
         else:
             self.gpu_optimizer = None
 
-        self.cpu_copy_map_grad: Dict[torch.Tensor, torch.Tensor] = defaultdict(torch.Tensor)
+        self.cpu_copy_map_grad: Dict[torch.Tensor, torch.Tensor] = {
+            host: host_grads[host] for host in self.cpu_copys_map_gpu_param if host in host_grads
+        }
         self._d2h_stream = torch.cuda.current_stream()
         self._h2d_stream = torch.cuda.current_stream()
         if self.overlap_cpu_optimizer_d2h_h2d:
@@ -250,12 +385,19 @@ class HybridDeviceOptimizer(torch.optim.Optimizer):
                 cpu_optimizers.append(cpu_optimizer_cls([_cpu_param_group]))
         return cpu_optimizers
 
-    def _get_sub_optimizer_param_groups(self, offload_fraction: float):
+    def _get_sub_optimizer_param_groups(self, offload_fraction: float, reuse=None):
+        """Split the parameters into CPU and device groups. ``reuse``: host copies to keep,
+        by parameter (see ``_init_sub_optimizers``)."""
+        reuse = reuse or {}
         params = []
         for group in self.param_groups:
             params.extend(group["params"])
+        # A DTensor's numel() is its global numel: the same on every rank, so every rank makes
+        # the same offload decisions.
         params_total_numel = sum([param.numel() for param in params])
-        gpu_params_total_numel = sum([param.numel() for param in params if param.is_cuda])
+        gpu_params_total_numel = sum(
+            [param.numel() for param in params if _is_device_tensor(param)]
+        )
         cpu_params_total_numel = params_total_numel - gpu_params_total_numel
         offload_threshold = gpu_params_total_numel * offload_fraction
         offload_params_numel = 0
@@ -271,22 +413,41 @@ class HybridDeviceOptimizer(torch.optim.Optimizer):
             cpu_group["params"] = []
             for param in group["params"]:
                 orig_param = param
+                on_device = _is_device_tensor(param)
                 cpu_copy = False
-                if offload_params_numel < offload_threshold and param.is_cuda:
-                    param = param.detach().clone().cpu().pin_memory()
-                    offload_params_numel += param.numel()
+                if offload_params_numel < offload_threshold and on_device:
+                    # The host copy of a DTensor parameter is a plain tensor holding this
+                    # rank's local shard; the DTensor itself is never cloned or pinned. With
+                    # ``param_update_in_fp32`` it is the fp32 master. It comes from the host
+                    # pool (pinned with ``pin_cpu_params``).
+                    local = _local_data(param)
+                    host_dtype = torch.float32 if self.param_update_in_fp32 else local.dtype
+                    host = reuse.get(orig_param)
+                    if host is None or host.shape != local.shape or host.dtype != host_dtype:
+                        host = self._host_param_pool.empty(local.shape, host_dtype)
+                        host.copy_(local)
+                    elif not (
+                        host_dtype != local.dtype
+                        and "master_param" in self.state.get(orig_param, {})
+                    ):
+                        # A kept host copy is refreshed from the (loaded) parameter, unless
+                        # it is a master that the loaded state restores.
+                        host.copy_(local)
+                    param = host
+                    offload_params_numel += orig_param.numel()
                     cpu_copy = True
-                if self.param_update_in_fp32 and param.dtype != torch.float32:
+                    if host_dtype != local.dtype:
+                        param_to_fp32_param[orig_param] = param
+                elif self.param_update_in_fp32 and param.dtype != torch.float32:
                     param = param.detach().clone().float()
-                    if cpu_copy and self.pin_cpu_params:
-                        param = param.pin_memory()
                     param_to_fp32_param[orig_param] = param
 
                 if cpu_copy:
                     gpu_params_map_cpu_copy[orig_param] = param
                     cpu_copys_map_gpu_param[param] = orig_param
 
-                if param.is_cuda:
+                # The fp32 copy above stays on its source's device.
+                if on_device and not cpu_copy:
                     gpu_group["params"].append(param)
                 else:
                     cpu_group["params"].append(param)
@@ -319,10 +480,64 @@ class HybridDeviceOptimizer(torch.optim.Optimizer):
         for optimizer in self.sub_optimizers:
             for param in optimizer.state:
                 orig_param = self.inner_param_to_orig_param[param]
+                if orig_param in self.offloaded_dtensor_params:
+                    new_state[orig_param] = self._dtensor_state_view(
+                        orig_param, param, optimizer.state[param]
+                    )
+                    continue
                 new_state[orig_param] = optimizer.state[param]
                 if self.param_update_in_fp32:
                     new_state[orig_param]["master_param"] = param
         self.state = new_state
+
+    def _dtensor_like(self, orig_param, host_tensor, state_key=None):
+        """A DTensor with ``orig_param``'s mesh, placements, global shape and stride over
+        ``host_tensor`` (a tensor of this rank's local shard shape, on the host): no copy and no
+        communication; ``host_tensor`` keeps its device and dtype. With ``state_key``, the view
+        is cached while the state key holds the same host tensor (no new DTensor per step)."""
+        if state_key is not None:
+            cached = self._dtensor_state_views.get((orig_param, state_key))
+            if cached is not None and cached[0] is host_tensor:
+                return cached[1]
+            view = self._dtensor_like(orig_param, host_tensor)
+            self._dtensor_state_views[(orig_param, state_key)] = (host_tensor, view)
+            return view
+        key = (orig_param, host_tensor.dtype)
+        spec = self._dtensor_state_specs.get(key)
+        if spec is None:
+            spec = orig_param._spec
+            if spec.tensor_meta is not None and spec.tensor_meta.dtype != host_tensor.dtype:
+                spec = dataclasses.replace(
+                    spec, tensor_meta=spec.tensor_meta._replace(dtype=host_tensor.dtype)
+                )
+            self._dtensor_state_specs[key] = spec
+        return DTensor(host_tensor, spec, requires_grad=False)
+
+    def _dtensor_state_view(self, orig_param, host_param, host_state):
+        """``self.state`` of an offloaded DTensor parameter: the CPU optimizer's state of its
+        host copy ``host_param``, every per-element tensor as a DTensor like ``orig_param`` over
+        the host tensor, so a DTensor checkpoint saves them sharded like the parameter and a
+        load writes them in place.
+
+        ``master_param`` (the fp32 host copy) is added only for a parameter of lower precision
+        (one in ``param_to_fp32_param``), whose master holds more than the parameter. An fp32
+        parameter (a Megatron-FSDP main weight) is its own master: the model checkpoint holds
+        it, the host copy is refreshed from it after a load, and a separate ``master_param``
+        would duplicate it in the checkpoint and could override it (a checkpoint without the
+        key, e.g. written with the GPU optimizer, would leave a stale one)."""
+        view = {}
+        for key, value in host_state.items():
+            if (
+                key != "step"
+                and isinstance(value, torch.Tensor)
+                and not _is_dtensor(value)
+                and value.shape == host_param.shape
+            ):
+                value = self._dtensor_like(orig_param, value, key)
+            view[key] = value
+        if self.param_update_in_fp32 and orig_param in self.param_to_fp32_param:
+            view["master_param"] = self._dtensor_like(orig_param, host_param, "master_param")
+        return view
 
     def _sync_hdo_state_to_sub_optimizers(self):
         for optimizer in self.sub_optimizers:
@@ -330,10 +545,29 @@ class HybridDeviceOptimizer(torch.optim.Optimizer):
             for group in optimizer.param_groups:
                 for param in group["params"]:
                     orig_param = self.inner_param_to_orig_param[param]
+                    if _is_dtensor(orig_param) and not self.state.get(orig_param):
+                        # A DTensor parameter without state, e.g. an empty local shard.
+                        continue
+                    if orig_param in self.offloaded_dtensor_params:
+                        # The CPU optimizer steps plain host tensors: the local shards of
+                        # DTensor values. ``master_param`` (lower-precision parameters only) is
+                        # the host copy itself (restored by _update_fp32_params_by_new_state).
+                        new_state[param] = {
+                            k: _local_data(v) if _is_dtensor(v) else v
+                            for k, v in self.state[orig_param].items()
+                            if k != "master_param"
+                        }
+                        continue
                     new_state[param] = self.state[orig_param]
             optimizer.state = new_state
         self._update_fp32_params_by_new_state()
         self._move_new_state_to_right_device()
+        # Present the offloaded DTensor parameters' state as DTensors again.
+        for optimizer in self.cpu_optimizers:
+            for param, state in optimizer.state.items():
+                orig_param = self.inner_param_to_orig_param[param]
+                if orig_param in self.offloaded_dtensor_params:
+                    self.state[orig_param] = self._dtensor_state_view(orig_param, param, state)
 
     def _sync_hdo_param_groups_to_sub_optimizers(self):
         """Sync HDO new param_groups attribute (e.g. lr, wd, etc.) to sub-optimizers."""
@@ -378,7 +612,13 @@ class HybridDeviceOptimizer(torch.optim.Optimizer):
             # intentionally absent from param_to_fp32_param.
             fp32_param = self.param_to_fp32_param.get(param)
             if fp32_param is not None:
-                fp32_param.data.copy_(v["master_param"])
+                master_param = v["master_param"]
+                if not _is_dtensor(fp32_param):
+                    # An offloaded DTensor parameter's master is its host local shard.
+                    master_param = _local_data(master_param)
+                fp32_param.data.copy_(master_param)
+            # An offloaded native-FP32 DTensor parameter has no separate master: its host copy
+            # was re-made from the (loaded) parameter by _init_sub_optimizers.
 
     @torch.no_grad()
     def update_fp32_param_by_new_param(self):
@@ -391,7 +631,7 @@ class HybridDeviceOptimizer(torch.optim.Optimizer):
         """
         for param, inner_param in self.param_to_inner_param.items():
             if inner_param is not param:
-                inner_param.copy_(param)
+                inner_param.copy_(_local_data(param) if _is_dtensor(param) and not _is_dtensor(inner_param) else param)
 
     def _register_load_state_dict_hooks(self):
         def pre_load_state_dict_hook(self, state_dict):
@@ -404,47 +644,85 @@ class HybridDeviceOptimizer(torch.optim.Optimizer):
             potentially losing precision. This hook replaces parameters with
             their `float32` copies to mitigate this issue.
 
+            An offloaded DTensor parameter is replaced with its host copy (the
+            local shard) too, and its DTensor state values (the views of
+            ``self.state``, which a DTensor checkpoint load fills in place) are
+            unwrapped to their local shards: torch then keeps them on the host
+            instead of casting them to the parameter's device.
+
             Args:
                 state_dict (dict): The state dictionary to be loaded.
 
             Returns:
                 dict: The modified state dictionary with `float32` parameters.
             """
-            if not self.param_update_in_fp32:
+            load_params = {}
+            for group in self.param_groups:
+                for param in group["params"]:
+                    if self.param_update_in_fp32 and param in self.param_to_fp32_param:
+                        load_params[param] = self.param_to_fp32_param[param]
+                    elif param in self.offloaded_dtensor_params:
+                        load_params[param] = self.gpu_params_map_cpu_copy[param]
+            self._load_param_to_orig_param = {v: k for k, v in load_params.items()}
+            if not self.param_update_in_fp32 and not load_params:
                 return state_dict
+
+            if self.offloaded_dtensor_params:
+                # torch pairs the saved and the current parameters in param_groups order.
+                offloaded_ids = {
+                    saved_id
+                    for saved_id, param in zip(
+                        chain.from_iterable(g["params"] for g in state_dict["param_groups"]),
+                        chain.from_iterable(g["params"] for g in self.param_groups),
+                    )
+                    if param in self.offloaded_dtensor_params
+                }
+                state_dict = dict(state_dict)
+                state_dict["state"] = {
+                    saved_id: (
+                        {k: _local_data(v) if _is_dtensor(v) else v for k, v in value.items()}
+                        if saved_id in offloaded_ids
+                        else value
+                    )
+                    for saved_id, value in state_dict["state"].items()
+                }
 
             new_state = {}
             for param, v in self.state.items():
-                param = self.param_to_fp32_param.get(param, param)
+                param = load_params.get(param, param)
                 new_state[param] = v
             self.state = new_state
 
             for group in self.param_groups:
                 for i, param in enumerate(group["params"]):
-                    group["params"][i] = self.param_to_fp32_param.get(param, param)
+                    group["params"][i] = load_params.get(param, param)
 
             return state_dict
 
         self.register_load_state_dict_pre_hook(pre_load_state_dict_hook)
 
         def post_load_state_dict_hook(self):
-            # 1. Replace the temporarily replaced fp32 parameters back. Please
-            # refer to the documentation in `pre_load_state_dict_hook`.
-            if self.param_update_in_fp32:
+            # 1. Replace the temporarily replaced fp32 parameters (and host copies of
+            # offloaded DTensor parameters) back. Please refer to the documentation in
+            # `pre_load_state_dict_hook`.
+            swapped = getattr(self, "_load_param_to_orig_param", {})
+            self._load_param_to_orig_param = {}
+            if self.param_update_in_fp32 or swapped:
                 new_state = {}
                 for param, v in self.state.items():
-                    orig_param = self.fp32_param_to_orig_param.get(param, param)
+                    orig_param = swapped.get(param, param)
                     new_state[orig_param] = v
                 self.state = new_state
 
                 for group in self.param_groups:
                     for i, param in enumerate(group["params"]):
-                        group["params"][i] = self.fp32_param_to_orig_param.get(param, param)
+                        group["params"][i] = swapped.get(param, param)
 
             # 2. After loading state_dict, the parameters may change, and we need to
             # reinitialize the sub-optimizers to regenerate the new parameters and
-            # cpu copy pairs.
-            self._init_sub_optimizers()
+            # cpu copy pairs. The host copies and gradient buffers are kept (refreshed),
+            # not pinned again.
+            self._init_sub_optimizers(reuse_host_copies=True)
             self._sync_hdo_param_groups_to_sub_optimizers()
             self._sync_hdo_state_to_sub_optimizers()
 

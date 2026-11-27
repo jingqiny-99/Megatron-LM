@@ -46,6 +46,22 @@ def validate_moe_cuda_graph_support(config) -> None:
     ):
         return
 
+    if (
+        getattr(config, "moe_cuda_graph_static_budget_without_paged_stash", False)
+        and config.cuda_graph_impl == "transformer_engine"
+        and config.moe_token_dispatcher_type == "flex"
+        and config.moe_flex_dispatcher_backend == "hybridep"
+        and config.moe_expert_rank_capacity_factor is not None
+        and config.use_transformer_engine_op_fuser
+        and not config.moe_paged_stash
+    ):
+        # Static-budget whole-MoE capture without the paged stash: sync-free and capturable.
+        # Nothing here retries an over-budget step (only the paged-stash runner does), so the
+        # caller that opts in must check token_dispatcher.check_over_budget() every step.
+        # Like the assert below, this requires the op fuser, although the rank-capacity
+        # rule in TransformerConfig also accepts moe_use_grouped_tensor.
+        return
+
     assert (
         config.cuda_graph_impl == "transformer_engine"
         and config.moe_token_dispatcher_type == "flex"

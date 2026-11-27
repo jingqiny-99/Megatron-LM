@@ -3,6 +3,7 @@
 /* Helper methods for fast index mapping builds */
 
 #include <algorithm>
+#include <array>
 #include <cassert>
 #include <iostream>
 #include <limits>
@@ -12,6 +13,7 @@
 #include <pybind11/pybind11.h>
 #include <pybind11/numpy.h>
 #include <random>
+#include <vector>
 
 namespace py = pybind11;
 using namespace std;
@@ -246,6 +248,158 @@ py::array_t<T> build_sample_idx(
     sample_idx,                               // the data pointer
     free_when_done                            // numpy array references
   );
+}
+
+namespace {
+
+using PackedPiece = std::array<int64_t, 3>;  // (document id, token offset, token count)
+
+// First fit of one document-index segment [begin, end) over at most open_rows open rows;
+// appends the rows to `rows` in emission order. Mirrors sbhd_packing._pack_segment.
+void pack_segment(const py::detail::unchecked_reference<int32_t, 1> &document_index,
+                  const py::detail::unchecked_reference<int32_t, 1> &sizes,
+                  const int64_t begin,
+                  const int64_t end,
+                  const int64_t seq_length,
+                  const int64_t capacity,
+                  const int64_t min_piece,
+                  const int64_t open_rows,
+                  std::vector<std::vector<PackedPiece>> &rows)
+{
+  std::vector<int64_t> open_used;
+  std::vector<std::vector<PackedPiece>> open_pieces;
+  auto place = [&](const int64_t document, const int64_t offset, const int64_t length) {
+    if (length == capacity)
+    {
+      // A full row on its own (no open row has room: every open row holds a token).
+      rows.push_back({{document, offset, length}});
+      return;
+    }
+    for (size_t slot = 0; slot < open_used.size(); ++slot)
+    {
+      if (open_used[slot] + length <= capacity)
+      {
+        open_used[slot] += length;
+        open_pieces[slot].push_back({document, offset, length});
+        if (open_used[slot] == capacity)
+        {
+          rows.push_back(std::move(open_pieces[slot]));
+          open_pieces.erase(open_pieces.begin() + slot);
+          open_used.erase(open_used.begin() + slot);
+        }
+        return;
+      }
+    }
+    if (static_cast<int64_t>(open_used.size()) == open_rows)
+    {
+      rows.push_back(std::move(open_pieces.front()));
+      open_pieces.erase(open_pieces.begin());
+      open_used.erase(open_used.begin());
+    }
+    open_used.push_back(length);
+    open_pieces.push_back({{document, offset, length}});
+  };
+  for (int64_t i = begin; i < end; ++i)
+  {
+    const int64_t document = document_index[i];
+    const int64_t length = sizes[document];
+    if (length <= 0)
+    {
+      continue;
+    }
+    if (length <= capacity)
+    {
+      place(document, 0, length);
+      continue;
+    }
+    int64_t offset = 0;
+    while (offset + capacity <= length)
+    {
+      rows.push_back({{document, offset, capacity}});
+      offset += seq_length;
+    }
+    const int64_t remainder = length - offset;
+    if (remainder >= min_piece)
+    {
+      place(document, offset, remainder);
+    }
+  }
+  for (auto &row : open_pieces)
+  {
+    rows.push_back(std::move(row));
+  }
+}
+
+}  // namespace
+
+py::tuple build_packed_rows(const py::array_t<int32_t> &document_index_,
+                            const py::array_t<int32_t> &sizes_,
+                            const int64_t seq_length,
+                            const int64_t add_extra_token_to_sequence,
+                            const int64_t open_rows,
+                            const int64_t split_at)
+{
+  /*
+      Whole-document SBHD row packing (megatron/core/datasets/sbhd_packing.py, pack_rows):
+      the same first fit over a bounded window of open rows, the same pieces, the same row
+      order. Returns (row_offsets int64 [rows + 1], pieces int64 [pieces, 3], num_rows_first).
+      split_at < 0 packs the document index as one segment.
+  */
+  if (seq_length < 1 || open_rows < 1)
+  {
+    throw std::invalid_argument("build_packed_rows: seq_length and open_rows must be >= 1");
+  }
+  const auto document_index = document_index_.unchecked<1>();
+  const auto sizes = sizes_.unchecked<1>();
+  const int64_t num_documents = document_index_.shape(0);
+  if (split_at > num_documents)
+  {
+    throw std::invalid_argument("build_packed_rows: split_at is past the document index");
+  }
+  const int64_t capacity = seq_length + (add_extra_token_to_sequence ? 1 : 0);
+  const int64_t min_piece = add_extra_token_to_sequence ? 2 : 1;
+
+  std::vector<std::vector<PackedPiece>> rows;
+  int64_t num_rows_first = 0;
+  if (split_at < 0)
+  {
+    pack_segment(document_index, sizes, 0, num_documents, seq_length, capacity, min_piece,
+                 open_rows, rows);
+    num_rows_first = static_cast<int64_t>(rows.size());
+  }
+  else
+  {
+    pack_segment(document_index, sizes, 0, split_at, seq_length, capacity, min_piece, open_rows,
+                 rows);
+    num_rows_first = static_cast<int64_t>(rows.size());
+    pack_segment(document_index, sizes, split_at, num_documents, seq_length, capacity,
+                 min_piece, open_rows, rows);
+  }
+
+  const int64_t num_rows = static_cast<int64_t>(rows.size());
+  py::array_t<int64_t> row_offsets(num_rows + 1);
+  auto offsets = row_offsets.mutable_unchecked<1>();
+  int64_t num_pieces = 0;
+  offsets(0) = 0;
+  for (int64_t k = 0; k < num_rows; ++k)
+  {
+    num_pieces += static_cast<int64_t>(rows[k].size());
+    offsets(k + 1) = num_pieces;
+  }
+  py::array_t<int64_t> pieces({num_pieces, static_cast<int64_t>(3)});
+  auto out = pieces.mutable_unchecked<2>();
+  int64_t p = 0;
+  for (const auto &row : rows)
+  {
+    for (const auto &piece : row)
+    {
+      out(p, 0) = piece[0];
+      out(p, 1) = piece[1];
+      out(p, 2) = piece[2];
+      ++p;
+    }
+  }
+  return py::make_tuple(row_offsets, pieces, num_rows_first);
 }
 
 inline int32_t get_target_sample_len(const int32_t short_seq_ratio,
@@ -844,6 +998,7 @@ PYBIND11_MODULE(helpers_cpp, m)
   m.def("build_blocks_mapping", &build_blocks_mapping);
   m.def("build_sample_idx_int32", &build_sample_idx<int32_t>);
   m.def("build_sample_idx_int64", &build_sample_idx<int64_t>);
+  m.def("build_packed_rows", &build_packed_rows);
   m.def("build_blending_indices", &build_blending_indices);
   m.def("build_exhaustive_blending_indices", &build_exhaustive_blending_indices);
 }

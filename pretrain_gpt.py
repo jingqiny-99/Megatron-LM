@@ -35,6 +35,7 @@ from megatron.core.packed_seq_params import (
 from megatron.core.parallel_state import get_context_parallel_group
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.rerun_state_machine import get_rerun_state_machine
+from megatron.core.transformer.loop.reporting import loop_metric_report
 from megatron.core.transformer.multi_token_prediction import (
     get_mtp_ranks,
 )
@@ -282,7 +283,12 @@ def _build_cached_logits_loss_func(
 
 
 def loss_func(
-    loss_mask: torch.Tensor, output_tensor: torch.Tensor, model: Optional[GPTModel] = None
+    loss_mask: torch.Tensor,
+    output_tensor: torch.Tensor,
+    model: Optional[GPTModel] = None,
+    loop_losses=None,
+    loop_metrics=None,
+    loop_metric_populations=None,
 ):
     """Loss function.
 
@@ -290,6 +296,13 @@ def loss_func(
         loss_mask (torch.Tensor): Used to mask out some portions of the loss
         output_tensor (torch.Tensor): The tensor with the losses
         model (GPTModel, optional): The model (can be wrapped)
+        loop_losses (dict, optional): Auxiliary losses of a loop decoder for this microbatch
+            (MoR router losses), added per token.
+        loop_metrics (dict, optional): Loop decoder metrics for this microbatch, each
+            reported as ``[value summed over its population, population size]``
+            (``megatron/core/transformer/loop/reporting.py``).
+        loop_metric_populations (dict, optional): The loop decoder's population size of each
+            metric not defined over the issued tokens (MoR metrics: valid tokens).
 
     Returns:
         the loss scalar for this micro-batch
@@ -319,6 +332,19 @@ def loss_func(
 
         num_tokens = loss_mask.sum().clone().detach().to(torch.int)
         report = {'lm loss': torch.cat([loss.clone().detach().view(1), num_tokens.view(1)])}
+
+    # Capture these tensors with the forward's loss closure, so another
+    # microbatch cannot overwrite its depth-router objective.
+    for name, auxiliary in (loop_losses or {}).items():
+        loss = loss + num_tokens * auxiliary
+        report[name] = torch.stack((auxiliary.detach() * num_tokens, num_tokens))
+    # Loop metrics: [value summed over the metric's population, population size] (the
+    # per-token loss tensor has one element per issued token).
+    report.update(
+        loop_metric_report(
+            loop_metrics, issued_tokens=output_tensor.numel(), populations=loop_metric_populations
+        )
+    )
 
     # Check individual rank losses are not NaN prior to DP all-reduce.
     rerun_state_machine = get_rerun_state_machine()
@@ -523,7 +549,19 @@ def forward_step(data_iterator, model: GPTModel, return_schedule_plan: bool = Fa
             )
 
     # [ModelOpt]: model is needed to access ModelOpt distillation losses
-    return output_tensor, partial(loss_func, loss_mask, model=model)
+    decoder = (
+        get_attr_wrapped_model(model, "decoder")
+        if getattr(args, "loop_architecture", "none") != "none"
+        else None
+    )
+    return output_tensor, partial(
+        loss_func,
+        loss_mask,
+        model=model,
+        loop_losses=getattr(decoder, "loop_losses", None),
+        loop_metrics=getattr(decoder, "loop_metrics", None),
+        loop_metric_populations=getattr(decoder, "loop_metric_populations", None),
+    )
 
 
 def train_valid_test_datasets_provider(train_val_test_num_samples, vp_stage=None):
@@ -533,6 +571,11 @@ def train_valid_test_datasets_provider(train_val_test_num_samples, vp_stage=None
     ``pretrain_hybrid.py`` and ``pretrain_hybrid_flex.py``, called with the shared rank
     predicate.
     """
+    args = get_args()
+    if getattr(args, "sbhd_document_packing", False):
+        # This entry's get_batch does not carry the row-tail padding mask to the model.
+        raise ValueError("--sbhd-document-packing is wired for pretrain_hybrid.py only")
+
     return build_gpt_datasets(
         train_val_test_num_samples, vp_stage, built_on_rank=is_dataset_built_on_rank
     )

@@ -843,6 +843,61 @@ def get_model_config(model):
     return get_attr_wrapped_model(model, "config", allow_none=False)
 
 
+def get_logical_num_parameters(
+    model: Union[torch.nn.Module, Iterable[torch.nn.Module]],
+    *,
+    expert_model_parallel_size: Optional[int],
+    tensor_model_parallel_size: int = 1,
+    pipeline_model_parallel_size: int = 1,
+    expert_tensor_parallel_size: int = 1,
+) -> Optional[int]:
+    """The parameter count of the whole model, from this rank's built model chunks.
+
+    Defined when expert parallelism is the only axis that splits parameters: tensor, pipeline
+    and expert-tensor parallel sizes 1 and no GTP-sharded parameter. Every parameter object is
+    counted once over all chunks, and a routed-expert parameter (``allreduce == False``: this
+    rank holds ``1 / expert_model_parallel_size`` of the routed experts) counts
+    ``expert_model_parallel_size`` times. Data and context parallelism replicate parameters and
+    change nothing. Count the chunks as built, before a DDP / FSDP wrapper or a parameter store
+    replaces their parameters.
+
+    Args:
+        model (torch.nn.Module or iterable of torch.nn.Module): The model chunks as built.
+        expert_model_parallel_size (int, optional): The EP size the chunks were built with;
+            None when unknown (a model with routed experts then has no logical count).
+        tensor_model_parallel_size (int): The TP size the chunks were built with.
+        pipeline_model_parallel_size (int): The PP size the chunks were built with.
+        expert_tensor_parallel_size (int): The expert TP size the chunks were built with.
+
+    Returns:
+        Optional[int]: The logical count, or None when it is not defined for this layout.
+    """
+    splitting_sizes = (
+        tensor_model_parallel_size,
+        pipeline_model_parallel_size,
+        expert_tensor_parallel_size,
+    )
+    if any(size != 1 for size in splitting_sizes):
+        return None
+    chunks = [model] if isinstance(model, torch.nn.Module) else list(model)
+    seen = set()
+    total = 0
+    for chunk in chunks:
+        for param in chunk.parameters():
+            if id(param) in seen:
+                continue
+            seen.add(id(param))
+            if getattr(param, "is_gtp_weight_remat", False):
+                return None
+            if getattr(param, "allreduce", True):
+                total += param.nelement()
+            elif expert_model_parallel_size is None:
+                return None
+            else:
+                total += param.nelement() * expert_model_parallel_size
+    return total
+
+
 def move_host_tensor_to_device(
     values: torch.Tensor, device: torch.device, pin_memory: bool = True
 ) -> torch.Tensor:
@@ -1260,6 +1315,7 @@ def make_tp_sharded_tensor_for_checkpoint(
             new_offsets.append((prepend_axis_num, dp_rank, dp_size))
 
     gtp_pad_length = 0  # overwritten below for GTP params
+    gtp_remat_size = 1
 
     # GTP: a GTP param additionally shards out_features (axis 0) by 1/gtp_remat. Layer that
     # split onto TP offset — mirrors make_sharded_tensors_for_checkpoint_with_gtp_remat so direct
@@ -1324,6 +1380,8 @@ def make_tp_sharded_tensor_for_checkpoint(
     # Plain attribute (not a ShardedTensor field, so DCP never serializes it): global_shape minus
     # this gives the true unpadded dim0. Read later by grant_shape_mismatch_for_gtp_padding.
     sharded_tensor.gtp_pad_length = gtp_pad_length
+    # Fused FC1 uses this to recover the TP-local gate/up split after weight dequantization.
+    sharded_tensor.gtp_size = gtp_remat_size
     return sharded_tensor
 
 
@@ -1539,14 +1597,11 @@ def prepare_input_tensors_for_wgrad_compute(grad_output, all_gathered_input):
     # https://github.com/pytorch/pytorch/blob/c47cf9bc7f9e02f649ab4ed53fe4d35732c92ab6/torch/_refs/__init__.py#L2761
     grad_output = grad_output.contiguous()
     all_gathered_input = all_gathered_input.contiguous()
-    # Convert the tensor shapes to 2D for execution compatibility
-    if grad_output.dim() == 3:
-        grad_output = grad_output.view(
-            grad_output.shape[0] * grad_output.shape[1], grad_output.shape[2]
-        )
-        all_gathered_input = all_gathered_input.view(
-            all_gathered_input.shape[0] * all_gathered_input.shape[1], all_gathered_input.shape[2]
-        )
+    # Convert the tensor shapes to 2D for execution compatibility. Inputs may have more than
+    # one leading dimension (e.g. the per-stream [s, b, n, h] input of the mHC MTP h_proj).
+    if grad_output.dim() > 2:
+        grad_output = grad_output.view(-1, grad_output.shape[-1])
+        all_gathered_input = all_gathered_input.view(-1, all_gathered_input.shape[-1])
 
     return grad_output, all_gathered_input
 
@@ -3118,6 +3173,11 @@ def configure_nvtx_profiling(enabled: bool) -> None:
     """
     global _nvtx_enabled
     _nvtx_enabled = enabled
+
+
+def nvtx_profiling_enabled() -> bool:
+    """Whether NVTX range profiling is enabled (``configure_nvtx_profiling``)."""
+    return _nvtx_enabled
 
 
 def _nvtx_range_get_func_path():

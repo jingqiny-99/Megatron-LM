@@ -345,6 +345,35 @@ class DistributedDataParallelConfig:
     Only effective with ``outer_dp_sharding_strategy='optim'``.
     """
 
+    megatron_fsdp_accumulate_main_grad: bool = False
+    """If true, Megatron-FSDP (version 1) accumulates every backward use of a parameter into
+      the parameter's unsharded gradient bucket. By default a parameter whose gradients are
+      sharded (``optim_grads`` / ``optim_grads_params`` over more than one rank) is marked
+      ``overwrite_main_grad`` at every unshard, so a fused weight-gradient kernel (Transformer
+      Engine ``fuse_wgrad_accumulation``) writes each use's gradient over the bucket and a
+      parameter used several times per microbatch, such as the core of a loop model, keeps the
+      gradient of its last-computed use only. With this flag the bucket is zeroed on its first
+      fetch after each allocation, every use adds into it, and the reduce-scatter sends the sum.
+      Single-use parameters get the same gradients. Requires ``use_megatron_fsdp`` with
+      ``megatron_fsdp_version=1``.
+    """
+
+    megatron_fsdp_reduce_scatter_per_use: bool = False
+    """If true, Megatron-FSDP (version 1) reduce-scatters a sharded gradient bucket after every
+      backward use of its FSDP unit, adding each use's reduced shard into the sharded fp32 main
+      gradient, and frees the unsharded bucket before the next use. In accumulate mode alone a
+      parameter used several times per microbatch (a loop core) keeps its unsharded bucket from
+      its first backward use to its last; with this flag only the buckets of the units in
+      backward (and of the queued reduce-scatters) are alive. Costs one reduce-scatter per use
+      instead of one per microbatch (4x for a core run 4 times). The reduction over DP-Outer
+      (HSDP / HFSDP) still runs once per step, after the last use in the last microbatch.
+      Requires ``megatron_fsdp_accumulate_main_grad`` (every bucket starts at zero), a
+      gradient-sharding strategy (``optim_grads`` / ``optim_grads_params``) and no persistent
+      communication buffers (``fsdp_double_buffer`` / ``nccl_ub`` /
+      ``megatron_fsdp_max_pool_double_buffer``). Every data-parallel rank must run the same
+      FSDP units in the same order (a fixed loop depth).
+    """
+
     @property
     def param_sync_via_bucket_group(self) -> bool:
         """Whether DP parameter synchronization is dispatched through DDP bucket groups.
@@ -459,6 +488,36 @@ class DistributedDataParallelConfig:
             assert (
                 self.use_megatron_fsdp
             ), "megatron_fsdp_cache_param_bucket_views requires use_megatron_fsdp."
+
+        if self.megatron_fsdp_accumulate_main_grad and not (
+            self.use_megatron_fsdp and self.megatron_fsdp_version == 1
+        ):
+            # Only Megatron-FSDP v1 reads the flag; elsewhere it would be ignored silently.
+            raise ValueError(
+                "megatron_fsdp_accumulate_main_grad requires use_megatron_fsdp with "
+                "megatron_fsdp_version=1."
+            )
+
+        if self.megatron_fsdp_reduce_scatter_per_use:
+            problems = []
+            if not (self.use_megatron_fsdp and self.megatron_fsdp_version == 1):
+                problems.append("use_megatron_fsdp with megatron_fsdp_version=1")
+            if not self.megatron_fsdp_accumulate_main_grad:
+                problems.append("megatron_fsdp_accumulate_main_grad")
+            if not {
+                self.data_parallel_sharding_strategy,
+                self.expert_data_parallel_sharding_strategy,
+            } & {"optim_grads", "optim_grads_params"}:
+                problems.append("a gradient-sharding strategy (optim_grads or optim_grads_params)")
+            if self.fsdp_double_buffer or self.nccl_ub or self.megatron_fsdp_max_pool_double_buffer:
+                problems.append(
+                    "no persistent communication buffers (fsdp_double_buffer / nccl_ub / "
+                    "megatron_fsdp_max_pool_double_buffer)"
+                )
+            if problems:
+                raise ValueError(
+                    "megatron_fsdp_reduce_scatter_per_use requires " + "; ".join(problems) + "."
+                )
 
         # NCCL user buffers and MaxPoolAllocator force persistent buffer pools in
         # _canonicalize(); evaluate that here without requiring canonicalization first.

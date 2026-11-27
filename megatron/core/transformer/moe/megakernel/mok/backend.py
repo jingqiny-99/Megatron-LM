@@ -20,6 +20,7 @@ from megatron.core.transformer.moe.megakernel.backend import MegakernelBackend
 from megatron.core.transformer.moe.megakernel.factory import split_megakernel_backend_config
 from megatron.core.transformer.moe.megakernel.mok.route_adapter import routing_map_to_mok_inputs
 from megatron.core.transformer.moe.megakernel.mok.runtime import _MoKAutograd
+from megatron.core.transformer.moe.megakernel.mok.virtual_layout import MoKVirtualLayout
 from megatron.core.transformer.moe.megakernel.mok.weights import (
     _native_single_grouped_weight_view,
     _native_split_weight_view,
@@ -37,6 +38,8 @@ if TYPE_CHECKING:
 
 class MoKMegakernel(MegakernelBackend):
     """Execute MOK using trainable parameters owned by native MCore modules."""
+
+    virtual_layout: MoKVirtualLayout | None = None
 
     def __init__(
         self,
@@ -156,6 +159,38 @@ class MoKMegakernel(MegakernelBackend):
         # once per optimizer iteration while retaining graph-captured addresses.
         self._routed_weight_view_cache = None
         self._split_main_grad_descriptor_cache = None
+        self.virtual_layout = (
+            MoKVirtualLayout(config, ep_group, num_local_experts)
+            if getattr(config, "moe_virtual_expert_load_balance", False)
+            else None
+        )
+
+    def bind_fsdp_weight_owners(self, routed, shared):
+        """Resolve canonical parameters through their owner after FSDP swaps optimizer views.
+
+        DDP uses direct registered aliases to drive its prefetch hook. FSDP gathers an
+        enclosing unit instead. Registering the same parameter twice inside it would mark
+        it tied and defer the gradient reduction of every expert to the root callback.
+        """
+        owners = {
+            id(param): (module, name)
+            for tree in (routed, shared)
+            for module in tree.modules()
+            for name, param in module.named_parameters(recurse=False)
+        }
+        aliases = {name: owners[id(p)] for name, p in self._parameters.items() if p is not None}
+        for name in aliases:
+            del self._parameters[name]
+        self._fsdp_weight_owners = aliases
+        if self.virtual_layout is not None:
+            self.virtual_layout.transport.sharded_owner_grads = True
+
+    def __getattr__(self, name):
+        owners = self.__dict__.get("_fsdp_weight_owners")
+        if owners is not None and name in owners:
+            module, key = owners[name]
+            return module.get_parameter(key)
+        return super().__getattr__(name)
 
     @property
     def routed_fc1_parameters(self) -> tuple[nn.Parameter, ...]:
@@ -339,6 +374,8 @@ class MoKMegakernel(MegakernelBackend):
         del missing_keys, unexpected_keys, error_msgs
         self._routed_weight_view_cache = None
         self._split_main_grad_descriptor_cache = None
+        if self.virtual_layout is not None:
+            self.virtual_layout.clear()
         self.is_first_microbatch = True
 
     def _apply(self, *args, **kwargs):
@@ -375,6 +412,8 @@ class MoKMegakernel(MegakernelBackend):
         # Device/dtype conversion invalidates cached storage views and descriptors.
         self._routed_weight_view_cache = None
         self._split_main_grad_descriptor_cache = None
+        if self.virtual_layout is not None:
+            self.virtual_layout.clear()
         self.is_first_microbatch = True
         return out
 
@@ -400,7 +439,27 @@ class MoKMegakernel(MegakernelBackend):
         # representation. Missing routes are encoded as expert -1 with zero weight.
         router_weights, top_experts = routing_map_to_mok_inputs(probs, routing_map, self.topk)
 
-        output = _MoKAutograd.apply(
+        return self._apply_compact(x, router_weights, top_experts).view(original_shape)
+
+    def forward_null(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """Serve peer tokens on the local experts without routing any local token.
+
+        MoK's symmetric workspace needs the same nominal row count on every EP
+        rank. Expert -1 denotes an absent route. The differentiable empty sum
+        connects successive expert backward calls while sending zero adjoint to
+        the local stopped sequence, even if its original values were non-finite.
+        """
+        if self.virtual_layout is not None:
+            raise ValueError("online null participation requires owner-only MoK")
+        width = hidden_states.shape[-1]
+        rows = hidden_states.numel() // width
+        x = hidden_states.reshape(-1)[:0].sum().expand(rows, width).contiguous()
+        weights = torch.zeros(rows, self.topk, device=x.device, dtype=torch.float32)
+        experts = torch.full((rows, self.topk), -1, device=x.device, dtype=torch.int32)
+        return self._apply_compact(x, weights, experts).view_as(hidden_states)
+
+    def _apply_compact(self, x, router_weights, top_experts):
+        return _MoKAutograd.apply(
             self,
             x,
             router_weights,
@@ -410,4 +469,3 @@ class MoKMegakernel(MegakernelBackend):
             self.shared_fc1_weight,
             self.shared_fc2_weight,
         )
-        return output.view(original_shape)

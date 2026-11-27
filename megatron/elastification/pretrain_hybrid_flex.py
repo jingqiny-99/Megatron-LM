@@ -536,6 +536,8 @@ def flex_data_config_from_args(args, *, standalone=False):
             "pretrain_hybrid_flex.py does not support --use-varlen-dataset (its batch path has no "
             "varlen packing support); use pretrain_hybrid.py for varlen data."
         )
+    if getattr(args, "sbhd_document_packing", False):
+        raise ValueError("--sbhd-document-packing is wired for pretrain_hybrid.py only")
     return gpt_data_config_from_args(args, standalone=standalone)
 
 

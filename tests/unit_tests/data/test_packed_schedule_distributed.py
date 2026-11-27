@@ -1,6 +1,6 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
-from types import SimpleNamespace
+from types import MethodType, SimpleNamespace
 
 import pytest
 import torch
@@ -150,6 +150,9 @@ def test_packed_schedule_pipeline_cp_and_hybrid_sp(dynamic_cp, cp_size, hybrid):
                 mtp_process=False,
                 pg_collection=pg,
             )
+            # forward calls the HybridModel stages (embed / rope_ctx / head_loss) on self.
+            for name in ("embed", "rope_ctx", "head_loss"):
+                setattr(model, name, MethodType(getattr(HybridModel, name), model))
             boundary = result.get_batch('contiguous')
             decoder.input_tensor = torch.zeros(
                 boundary['padding_mask'].shape[1] // pg.tp.size(), 1, 8, device='cuda'

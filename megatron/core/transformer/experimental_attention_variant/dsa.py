@@ -50,6 +50,13 @@ from megatron.core.transformer.experimental_attention_variant.dsa_logging import
 from megatron.core.transformer.experimental_attention_variant.head_batched_matmul import (
     head_batched_matmul,
 )
+from megatron.core.transformer.experimental_attention_variant.dsa_loop_kv import (
+    compact_source_topk,
+    gather_zigzag_window_kv,
+    two_bank_topk,
+    zigzag_window_positions,
+)
+from megatron.core.transformer.loop.cross_loop_kv import current_cross_loop_pass
 from megatron.core.transformer.module import MegatronModule, mark_keep_in_fp32
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.transformer_config import TransformerConfig
@@ -398,11 +405,17 @@ def _validate_nonpacked_cp_uniform_length(
     cp_size: int,
     cp_group: Optional[torch.distributed.ProcessGroup],
     device: torch.device,
+    layout_cache: Optional[dict] = None,
 ) -> None:
-    """Validate the uniform-length precondition for non-packed allgather CP."""
+    """Check uniform rank lengths once per fixed SBHD microbatch and local KV on every call."""
     expected_skv = sq * cp_size
+    geometry = (cp_group, cp_size, device, sq)
+    previous = None if layout_cache is None else layout_cache.get("uniform_sbhd_geometry")
+    if previous is not None and previous != geometry:
+        raise RuntimeError("Non-packed DSA context geometry changed within a fixed SBHD microbatch")
     if (
-        cp_group is not None
+        previous is None
+        and cp_group is not None
         and torch.distributed.is_available()
         and torch.distributed.is_initialized()
         and get_pg_size(cp_group) == cp_size
@@ -416,13 +429,14 @@ def _validate_nonpacked_cp_uniform_length(
                 "Non-packed DSA allgather CP expects uniform per-rank sequence lengths; "
                 f"got per-rank lengths {all_lens.tolist()}."
             )
-        expected_skv = int(all_lens.sum().item())
 
     if skv != sq and skv != expected_skv:
         raise RuntimeError(
             "Non-packed DSA allgather CP expects uniform per-rank sequence lengths; "
             f"got local query length {sq} and key length {skv} for cp_size={cp_size}."
         )
+    if layout_cache is not None and previous is None:
+        layout_cache["uniform_sbhd_geometry"] = geometry
 
 
 class _PermuteRows(torch.autograd.Function):
@@ -1833,8 +1847,10 @@ def bwd_fused_indexer_loss_naive(
                 dtype=torch.float32, device=attention_scores_normalized.device
             )
             if query_valid_rows is not None
-            else torch.tensor(
-                float(b * sq), dtype=torch.float32, device=attention_scores_normalized.device
+            # A device fill, not torch.tensor(..., device=...): the latter is a pageable
+            # host-to-device copy, which CUDA graph capture rejects.
+            else torch.full(
+                (), float(b * sq), dtype=torch.float32, device=attention_scores_normalized.device
             )
         ).clamp_min(1.0)
         grad_kl_per_row = grad_kl_div / valid_row_count  # scalar value for each real row
@@ -2967,9 +2983,22 @@ class _DSAWeightsProjection(torch.autograd.Function):
         ctx.linear = linear
         # This path does not use TE's parameter-transpose cache. Keep the
         # first-microbatch signal solely for fused WGrad overwrite/accumulate semantics.
-        ctx.is_first_microbatch = getattr(linear, "is_first_microbatch", None)
+        is_first_microbatch = getattr(linear, "is_first_microbatch", None)
         if hasattr(linear, "is_first_microbatch"):
             linear.is_first_microbatch = False
+        # A True makes the fused WGrad overwrite main_grad. It belongs to the first call, whose
+        # backward runs last when the module is called again before that backward (a loop
+        # core run several times per microbatch, a repeated MTP layer): the overwrite would
+        # drop the later calls' gradients. A later call therefore withdraws the pending True,
+        # and a layer marked is_repeated_layer never overwrites (as TE's linears).
+        if getattr(linear, "is_repeated_layer", False) and is_first_microbatch is True:
+            is_first_microbatch = None
+        pending = getattr(linear, "_dsa_pending_first_call", None)
+        if pending is not None:
+            pending[0] = None
+        # Read at backward time (one-element holder, so a later call can still withdraw it).
+        ctx.first_call = [is_first_microbatch]
+        linear._dsa_pending_first_call = ctx.first_call if is_first_microbatch is True else None
         output, indexer._weights_proj_te_gemm_supported = _dsa_weights_proj_forward_gemm(
             x, weight, indexer._weights_proj_te_gemm_supported
         )
@@ -2987,6 +3016,10 @@ class _DSAWeightsProjection(torch.autograd.Function):
             grad_input = torch.mm(grad_output_2d.float(), weight.float())
             grad_input = grad_input.reshape_as(x).to(dtype=x.dtype)
 
+        is_first_microbatch = ctx.first_call[0]
+        if getattr(linear, "_dsa_pending_first_call", None) is ctx.first_call:
+            linear._dsa_pending_first_call = None
+
         grad_weight = None
         if ctx.needs_input_grad[1]:
             if (
@@ -2997,12 +3030,12 @@ class _DSAWeightsProjection(torch.autograd.Function):
                     _dsa_weights_proj_wgrad,
                     weight=weight,
                     linear=linear,
-                    is_first_microbatch=ctx.is_first_microbatch,
+                    is_first_microbatch=is_first_microbatch,
                 )
                 linear.wgrad_store.put([x, grad_output], wgrad_func)
             else:
                 grad_weight, _ = _dsa_weights_proj_wgrad(
-                    x, grad_output, weight, linear, ctx.is_first_microbatch
+                    x, grad_output, weight, linear, is_first_microbatch
                 )
 
             if getattr(linear, "fuse_wgrad_accumulation", False) and hasattr(
@@ -4136,6 +4169,10 @@ def get_dsa_index_sharing_payload(
 ) -> _DSAIndexSharingPayload:
     """Return the ordinary index-sharing record: a view of the carrier's per-layer holders."""
     carrier = get_index_share_carrier(packed_seq_params, attention_mask, config)
+    return _index_sharing_payload_from_carrier(carrier)
+
+
+def _index_sharing_payload_from_carrier(carrier: object) -> _DSAIndexSharingPayload:
     return _DSAIndexSharingPayload(
         **{
             name: _carrier_holder(carrier, attr)
@@ -4380,7 +4417,8 @@ class DSAttention(MegatronModule):
         self, packed_seq_params: Optional[PackedSeqParams], attention_mask: Optional[torch.Tensor]
     ) -> _DSAIndexSharingPayload:
         """Return the ordinary index-sharing record of this forward."""
-        return get_dsa_index_sharing_payload(packed_seq_params, attention_mask, self.config)
+        carrier = self._get_index_share_carrier(packed_seq_params, attention_mask)
+        return _index_sharing_payload_from_carrier(carrier)
 
     def _get_mtp_sharing_payload(
         self,
@@ -4673,6 +4711,10 @@ class DSAttention(MegatronModule):
             torch.arange(k_pooled.size(0), device=k_pooled.device, dtype=torch.int64) * pool_size
         )
         return k_pooled, pool_token_base
+
+    def _get_nonpacked_cp_layout_cache(self) -> Optional[dict]:
+        """A fixed-layout subclass may share shape metadata within its own model forward."""
+        return None
 
     @staticmethod
     def _broadcast_kpool_selection_from_tp_rank0(
@@ -5148,6 +5190,24 @@ class DSAttention(MegatronModule):
         cp_rank = cp_group.rank() if cp_group is not None else 0
         tp_group = getattr(self.pg_collection, "tp", None)
         tp_size = get_pg_size(tp_group)
+        loop_pass = (
+            current_cross_loop_pass()
+            if getattr(self.config, "loop_reuse_sparse_kv", False)
+            else None
+        )
+        if loop_pass is not None and (
+            (packed_seq_params is not None and packed_seq_params.qkv_format != "thd")
+            or x.ndim not in (2, 3)
+            or tp_size != 1
+            or (cp_size > 1 and self.cp_comm_type != "allgather")
+            or not absorbed_mla
+            or value is not None
+            or attn_mask_type != AttnMaskType.causal
+            or key.size(0) != sq
+        ):
+            raise ValueError(
+                "Cross-loop DSA requires causal SBHD or packed THD absorbed MLA with TP1 and allgather CP"
+            )
         sequence_parallel_tp = self.config.sequence_parallel and tp_size > 1
         sequence_parallel_tp_row_start = 0
         sequence_parallel_tp_full_rows = sq
@@ -5323,12 +5383,14 @@ class DSAttention(MegatronModule):
                     )
 
         if not packed_thd and cp_size > 1:
+            layout_cache = self._get_nonpacked_cp_layout_cache()
             _validate_nonpacked_cp_uniform_length(
                 sq=cp_local_sequence_rows,
                 skv=key.size(0),
                 cp_size=cp_size,
                 cp_group=cp_group,
                 device=query.device,
+                layout_cache=layout_cache,
             )
 
         local_cp_kv_lens = {cp_local_sequence_rows}
@@ -5337,7 +5399,19 @@ class DSAttention(MegatronModule):
         # skv is the key length after it.
         cp_kv_gather = None
         skv = key.size(0)
-        if cp_size > 1:
+        # The recurrent window needs just the two local chunks and their preceding
+        # tails. Large windows and noncanonical masks still use globally ordered KV.
+        compact_window = (
+            loop_pass is not None
+            and not loop_pass.is_source
+            and not packed_thd
+            and cp_size > 1
+            and position_ids is None
+            and attention_mask is None
+            and sq % 2 == 0
+            and 0 < self.config.loop_sparse_kv_window_size <= sq // 2 + 1
+        )
+        if cp_size > 1 and not compact_window:
             assert (
                 self.cp_comm_type == "allgather"
             ), "DSAttention context parallelism currently supports cp_comm_type=allgather only."
@@ -5397,11 +5471,12 @@ class DSAttention(MegatronModule):
                         prebuilt=_prebuilt_layout_tables(local_len),
                     )
                     return idx, inv_idx
-                return dsa_layout.build_zigzag_allgather_cp_key_reorder(
-                    sq=local_len,
-                    cp_size=cp_size,
-                    device=query.device,
-                    return_inverse_key_reorder=True,
+                return self._memoized(
+                    layout_cache,
+                    ("sbhd_kv_reorder", local_len, cp_size, query.device),
+                    lambda: dsa_layout.build_zigzag_allgather_cp_key_reorder(
+                        sq=local_len, cp_size=cp_size, device=query.device, return_inverse_key_reorder=True
+                    ),
                 )
 
             gather_cp_key = key.size(0) in local_cp_kv_lens
@@ -5451,6 +5526,8 @@ class DSAttention(MegatronModule):
 
         if cp_kv_gather is None:
             capture_mtp_latent_kv()
+        if compact_window:
+            skv = sq * cp_size
 
         if not packed_thd and sequence_parallel_query_is_local:
             nonpacked_query_positions = dsa_layout.extract_query_positions_from_position_ids(
@@ -5516,6 +5593,59 @@ class DSAttention(MegatronModule):
         query_valid_rows = dsa_masking.extract_query_valid_rows_from_packed_seq_params(
             packed_seq_params, b=b, sq=sq, device=query.device
         )
+        if loop_pass is not None and packed_thd and query_valid_rows is None:
+            # Static packed inputs can carry real and aligned document offsets without
+            # a rank-local token mask. Recurrent attention must not attend padding rows.
+            real_cu = packed_seq_params.cu_seqlens_q
+            padded_cu = packed_seq_params.cu_seqlens_q_padded
+            if real_cu is not None and padded_cu is not None and real_cu is not padded_cu:
+                canonical_rows = varlen_ends - 1
+                document = torch.searchsorted(padded_cu[1:], canonical_rows, right=True)
+                real_lengths = real_cu[1:] - real_cu[:-1]
+                query_valid_rows = (canonical_rows - varlen_starts < real_lengths[document])[None, :]
+        if loop_pass is not None and not loop_pass.is_source:
+            # The saved bank stays in global order. Current-window indices address
+            # either the compact local+halo bank or the complete gathered bank.
+            finish_cp_kv_gather()
+            prefix_key = loop_pass.read(self, "dsa_latent")
+            if prefix_key.shape != (skv, *key.shape[1:]):
+                raise ValueError("First and second DSA passes require identical KV geometry")
+            window_ends = varlen_ends
+            if compact_window:
+                window = self.config.loop_sparse_kv_window_size
+                key = gather_zigzag_window_kv(key, window, cp_group)
+                bank_positions, window_ends = self._memoized(
+                    layout_cache,
+                    ("window_positions", sq, cp_size, cp_rank, window, query.device),
+                    lambda: zigzag_window_positions(sq, cp_size, cp_rank, window, query.device),
+                )
+            else:
+                bank_positions = torch.arange(skv, device=query.device).repeat(2)
+            selected, lengths = two_bank_topk(
+                loop_pass.read(self, "dsa_topk"),
+                loop_pass.read(self, "dsa_topk_length"),
+                self.config.loop_sparse_kv_window_size,
+                causal_ends=window_ends,
+                causal_starts=varlen_starts if packed_thd else None,
+                valid_rows=query_valid_rows,
+                bank_size=skv,
+            )
+            return _run_sparse_attention(
+                absorbed_mla=True,
+                query=query,
+                key=torch.cat((prefix_key, key), dim=0),
+                value=None,
+                up_v_weight=up_v_weight,
+                topk_indices=selected,
+                topk_length=lengths,
+                softmax_scale=self.softmax_scale,
+                config=self.config,
+                mask=None,
+                varlen_starts=varlen_starts,
+                varlen_ends=varlen_ends,
+                key_positions=bank_positions,
+                all_topk_rows_nonempty=not packed_thd,
+            )
         if kpool_trainable:
             # Layouts the trainable KPool path does not cover. The config cannot see them:
             # they come with the packed parameters and the mask of each forward.
@@ -5558,6 +5688,21 @@ class DSAttention(MegatronModule):
             and varlen_starts is not None
             and varlen_ends is not None
             and key_positions is None
+        )
+        # This proof is independent of packed THD. The non-packed CP gather
+        # reorders KV to global order and the dataloader sends two equal,
+        # mirrored query chunks; custom position IDs can change their bounds.
+        sbhd_cp_zigzag = (
+            cp_size > 1
+            and self.cp_comm_type == "allgather"
+            and cp_kv_gather is not None
+            and packed_seq_params is None
+            and attn_mask_type == AttnMaskType.causal
+            and position_ids is None
+            and nonpacked_query_positions is None
+            and not sequence_parallel_query_is_local
+            and skv == sq * cp_size
+            and sq % 2 == 0
         )
         indexer_reduce_group = (
             cp_group if cp_size > 1 and self.config.calculate_per_token_loss else None
@@ -5797,6 +5942,7 @@ class DSAttention(MegatronModule):
             use_fused_kernels
             and not self.index_share
             and not self.mtp_sparse_attention_index_share
+            and loop_pass is None
             and not _is_kpool
         ):
             assert q is not None and k is not None and weights is not None
@@ -5824,6 +5970,7 @@ class DSAttention(MegatronModule):
                 key_positions=key_positions,
                 query_valid_rows=query_valid_rows,
                 varlen_is_plain_causal=varlen_is_plain_causal,
+                sbhd_cp_zigzag=sbhd_cp_zigzag,
                 use_relu=self.config.dsa_indexer_scoring_relu,
                 use_local_indexer_varlen=use_local_indexer_varlen,
                 single_packed_thd_sequence=single_packed_thd_sequence,
@@ -6133,6 +6280,7 @@ class DSAttention(MegatronModule):
                     packed_seq_params=packed_seq_params,
                     cp_size=cp_size,
                     varlen_is_plain_causal=varlen_is_plain_causal,
+                    sbhd_cp_zigzag=sbhd_cp_zigzag,
                     query=query,
                     key=key if cp_kv_gather is None else cp_kv_gather.key_shape_twin(key),
                 )
@@ -6168,6 +6316,7 @@ class DSAttention(MegatronModule):
                     packed_seq_params=packed_seq_params,
                     cp_size=cp_size,
                     varlen_is_plain_causal=varlen_is_plain_causal,
+                    sbhd_cp_zigzag=sbhd_cp_zigzag,
                 )
                 if fused_topk_with_loss is not None:
                     topk_indices, topk_length, indexer_loss = fused_topk_with_loss
@@ -6251,6 +6400,7 @@ class DSAttention(MegatronModule):
                     packed_seq_params=packed_seq_params,
                     cp_size=cp_size,
                     varlen_is_plain_causal=varlen_is_plain_causal,
+                    sbhd_cp_zigzag=sbhd_cp_zigzag,
                 )
                 if stash_checkpoint_topk_scores:
                     finish_cp_kv_gather()
@@ -6345,6 +6495,14 @@ class DSAttention(MegatronModule):
         # Run sparse attention kernel
         # ===================================
         finish_cp_kv_gather()
+        if loop_pass is not None:
+            shared_indices, shared_lengths = compact_source_topk(
+                topk_indices, topk_length, causal_ends=varlen_ends,
+                causal_starts=varlen_starts if packed_thd else None, valid_rows=query_valid_rows
+            )
+            loop_pass.publish(self, "dsa_latent", key)
+            loop_pass.publish(self, "dsa_topk", shared_indices)
+            loop_pass.publish(self, "dsa_topk_length", shared_lengths)
         output = _run_sparse_attention(
             absorbed_mla=absorbed_mla,
             query=query,

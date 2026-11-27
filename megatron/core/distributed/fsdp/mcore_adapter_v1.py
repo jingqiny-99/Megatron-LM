@@ -70,8 +70,16 @@ def _get_default_fsdp_unit_modules(overlap_moe_expert_parallel_comm: bool) -> Li
         return fsdp_unit_modules
 
     from megatron.core.models.bagel.transformer_mot_layer import MoTTransformerLayer
+    from megatron.core.models.hybrid.layers.hybrid_hyper_connection import (
+        HyperConnectionHybridLayer,
+    )
 
-    return [*fsdp_unit_modules, MoTTransformerLayer]
+    # The mHC hybrid wrapper runs its inner TransformerLayer's sublayer methods directly, not
+    # through the inner layer's __call__, so unit hooks on the inner layer would never fire
+    # (its weights would not be gathered under optim_grads_params, nor overwrite_main_grad
+    # set). The wrapper is the module the stack calls: hook registration visits it before its
+    # inner layer, makes it the unit and skips the inner layer as a submodule of a unit.
+    return [*fsdp_unit_modules, MoTTransformerLayer, HyperConnectionHybridLayer]
 
 
 class FullyShardedDataParallelV1(_BaseDataParallel):
@@ -146,14 +154,34 @@ class FullyShardedDataParallelV1(_BaseDataParallel):
             raise IMPORT_MEGATRON_FSDP_ERROR
 
         ddp_config.finalize()
-        if config.moe_virtual_expert_load_balance:
+        if (
+            config.moe_virtual_expert_load_balance
+            and getattr(config, "moe_megakernel_backend", None) != "mok"
+        ):
             raise ValueError(
-                "MoonEP is not yet integrated with Megatron-FSDP v1. Supporting it requires "
-                "binding gathered expert weights, acquiring FSDP-managed full-gradient "
-                "buffers through get_main_grad, and completing replica-gradient accumulation "
-                "before FSDP reduces or releases those buffers. "
-                "Use regular DDP or the distributed optimizer for now."
+                "Megatron-FSDP v1 supports MoonEP only with the native MoK fixed-depth "
+                "RSBF ZeRO-2 gradient and replica transport."
             )
+
+        if getattr(config, "loop_architecture", "none") != "none":
+            # A loop runs its core weights several times per microbatch: accumulate mode, fp32
+            # gradient buckets and the other loop rules. Imported lazily: the guards module
+            # imports model code.
+            from megatron.core.transformer.loop.guards import validate_loop_fsdp_config
+
+            validate_loop_fsdp_config(config, ddp_config)
+
+        if getattr(config, "moe_megakernel_backend", None) == "mok":
+            from megatron.core.transformer.loop.guards import lockstep_rsbf_mok_zero2
+            from megatron.core.transformer.moe.moe_layer import MoELayer
+
+            if not lockstep_rsbf_mok_zero2(config, ddp_config):
+                raise ValueError("MoK requires fixed-depth BF16 RSBF and ZeRO-2 gradient sharding")
+            for layer in module.modules():
+                if isinstance(layer, MoELayer):
+                    layer.megakernel_experts.bind_fsdp_weight_owners(
+                        layer.experts, layer.shared_experts
+                    )
 
         if has_config_logger_enabled(config):
             log_config_to_disk(config, locals(), prefix=type(self).__name__)

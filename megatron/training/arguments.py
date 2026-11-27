@@ -54,6 +54,7 @@ from megatron.training.argument_utils import (  # noqa: F401 # pylint: disable=u
     _wide_residual_config_from_args,
     checkpoint_config_from_args,
     core_transformer_config_from_args,
+    hybrid_pattern_attention_variant,
 )
 from megatron.training.utils import (
     get_device_arch_version,
@@ -88,6 +89,8 @@ def add_megatron_arguments(parser: argparse.ArgumentParser):
     parser = _add_experimental_attention_variant_args(parser)
     parser = _add_heterogeneous_args(parser)
     parser = _add_logging_args(parser)
+    parser = _add_loop_planner_args(parser)
+    parser = _add_loop_param_store_args(parser)
     parser = _add_straggler_detector_args(parser)
     parser = _add_workload_inspector_server_args(parser)
     parser = _add_inference_args(parser)
@@ -470,6 +473,424 @@ def dataloader_prefetch_factor_type(x):
     return value
 
 
+def _validate_loop_rsbf_waves(args):
+    """``--loop-rsbf-waves`` must divide the microbatches per step of every step: checked here
+    rather than at the first step; a batch-size schedule (whose microbatch count changes during
+    the run) is rejected with more than one wave."""
+    waves = getattr(args, 'loop_rsbf_waves', 1)
+    if getattr(args, 'loop_schedule', 'standard') != 'rsbf' or waves == 1:
+        return
+    if getattr(args, 'step_batch_size_schedule', None) is not None or getattr(
+        args, 'decrease_batch_size_if_needed', False
+    ):
+        raise ValueError(
+            '--loop-rsbf-waves > 1 does not support --step-batch-size-schedule or '
+            '--decrease-batch-size-if-needed (the microbatch count must stay divisible)'
+        )
+    # The same divisor as the microbatch calculator (data_parallel_size excludes the
+    # GTP-remat axis).
+    per_step = (
+        args.micro_batch_size * args.data_parallel_size * getattr(args, 'gtp_weight_remat_size', 1)
+    )
+    num_microbatches = args.global_batch_size // per_step
+    if num_microbatches % waves:
+        raise ValueError(
+            f'--loop-rsbf-waves ({waves}) must divide the microbatches per step '
+            f'({num_microbatches} = global_batch_size {args.global_batch_size} // '
+            f'(micro_batch_size x data_parallel_size x gtp_weight_remat_size = {per_step}))'
+        )
+
+
+def _validate_stratified_loop_batch(args):
+    """Every optimizer update must contain the complete prescribed depth histogram."""
+    if getattr(args, 'loop_exit_criterion', 'fixed') != 'stratified':
+        return
+    from megatron.core.transformer.loop.depth_schedule import validate_stratified_depth
+
+    validate_stratified_depth(args)
+    if sum(args.loop_depth_counts) != args.global_batch_size:
+        raise ValueError('the sum of --loop-depth-counts must equal --global-batch-size')
+    if (
+        getattr(args, 'rampup_batch_size', None) is not None
+        or getattr(args, 'step_batch_size_schedule', None) is not None
+        or getattr(args, 'decrease_batch_size_if_needed', False)
+    ):
+        raise ValueError('stratified loop depth counts require a constant global batch size')
+
+
+def _validate_loop_exit_histogram(args):
+    """``--loop-exit-histogram-path`` needs the RSBF schedule: the eager schedule records no exit
+    histogram (its depths stay per-microbatch device tensors)."""
+    if getattr(args, 'loop_exit_histogram_path', None) is None:
+        return
+    if getattr(args, 'loop_schedule', 'standard') != 'rsbf':
+        raise ValueError(
+            '--loop-exit-histogram-path needs --loop-schedule rsbf (only the RSBF executor '
+            'records the exit-depth histogram)'
+        )
+
+
+def _validate_loop_carrier_diagnostics(args):
+    """``--loop-carrier-diagnostics summary|full``: the eager hybrid Huginn loop (the RSBF
+    executor runs no eager layer loop in training) at a fixed round count (the summary metrics
+    are keyed by round 1..--loop-iterations, the same on every microbatch and rank), or a
+    non-loop hybrid model with ``--loop-carrier-diagnostics-segments`` (the carrier ablation's
+    ``plain-mhc``); ``--loop-carrier-diagnostics-path`` needs ``full``."""
+    mode = getattr(args, 'loop_carrier_diagnostics', 'off')
+    if getattr(args, 'loop_carrier_diagnostics_path', None) is not None and mode != 'full':
+        raise ValueError('--loop-carrier-diagnostics-path needs --loop-carrier-diagnostics full')
+    segments = getattr(args, 'loop_carrier_diagnostics_segments', None)
+    if segments is not None and mode == 'off':
+        raise ValueError(
+            '--loop-carrier-diagnostics-segments needs --loop-carrier-diagnostics summary or full'
+        )
+    if mode == 'off':
+        return
+    from megatron.core.transformer.loop.guards import is_hybrid_loop_config
+
+    if getattr(args, 'loop_architecture', 'none') == 'none' and segments is not None:
+        prelude, rounds, coda = segments
+        if getattr(args, 'hybrid_layer_pattern', None) is None:
+            raise ValueError('--loop-carrier-diagnostics-segments needs a hybrid model')
+        if prelude < 0 or rounds < 1 or coda < 0:
+            raise ValueError(
+                '--loop-carrier-diagnostics-segments PRELUDE ROUNDS CODA needs PRELUDE >= 0, '
+                f'ROUNDS >= 1 and CODA >= 0, got {segments}'
+            )
+        # The boundary hooks index the local decoder's sublayers as the whole model's, and
+        # their metrics reach the loss function only on the last pipeline stage. Inside
+        # validate_args the PP clause decides (VPP is derived later and needs PP > 1); the VPP
+        # clause covers a direct call with a VPP size set.
+        if (getattr(args, 'pipeline_model_parallel_size', 1) or 1) > 1 or getattr(
+            args, 'virtual_pipeline_model_parallel_size', None
+        ) not in (None, 1):
+            raise ValueError(
+                '--loop-carrier-diagnostics-segments supports no pipeline parallelism '
+                '(--pipeline-model-parallel-size 1, no virtual pipeline stages)'
+            )
+        return
+    if segments is not None:
+        raise ValueError(
+            '--loop-carrier-diagnostics-segments is for a non-loop hybrid model (a loop takes '
+            'its rounds from --loop-prelude-sublayers / --loop-coda-sublayers)'
+        )
+    if (
+        not is_hybrid_loop_config(args)
+        or getattr(args, 'loop_architecture', 'none') != 'huginn'
+        or getattr(args, 'loop_schedule', 'standard') != 'standard'
+        or getattr(args, 'loop_sample_depth', False)
+    ):
+        raise ValueError(
+            '--loop-carrier-diagnostics needs an eager hybrid Huginn loop (--loop-architecture '
+            'huginn with --loop-prelude-sublayers / --loop-coda-sublayers, --loop-schedule '
+            'standard, no --loop-sample-depth) or a non-loop hybrid model with '
+            '--loop-carrier-diagnostics-segments'
+        )
+
+
+def _validate_loop_planner(args):
+    """``--loop-planner report|apply``: a hybrid Huginn loop on the RSBF schedule; positive
+    sizes; a depth source the run has; and for ``apply``: cp = 1, the four planner-owned RSBF
+    flags left at their defaults, no user ``--optimizer-cpu-offload`` unless pinned with
+    ``--loop-planner-optimizer-offload always``, whose prerequisites must hold."""
+    mode = getattr(args, 'loop_planner', 'off')
+    if mode == 'off':
+        for flag in ('loop_planner_report_path', 'loop_planner_histogram_path'):
+            if getattr(args, flag, None) is not None:
+                raise ValueError(f"--{flag.replace('_', '-')} needs --loop-planner report or apply")
+        return
+    from megatron.core.transformer.loop.guards import is_hybrid_loop_config
+
+    if (
+        getattr(args, 'loop_schedule', 'standard') != 'rsbf'
+        or not is_hybrid_loop_config(args)
+        or getattr(args, 'loop_architecture', 'none') != 'huginn'
+    ):
+        raise ValueError(
+            '--loop-planner needs a hybrid Huginn loop (--loop-architecture huginn with '
+            '--loop-prelude-sublayers / --loop-coda-sublayers) on --loop-schedule rsbf'
+        )
+    if getattr(args, 'loop_carrier', 'injection') != 'injection':
+        # The cost model has no attention-residual history rows (and RSBF runs only the
+        # injection carrier).
+        raise ValueError("--loop-planner needs --loop-carrier injection")
+    if getattr(args, 'loop_untie_core', False):
+        # The cost model has no untied-core rows (and RSBF runs only a tied core).
+        raise ValueError("--loop-planner does not support --loop-untie-core")
+    for flag in (
+        'loop_planner_hbm_cap_gb',
+        'loop_planner_c2c_gbps',
+        'loop_planner_c2c_margin',
+        'loop_planner_act_bytes_per_token',
+    ):
+        value = getattr(args, flag, None)
+        if value is not None and not value > 0:
+            raise ValueError(f"--{flag.replace('_', '-')} must be > 0, got {value}")
+    for flag in (
+        'loop_planner_grace_gb',
+        'loop_planner_grace_margin_gb',
+        'loop_planner_ep_reserve_gb',
+    ):
+        value = getattr(args, flag, None)
+        if value is not None and value < 0:
+            raise ValueError(f"--{flag.replace('_', '-')} must be >= 0, got {value}")
+    for flag in ('loop_planner_strides', 'loop_planner_waves'):
+        values = getattr(args, flag, None) or [1]
+        if any(value < 1 for value in values):
+            raise ValueError(f"--{flag.replace('_', '-')} must be >= 1, got {values}")
+    if getattr(args, 'loop_planner_small_core_layers', 4) < 0:
+        raise ValueError('--loop-planner-small-core-layers must be >= 0')
+
+    from megatron.training.loop_rsbf_planning import (
+        LOOP_PLANNER_FIXED_DEPTHS,
+        loop_optimizer_offload_blockers,
+        loop_planner_hardware,
+        loop_planner_user_flags,
+    )
+
+    hardware = loop_planner_hardware(args)
+    if not 0 < hardware.hbm_cap_bytes <= hardware.hbm_bytes:
+        raise ValueError(
+            f'--loop-planner-hbm-cap-gb must be in (0, {hardware.hbm_bytes / 1e9:g}] on '
+            f'{hardware.name}'
+        )
+    depths = getattr(args, 'loop_planner_depths', 'config')
+    if depths == 'histogram' and getattr(args, 'loop_planner_histogram_path', None) is None:
+        raise ValueError('--loop-planner-depths histogram needs --loop-planner-histogram-path')
+    if depths != 'histogram' and getattr(args, 'loop_planner_histogram_path', None) is not None:
+        raise ValueError(
+            '--loop-planner-histogram-path is read with --loop-planner-depths histogram'
+        )
+    if depths in LOOP_PLANNER_FIXED_DEPTHS and getattr(args, 'loop_iterations', None) != 4:
+        raise ValueError(
+            f'--loop-planner-depths {depths} is an R_max = 4 setting; --loop-iterations is '
+            f"{getattr(args, 'loop_iterations', None)}"
+        )
+    if mode != 'apply':
+        return
+    if getattr(args, 'context_parallel_size', 1) > 1:
+        raise ValueError(
+            '--loop-planner apply needs --context-parallel-size 1 (a cp > 1 plan is reported '
+            'only; CP / THD is M11): use --loop-planner report'
+        )
+    user = loop_planner_user_flags(args)
+    if user:
+        raise ValueError(
+            '--loop-planner apply sets the RSBF item form, block stride, waves and D42; set by '
+            f"the user: {', '.join(user)}. Drop them, or use --loop-planner report to check them"
+        )
+    offload_mode = getattr(args, 'loop_planner_optimizer_offload', 'auto')
+    if getattr(args, 'optimizer_cpu_offload', False) and offload_mode != 'always':
+        raise ValueError(
+            '--optimizer-cpu-offload is set: under --loop-planner apply the planner decides Adam '
+            'to Grace; pin it with --loop-planner-optimizer-offload always (or drop the flag)'
+        )
+    if offload_mode == 'always':
+        blockers = loop_optimizer_offload_blockers(args, hardware)
+        if blockers:
+            raise ValueError(
+                '--loop-planner-optimizer-offload always needs Adam to Grace to be possible: '
+                + '; '.join(blockers)
+                + ' (set --use-precision-aware-optimizer, AdamW, and a Grace / host tier with '
+                '--loop-planner-grace-gb)'
+            )
+
+
+def _validate_loop_param_store(args):
+    """``--loop-param-store-*`` (the loop parameter store, z = ``--loop-param-store-shard-size``
+    > 1): every rule of ``loop_param_store_setup.loop_param_store_problems`` (the RSBF schedule
+    on a hybrid Huginn loop, z dividing the RSBF domain, no module GTP / TP / PP / CP, the
+    per-token loss, fp32 gradient reduction, no FSDP / delayed wgrad / FP8 primary weights /
+    shared-expert overlap, Adam or SGD, the store modes against ``--loop-planner apply``) and the
+    checkpoint rules (``_validate_loop_checkpoint``); the store flags need z > 1.
+    ``args.data_parallel_size`` stays the full data-distribution degree (z is not folded into
+    ``total_model_size``)."""
+    from megatron.training.loop_param_store_setup import loop_param_store_problems
+
+    problems = loop_param_store_problems(args)
+    if problems:
+        raise ValueError('loop parameter store: ' + '; '.join(problems))
+    _validate_loop_checkpoint(args)
+
+
+def _validate_loop_fsdp(args):
+    """A loop model with FSDP: the hybrid loop trains with Megatron-FSDP v1 under every rule of
+    ``guards.validate_loop_fsdp_config`` (``--megatron-fsdp-accumulate-main-grad``, fp32 main
+    and communication gradients, no persistent buffers / fine-grained gather / TE op fuser /
+    delayed wgrad / sampled depths / MoR / attention-residual carrier / HSDP or per-use
+    reduce-scatter without a fixed depth / checkpointing
+    other than a model-only ``--load --finetune --no-load-optim``, which training runs before
+    the Megatron-FSDP wrap); torch FSDP2, Megatron-FSDP v2 and the GPT loop are refused. A no-op
+    without a loop."""
+    if getattr(args, 'loop_architecture', 'none') == 'none':
+        return
+    if getattr(args, 'use_torch_fsdp2', False):
+        raise ValueError(
+            'Loop decoder does not support torch FSDP2 (use DDP / the distributed optimizer, or '
+            '--use-megatron-fsdp with a hybrid loop)'
+        )
+    if getattr(args, 'use_megatron_fsdp', False):
+        from megatron.core.transformer.loop.guards import validate_loop_fsdp_config
+
+        validate_loop_fsdp_config(args, args)
+
+
+def _validate_loop_checkpoint(args):
+    """Checkpoints with the loop parameter store (M3c,
+    ``loop_checkpoint.loop_checkpoint_problems``): save in torch_dist only (no local
+    non-persistent checkpoints), no mem-efficient fully reshardable optimizer state, no chunked
+    optimizer-state offload, no ``distributed_weight`` binding with ``--save`` / ``--load``.
+    A no-op without a store."""
+    from megatron.training.loop_checkpoint import loop_checkpoint_problems
+
+    problems = loop_checkpoint_problems(args)
+    if problems:
+        raise ValueError('loop parameter store checkpoints: ' + '; '.join(problems))
+
+
+def _validate_sbhd_document_packing(args):
+    """``--sbhd-document-packing`` (whole documents per SBHD row, row-tail padding): reject the
+    options that would split documents differently, isolate documents, need THD, or let the
+    row-tail padding reach a consumer that cannot exclude it. Reads every argument with
+    ``getattr`` (stub argument namespaces in tests)."""
+    if not getattr(args, 'sbhd_document_packing', False):
+        return
+    open_rows = getattr(args, 'sbhd_packing_open_rows', 64)
+    if open_rows < 1:
+        raise ValueError(f'--sbhd-packing-open-rows must be >= 1, got {open_rows}')
+
+    def reject(option, reason):
+        raise ValueError(f'--sbhd-document-packing is incompatible with {option}: {reason}')
+
+    if getattr(args, 'sft', False):
+        reject('--sft', 'SFT uses its own (THD) packed dataset')
+    if getattr(args, 'use_varlen_dataset', False):
+        reject('--use-varlen-dataset', 'the varlen dataset has its own packing')
+    if getattr(args, 'dataloader_inter_document_masking', False):
+        reject(
+            '--dataloader-inter-document-masking',
+            'packed rows use plain causal attention (no per-document isolation)',
+        )
+    if getattr(args, 'reset_attention_mask', False):
+        reject(
+            '--reset-attention-mask',
+            'per-document attention masks contradict plain causal attention over the row',
+        )
+    if getattr(args, 'context_parallel_size', 1) > 1 or getattr(
+        args, 'dynamic_context_parallel', False
+    ):
+        reject(
+            '--context-parallel-size > 1 / --dynamic-context-parallel',
+            'packed SBHD rows run without context parallelism (THD only where cp > 1)',
+        )
+    if getattr(args, 'sequence_packing_scheduler', None) is not None:
+        reject('--sequence-packing-scheduler', 'it packs THD sequences')
+    if getattr(args, 'dataloader_defer_npy_index_mmap', False):
+        reject(
+            '--dataloader-defer-npy-index-mmap',
+            'the packed dataset length needs the packed row index',
+        )
+    if getattr(args, 'moe_expert_capacity_factor', None) is not None:
+        reject(
+            '--moe-expert-capacity-factor',
+            'padded tokens would take expert capacity (token dropping sees no padding mask)',
+        )
+    balancing = getattr(args, 'moe_router_load_balancing_type', 'aux_loss')
+    balancing = balancing if isinstance(balancing, (list, tuple)) else [balancing]
+    for kind in ('sinkhorn', 'quantile_balancing'):
+        if kind in balancing:
+            reject(
+                f'--moe-router-load-balancing-type {kind}', 'the balancer would count padded tokens'
+            )
+
+    if 'seq_aux_loss' in balancing and getattr(args, 'micro_batch_size', 1) > 1:
+        if getattr(args, 'loop_schedule', 'standard') != 'rsbf':
+            warn_rank_0(
+                '--sbhd-document-packing with seq_aux_loss and --micro-batch-size > 1 outside '
+                'the RSBF executor: rows with unequal row-tail padding share one sequence '
+                'aux-loss normalisation, so the loss is approximate (padding itself is not '
+                'counted).'
+            )
+
+    if (getattr(args, 'dsa_indexer_loss_coeff', None) or 0) > 0:
+        from megatron.core.transformer.transformer_config import resolve_dsa_kernel_backend
+
+        # The variant the model is built with: --hybrid-layer-pattern may imply it.
+        variant = hybrid_pattern_attention_variant(args) or getattr(
+            args, 'experimental_attention_variant', None
+        )
+        check_sbhd_packing_indexer_loss(
+            variant,
+            args.dsa_indexer_loss_coeff,
+            getattr(args, 'loop_architecture', 'none'),
+            resolve_dsa_kernel_backend(
+                variant,
+                getattr(args, 'dsa_kernel_backend', None),
+                getattr(args, 'apply_dsa_kernel_fusion', None),
+            ),
+            recompute_granularity=getattr(args, 'recompute_granularity', None),
+            mtp_num_layers=getattr(args, 'mtp_num_layers', None),
+            cuda_graph_impl=getattr(args, 'cuda_graph_impl', None),
+        )
+
+
+def check_sbhd_packing_indexer_loss(
+    variant,
+    indexer_loss_coeff,
+    loop_architecture,
+    backend,
+    recompute_granularity=None,
+    mtp_num_layers=None,
+    cuda_graph_impl=None,
+):
+    """The DSA indexer-loss rows of ``--sbhd-document-packing``: the row-tail padding must not
+    reach an indexer loss. A plain ``dsa`` indexer loss excludes padding only through THD; a
+    DSv4 indexer loss excludes it only inside an ``indexer_loss_padding_mask`` scope (a loop
+    stack's row mask, or a loop-less ``HybridStack`` with ``indexer_loss_row_mask``, which
+    ``hybrid_builder`` sets under packing) and only on the unfused SBHD path
+    (``dsa_kernel_backend`` 'none'). The loop-less scope covers ``HybridStack._layer_loop``
+    only: full recomputation (``checkpointed_forward``), the MTP layers and CUDA graphs (TE
+    graphs are captured outside the forward; a local graph replays its capture-time mask) run
+    outside it. Takes the resolved variant and backend, so the argument validator and the built-config
+    backstop share it."""
+    if not (indexer_loss_coeff or 0) > 0 or variant not in ('dsa', 'dsv4_hybrid'):
+        return
+
+    def reject(option, reason):
+        raise ValueError(f'--sbhd-document-packing is incompatible with {option}: {reason}')
+
+    if variant == 'dsa':
+        reject(
+            f'a DSA indexer loss of experimental_attention_variant={variant!r}',
+            'it excludes padding only through THD packed sequences',
+        )
+    if loop_architecture == 'none' and recompute_granularity == 'full':
+        reject(
+            'a DSv4 indexer loss without --loop-architecture under --recompute-granularity full',
+            'full recomputation replays the HybridStack layers outside its indexer-loss row mask',
+        )
+    if loop_architecture == 'none' and cuda_graph_impl not in (None, 'none'):
+        # Conservative: every implementation and scope is refused, also the scopes that leave
+        # the attention eager (mlp, moe_router, moe_preprocess).
+        reject(
+            f'a DSv4 indexer loss without --loop-architecture under --cuda-graph-impl '
+            f'{cuda_graph_impl}',
+            'a captured graph does not run inside the HybridStack indexer-loss row mask '
+            '(refused for every CUDA-graph scope)',
+        )
+    if loop_architecture == 'none' and mtp_num_layers:
+        reject(
+            'a DSv4 indexer loss without --loop-architecture with --mtp-num-layers',
+            'the MTP layers of a loop-less model run outside the indexer-loss row mask',
+        )
+    if backend != 'none':
+        reject(
+            f'a DSv4 indexer loss on the fused SBHD kernels (dsa_kernel_backend '
+            f'resolves to {backend!r})',
+            'the fused SBHD indexer loss has no row mask; use --dsa-kernel-backend none',
+        )
+
+
 def validate_args(args, defaults={}):
     _normalize_dynamic_context_parallel_args(args)
     # Preserve dev's padded hash-table checkpoint shape when its legacy flag is used.
@@ -735,6 +1156,19 @@ def validate_args(args, defaults={}):
         f"eval_micro_batch_size ({args.eval_micro_batch_size}) "
         f"* batch_parallel_size ({args.batch_parallel_size})"
     )
+    _validate_loop_rsbf_waves(args)
+    _validate_stratified_loop_batch(args)
+    if getattr(args, 'loop_exit_criterion', 'fixed') == 'online':
+        if args.micro_batch_size != 1:
+            raise ValueError('online loop training currently requires micro-batch-size 1')
+        if args.loop_schedule in ('standard', 'rsbf') and (
+            getattr(args, 'overlap_grad_reduce', False) or getattr(args, 'overlap_param_gather', False)
+        ):
+            raise ValueError('online PP1 loop training requires non-overlapping DDP collectives')
+    _validate_loop_exit_histogram(args)
+    _validate_loop_carrier_diagnostics(args)
+    _validate_loop_planner(args)
+    _validate_loop_param_store(args)
 
     # === Hybrid layer pattern: deprecation handling and validation ===
 
@@ -788,6 +1222,17 @@ def validate_args(args, defaults={}):
     parsed_hybrid_pattern = parse_hybrid_pattern(args.hybrid_layer_pattern)
 
     if args.hybrid_layer_pattern is not None:
+        # A loop model counts its roles over the whole main pattern; reject '|' stages before
+        # they set the pipeline layout and VPP below, unless the ring schedule runs the loop
+        # over them (--loop-schedule ring).
+        from megatron.core.transformer.loop.guards import reject_pipe_in_loop_pattern
+
+        reject_pipe_in_loop_pattern(
+            getattr(args, 'loop_architecture', 'none'),
+            args.hybrid_layer_pattern,
+            getattr(args, 'loop_schedule', 'standard'),
+        )
+
         # Derive num_layers from pattern; hybrid_layer_pattern always overrides --num-layers when
         # both are present (e.g. when loading from checkpoint with --use-checkpoint-args).
         num_layers_in_pattern = get_hybrid_total_layer_count(args.hybrid_layer_pattern)
@@ -1025,6 +1470,12 @@ def validate_args(args, defaults={}):
                 'pipeline-model-parallel size should be greater than 2 to avoid having multiple '
                 'p2p sends and recvs between same 2 ranks per communication batch'
             )
+    elif getattr(args, 'loop_schedule', 'standard') == 'ring':
+        # The loop ring runs the interleaved schedule over its round views at every virtual
+        # pipeline size, also at one chunk per rank: keep the user's overlap_p2p_comm (required
+        # at PP 2, the loop guard RING_P2_WITHOUT_OVERLAP). Aligned param AG stays off (the loop
+        # refuses overlapped param gather).
+        args.align_param_gather = False
     else:
         # Overlap P2P communication is disabled if not using the interleaved schedule.
         args.overlap_p2p_comm = False
@@ -1152,7 +1603,11 @@ def validate_args(args, defaults={}):
         raise ValueError("MXFP8 with inference optimized layers requires FlashInfer >= 0.6.4")
 
     if args.moe_megakernel_backend == "mok" and (args.use_megatron_fsdp or args.use_torch_fsdp2):
-        raise ValueError("MOK has not been validated with Megatron-FSDP or Torch FSDP2")
+        from megatron.core.transformer.loop.guards import lockstep_rsbf_mok_zero2
+
+        if args.use_torch_fsdp2 or not lockstep_rsbf_mok_zero2(args, args):
+            raise ValueError("MoK with sharded DP requires fixed-depth RSBF, BF16, and "
+                             "Megatron-FSDP v1 optim_grads for both dense and expert weights")
 
     if args.use_megatron_fsdp:
         # NOTE: The flag `use_custom_fsdp` is deprecated and will be removed in future versions.
@@ -1247,6 +1702,46 @@ def validate_args(args, defaults={}):
                 "Meta device initialization (init_model_with_meta_device=True) is not "
                 "supported or necessary for the 'no_shard' / 0 sharding strategy."
             )
+
+        if (
+            args.megatron_fsdp_version == 1
+            and args.num_distributed_optimizer_instances > 1
+            and args.outer_dp_sharding_strategy != "no_shard"
+        ):
+            # DP-Outer sharding (HFSDP) reduce-scatters the gradient shard that the DP-Shard
+            # reduction produced, so every parameter class has to shard gradients on DP-Shard.
+            # fully_shard() refuses the other strategies; the MCore wrapper builds MegatronFSDP
+            # directly and would only fail when it allocates the gradient buffers.
+            replicated = sorted(sharding_strategies & {"no_shard", "optim"})
+            if replicated:
+                raise ValueError(
+                    f"--outer-dp-sharding-strategy {args.outer_dp_sharding_strategy} with "
+                    "--num-distributed-optimizer-instances > 1 needs a DP-Shard strategy that "
+                    "shards gradients (optim_grads or optim_grads_params) for dense and expert "
+                    f"parameters, but got {replicated} (--data-parallel-sharding-strategy / "
+                    "--expert-data-parallel-sharding-strategy)."
+                )
+
+        if args.megatron_fsdp_reduce_scatter_per_use:
+            # After the double-buffer normalization above. The DDP config repeats these checks
+            # for callers that build it directly.
+            assert (
+                args.megatron_fsdp_version == 1
+            ), "--megatron-fsdp-reduce-scatter-per-use requires --megatron-fsdp-version 1."
+            assert args.megatron_fsdp_accumulate_main_grad, (
+                "--megatron-fsdp-reduce-scatter-per-use requires "
+                "--megatron-fsdp-accumulate-main-grad (every use's reduce-scatter starts from a "
+                "zeroed bucket)."
+            )
+            assert sharding_strategies & {"optim_grads", "optim_grads_params"}, (
+                "--megatron-fsdp-reduce-scatter-per-use needs a gradient-sharding strategy "
+                "(optim_grads or optim_grads_params); without one it has no effect."
+            )
+            assert not args.fsdp_double_buffer, (
+                "--megatron-fsdp-reduce-scatter-per-use does not support persistent "
+                "communication buffers (--fsdp-double-buffer / --nccl-ub / "
+                "--megatron-fsdp-max-pool-double-buffer)."
+            )
     else:
         assert not args.megatron_fsdp_prefetch_recompute_forward_weights, (
             "--megatron-fsdp-prefetch-recompute-forward-weights requires " "--use-megatron-fsdp."
@@ -1254,12 +1749,21 @@ def validate_args(args, defaults={}):
         assert not args.megatron_fsdp_cache_param_bucket_views, (
             "--megatron-fsdp-cache-param-bucket-views requires " "--use-megatron-fsdp."
         )
+        assert (
+            not args.megatron_fsdp_accumulate_main_grad
+        ), "--megatron-fsdp-accumulate-main-grad requires --use-megatron-fsdp."
+        assert (
+            not args.megatron_fsdp_reduce_scatter_per_use
+        ), "--megatron-fsdp-reduce-scatter-per-use requires --use-megatron-fsdp."
 
     if args.fsdp_manual_registration:
         assert (
             args.use_megatron_fsdp
         ), "FSDP manual registration is only supported with Megatron FSDP."
         assert args.nccl_ub, "FSDP manual registration is only supported with --nccl-ub argument."
+
+    # After the Megatron-FSDP normalization above (dtype mapping, implied double buffering).
+    _validate_loop_fsdp(args)
 
     # Parameters dtype.
     args.params_dtype = torch.float
@@ -1837,6 +2341,8 @@ def validate_args(args, defaults={}):
                 args.sequence_packing_scheduler = (
                     'default_dynamic_cp' if args.dynamic_context_parallel else 'dp_balanced'
                 )
+
+    _validate_sbhd_document_packing(args)
 
     # Packed-sequence buffer-size check. Placed after all scheduler auto-select
     # logic (dynamic-cp and --use-varlen-dataset both set the scheduler above)
@@ -3495,6 +4001,294 @@ def _add_logging_args(parser):
     return parser
 
 
+def _add_loop_planner_args(parser):
+    """The loop RSBF planner group: the planner (megatron/training/loop_rsbf_planning.py) and
+    the measured exit-depth histogram export; the eager loop's carrier diagnostics."""
+    group = parser.add_argument_group(title='loop planner')
+    group.add_argument(
+        '--loop-carrier-diagnostics',
+        type=str,
+        default='off',
+        choices=['off', 'summary', 'full'],
+        help='Eager hybrid Huginn loops: log the residual carrier\'s state. summary: per log '
+        'interval, with the other loop metrics, the hidden-state RMS per round (loop state rms '
+        'r{r}) and, for --loop-carrier attn_res, the attention-residual weights on the prelude '
+        'output, on each earlier round and on the current round, averaged over the core / coda '
+        'sublayers and the head (loop attnres weight ...). full: also, at the TensorBoard '
+        'interval, every sublayer\'s weights (loop attnres/<segment>/sub<j>/r<r>/<source>, '
+        'summed over the data-parallel ranks; megatron/training/loop_diagnostics.py).',
+    )
+    group.add_argument(
+        '--loop-carrier-diagnostics-segments',
+        type=int,
+        nargs=3,
+        default=None,
+        metavar=('PRELUDE', 'ROUNDS', 'CODA'),
+        help='A non-loop hybrid model (the carrier ablation\'s plain-mhc): log the same '
+        'hidden-state RMS as a loop (loop state rms prelude / r{r}) at the boundaries of a '
+        'pattern read as PRELUDE sublayers, ROUNDS equal core segments and CODA sublayers '
+        '(the RMS of the mHC stream mean after the prelude and after each segment).',
+    )
+    group.add_argument(
+        '--loop-carrier-diagnostics-path',
+        type=str,
+        default=None,
+        help='With --loop-carrier-diagnostics full: append every TensorBoard-interval record of '
+        'the per-sublayer attention-residual weights to this file, one JSON object per line '
+        '(format megatron-loop-carrier-diagnostics/1), written by the last rank.',
+    )
+    group.add_argument(
+        '--loop-exit-histogram-path',
+        type=str,
+        default=None,
+        help='Loop RSBF runs (--loop-schedule rsbf): append the realized exit-depth histogram '
+        'of every training step to this file, one JSON object per line ("counts" per depth '
+        '1..R_max, "samples", "padding_fraction", the phase geometry), written by the last '
+        'rank. The loop planner (--loop-planner-depths histogram) and the toolkit cost model '
+        '(measured_depth.py) re-run on it.',
+    )
+    group.add_argument(
+        '--loop-param-checksums',
+        action='store_true',
+        default=False,
+        help='Hybrid loop models: after the model is built and the checkpoint (if any) loaded, '
+        'print one checksum line per parameter and persistent buffer, keyed by its PP = 1 name '
+        '(a loop ring chunk\'s layer indices and the routed experts\' local indices made '
+        'global): element count, dtype, the exact integer sum of the raw element bits, and the '
+        'float64 sum and sum of squares (megatron/training/loop_ring_report.py). Runs of '
+        'different layouts loaded from one checkpoint print equal lines. With an optimizer it '
+        'also prints every parameter\'s optimizer group (weight-decay and LR multipliers, '
+        'expert-parallel flag, decoupled LR, LR bounds) and the decay / no-decay tensor and '
+        'element counts.',
+    )
+    group.add_argument(
+        '--loop-planner',
+        type=str,
+        default='off',
+        choices=['off', 'report', 'apply'],
+        help='RSBF planner v1 (hybrid Huginn loops with --loop-schedule rsbf), run at startup '
+        'after the model is built: it evaluates the executor options (item form and block '
+        'stride, waves, D42 coda recompute, Adam to Grace) with a memory and time model and '
+        'logs the decision table. "apply" sets the chosen --loop-rsbf-item-form, '
+        '--loop-rsbf-block-stride, --loop-rsbf-waves and --loop-rsbf-coda-recompute-mla-up-proj '
+        '(which must then be left at their defaults) and, when chosen, --optimizer-cpu-offload; '
+        '"report" only logs the plan and checks the current options.',
+    )
+    group.add_argument(
+        '--loop-planner-hardware',
+        type=str,
+        default='gb200',
+        choices=['gb200', 'h100'],
+        help='Planner hardware preset: gb200 (HBM cap 175 GB, Grace 200 GB, HybridEP reserve '
+        '20 GB, C2C 100 GB/s) or h100 (est.: HBM cap 75 GB, no Grace tier, reserve 8 GB).',
+    )
+    group.add_argument(
+        '--loop-planner-hbm-cap-gb',
+        type=float,
+        default=None,
+        help='HBM the plan may use per GPU, GB (default: the preset, 175 on gb200, 75 on h100).',
+    )
+    group.add_argument(
+        '--loop-planner-grace-gb',
+        type=float,
+        default=None,
+        help='Grace (host) memory per GPU for Adam to Grace and round-state data, GB (default: '
+        'the preset, 200 on gb200, 0 = no Grace tier on h100).',
+    )
+    group.add_argument(
+        '--loop-planner-grace-margin-gb',
+        type=float,
+        default=None,
+        help='Grace planning margin, GB (default 10): a plan using Grace leaves this much free.',
+    )
+    group.add_argument(
+        '--loop-planner-ep-reserve-gb',
+        type=float,
+        default=None,
+        help='HBM reserved for NCCL / HybridEP buffers, GB (default: the preset, 20 / 8).',
+    )
+    group.add_argument(
+        '--loop-planner-c2c-gbps',
+        type=float,
+        default=None,
+        help='Sustained GPU <-> Grace (host) rate, GB/s (default: the preset, 100 / 50).',
+    )
+    group.add_argument(
+        '--loop-planner-c2c-margin',
+        type=float,
+        default=None,
+        help='Headroom factor on the C2C rate a plan may need (default 1.25).',
+    )
+    group.add_argument(
+        '--loop-planner-strides',
+        type=int,
+        nargs='+',
+        default=[1, 2, 3, 4, 6, 9, 18],
+        help='Block-checkpoint strides the planner considers, in core LAYERS (attention + FFN '
+        'pairs; applied as 2 x s core sublayers).',
+    )
+    group.add_argument(
+        '--loop-planner-waves',
+        type=int,
+        nargs='+',
+        default=[1, 2, 4, 8],
+        help='Wave counts the planner considers (kept when they divide the samples and the '
+        'microbatches per EU).',
+    )
+    group.add_argument(
+        '--loop-planner-depths',
+        type=str,
+        default='config',
+        choices=['config', 'histogram', 'r4_geom', 'r4_unif', 'r4_skew'],
+        help='Exit-depth distribution the planner simulates: the exit criterion\'s (config), '
+        'a measured exit histogram (--loop-planner-histogram-path) or an R_max = 4 setting.',
+    )
+    group.add_argument(
+        '--loop-planner-histogram-path',
+        type=str,
+        default=None,
+        help='Exit-histogram file (--loop-exit-histogram-path of an earlier run) for '
+        '--loop-planner-depths histogram.',
+    )
+    group.add_argument(
+        '--loop-planner-act-bytes-per-token',
+        type=float,
+        default=None,
+        help='Saved activation bytes per token of one layer (default: the cost model\'s '
+        'Pro-width estimate scaled to the model\'s dimensions).',
+    )
+    group.add_argument(
+        '--loop-planner-optimizer-offload',
+        type=str,
+        default='auto',
+        choices=['auto', 'never', 'always'],
+        help='Adam to Grace (optimizer CPU offload): auto = a planner option when the hardware '
+        'has a Grace tier and --use-precision-aware-optimizer with AdamW is set; never; always '
+        '= only options with it.',
+    )
+    group.add_argument(
+        '--loop-planner-forms',
+        type=str,
+        default='d28',
+        choices=['d28', 'nested', 'planner'],
+        help='Item forms the applied plan may use: d28 = the whole round on small cores '
+        '(--loop-planner-small-core-layers), the full menu above; nested = the nested item; '
+        'planner = the full menu.',
+    )
+    group.add_argument(
+        '--loop-planner-small-core-layers',
+        type=int,
+        default=4,
+        help='Core layers up to which the d28 form policy applies the whole round.',
+    )
+    group.add_argument(
+        '--loop-planner-report-path',
+        type=str,
+        default=None,
+        help='Write the plan with every evaluated option as JSON to this file (rank 0).',
+    )
+    group.add_argument(
+        '--loop-resume-changes',
+        type=str,
+        default='refuse',
+        choices=['refuse', 'allow'],
+        help='Hybrid loop models resumed from a checkpoint (megatron/training/loop_checkpoint.py): '
+        '"refuse" stops a resume whose numerics-relevant loop arguments (every --loop-* '
+        'argument except the planner inputs, the parameter store layout and paths / reports / '
+        'debug settings), roles, layer pattern or applied RSBF plan differ from the '
+        'checkpoint\'s, since the resumed loss curve would not continue the checkpoint\'s; '
+        '"allow" logs each change and resumes. Ignored for other models.',
+    )
+    return parser
+
+
+def _add_loop_param_store_args(parser):
+    """The loop parameter store group (M3: ``megatron/training/loop_param_store_setup.py``)."""
+    group = parser.add_argument_group(title='loop parameter store')
+    group.add_argument(
+        '--loop-param-store-shard-size',
+        type=int,
+        default=1,
+        help='Loop RSBF runs (hybrid Huginn loop, --loop-schedule rsbf): hold the dense '
+        'parameters as canonical shards on a shard axis of this many data-parallel ranks (the '
+        'GTP-remat grid, used as a grid only; DDP and the distributed optimizer run over the '
+        'replicate group of world / z ranks) and bind full weights per residency mode '
+        '(--loop-param-store-modes). 1 = no store (default).',
+    )
+    group.add_argument(
+        '--loop-param-store-modes',
+        type=str,
+        default='auto',
+        help='Residency mode of each store group, e.g. "core=lw,edges=lw,emb_head=rsg": groups '
+        'core (core layers + loop adapter), prelude, coda, mtp (edges = the three), emb_head, '
+        'all; modes r (Resident), rsg (Resident + sharded grads), lw (Layer window; not '
+        'emb_head); core_regather=on / edge_regather=on re-gather windowed units for the '
+        'backward. auto (default): core Layer window when the planner\'s memory model says the '
+        'Resident core does not fit (--loop-planner-hardware), else Resident. Under '
+        '--loop-planner apply the planner sets the modes (leave auto).',
+    )
+    group.add_argument(
+        '--loop-param-store-min-numel',
+        type=int,
+        default=1 << 20,
+        help='Dense parameters with fewer elements stay replicated (default 1048576).',
+    )
+    group.add_argument(
+        '--loop-param-store-binding',
+        type=str,
+        default='data',
+        choices=['data', 'distributed_weight'],
+        help='How full weights are bound: data (rebind each compute parameter\'s .data onto '
+        'the gathered buffer; every TE) or distributed_weight (TE\'s DistributedWeight '
+        'protocol, TE >= 2.19, TE linear weights only).',
+    )
+    group.add_argument(
+        '--loop-param-store-separate-rs-group',
+        action='store_true',
+        help='Run the store\'s reduce-scatters on a second communicator of the shard ranks.',
+    )
+    group.add_argument(
+        '--loop-param-store-gather-engine',
+        type=str,
+        default='nccl',
+        choices=['nccl', 'copy'],
+        help='(experimental) How the store all-gathers inside a step: nccl (default) or copy '
+        '(copy-engine '
+        'pulls from a symmetric-memory mirror of the shards, no SMs taken from the overlapped '
+        'compute; CUDA, the shard group inside one NVLink domain; one more copy of this '
+        'rank\'s shards).',
+    )
+    group.add_argument(
+        '--loop-param-store-reduce-engine',
+        type=str,
+        default='nccl',
+        choices=['nccl', 'copy'],
+        help='(experimental) How the store reduce-scatters gradients: nccl (default) or copy '
+        '(copy-engine '
+        'pushes into symmetric receive slots and one short sum kernel, no long-lived NCCL '
+        'kernel during the backward; CUDA, the shard group inside one NVLink domain; '
+        'deterministic but associated differently from NCCL, equal within fp32 rounding).',
+    )
+    group.add_argument(
+        '--loop-param-store-copy-engine-timeout-ms',
+        type=int,
+        default=0,
+        help='The copy engines\' in-step symmetric-memory barrier timeout in ms (with '
+        '--loop-param-store-gather-engine / --loop-param-store-reduce-engine copy). 0 (default) '
+        'waits forever, like NCCL; a finite value traps the device on a hang and kills the '
+        'process (the CUDA context is lost), so use it for debugging only.',
+    )
+    group.add_argument(
+        '--loop-param-store-debug',
+        type=str,
+        default='off',
+        help='Store debug switches, a comma list: check (every windowed module runs bound), '
+        'poison (NaN-fill released windows), verify (compare gathers with a reference), timing '
+        '(per-gather exposure); off (default).',
+    )
+    return parser
+
+
 def _add_regularization_args(parser):
     group = parser.add_argument_group(title='regularization')
 
@@ -4700,6 +5494,22 @@ def _add_data_args(parser):
         'to individual documents.',
     )
     group.add_argument(
+        '--sbhd-document-packing',
+        action='store_true',
+        help='GPT / hybrid dataset path of pretrain_hybrid.py: pack whole documents into each '
+        'SBHD row (a document that fits is never split across rows; a longer one is cut into '
+        'sequence-length windows as without packing). Rows carry a row-tail padding mask that '
+        'the loss, the MoE router statistics and aux losses, the DSA indexer loss and the loop '
+        'exit criterion exclude; attention stays plain causal over the row. Rows count as '
+        'samples. Context parallelism (THD) is not supported.',
+    )
+    group.add_argument(
+        '--sbhd-packing-open-rows',
+        type=int,
+        default=64,
+        help='First-fit window of open rows of --sbhd-document-packing (1 = next fit).',
+    )
+    group.add_argument(
         '--eod-mask-loss', action='store_true', help='Mask loss for the end of document tokens.'
     )
     group.add_argument(
@@ -5340,6 +6150,32 @@ def _add_experimental_args(parser):
         ),
     )
 
+    group.add_argument(
+        '--megatron-fsdp-accumulate-main-grad',
+        action='store_true',
+        default=False,
+        dest='megatron_fsdp_accumulate_main_grad',
+        help=(
+            'If set, Megatron-FSDP v1 accumulates every backward use of a parameter into its '
+            'unsharded gradient bucket (zeroed on its first fetch) instead of letting each use '
+            'overwrite it, so a parameter used several times per microbatch (a loop core) '
+            'keeps the sum of its uses. Required for a loop model with Megatron-FSDP.'
+        ),
+    )
+    group.add_argument(
+        '--megatron-fsdp-reduce-scatter-per-use',
+        action='store_true',
+        default=False,
+        dest='megatron_fsdp_reduce_scatter_per_use',
+        help=(
+            'If set, Megatron-FSDP v1 reduce-scatters a sharded gradient bucket after every '
+            'backward use of its FSDP unit into the sharded fp32 main gradient and frees the '
+            'unsharded bucket before the next use, instead of keeping it alive from the first '
+            'use to the last. One reduce-scatter per use (4x for a loop core run 4 times); the '
+            'DP-Outer (HSDP) reduction stays once per step. Requires '
+            '--megatron-fsdp-accumulate-main-grad and a gradient-sharding strategy.'
+        ),
+    )
     group.add_argument(
         "--megatron-fsdp-max-pool-double-buffer",
         action='store_true',

@@ -88,15 +88,17 @@ def _packed_layout_hook_kwargs(
     fn,
     *,
     varlen_is_plain_causal: bool,
+    sbhd_cp_zigzag: bool,
     packed_thd_causal_identity_layout: bool,
     packed_thd_single_sequence: bool,
     opaque_fallback_names: Tuple[str, ...] = (),
 ):
-    """Offer CP-independent layout facts only to hooks that declare support."""
+    """Offer layout facts only to hooks that declare support."""
     return filter_kwargs_for_callable(
         fn,
         {
             "varlen_is_plain_causal": varlen_is_plain_causal,
+            **({"sbhd_cp_zigzag": True} if sbhd_cp_zigzag else {}),
             "packed_thd_causal_identity_layout": packed_thd_causal_identity_layout,
             "packed_thd_single_sequence": packed_thd_single_sequence,
         },
@@ -159,6 +161,7 @@ def run_fused_qk_topk(
     packed_seq_params: Optional[PackedSeqParams] = None,
     cp_size: int = 1,
     varlen_is_plain_causal: bool = False,
+    sbhd_cp_zigzag: bool = False,
 ) -> Optional[Tuple[Tensor, Optional[Tensor]]]:
     """Optional fused indexer hook for backend-specific implementations.
 
@@ -196,6 +199,7 @@ def run_fused_qk_topk(
         **_packed_layout_hook_kwargs(
             fn,
             varlen_is_plain_causal=varlen_is_plain_causal,
+            sbhd_cp_zigzag=sbhd_cp_zigzag,
             packed_thd_causal_identity_layout=use_local_indexer_varlen,
             packed_thd_single_sequence=single_packed_thd_sequence,
         ),
@@ -391,6 +395,7 @@ def run_fused_qk_topk_with_scores(
     packed_seq_params: Optional[PackedSeqParams] = None,
     cp_size: int = 1,
     varlen_is_plain_causal: bool = False,
+    sbhd_cp_zigzag: bool = False,
     query: Optional[Tensor] = None,
     key: Optional[Tensor] = None,
 ) -> Optional[Tuple[Tensor, Tensor, Tensor]]:
@@ -437,6 +442,7 @@ def run_fused_qk_topk_with_scores(
         **_packed_layout_hook_kwargs(
             fn,
             varlen_is_plain_causal=varlen_is_plain_causal,
+            sbhd_cp_zigzag=sbhd_cp_zigzag,
             packed_thd_causal_identity_layout=use_local_indexer_varlen,
             packed_thd_single_sequence=single_packed_thd_sequence,
         ),
@@ -527,6 +533,7 @@ def run_fused_qk_topk_with_loss(
     packed_seq_params: Optional[PackedSeqParams] = None,
     cp_size: int = 1,
     varlen_is_plain_causal: bool = False,
+    sbhd_cp_zigzag: bool = False,
 ) -> Optional[Tuple[Tensor, Optional[Tensor], Tensor]]:
     """Optional fused indexer+loss hook for backend-specific implementations.
 
@@ -569,6 +576,7 @@ def run_fused_qk_topk_with_loss(
         **_packed_layout_hook_kwargs(
             fn,
             varlen_is_plain_causal=varlen_is_plain_causal,
+            sbhd_cp_zigzag=sbhd_cp_zigzag,
             packed_thd_causal_identity_layout=use_local_indexer_varlen,
             packed_thd_single_sequence=single_packed_thd_sequence,
         ),
@@ -676,6 +684,7 @@ def run_fused_dsa_attention(
     key_positions: Optional[Tensor],
     query_valid_rows: Optional[Tensor],
     varlen_is_plain_causal: bool = False,
+    sbhd_cp_zigzag: bool = False,
     use_relu: bool,
     use_local_indexer_varlen: bool = False,
     single_packed_thd_sequence: bool = False,
@@ -728,6 +737,7 @@ def run_fused_dsa_attention(
         **_packed_layout_hook_kwargs(
             fn,
             varlen_is_plain_causal=varlen_is_plain_causal,
+            sbhd_cp_zigzag=sbhd_cp_zigzag,
             packed_thd_causal_identity_layout=use_local_indexer_varlen,
             packed_thd_single_sequence=single_packed_thd_sequence,
             # The full-hook contract includes this kwarg even for opaque callables.

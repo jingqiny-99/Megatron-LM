@@ -14,6 +14,10 @@ Test groups
 - TestLinearGTP / TestLayerNormLinearGTP / TestGroupedLinearGTP - single-layer fwd/bwd
 - TestGTPPrefetchChain       - linked-list next_w/prev_w wiring
 - TestGTPWgradRS             - wgrad reduce-scatter shape + multi-layer deferred path
+- TestGTPWgradRSDtype        - Megatron linear: the wgrad RS runs in main_grad's dtype
+- TestGTPEmbeddingWgradRSDtype - embedding (two uses, aligned and padded): its BF16 lookup
+                                gradient is reduce-scattered in FP32 main_grad's dtype, exactly,
+                                pad rows zero; with fp32-accumulation it stays BF16 on the wire
 - TestGTPMicrobatches        - output consistency across microbatches
 - TestMXFP8LinearGTP         - Linear + MXFP8 recipe: quantized shard setup, fwd/bwd, padding
 - TestGTPGroupSizeOne        - wrap_module_params_gtp no-op when gtp_remat_group.size()==1
@@ -397,6 +401,141 @@ class TestGTPWgradRSDtype:
     def test_wgrad_rs_follows_main_grad_dtype(self):
         _requires_multi_gpu(4)
         _run_distributed(_worker_wgrad_rs_dtype, 4)
+
+
+# ---------------------------------------------------------------------------
+# Embedding: its lookup gradient is reduce-scattered in main_grad's dtype too
+# ---------------------------------------------------------------------------
+
+
+def _worker_embedding_wgrad_rs_fp32(rank, world_size, port, degree, padded, fp32_accum=False):
+    """With an FP32 main_grad, the embedding's gtp_remat reduce-scatter must sum in FP32.
+
+    Autograd hands GTPEmbeddingWeight.backward the lookup gradient in the weight dtype (BF16),
+    so unlike the linears (see _worker_wgrad_rs_dtype) nothing types it from main_grad: a BF16
+    cross-rank sum rounds before main_grad sees it. The values are chosen so that rounding is
+    visible exactly: GTP rank 0 contributes 1.0 per element and every other GTP rank 2**-8. All
+    are exact in BF16, but their mean (1 + (d-1) 2**-8) / d needs 8 fractional bits and BF16
+    has 7, so any reduction with a BF16 partial sum or output misses it (d=2 gives 0.5, d=4
+    0.25 or 0.25390625), while an FP32 sum is exact in any order. Two uses per forward, like
+    the main and MTP lookups, each reduce-scatter on their own.
+
+    Plain path (fp32_accum False): each use's reduce-scatter sends an FP32 buffer. Its pad rows
+    must be zero: torch.empty of the padded FP32 send shape is NaN-filled during the backward
+    (any content is legal for empty), so a send buffer whose pad tail is not cleared shows up
+    deterministically in the sent bytes, whatever the caching allocator hands out.
+
+    fp32_accum True (GTP_CONFIG.reduce_scatter_with_fp32_accumulation, degree > 2): the
+    all-to-all moves the BF16 wgrad and the receiver sums it in FP32, which is already exact
+    here, so the embedding is not widened (BF16 on the wire, no padded FP32 buffer) and the plain
+    reduce-scatter is not called.
+    """
+    import torch.nn.functional as F
+
+    import megatron.core.distributed.reduce_scatter_with_fp32_accumulation as fp32_rs_module
+    from megatron.core.tensor_parallel.generalized_tensor_parallelism import (
+        GTP_CONFIG,
+        GTPEmbeddingWeight,
+    )
+
+    groups = [dist.new_group(list(range(s, s + degree))) for s in range(0, world_size, degree)]
+    group = groups[rank // degree]
+    g = group.rank()
+
+    saved = (GTP_CONFIG.calculate_per_token_loss, GTP_CONFIG.reduce_scatter_with_fp32_accumulation)
+    original_rs = gtp_module.reduce_scatter_along_first_dim
+    original_a2a = fp32_rs_module.reduce_scatter_with_fp32_accumulation
+    original_empty = torch.empty
+    wire, pad_nonzero, a2a_wire, poisoned = [], [], [], []
+
+    try:
+        GTP_CONFIG.calculate_per_token_loss = False  # mean RS: the 1/degree prescale runs too
+        GTP_CONFIG.reduce_scatter_with_fp32_accumulation = fp32_accum
+        align = GTP_CONFIG.pad_for_alignment * degree
+        vocab, hidden = 2 * align - (3 if padded else 0), 32
+        mod = nn.Module()
+        mod.weight = nn.Parameter(torch.zeros(vocab, hidden, dtype=torch.bfloat16, device="cuda"))
+        wrap_module_params_gtp(mod, ["weight"], group)
+        w = mod.weight
+        assert isinstance(w, GTPShardedParam)
+        w._need_weight_prefetch = False  # as VocabParallelEmbedding (layers.py) sets it
+        assert (w.pad_length > 0) == padded, (w.pad_length, padded)
+        w.main_grad = torch.zeros(w.shape, dtype=torch.float32, device="cuda")
+        padded_shape = tuple(w._unsharded_shape_padded)
+
+        def spy_rs(tensor, *args, **kwargs):
+            wire.append(tensor.dtype)
+            pad_nonzero.append(int(torch.count_nonzero(tensor[vocab:])))  # NaN counts as nonzero
+            return original_rs(tensor, *args, **kwargs)
+
+        def spy_a2a(output_tensor, input_tensor, *args, **kwargs):
+            a2a_wire.append(input_tensor.dtype)
+            pad_nonzero.append(int(torch.count_nonzero(input_tensor[vocab:])))
+            return original_a2a(output_tensor, input_tensor, *args, **kwargs)
+
+        def poisoned_empty(*size, **kwargs):
+            out = original_empty(*size, **kwargs)
+            shape = size[0] if len(size) == 1 and not isinstance(size[0], int) else size
+            if tuple(shape) == padded_shape and out.dtype == torch.float32:
+                out.fill_(float("nan"))
+                poisoned.append(tuple(shape))
+            return out
+
+        val = 1.0 if g == 0 else 2.0**-8
+        ids = torch.arange(vocab, device="cuda")
+        out = sum(F.embedding(ids, GTPEmbeddingWeight.apply(w)) * val for _ in range(2))
+        gtp_module.reduce_scatter_along_first_dim = spy_rs
+        fp32_rs_module.reduce_scatter_with_fp32_accumulation = spy_a2a
+        torch.empty = poisoned_empty
+        try:
+            out.sum().backward()
+        finally:
+            torch.empty = original_empty
+    finally:
+        gtp_module.reduce_scatter_along_first_dim = original_rs
+        fp32_rs_module.reduce_scatter_with_fp32_accumulation = original_a2a
+        GTP_CONFIG.calculate_per_token_loss = saved[0]
+        GTP_CONFIG.reduce_scatter_with_fp32_accumulation = saved[1]
+
+    # Chain head (as the real embedding is): the reduce-scatter is sync, accumulated inline.
+    assert w.prev_w is None
+    if fp32_accum:
+        assert wire == [] and poisoned == [], (wire, poisoned)
+        assert a2a_wire == [torch.bfloat16, torch.bfloat16], (
+            f"fp32-accumulating reduce-scatter sent {a2a_wire}: the embedding must stay BF16 on "
+            "the wire there (the receiver sums in FP32), one all-to-all per use"
+        )
+    else:
+        assert a2a_wire == [], a2a_wire
+        assert wire == [torch.float32, torch.float32], (
+            f"embedding reduce-scatter sent {wire} with an FP32 main_grad; each of the two uses "
+            f"must reduce-scatter once, in FP32"
+        )
+        # Teeth of the pad check: both uses' send buffers came out of the poisoned empty.
+        assert poisoned == [padded_shape, padded_shape], poisoned
+    assert pad_nonzero == [0, 0], f"GTP rank {g}: nonzero pad rows sent per use {pad_nonzero}"
+    rows = w.shape[0]
+    global_row = g * rows + torch.arange(rows, device="cuda")
+    per_use = (1.0 + (degree - 1) * 2.0**-8) / degree  # exact in FP32
+    expected = torch.where(global_row < vocab, 2 * per_use, 0.0).unsqueeze(1).expand(rows, hidden)
+    assert torch.equal(w.main_grad, expected), (
+        f"GTP rank {g} of degree {degree}: embedding main_grad differs from the exact FP32 sum "
+        f"(real-row value {2 * per_use!r}, pad rows 0); got values "
+        f"{torch.unique(w.main_grad).tolist()}"
+    )
+
+
+class TestGTPEmbeddingWgradRSDtype:
+    @pytest.mark.parametrize("padded", [False, True], ids=["aligned", "padded"])
+    @pytest.mark.parametrize("degree", [2, 4], ids=["degree2", "degree4"])
+    def test_embedding_rs_sums_in_main_grad_dtype(self, degree, padded):
+        _requires_multi_gpu(4)
+        _run_distributed(_worker_embedding_wgrad_rs_fp32, 4, degree, padded)
+
+    @pytest.mark.parametrize("padded", [False, True], ids=["aligned", "padded"])
+    def test_embedding_rs_fp32_accumulation_keeps_bf16_wire(self, padded):
+        _requires_multi_gpu(4)
+        _run_distributed(_worker_embedding_wgrad_rs_fp32, 4, 4, padded, True)
 
 
 # ---------------------------------------------------------------------------
@@ -2038,7 +2177,10 @@ class TestGTPCaptureParamReadiness:
         assert ordinary._recompute_already_drained is False
         assert incoming._prefetch_handle is None
 
-    def test_drained_cross_graph_prefetch_still_waits_on_ag_event(self, monkeypatch):
+    # verify: GTP_CONFIG.verify_prefetched_gathers on an eager chain (_verify_gathers), with the
+    # prefetched buffers still current, so the consume keeps the prefetched path either way.
+    @pytest.mark.parametrize("verify", [False, True])
+    def test_drained_cross_graph_prefetch_still_waits_on_ag_event(self, monkeypatch, verify):
         class ExpectedEventWait(Exception):
             pass
 
@@ -2057,6 +2199,10 @@ class TestGTPCaptureParamReadiness:
                 "_weights": (),
                 "ag_event": FakeEvent(),
                 "_wait_param_gather": lambda self: calls.append("handle_wait"),
+                "_verify_gathers": lambda self: verify,
+                "_prefetched_buffers_current": lambda self, slot, consume=True: (
+                    calls.append(f"verify_{slot}") or True
+                ),
             },
         )()
         monkeypatch.setattr(gtp_module.GTP_CONFIG, "check_param_states", False)
@@ -2064,10 +2210,11 @@ class TestGTPCaptureParamReadiness:
         with pytest.raises(ExpectedEventWait):
             GTPShardedParam._get_prefetched_weight(param, fwd=True)
 
-        assert calls == ["event_wait"]
+        assert calls == (["verify_fwd"] if verify else []) + ["event_wait"]
         assert param._already_ag_drained is False
 
-    def test_drained_recompute_prefetch_still_waits_on_ag_event(self):
+    @pytest.mark.parametrize("verify", [False, True])
+    def test_drained_recompute_prefetch_still_waits_on_ag_event(self, verify):
         class ExpectedEventWait(Exception):
             pass
 
@@ -2086,13 +2233,17 @@ class TestGTPCaptureParamReadiness:
                 "_weights": (),
                 "_recompute_ag_event": FakeEvent(),
                 "_wait_recompute_param_gather": lambda self: calls.append("handle_wait"),
+                "_verify_gathers": lambda self: verify,
+                "_prefetched_buffers_current": lambda self, slot, consume=True: (
+                    calls.append(f"verify_{slot}") or True
+                ),
             },
         )()
 
         with pytest.raises(ExpectedEventWait):
             GTPShardedParam._get_recompute_prefetched_weight(param)
 
-        assert calls == ["event_wait"]
+        assert calls == (["verify_recompute"] if verify else []) + ["event_wait"]
         assert param._recompute_already_drained is False
 
     def test_warmup_exception_is_not_masked_by_leaked_handle(self):

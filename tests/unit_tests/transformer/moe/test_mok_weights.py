@@ -41,6 +41,24 @@ def _mok_transformer_config(**overrides):
     return TransformerConfig(**values)
 
 
+def test_mok_virtual_expert_config_supports_eager_native_routing():
+    """The MoK integration owns the slots and requires no HybridEP dispatcher."""
+    kwargs = dict(
+        moe_virtual_expert_load_balance=True,
+        moe_router_dtype="fp32",
+        add_bias_linear=False,
+        params_dtype=torch.bfloat16,
+        moe_token_dispatcher_type="alltoall",
+        moe_use_grouped_tensor=False,
+    )
+    assert _mok_transformer_config(**kwargs).moe_virtual_expert_load_balance
+    with pytest.raises(ValueError, match="2<=expert_model_parallel_size<=64"):
+        _mok_transformer_config(**kwargs, expert_model_parallel_size=1)
+    with pytest.raises(ValueError, match="cuda_graph_impl='none'"):
+        _mok_transformer_config(**kwargs, cuda_graph_impl="local")
+
+
+
 def test_mxfp8_shared_expert_config_expresses_bf16_module(monkeypatch, recwarn):
     original_recipe = object()
     config = SimpleNamespace(

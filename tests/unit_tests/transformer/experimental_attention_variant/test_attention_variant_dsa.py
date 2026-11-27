@@ -1255,6 +1255,32 @@ class TestDSACPPositionHelpers:
                 device=torch.device("cpu"),
             )
 
+    def test_uniform_sbhd_cache_belongs_to_one_microbatch(self, monkeypatch):
+        group = _FakeCPGroup(2)
+        gathers = []
+
+        def gather(outputs, local, group):
+            gathers.append(group)
+            for output in outputs:
+                output.copy_(local)
+
+        monkeypatch.setattr(torch.distributed, "is_available", lambda: True)
+        monkeypatch.setattr(torch.distributed, "is_initialized", lambda: True)
+        monkeypatch.setattr(torch.distributed, "all_gather", gather)
+        cache = {}
+
+        def validate(rows, keys, memo):
+            _validate_nonpacked_cp_uniform_length(rows, keys, 2, group, torch.device("cpu"), memo)
+
+        validate(4, 4, cache)
+        validate(4, 8, cache)
+        with pytest.raises(RuntimeError, match="key length 6"):
+            validate(4, 6, cache)
+        with pytest.raises(RuntimeError, match="geometry changed"):
+            validate(6, 6, cache)
+        validate(6, 6, {})
+        assert gathers == [group, group]
+
     def test_nonpacked_allgather_cp_checks_cuda_lengths(self, monkeypatch):
         """Non-packed CP length validation should not skip CUDA/NCCL-style groups."""
         local_lengths = [3, 5]

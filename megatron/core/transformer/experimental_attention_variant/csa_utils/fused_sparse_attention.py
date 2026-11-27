@@ -2888,7 +2888,7 @@ def _kl_loss_from_target_predict(
     )
 
 
-def _scale_indexer_grads(grad_loss: Tensor, *grads: Tensor) -> Tuple[Tensor, ...]:
+def _scale_indexer_grads(grad_loss: Tensor | float, *grads: Tensor) -> Tuple[Tensor, ...]:
     """Scale independent indexer gradients with one foreach launch per dtype group."""
     if not grads:
         return ()
@@ -3139,7 +3139,8 @@ class FusedCSAIndexerSparseAttnFunc(torch.autograd.Function):
         thd_compressed_is_sequence_major: bool = False,
         out_rope: Optional[OutputRopeParams] = None,  # inverse-RoPE fused onto the output
         cuda_graph: bool = False,
-    ) -> Tuple[Tensor, Tensor]:
+        return_indices: bool = False,
+    ) -> tuple[Tensor, Tensor] | tuple[Tensor, Tensor, Tensor]:
         """Fused forward: indexer scoring, sparse attention, KL loss, and indexer backward."""
         _ensure_dsa_namespace()
 
@@ -3233,6 +3234,10 @@ class FusedCSAIndexerSparseAttnFunc(torch.autograd.Function):
             # so score rows in bounded chunks; dense loss keeps the full matrix.
             scores_output=("none" if loss_coeff <= 0 else ("topk" if sparse_loss else "full")),
         )
+        if return_indices:
+            # Retain the logical selection used by attention, before any loss-only
+            # masking or lowering into the concatenated KV address space.
+            selected_indices = topk_indices_cmp
         indexer_topk_scores = None
         if loss_coeff > 0 and sparse_loss:
             indexer_topk_scores, indexer_scores = indexer_scores, None
@@ -3699,10 +3704,15 @@ class FusedCSAIndexerSparseAttnFunc(torch.autograd.Function):
             output = out_flat.reshape(total_q, np_ * d_v)
         else:
             output = out_flat.reshape(sq, b, np_, d_v).reshape(sq, b, np_ * d_v)
+        if return_indices:
+            ctx.mark_non_differentiable(selected_indices)
+            # Avoid allocating a dummy [batch, sequence, top-k] gradient.
+            ctx.set_materialize_grads(False)
+            return output, indexer_loss, selected_indices
         return output, indexer_loss
 
     @staticmethod
-    def backward(ctx, grad_output, grad_loss):
+    def backward(ctx, grad_output, grad_loss, _grad_indices=None):
         """Backward: sparse attention bwd + scale pre-computed indexer grads."""
         (
             q_flat,
@@ -3722,6 +3732,8 @@ class FusedCSAIndexerSparseAttnFunc(torch.autograd.Function):
 
         # ---- 1. Sparse attn backward (flat layout, layout-agnostic). --------
         d_v = out_flat.shape[-1]
+        if grad_output is None:
+            grad_output = torch.zeros_like(out_flat)
         if is_thd:
             dO_flat = grad_output.reshape(ctx.total_q, np_, d_v)
         else:
@@ -3766,7 +3778,7 @@ class FusedCSAIndexerSparseAttnFunc(torch.autograd.Function):
 
         # ---- 2. Scale pre-computed indexer grads by grad_loss. ---------------
         grad_q_indexer, grad_k_indexer, grad_weights = _scale_indexer_grads(
-            grad_loss,
+            grad_loss if grad_loss is not None else 0.0,
             precomputed_grad_q_indexer,
             precomputed_grad_k_indexer,
             precomputed_grad_weights,
@@ -3780,7 +3792,8 @@ class FusedCSAIndexerSparseAttnFunc(torch.autograd.Function):
         #   max_seqlen_q, max_seqlen_compressed_idx,
         #   compressed_kv, cu_seqlens_q_unpadded, compact_workspace,
         #   indexer_precision, deterministic,
-        #   thd_window_size, thd_compressed_is_sequence_major, out_rope, cuda_graph
+        #   thd_window_size, thd_compressed_is_sequence_major, out_rope, cuda_graph,
+        #   return_indices
         return (
             grad_query,
             grad_kv_full,
@@ -3789,6 +3802,7 @@ class FusedCSAIndexerSparseAttnFunc(torch.autograd.Function):
             grad_q_indexer,
             grad_k_indexer,
             grad_weights,
+            None,
             None,
             None,
             None,
@@ -4345,7 +4359,8 @@ def fused_csa_indexer_sparse_attn(
     thd_compressed_is_sequence_major: bool = False,
     out_rope: Optional[OutputRopeParams] = None,
     cuda_graph: bool = False,
-) -> Tuple[Tensor, Tensor]:
+    return_indices: bool = False,
+) -> tuple[Tensor, Tensor] | tuple[Tensor, Tensor, Tensor]:
     """Path B (training): fused indexer (+KL loss) + sparse attention.
 
     Layout is selected by ``cu_seqlens_q``:
@@ -4370,6 +4385,8 @@ def fused_csa_indexer_sparse_attn(
         kv_offset:    start of compressed region within ``kv_full`` (== sq).
 
     SBHD return: ``output (sq, b, np * d_v)`` + scalar ``indexer_loss``.
+    With ``return_indices=True``, a third result contains the exact local
+    compressed Top-K IDs from this forward, with -1 for invalid entries.
 
     THD args (when ``cu_seqlens_q is not None``):
         query:        ``(total_q, np, d)`` bf16 — flat-packed Q.
@@ -4494,6 +4511,7 @@ def fused_csa_indexer_sparse_attn(
         thd_compressed_is_sequence_major,
         out_rope,
         cuda_graph,
+        return_indices,
     )
 
 

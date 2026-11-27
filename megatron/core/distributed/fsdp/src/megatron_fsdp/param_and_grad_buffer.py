@@ -13,7 +13,7 @@ import operator
 import traceback
 import warnings
 from collections import defaultdict, namedtuple
-from contextlib import ExitStack, nullcontext
+from contextlib import ExitStack, contextmanager, nullcontext
 from enum import Enum
 from typing import Any, Callable, Dict, List, NamedTuple, Optional, Tuple, cast
 
@@ -34,7 +34,11 @@ from .mixed_precision import (
     is_float8tensor,
     is_te_min_version,
 )
-from .uneven_dtensor import update_uneven_dtensor_chunk_metadata, validate_uneven_dtensor
+from .uneven_dtensor import (
+    dtensor_from_local_in_place,
+    update_uneven_dtensor_chunk_metadata,
+    validate_uneven_dtensor,
+)
 from .utils import (
     _MODEL_PARALLEL_RNG_TRACKER_NAME,
     FSDPDistributedIndex,
@@ -295,6 +299,15 @@ def _pad(number_to_be_padded: int, divisor: int) -> int:
     return int(math.ceil(number_to_be_padded / divisor) * divisor)
 
 
+# Every tensor item of a buffer index starts at a multiple of this many elements, and every
+# bucket (so every shard) is a multiple of it long: at least 16 bytes for every buffer dtype
+# (1-byte FP8 to 4-byte fp32), the 64-element alignment of DDP's buffers. Parameters and
+# gradients are views of buckets, and kernels such as TE GEMMs and the Triton kernels
+# torch.compile generates assume 16-byte aligned pointers; small parameters packed one after
+# another would otherwise start at arbitrary offsets (CUDA "misaligned address").
+_ITEM_ALIGNMENT = 64
+
+
 def build_data_parallel_buffer_index(
     elements: List[torch.Size],
     data_parallel_rank: int,
@@ -320,15 +333,23 @@ def build_data_parallel_buffer_index(
     Returns:
         Tuple[Dict[int, TensorItemIndex], BucketIndex, ShardBucketIndex]: The index
             range of every tensor, every bucket and every in bucket local buffer.
+
+    Every item starts at a multiple of ``_ITEM_ALIGNMENT`` elements (an item of at least
+    ``chunk_size_factor`` elements at a multiple of both), and the bucket size is a multiple
+    of ``_ITEM_ALIGNMENT`` (sharded: of ``data_parallel_world_size`` times both), so views of
+    a bucket and of a shard are aligned. A layout that already satisfies this is unchanged.
     """
+    # Regular items start on the common multiple of their row size and the item alignment.
+    item_alignment = math.lcm(chunk_size_factor, _ITEM_ALIGNMENT)
 
     def _pad_if_needed(data_index: int) -> int:
         # Padded whenever any parameter class is sharded. Over-padding an unsharded
         # buffer only costs a few elements, and this index is built before the
         # buffer knows which parameter class it holds.
         if not all_sharding_strategies_in(ddp_config, ["no_shard"]):
-            return _pad(data_index, data_parallel_world_size * chunk_size_factor)
-        return data_index
+            return _pad(data_index, data_parallel_world_size * item_alignment)
+        # Buckets of one buffer are allocated back to back: keep the next one aligned.
+        return _pad(data_index, _ITEM_ALIGNMENT)
 
     def add_item(item_id, item, offset, item_index_map):
         # The item index map contains information on where each parameter item will
@@ -366,6 +387,7 @@ def build_data_parallel_buffer_index(
     data_index = 0
     while len(regular_items) > 0:
         item_id, item = regular_items.pop(0)
+        data_index = _pad(data_index, item_alignment)
         add_item(item_id, item, data_index, item_index_map)
         if item.numel() % chunk_size_factor == 0:
             data_index += item.numel()
@@ -381,7 +403,10 @@ def build_data_parallel_buffer_index(
             if rhs.numel() % chunk_size_factor == 0:
                 continue
             rhs_remain = rhs.numel() % chunk_size_factor
-            if remain + rhs_remain <= chunk_size_factor:
+            if (
+                remain + rhs_remain <= chunk_size_factor
+                and (data_index - rhs_remain) % _ITEM_ALIGNMENT == 0
+            ):
                 found_rhs = True
                 regular_items.remove(id_rhs)
                 break
@@ -393,17 +418,19 @@ def build_data_parallel_buffer_index(
             space -= rhs_remain
             data_index += rhs.numel() // chunk_size_factor * chunk_size_factor
 
-        # Try adding the fragments into the gaps
+        # Try adding the fragments into the gaps, each at an aligned offset.
+        gap_end = gap_offset + space
         for id_frag in fragment_items[:]:
             frag_id, frag = id_frag
-            if frag.numel() > space:
+            frag_offset = _pad(gap_offset, _ITEM_ALIGNMENT)
+            if frag_offset + frag.numel() > gap_end:
                 continue
-            add_item(frag_id, frag, gap_offset, item_index_map)
-            space -= frag.numel()
-            gap_offset += frag.numel()
+            add_item(frag_id, frag, frag_offset, item_index_map)
+            gap_offset = frag_offset + frag.numel()
             fragment_items.remove(id_frag)
 
     for frag_id, frag in fragment_items:
+        data_index = _pad(data_index, _ITEM_ALIGNMENT)
         add_item(frag_id, frag, data_index, item_index_map)
         data_index += frag.numel()
 
@@ -1324,9 +1351,15 @@ class DataParallelBuffer:
         item_index_map: Optional[Dict[int, TensorItemIndex]] = None,
         bucket_index: Optional[BucketIndex] = None,
         shard_bucket_index: Optional[ShardBucketIndex] = None,
+        zero_fresh_bucket: bool = False,
     ) -> None:
         self.ddp_config = ddp_config
         self.params = params
+        # Gradient accumulation mode (megatron_fsdp_accumulate_main_grad): a sharded buffer's
+        # communication bucket is zeroed on its first fetch after each allocation, so every
+        # backward use of a parameter can add into it (see fetch_bucket).
+        self.zero_fresh_bucket = zero_fresh_bucket
+        self._bucket_is_fresh = True
         _param_dtype = {p.dtype for p in self.params}
 
         assert len(_param_dtype) == 1, f"params have different dtypes: {_param_dtype}"
@@ -1448,6 +1481,13 @@ class DataParallelBuffer:
             bucket = self.allocate_bucket_storage(
                 dtype=dtype, device=self.device, strict_assignments=strict_assignments
             )
+            if self.zero_fresh_bucket and self.is_data_distributed and self._bucket_is_fresh:
+                # The first fetch since the bucket was (re)allocated starts its gradient
+                # accumulation at zero. Later fetches return the live bucket unchanged (the
+                # allocator hands back the bucket it holds for this ID) until
+                # free_bucket_storage releases it after its reduce-scatter.
+                bucket.data.zero_()
+                self._bucket_is_fresh = False
 
         # Need to set parameter data after resize model weight buffer data-storage.
         if set_param_data:
@@ -1573,6 +1613,8 @@ class DataParallelBuffer:
         """
         self.temporary_bucket_allocator.free(self.bucket_index.bucket_id)
         self.bucket_allocation_stream = None
+        # The next fetch allocates again (zeroed under zero_fresh_bucket).
+        self._bucket_is_fresh = True
 
     def reset_param_main_grad(self):
         """
@@ -2985,6 +3027,11 @@ class ParamAndGradBuffer:
                     bucket_id=group_id,
                     chunk_size_factor=group.chunk_size_factor,
                     mem_alloc_context=self.mem_alloc_context,
+                    # Accumulate mode: every backward use of a parameter adds into its
+                    # unsharded gradient bucket, which therefore has to start at zero.
+                    zero_fresh_bucket=getattr(
+                        self.ddp_config, "megatron_fsdp_accumulate_main_grad", False
+                    ),
                     **main_buf_extra_kwargs,
                 )
 
@@ -3372,9 +3419,10 @@ class ParamAndGradBuffer:
                     # Get gradient buffer and item ID.
                     gbuf = p._gbuf
                     item_id = p._item_id
-                    # Need to free a bucket for the incoming bucket if double-buffering.
-                    p._megatron_fsdp_model.grad_reduce_pipeline._enforce_double_buffer_limit(
-                        [gbuf.bucket_id]
+                    # Need to free a bucket for the incoming bucket if double-buffering, and
+                    # to finish a per-use reduction of the bucket (per-use reduce-scatter mode).
+                    p._megatron_fsdp_model.grad_reduce_pipeline.before_main_grad_fetch(
+                        gbuf.bucket_id
                     )
                     # Make sure main_grad memory is allocated when initially accessed.
                     # When gradients are sharded, we can pre-allocate a communication
@@ -4134,6 +4182,8 @@ def _create_hfsdp_helper_buffer(
             data_parallel_world_size=inner_dp_group.size(),
             data_parallel_rank=inner_dp_group.rank(),
         ),
+        # A gradient helper is the buffer parameters fetch their gradient bucket from.
+        zero_fresh_bucket=dp_buffer.zero_fresh_bucket,
     )
 
     return helper_buffer
@@ -4239,6 +4289,15 @@ class GradReducePipeline:
         self.pending_outer_fsdp_group_grad_reduce: List[Tuple[int, ...]] = []
         self.rs_stream = rs_stream
         self.check_nans = check_nans
+        # Per-use reduce-scatter mode (megatron_fsdp_reduce_scatter_per_use): every backward use
+        # of an FSDP unit reduce-scatters the unit's sharded buckets (reduce_scatter_use). The
+        # buckets already reduced after their parameters' last use in this backward
+        # (reduce_gradients) are skipped by later per-use reductions until reset().
+        self.reduce_scatter_per_use = bool(
+            getattr(self.buffer.ddp_config, "megatron_fsdp_reduce_scatter_per_use", False)
+        )
+        self._reduced_after_last_use = set()
+        self._partial_backward_buckets = None
 
         # Init outer-DP group gradient reduction related attributes.
         dist_index = self.buffer.dist_index
@@ -4273,6 +4332,30 @@ class GradReducePipeline:
             gbuf.free_bucket_storage()
             gbuf.reset_param_main_grad()
             self.bucket_status[bucket_id] = BucketStatus.EMPTY
+        self._reduced_after_last_use = set()
+
+    @contextmanager
+    def partial_backward(self, suggested_queue_capacity):
+        """Reduce the buckets written by one lockstep autograd graph.
+
+        The next RSBF graph may use only a subset of the same recurrent weights (for
+        instance, the second pass skips the indexer). Per-parameter hooks in one such
+        graph cannot mark a bucket ready on behalf of a different graph. Reduce this
+        graph's touched buckets once; untouched slices of a fresh bucket are zero.
+        """
+        if self._partial_backward_buckets is not None:
+            raise RuntimeError("Nested FSDP partial backward is unsupported")
+        touched = set()
+        self._partial_backward_buckets = touched
+        try:
+            yield
+        finally:
+            self._partial_backward_buckets = None
+        # Full buckets were already reduced as their last hook fired. Flush only
+        # incomplete buckets; their readiness marks belong to this graph alone.
+        for bucket_id in touched:
+            self.bucket_grad_ready_params[bucket_id].clear()
+        self.reduce_scatter_use(touched, suggested_queue_capacity)
 
     def reduce_gradients(
         self,
@@ -4306,17 +4389,91 @@ class GradReducePipeline:
             )
 
             # Mark grad as ready for reduce-scatter/all-reduce.
+            if self._partial_backward_buckets is not None:
+                self._partial_backward_buckets.add(bucket_id)
             self.bucket_grad_ready_params[bucket_id].add(param)
             bucket_group = self.get_ready_bucket_group_for_reduction(bucket_id)
             if bucket_group:
+                if self._partial_backward_buckets is not None:
+                    self._partial_backward_buckets.difference_update(bucket_group)
+                    # The CUDA release callback may run much later. A sibling bucket's
+                    # marks must not make a new graph's coalesced group look complete.
+                    for reduced_bucket_id in bucket_group:
+                        self.bucket_grad_ready_params[reduced_bucket_id].clear()
                 self.wait_for_previous_grad_reduce(
                     suggested_queue_capacity=suggested_queue_capacity
                 )
+                if self.reduce_scatter_per_use:
+                    # Release a queued per-use reduction of these buckets first, so this one
+                    # starts from fresh (zeroed) buckets instead of reducing that data again.
+                    for group_bucket_id in bucket_group:
+                        self.wait_for_bucket_reduce(group_bucket_id)
+                    self._reduced_after_last_use.update(bucket_group)
                 self._bucket_group_gradient_reduce(
                     bucket_group,
                     async_op=True,
                     outer_fsdp_group_grad_reduce=outer_fsdp_group_grad_reduce,
                 )
+
+    def reduce_scatter_use(
+        self, bucket_ids: List[int], suggested_queue_capacity: Optional[int] = None
+    ):
+        """Reduce-scatter what one backward use of an FSDP unit added into its sharded gradient
+        buckets ``bucket_ids`` (per-use reduce-scatter mode).
+
+        Each bucket is reduced over DP-Shard and its reduced shard is added into the sharded
+        main gradient, as after a parameter's last use, but without the DP-Outer reduction and
+        without marking parameters ready; the bucket is freed when the reduction is drained,
+        at the latest by the next fetch of the bucket (``before_main_grad_fetch``), so the next
+        use writes into a fresh, zeroed bucket. A bucket already reduced after its parameters'
+        last use in this backward (``reduce_gradients``) is skipped: that reduction carries the
+        DP-Outer reduction and is the bucket's last in this backward.
+
+        Each reduction is a collective: every data-parallel rank must run the same units in
+        the same order. Which buckets are skipped depends only on the order of the gradient
+        hooks, not on when reductions are drained.
+        """
+        bucket_ids = [
+            bucket_id
+            for bucket_id in bucket_ids
+            if bucket_id in self.bucket_status and bucket_id not in self._reduced_after_last_use
+        ]
+        # One coalesced reduction per data-parallel group (expert and non-expert parameters
+        # have their own DP-Shard groups), in bucket order.
+        groups = {}
+        for bucket_id in sorted(bucket_ids):
+            # A queued reduction of an earlier use still holds the bucket's storage.
+            self.wait_for_bucket_reduce(bucket_id)
+            dp_group = self.get_fsdp_buffer(bucket_id).data_parallel_group
+            groups.setdefault(dp_group, []).append(bucket_id)
+        for bucket_group in groups.values():
+            self.wait_for_previous_grad_reduce(suggested_queue_capacity=suggested_queue_capacity)
+            self._bucket_group_gradient_reduce(
+                bucket_group, async_op=True, outer_fsdp_group_grad_reduce=False, per_use=True
+            )
+
+    def wait_for_bucket_reduce(self, bucket_id: int):
+        """Finish a queued reduction of ``bucket_id``: drain the reduction queue, oldest first,
+        until the bucket's entry is out (the current stream waits for each reduction, then its
+        bucket is freed). A no-op if the bucket has no queued reduction."""
+        while any(queued_id == bucket_id for _, _, queued_id in self.grad_reduce_queue):
+            grad_reduce_event, free_up_grad_bucket, _ = self.grad_reduce_queue.pop(0)
+            grad_reduce_event.wait()
+            free_up_grad_bucket()
+
+    def before_main_grad_fetch(self, bucket_id: int):
+        """Called by a parameter's main-gradient getter before it fetches the gradient bucket.
+
+        With double buffering, frees a pool buffer for the bucket. In per-use reduce-scatter
+        mode, finishes a queued per-use reduction of the bucket, so that this use writes into a
+        fresh, zeroed bucket instead of the storage that reduction is still reading and will
+        free."""
+        self._enforce_double_buffer_limit([bucket_id])
+        if self.reduce_scatter_per_use or (
+            self._partial_backward_buckets is not None
+            and self.bucket_status[bucket_id] == BucketStatus.COMMUNICATING
+        ):
+            self.wait_for_bucket_reduce(bucket_id)
 
     def wait_for_previous_grad_reduce(
         self, suggested_queue_size: int = 1, suggested_queue_capacity: Optional[int] = None
@@ -4527,6 +4684,7 @@ class GradReducePipeline:
         bucket_group: List[int],
         async_op: bool = False,
         outer_fsdp_group_grad_reduce: bool = False,
+        per_use: bool = False,
     ) -> bool:
         """Mark the bucket ready for reduce-scatter/all-reduce, if all bucket in
         the bucket group are ready, then do the reduce-scatter/all-reduce.
@@ -4535,6 +4693,9 @@ class GradReducePipeline:
             bucket_group (List[int]): The bucket group to be reduced.
             async_op (bool, optional): Whether to do the reduce-scatter/all-reduce
                 asynchronously. Defaults to False.
+            per_use (bool, optional): A per-use reduction (``reduce_scatter_use``): freeing
+                the bucket keeps its parameters' grad-ready marks, which belong to the
+                reduction after their last use. Defaults to False.
         Returns:
             bool: True if the bucket is go for reduce-scatter/all-reduce.
         """
@@ -4671,7 +4832,8 @@ class GradReducePipeline:
             def get_closure(bucket_id):
                 def free_up_grad_bucket():
                     # Empty the set of parameters that are ready for gradient reduction.
-                    self.bucket_grad_ready_params[bucket_id] = set()
+                    if not per_use:
+                        self.bucket_grad_ready_params[bucket_id] = set()
                     gbuf = self.get_fsdp_buffer(bucket_id)
                     # The allocating stream can differ from the current one under the 1F1B
                     # overlap schedule, which runs some gradient hooks on its communication
@@ -5825,10 +5987,10 @@ def make_fsdp_dtensor(
             global_shape[tp_dim] *= tp_mesh.mesh.numel()
 
         # Construct TP-sharded DTensor using Megatron-style placement
-        param = DTensor.from_local(
-            local_tensor=local_tensor,
-            device_mesh=tp_mesh,
-            placements=placements,
+        param = dtensor_from_local_in_place(
+            local_tensor,
+            tp_mesh,
+            placements,
             run_check=run_check,
             shape=tuple(global_shape),
             stride=torch.empty(global_shape).stride(),
@@ -5845,11 +6007,13 @@ def make_fsdp_dtensor(
     else:
         local_shape = (-1,)
 
-    # Create the FSDP-compliant DTensor
-    fsdp_tensor = DTensor.from_local(
-        local_tensor=local_tensor.view(local_shape),
-        device_mesh=device_mesh,
-        placements=placements,
+    # Create the FSDP-compliant DTensor. A local tensor off the mesh's device (the host state of
+    # a CPU-offloaded optimizer, re-wrapped by the checkpoint handlers) stays where it is, so
+    # the DTensor still aliases it.
+    fsdp_tensor = dtensor_from_local_in_place(
+        local_tensor.view(local_shape),
+        device_mesh,
+        placements,
         run_check=False,
         shape=param.shape,
         stride=param.stride(),

@@ -149,6 +149,63 @@ def test_aliased_parameter_metadata_survives_dtype_conversion():
     assert backend.is_first_microbatch
 
 
+def test_fsdp_reads_current_bucket_and_canonical_weight_after_view_swap():
+    routed = torch.nn.Linear(4, 2, bias=False)
+    shared = torch.nn.Linear(4, 2, bias=False)
+    backend = mok_backend.MoKMegakernel.__new__(mok_backend.MoKMegakernel)
+    torch.nn.Module.__init__(backend)
+    backend.register_parameter("routed_fc1_weight", routed.weight)
+    backend.register_parameter("shared_fc1_weight", shared.weight)
+    backend.bind_fsdp_weight_owners(routed, shared)
+    assert not list(backend.parameters())
+
+    routed.weight = torch.nn.Parameter(routed.weight.detach().clone())
+    assert backend.routed_fc1_weight is routed.weight
+    assert backend.shared_fc1_weight is shared.weight
+    first, second = torch.zeros_like(routed.weight), torch.ones_like(routed.weight)
+    rotated_buckets = iter((first, second))
+    routed.weight.get_main_grad = lambda: next(rotated_buckets)
+    assert parameter_bridge.main_grad_buffer(backend.routed_fc1_weight) is first
+    assert parameter_bridge.main_grad_buffer(backend.routed_fc1_weight) is second
+
+
+def test_moon_sharded_owner_transport_uses_the_current_vjp_gradient_views(monkeypatch):
+    from megatron.core.transformer.moe.megakernel.mok.virtual_layout import MoKVirtualLayout
+    from megatron.core.transformer.moe.mok_virtual_experts import MoKVirtualExperts
+
+    def build_table(group):
+        return torch.tensor([g.data_ptr() for g in group], dtype=torch.int64)
+
+    monkeypatch.setitem(
+        sys.modules, "mok", SimpleNamespace(ops=SimpleNamespace(make_routed_d_weight_storage_table=build_table))
+    )
+    transport = MoKVirtualExperts.__new__(MoKVirtualExperts)
+    transport.clear()
+    transport.sharded_owner_grads = True
+    fc1, fc2 = (torch.nn.Parameter(torch.zeros(2, 4, dtype=torch.bfloat16)) for _ in range(2))
+    ghost = torch.zeros(1, 2, 4)
+    transport.pool = SimpleNamespace(
+        config=SimpleNamespace(device=torch.device("cpu")), slot_grads=(ghost, ghost.clone())
+    )
+    layout = MoKVirtualLayout.__new__(MoKVirtualLayout)
+    layout.transport = transport
+    layout.grad_tables = layout.grad_fingerprint = None
+    model = SimpleNamespace(routed_fc1_parameters=(fc1,), routed_fc2_parameters=(fc2,),
+                            shared_fc1_weight=None, shared_fc2_weight=None,
+                            native_single_grouped_weights=False)
+    old = torch.zeros(2, 4)
+    fresh = torch.ones(2, 4)
+    for current in (old, fresh):
+        fc1.get_main_grad = lambda: current
+        fc2.get_main_grad = lambda: current
+        _, tables, owners = layout.main_grad_arguments(model)
+        transport_tables = transport._ptr_tables("grads", owners)
+        for descriptors, addresses, canonical in zip(tables, transport_tables, owners):
+            assert canonical[0] is current
+            assert descriptors[0].item() == addresses[0].item() == current.data_ptr()
+        assert layout.grad_tables is None and "grads" not in transport._tables
+
+
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
 def test_main_grad_buffer_accepts_supported_dtype(dtype):
     param = torch.nn.Parameter(torch.zeros((4, 8), dtype=torch.bfloat16))

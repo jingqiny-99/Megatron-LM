@@ -441,3 +441,46 @@ domain over the network instead of NVLink.
 
 Before a 256-GPU run on a new cluster, verify the artifact identities and check
 the import directories that step 2 prints.
+
+### Two-pass loop on 112 GB300 GPUs
+
+The fixed-depth loop uses the GLM-5.2 dimensions and the same MXFP8 runtime.
+It is a benchmark configuration for a GLM-5.4-style architecture. The three
+physical sections have 26, 28 and 24 decoder blocks. Each block contains an
+attention and an FFN sublayer. A sample executes blocks 1–26, 27–54,
+27–54 and 55–78. The two visits to each core slice use the same weights.
+On its second visit the slice reads its first visit's sparse KV and top-k
+and adds a 128-token causal window from its current KV. Sharing also applies
+to the sparse index across the configured four-layer selector groups.
+
+| PP rank | Prelude | Shared core on each of two visits | Coda |
+| ---: | --- | --- | --- |
+| 0 | 1–2 | 27–30 | 55–58 |
+| 1 | 3–6 | 31–34 | 59–62 |
+| 2 | 7–10 | 35–38 | 63–66 |
+| 3 | 11–14 | 39–42 | 67–70 |
+| 4 | 15–18 | 43–46 | 71–74 |
+| 5 | 19–22 | 47–50 | 75–78 |
+| 6 | 23–26 | 51–54 | Shared MTP7, output and loss |
+
+The default workload uses TP1/PP7/EP16/CP16, MBS1, GBS56 and 63,488 real
+input tokens per 65,536-token pack. It uses the trained indexer, DeepGEMM
+scoring, DeepSelect, MoK, force-balanced routing, distributed Muon and a
+full-iteration graph. The MTP depths share latent KV and sparse indices
+within the prediction head. The benchmark uses synthetic inputs.
+
+Use 28 four-GPU nodes, the qualified runtime dependencies above and the same
+per-rank launcher. Set the four dependency/cache environment variables as in
+the original examples. Set WANDB_PROJECT and WANDB_NAME to log a curve under
+your account. To inspect the command before launch:
+
+```bash
+python examples/moe_recipes/glm5_2/run.py \
+  examples/moe_recipes/glm5_2/gb300/loop_THD64K_112GPU_TP1PP7EP16CP16.yaml --dry-run
+```
+
+The variants `4k`, `128k` and `1m` request the original lengths and global
+batches at the new PP7 placement. The `frozen_indexer` variant keeps the
+64K workload and sets the indexer loss coefficient to zero. For comparisons
+with the original recipe use warmup steps 1–3, capture at step 4, and report
+steps 13–32. For token throughput count the actual input tokens in a pack.

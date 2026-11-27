@@ -8,12 +8,17 @@
 import warnings
 from contextlib import nullcontext
 from dataclasses import dataclass
-from typing import List, Optional, Sequence, Tuple, Union
+from typing import Callable, ContextManager, List, Optional, Sequence, Tuple, Union
 
 import torch
 from torch import Tensor, nn
 
-from megatron.core.context_parallel import ContextParallelLayoutManager, CPLayout, THDCPLayoutPlan
+from megatron.core.context_parallel import (
+    ContextParallelLayoutManager,
+    ContextParallelLayoutState,
+    CPLayout,
+    THDCPLayoutPlan,
+)
 from megatron.core.dist_checkpointing.mapping import ShardedStateDict
 from megatron.core.dist_checkpointing.utils import replace_prefix_for_sharding
 from megatron.core.enums import Fp8Recipe
@@ -36,7 +41,10 @@ from megatron.core.models.hybrid.shortcut_block import (
 from megatron.core.packed_seq_params import PackedSeqParams, resolve_cp_group, resolve_tp_cp_group
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.recompute import checkpointed_forward
-from megatron.core.ssm.context_parallel.chunkwise import build_packed_sequence_cp_metadata
+from megatron.core.ssm.context_parallel.chunkwise import (
+    PackedSequenceCPMetadata,
+    build_packed_sequence_cp_metadata,
+)
 from megatron.core.ssm.mamba_layer import MambaLayer
 from megatron.core.tensor_observation import is_observing_tensor, observe_layer_residuals
 from megatron.core.tensor_parallel.random import MHCCheckpointManager
@@ -106,6 +114,69 @@ class HybridStackSubmodules:
     mtp_stack_submodules: "HybridStackSubmodules | None" = None
 
 
+@dataclass(frozen=True)
+class HybridStackCallRoles:
+    """The pipeline roles of one call of a built stage module.
+
+    A schedule that runs one built stage module in several roles (e.g. the loop ring's round
+    views, ``megatron/core/transformer/loop/ring_pp.py``) sets ``HybridStack.call_roles`` around
+    each call. The roles can only switch the built processing off: ``HybridStack.
+    call_pre_process`` is ``pre_process and roles.pre_process``, and so on. ``mtp_process`` is
+    read by ``HybridModel.call_mtp_process`` only. The built flags themselves never change.
+    """
+
+    pre_process: bool
+    post_process: bool
+    mtp_process: bool
+
+
+@dataclass
+class HybridStackLayerContext:
+    """Per-forward layer-call inputs, built once by ``HybridStack._prepare_forward``.
+
+    Holds activation-free metadata only (masks, rotary embeddings, packed-sequence
+    parameters, per-layout conversions, the quantization context factory and the recompute
+    plans) for one stack forward. ``grouped_tail_to_skip`` is the only field a layer call
+    writes.
+    """
+
+    attention_mask: Optional[Tensor]
+    inference_context: Optional[BaseInferenceContext]
+    rotary_pos_emb: Optional[Tensor]
+    sequence_len_offset: Optional[Tensor]
+    # After ``_stage_te_cuda_graph_route_metadata``.
+    packed_seq_params: Optional[PackedSeqParams]
+    padding_mask: Optional[Tensor]
+    input_ids: Optional[Tensor]
+    cp_layout_state: Optional[ContextParallelLayoutState]
+    packed_sequence_cp_metadata: Optional[PackedSequenceCPMetadata]
+    input_ids_by_layout: Optional[dict]
+    padding_mask_by_layout: Optional[dict]
+    # Called as ``quant_context_factory(layer_config, layer.layer_number - 1)`` per layer call.
+    quant_context_factory: Callable[[TransformerConfig, int], ContextManager]
+    # Delayed-scaling FP8 context around the whole layer pass, otherwise ``nullcontext()``.
+    outer_quant_context: ContextManager
+    use_inner_quantization_context: bool
+    # Indexed by execution index (``self.layers``).
+    mhc_layer_managers: List[Optional[MHCCheckpointManager]]
+    mhc_block_ends: List[bool]
+    # Indexed by physical layer index.
+    residual_stream_recompute_plan: list
+    observe_residuals: bool
+    # The layer a grouped attention->MoE CUDA-graph replay already ran; written by
+    # ``_run_layer`` and consumed by ``_layer_loop``.
+    attn_res_state: Optional[AttnResStageSources] = None
+    attn_res_sources: Optional[Tuple[Tensor, ...]] = None
+    grouped_tail_to_skip: Optional[nn.Module] = None
+    # Reserved for a per-forward layer adapter context (cross-layer working state).
+    # Always None today; nothing reads it.
+    forward_adapter_context: Optional[object] = None
+    # The layer call returns the branch output without the residual add (the layer's delta;
+    # a plain TransformerLayer with exactly one of attention / MLP). Set by the loop's
+    # attention-residual carrier, which observes its own residual stream.
+    return_layer_delta: bool = False
+
+
 class HybridStack(MegatronModule):
     """
     Constructor for the HybridStack class.
@@ -140,6 +211,18 @@ class HybridStack(MegatronModule):
         hash_moe_layer_threshold (int, optional): global Hybrid layer-number threshold used
             to select hash-routed MoE layers.
     """
+
+    # Opt-in (SBHD document packing, set by the training builder): ``_layer_loop`` runs the
+    # layers inside ``indexer_loss_padding_mask`` of the forward's padding mask, so the
+    # row-tail padding does not train DSv4 indexers (as a loop stack's ``_run_range``). Full
+    # recomputation bypasses ``_layer_loop``; the packing validator refuses it with this.
+    indexer_loss_row_mask: bool = False
+    # Per-call roles (``HybridStackCallRoles``), set around a call by a schedule that runs this
+    # built stage in several roles; None: the built roles (see ``call_pre_process``).
+    call_roles: Optional[HybridStackCallRoles] = None
+
+    # Specialized runners can checkpoint their own layer execution order.
+    _owns_full_recompute = False
 
     def __init__(
         self,
@@ -194,6 +277,7 @@ class HybridStack(MegatronModule):
         self.pre_process = pre_process
         self.post_layer_norm = post_layer_norm
         self.post_process = post_process
+        self.call_roles = None
         self.is_mtp_layer = is_mtp_layer
         self.mtp_layer_number = mtp_layer_number
         self.pp_layer_offset = pp_layer_offset
@@ -632,6 +716,21 @@ class HybridStack(MegatronModule):
         forward_step_func"""
         self.input_tensor = input_tensor
 
+    @property
+    def call_pre_process(self) -> bool:
+        """``pre_process`` of the current call: the built flag, switched off by the call roles
+        (``call_roles``) when set. The forward path reads this (the pipeline input, the mHC and
+        wide-residual stream expansion); construction and checkpointing read the built flag."""
+        roles = self.call_roles
+        return self.pre_process and (roles is None or roles.pre_process)
+
+    @property
+    def call_post_process(self) -> bool:
+        """``post_process`` of the current call (see ``call_pre_process``): the stream readouts
+        and the final norm."""
+        roles = self.call_roles
+        return self.post_process and (roles is None or roles.post_process)
+
     def physical_layers(self) -> tuple[nn.Module, ...]:
         """Return one layer per layer_type_list entry, in execution order.
 
@@ -719,6 +818,10 @@ class HybridStack(MegatronModule):
         It either returns the Loss values if labels are given or the
             final hidden units
 
+        The pass runs in three phases: ``_prepare_forward`` builds the per-forward
+        layer-call context, ``_layer_loop`` runs the layers (``checkpointed_forward`` does
+        under full recomputation), and ``_finalize_forward`` applies the stack readout.
+
         Args:
             hidden_states (Union[Tensor, WrappedTensor]): the input tensor.
                 Can be passed as a WrappedTensor during inference to avoid an obsolete
@@ -744,6 +847,71 @@ class HybridStack(MegatronModule):
         inference_context = deprecate_inference_params(inference_context, inference_params)
         if self._has_custom_layers and (inference_context is not None or InferenceMode.is_active()):
             raise ValueError("Custom hybrid layers do not support inference contexts yet.")
+        hidden_states, ctx = self._prepare_forward(
+            hidden_states,
+            attention_mask,
+            inference_context,
+            rotary_pos_emb,
+            packed_seq_params=packed_seq_params,
+            padding_mask=padding_mask,
+            input_ids=input_ids,
+            packed_seq_params_by_layout=packed_seq_params_by_layout,
+            cp_layout_plan=cp_layout_plan,
+            attn_res_sources=attn_res_sources,
+            padding_mask_by_layout=padding_mask_by_layout,
+        )
+
+        with ctx.outer_quant_context:
+            if (
+                self.config.recompute_granularity == 'full'
+                and self.training
+                and not self._owns_full_recompute
+            ):
+                hidden_states = checkpointed_forward(
+                    self,
+                    hidden_states=hidden_states,
+                    attention_mask=ctx.attention_mask,
+                    context=None,
+                    context_mask=None,
+                    rotary_pos_emb=ctx.rotary_pos_emb,
+                    attention_bias=None,
+                    packed_seq_params=ctx.packed_seq_params,
+                    padding_mask=ctx.padding_mask,
+                    use_inner_quantization_context=ctx.use_inner_quantization_context,
+                    cp_layout_state=ctx.cp_layout_state,
+                    packed_sequence_cp_metadata=ctx.packed_sequence_cp_metadata,
+                    input_ids=ctx.input_ids,
+                    input_ids_by_layout=ctx.input_ids_by_layout,
+                    padding_mask_by_layout=ctx.padding_mask_by_layout,
+                )
+            else:
+                hidden_states = self._layer_loop(hidden_states, ctx)
+
+        return self._finalize_forward(hidden_states, attn_res_state=ctx.attn_res_state)
+
+    def _prepare_forward(
+        self,
+        hidden_states: Union[Tensor, WrappedTensor],
+        attention_mask: Optional[Tensor],
+        inference_context: Optional[BaseInferenceContext],
+        rotary_pos_emb: Optional[Tensor],
+        *,
+        packed_seq_params: Optional[PackedSeqParams],
+        padding_mask: Optional[Tensor],
+        input_ids: Optional[Tensor],
+        packed_seq_params_by_layout: dict[CPLayout, PackedSeqParams | None] | None,
+        cp_layout_plan: THDCPLayoutPlan | None,
+        padding_mask_by_layout: dict[CPLayout, Tensor | None] | None = None,
+        attn_res_sources: Optional[Tuple[Tensor, ...]] = None,
+    ) -> Tuple[Tensor, HybridStackLayerContext]:
+        """Resolve the stack input and build the per-forward layer-call context.
+
+        Returns the input hidden states (the pipeline input when this is not the first
+        stage, unwrapped, and expanded to the residual-stream width on the first stage) and
+        the ``HybridStackLayerContext`` that every layer call of this forward reads.
+        ``padding_mask_by_layout`` is HybridModel's per-layout mask of a dynamic-CP batch;
+        when None (and CP layouts are active) it is derived from ``padding_mask``.
+        """
         packed_seq_params = self._stage_te_cuda_graph_route_metadata(packed_seq_params)
 
         runtime_cp_group, cp_layout_manager = self._resolve_runtime_cp_layout(packed_seq_params)
@@ -777,7 +945,9 @@ class HybridStack(MegatronModule):
                 cp_size=runtime_cp_group.size(),
             )
 
-        if not self.pre_process:
+        # The roles of this call (the built ones unless a schedule set call_roles).
+        pre_process = self.call_pre_process
+        if not pre_process:
             # See set_input_tensor()
             hidden_states = self.input_tensor
 
@@ -807,11 +977,11 @@ class HybridStack(MegatronModule):
                 for layout in set(cp_layout_state.manager.layer_layouts)
             }
 
-        if self.config.enable_mhc_connections and self.pre_process and not self.is_mtp_layer:
+        if self.config.enable_mhc_connections and pre_process and not self.is_mtp_layer:
             hidden_states = HyperConnectionModule.input_expand(
                 hidden_states, self.config.mhc_num_residual_streams
             )
-        elif self.uses_wide_residual_stream and self.pre_process:
+        elif self.uses_wide_residual_stream and pre_process:
             hidden_states = expand_wide_residual_stream(
                 hidden_states, self.config.wide_residual.num_streams
             )
@@ -928,259 +1098,315 @@ class HybridStack(MegatronModule):
             if use_residual_stream_recompute
             else [None] * self.num_layers_per_pipeline_rank
         )
+        observe_residuals = is_observing_tensor("residual_accumulator") or is_observing_tensor(
+            "residual_contribution"
+        )
 
-        with outer_fp8_context:
-            if self.config.recompute_granularity == 'full' and self.training:
-                hidden_states = checkpointed_forward(
-                    self,
-                    hidden_states=hidden_states,
-                    attention_mask=attention_mask,
-                    context=None,
-                    context_mask=None,
-                    rotary_pos_emb=rotary_pos_emb,
-                    attention_bias=None,
-                    packed_seq_params=packed_seq_params,
-                    padding_mask=padding_mask,
-                    use_inner_quantization_context=(use_inner_fp8_context or use_fp4_context),
-                    cp_layout_state=cp_layout_state,
-                    packed_sequence_cp_metadata=packed_sequence_cp_metadata,
-                    input_ids=input_ids,
-                    input_ids_by_layout=input_ids_by_layout,
-                    padding_mask_by_layout=padding_mask_by_layout,
+        ctx = HybridStackLayerContext(
+            attention_mask=attention_mask,
+            inference_context=inference_context,
+            rotary_pos_emb=rotary_pos_emb,
+            sequence_len_offset=sequence_len_offset,
+            packed_seq_params=packed_seq_params,
+            padding_mask=padding_mask,
+            input_ids=input_ids,
+            cp_layout_state=cp_layout_state,
+            packed_sequence_cp_metadata=packed_sequence_cp_metadata,
+            input_ids_by_layout=input_ids_by_layout,
+            padding_mask_by_layout=padding_mask_by_layout,
+            quant_context_factory=get_inner_quant_context,
+            outer_quant_context=outer_fp8_context,
+            use_inner_quantization_context=(use_inner_fp8_context or use_fp4_context),
+            mhc_layer_managers=mhc_layer_managers,
+            mhc_block_ends=mhc_block_ends,
+            residual_stream_recompute_plan=residual_stream_recompute_plan,
+            observe_residuals=observe_residuals,
+            attn_res_state=attn_res_state,
+            attn_res_sources=attn_res_sources,
+        )
+        return hidden_states, ctx
+
+    def _layer_loop(self, hidden_states: Tensor, ctx: HybridStackLayerContext) -> Tensor:
+        """Run every layer call of the stack once, in execution order.
+
+        Skips the tail layer of a grouped attention->MoE CUDA-graph replay, which the
+        preceding layer call already ran. Subclasses override this method to change the
+        layer schedule; full recomputation bypasses it (``checkpointed_forward``).
+
+        With ``indexer_loss_row_mask`` and a padding mask the loop runs inside
+        ``indexer_loss_padding_mask`` of it: padded rows do not train the DSv4 indexers.
+        """
+        ctx.grouped_tail_to_skip = None
+        scope = nullcontext()
+        if self.indexer_loss_row_mask and ctx.padding_mask is not None:
+            # pylint: disable=import-outside-toplevel
+            from megatron.core.transformer.experimental_attention_variant.dsa_masking import (
+                indexer_loss_padding_mask,
+            )
+
+            scope = indexer_loss_padding_mask(ctx.padding_mask)
+        with scope:
+            for l_no, (_, _, layer) in enumerate(
+                zip(
+                    self._execution_layer_indices,
+                    self._execution_layer_config_list,
+                    self.layers,
+                    strict=True,
                 )
-            else:
-                grouped_tail_to_skip = None
-                observe_residuals = is_observing_tensor(
-                    "residual_accumulator"
-                ) or is_observing_tensor("residual_contribution")
-                for layer_idx, (physical_layer_idx, layer_config, layer) in enumerate(
-                    zip(
-                        self._execution_layer_indices,
-                        self._execution_layer_config_list,
-                        self.layers,
-                        strict=True,
-                    )
-                ):
-                    if layer is grouped_tail_to_skip:
-                        grouped_tail_to_skip = None
-                        continue
-                    layer_packed_seq_params = packed_seq_params
-                    residual_stream_recompute_context = residual_stream_recompute_plan[
-                        physical_layer_idx
-                    ]
-                    mhc_manager = mhc_layer_managers[layer_idx]
-                    if mhc_manager is not None:
-                        mhc_manager.is_last_layer_in_recompute_block = mhc_block_ends[layer_idx]
-                    layer_cp_metadata = (
-                        packed_sequence_cp_metadata
-                        if type(layer_config) is layer_utils.MambaLayerConfig
-                        and layer_config.linear_cp_mode == "chunkwise"
-                        else None
-                    )
+            ):
+                if layer is ctx.grouped_tail_to_skip:
+                    ctx.grouped_tail_to_skip = None
+                    continue
+                hidden_states = self._run_layer(l_no, hidden_states, ctx)
+        return hidden_states
 
-                    if isinstance(layer, ShortcutMoEBlock):
-                        if layer.moe_local_idx is None:
-                            raise RuntimeError(
-                                "A registered ShortcutMoEBlock is missing its MoE physical index."
-                            )
-                        moe_recompute_context = residual_stream_recompute_plan[layer.moe_local_idx]
-                        hidden_states = layer(
-                            hidden_states=hidden_states,
-                            attention_mask=attention_mask,
-                            inference_context=inference_context,
-                            rotary_pos_emb=rotary_pos_emb,
-                            sequence_len_offset=sequence_len_offset,
-                            packed_seq_params=layer_packed_seq_params,
-                            padding_mask=padding_mask,
-                            quant_context_factory=get_inner_quant_context,
-                            cp_layout_state=cp_layout_state,
-                            packed_sequence_cp_metadata=layer_cp_metadata,
-                            input_ids=input_ids,
-                            input_ids_by_layout=input_ids_by_layout,
-                            padding_mask_by_layout=padding_mask_by_layout,
-                            attn_recompute_context=residual_stream_recompute_context,
-                            moe_recompute_context=moe_recompute_context,
-                        )
-                        residual_stream_recompute_context = moe_recompute_context
-                    else:
-                        if cp_layout_state is not None:
-                            hidden_states, layer_packed_seq_params = cp_layout_state.prepare_layer(
-                                physical_layer_idx, hidden_states
-                            )
-                        # Keep both residuals in the layer's layout, inside the CP conversions.
-                        residual_accumulator = hidden_states
-                        layer_padding_mask = padding_mask
-                        if cp_layout_state is not None:
-                            layer_padding_mask = cp_layout_state.get_layer_padding_mask(
-                                physical_layer_idx, padding_mask, padding_mask_by_layout
-                            )
-                        # Layers have 1-indexed layer numbers attribute.
-                        inner_quant_context = get_inner_quant_context(
-                            layer_config, layer.layer_number - 1
-                        )
-                        is_custom_layer = (
-                            layer_utils.get_custom_layer_type(layer_config) is not None
-                        )
-                        layer_input_ids = input_ids
-                        if is_custom_layer and cp_layout_state is not None:
-                            layer_input_ids = cp_layout_state.get_layer_input_ids(
-                                physical_layer_idx, input_ids
-                            )
-                        with inner_quant_context:
-                            if isinstance(layer, AttnResHybridLayer):
-                                if residual_stream_recompute_context is not None:
-                                    raise TypeError(
-                                        "'residual_stream' recomputation cannot be applied to "
-                                        "AttnResHybridLayer."
-                                    )
-                                if layer.attn_res_is_block_start:
-                                    # Block boundary: the completed partial sum becomes
-                                    # a depth source; the entry starts a fresh partial.
-                                    assert attn_res_state is not None
-                                    attn_res_state.append_block_start(hidden_states)
-                                if self.is_mtp_layer:
-                                    layer_attn_res_sources = attn_res_sources
-                                else:
-                                    assert attn_res_state is not None
-                                    layer_attn_res_sources = tuple(attn_res_state.graph_sources)
-                                layer_kwargs = dict(
-                                    hidden_states=hidden_states,
-                                    attention_mask=attention_mask,
-                                    inference_context=inference_context,
-                                    rotary_pos_emb=rotary_pos_emb,
-                                    sequence_len_offset=sequence_len_offset,
-                                    packed_seq_params=layer_packed_seq_params,
-                                    padding_mask=padding_mask,
-                                    input_ids=input_ids,
-                                    attn_res_sources=layer_attn_res_sources,
-                                )
-                                if layer_cp_metadata is not None:
-                                    layer_kwargs["packed_sequence_cp_metadata"] = layer_cp_metadata
-                                hidden_states = layer(**layer_kwargs)
-                            elif is_custom_layer and not isinstance(
-                                layer, HyperConnectionHybridLayer
-                            ):
-                                hidden_states = layer_utils.invoke_custom_layer(
-                                    layer,
-                                    hidden_states,
-                                    attention_mask=attention_mask,
-                                    rotary_pos_emb=rotary_pos_emb,
-                                    packed_seq_params=layer_packed_seq_params,
-                                    padding_mask=layer_padding_mask,
-                                    input_ids=layer_input_ids,
-                                )
-                            elif isinstance(layer, (TransformerLayer, HyperConnectionHybridLayer)):
-                                layer_kwargs = dict(
-                                    attention_mask=attention_mask,
-                                    inference_context=inference_context,
-                                    rotary_pos_emb=rotary_pos_emb,
-                                    sequence_len_offset=sequence_len_offset,
-                                    packed_seq_params=layer_packed_seq_params,
-                                    padding_mask=layer_padding_mask,
-                                )
-                                if input_ids is not None and self._uses_hash_routing(layer):
-                                    layer_kwargs["input_ids"] = (
-                                        input_ids_by_layout[
-                                            cp_layout_state.manager.layer_layouts[
-                                                physical_layer_idx
-                                            ]
-                                        ]
-                                        if input_ids_by_layout is not None
-                                        else input_ids
-                                    )
-                                if layer_cp_metadata is not None:
-                                    layer_kwargs["packed_sequence_cp_metadata"] = layer_cp_metadata
-                                if residual_stream_recompute_context is not None:
-                                    if isinstance(layer, HyperConnectionHybridLayer):
-                                        raise TypeError(
-                                            "'residual_stream' recomputation cannot be applied to "
-                                            "HyperConnectionHybridLayer. Wide residuals replay "
-                                            "connection reads, connected norms, and writes "
-                                            "through ResidualStreamRecomputeContext, while mHC "
-                                            "uses its own mhc_recompute_manager. For mHC, select "
-                                            "'mhc' in recompute_modules and configure "
-                                            "mhc_recompute_layer_num instead."
-                                        )
-                                    layer_kwargs["residual_stream_recompute_context"] = (
-                                        residual_stream_recompute_context
-                                    )
-                                if mhc_manager is not None and isinstance(
-                                    layer, HyperConnectionHybridLayer
-                                ):
-                                    layer_kwargs["mhc_recompute_manager"] = mhc_manager
-                                if input_ids is not None and is_custom_layer:
-                                    # Custom inner layers read IDs in their own CP layout;
-                                    # hash-routed layers received layout-aware IDs above.
-                                    layer_kwargs["input_ids"] = layer_input_ids
-                                if observe_residuals and isinstance(
-                                    layer, HyperConnectionHybridLayer
-                                ):
-                                    # Observe each physical boundary accurately. nn.Module's
-                                    # call path keeps hooks while bypassing grouped graph replay.
-                                    # Match the wrapper's __call__ state binding so an eval
-                                    # observation cannot reuse a previous training manager.
-                                    layer._mhc_recompute_manager = layer_kwargs.pop(
-                                        "mhc_recompute_manager", None
-                                    )
-                                    hidden_states, _ = nn.Module.__call__(
-                                        layer, hidden_states, **layer_kwargs
-                                    )
-                                else:
-                                    hidden_states, _ = layer(hidden_states, **layer_kwargs)
-                            elif isinstance(layer, MambaLayer):
-                                layer_kwargs = dict(
-                                    attention_mask=attention_mask,
-                                    inference_context=inference_context,
-                                    packed_seq_params=layer_packed_seq_params,
-                                )
-                                if layer_cp_metadata is not None:
-                                    layer_kwargs["packed_sequence_cp_metadata"] = layer_cp_metadata
-                                if residual_stream_recompute_context is not None:
-                                    layer_kwargs["residual_stream_recompute_context"] = (
-                                        residual_stream_recompute_context
-                                    )
-                                hidden_states = layer(hidden_states, **layer_kwargs)
-                            else:  # Expert or MLP
-                                if residual_stream_recompute_context is not None:
-                                    raise TypeError(
-                                        "Residual-stream recomputation in HybridStack supports "
-                                        "TransformerLayer and MambaLayer modules only."
-                                    )
-                                hidden_states = layer(
-                                    hidden_states=hidden_states,
-                                    attention_mask=attention_mask,
-                                    inference_context=inference_context,
-                                    packed_seq_params=layer_packed_seq_params,
-                                )
+    def _run_layer(self, l_no: int, hidden_states: Tensor, ctx: HybridStackLayerContext) -> Tensor:
+        """Run one layer call of this forward.
 
-                        if isinstance(hidden_states, tuple):
-                            hidden_states = hidden_states[0]
-                        observe_layer_residuals(layer, residual_accumulator, hidden_states)
-                        if isinstance(layer, HyperConnectionHybridLayer) and not observe_residuals:
-                            grouped_tail_to_skip = layer._get_active_te_cuda_graph_group_tail()
-                        if cp_layout_state is not None:
-                            final_physical_idx = (
-                                physical_layer_idx + 1
-                                if grouped_tail_to_skip is not None
-                                else physical_layer_idx
-                            )
-                            hidden_states = cp_layout_state.finalize_layer(
-                                final_physical_idx, hidden_states
-                            )
+        Args:
+            l_no (int): execution index into ``self.layers``; equal to the physical layer
+                index unless Shortcut MoE pairs two layers into one ``ShortcutMoEBlock``.
+            hidden_states (Tensor): the layer input.
+            ctx (HybridStackLayerContext): the context built by ``_prepare_forward``.
 
+        Returns:
+            Tensor: the layer output. Sets ``ctx.grouped_tail_to_skip`` when an mHC layer
+            replayed a grouped CUDA graph that also covered the next layer.
+        """
+        physical_layer_idx = self._execution_layer_indices[l_no]
+        layer_config = self._execution_layer_config_list[l_no]
+        layer = self.layers[l_no]
+        layer_packed_seq_params = ctx.packed_seq_params
+        residual_stream_recompute_context = ctx.residual_stream_recompute_plan[physical_layer_idx]
+        mhc_manager = ctx.mhc_layer_managers[l_no]
+        if mhc_manager is not None:
+            mhc_manager.is_last_layer_in_recompute_block = ctx.mhc_block_ends[l_no]
+        layer_cp_metadata = (
+            ctx.packed_sequence_cp_metadata
+            if type(layer_config) is layer_utils.MambaLayerConfig
+            and layer_config.linear_cp_mode == "chunkwise"
+            else None
+        )
+
+        if isinstance(layer, ShortcutMoEBlock):
+            if layer.moe_local_idx is None:
+                raise RuntimeError(
+                    "A registered ShortcutMoEBlock is missing its MoE physical index."
+                )
+            moe_recompute_context = ctx.residual_stream_recompute_plan[layer.moe_local_idx]
+            if ctx.return_layer_delta:
+                raise TypeError(
+                    "A layer delta needs a plain TransformerLayer, got ShortcutMoEBlock"
+                )
+            hidden_states = layer(
+                hidden_states=hidden_states,
+                attention_mask=ctx.attention_mask,
+                inference_context=ctx.inference_context,
+                rotary_pos_emb=ctx.rotary_pos_emb,
+                sequence_len_offset=ctx.sequence_len_offset,
+                packed_seq_params=layer_packed_seq_params,
+                padding_mask=ctx.padding_mask,
+                quant_context_factory=ctx.quant_context_factory,
+                cp_layout_state=ctx.cp_layout_state,
+                packed_sequence_cp_metadata=layer_cp_metadata,
+                input_ids=ctx.input_ids,
+                input_ids_by_layout=ctx.input_ids_by_layout,
+                padding_mask_by_layout=ctx.padding_mask_by_layout,
+                attn_recompute_context=residual_stream_recompute_context,
+                moe_recompute_context=moe_recompute_context,
+            )
+            residual_stream_recompute_context = moe_recompute_context
+        else:
+            if ctx.return_layer_delta and (
+                not isinstance(layer, TransformerLayer)
+                or isinstance(layer, HyperConnectionHybridLayer)
+                or residual_stream_recompute_context is not None
+            ):
+                raise TypeError(
+                    "A layer delta needs a plain TransformerLayer without residual-stream "
+                    f"recompute, got {type(layer).__name__}"
+                )
+            if ctx.cp_layout_state is not None:
+                hidden_states, layer_packed_seq_params = ctx.cp_layout_state.prepare_layer(
+                    physical_layer_idx, hidden_states
+                )
+            # Keep both residuals in the layer's layout, inside the CP conversions.
+            residual_accumulator = hidden_states
+            layer_padding_mask = ctx.padding_mask
+            if ctx.cp_layout_state is not None:
+                layer_padding_mask = ctx.cp_layout_state.get_layer_padding_mask(
+                    physical_layer_idx, ctx.padding_mask, ctx.padding_mask_by_layout
+                )
+            # Layers have 1-indexed layer numbers attribute.
+            inner_quant_context = ctx.quant_context_factory(layer_config, layer.layer_number - 1)
+            is_custom_layer = (
+                layer_utils.get_custom_layer_type(layer_config) is not None
+            )
+            layer_input_ids = ctx.input_ids
+            if is_custom_layer and ctx.cp_layout_state is not None:
+                layer_input_ids = ctx.cp_layout_state.get_layer_input_ids(
+                    physical_layer_idx, ctx.input_ids
+                )
+            with inner_quant_context:
+                if isinstance(layer, AttnResHybridLayer):
                     if residual_stream_recompute_context is not None:
-                        residual_stream_recompute_context.finalize(hidden_states)
-                    self._finalize_mhc_recompute_layer(
-                        manager=mhc_manager,
+                        raise TypeError(
+                            "'residual_stream' recomputation cannot be applied to "
+                            "AttnResHybridLayer."
+                        )
+                    if layer.attn_res_is_block_start:
+                        # Block boundary: the completed partial sum becomes
+                        # a depth source; the entry starts a fresh partial.
+                        assert ctx.attn_res_state is not None
+                        ctx.attn_res_state.append_block_start(hidden_states)
+                    if self.is_mtp_layer:
+                        layer_attn_res_sources = ctx.attn_res_sources
+                    else:
+                        assert ctx.attn_res_state is not None
+                        layer_attn_res_sources = tuple(ctx.attn_res_state.graph_sources)
+                    layer_kwargs = dict(
                         hidden_states=hidden_states,
-                        is_block_end=mhc_block_ends[layer_idx],
+                        attention_mask=ctx.attention_mask,
+                        inference_context=ctx.inference_context,
+                        rotary_pos_emb=ctx.rotary_pos_emb,
+                        sequence_len_offset=ctx.sequence_len_offset,
+                        packed_seq_params=layer_packed_seq_params,
+                        padding_mask=ctx.padding_mask,
+                        input_ids=ctx.input_ids,
+                        attn_res_sources=layer_attn_res_sources,
+                    )
+                    if layer_cp_metadata is not None:
+                        layer_kwargs["packed_sequence_cp_metadata"] = layer_cp_metadata
+                    hidden_states = layer(**layer_kwargs)
+                elif is_custom_layer and not isinstance(
+                    layer, HyperConnectionHybridLayer
+                ):
+                    hidden_states = layer_utils.invoke_custom_layer(
+                        layer,
+                        hidden_states,
+                        attention_mask=ctx.attention_mask,
+                        rotary_pos_emb=ctx.rotary_pos_emb,
+                        packed_seq_params=layer_packed_seq_params,
+                        padding_mask=layer_padding_mask,
+                        input_ids=layer_input_ids,
+                    )
+                elif isinstance(layer, (TransformerLayer, HyperConnectionHybridLayer)):
+                    layer_kwargs = dict(
+                        attention_mask=ctx.attention_mask,
+                        inference_context=ctx.inference_context,
+                        rotary_pos_emb=ctx.rotary_pos_emb,
+                        sequence_len_offset=ctx.sequence_len_offset,
+                        packed_seq_params=layer_packed_seq_params,
+                        padding_mask=layer_padding_mask,
+                    )
+                    if ctx.input_ids is not None and is_custom_layer:
+                        layer_kwargs["input_ids"] = layer_input_ids
+                    elif ctx.input_ids is not None and self._uses_hash_routing(layer):
+                        layer_kwargs["input_ids"] = (
+                            ctx.input_ids_by_layout[
+                                ctx.cp_layout_state.manager.layer_layouts[physical_layer_idx]
+                            ]
+                            if ctx.input_ids_by_layout is not None
+                            else ctx.input_ids
+                        )
+                    if layer_cp_metadata is not None:
+                        layer_kwargs["packed_sequence_cp_metadata"] = layer_cp_metadata
+                    if residual_stream_recompute_context is not None:
+                        if isinstance(layer, HyperConnectionHybridLayer):
+                            raise TypeError(
+                                "'residual_stream' recomputation cannot be applied to "
+                                "HyperConnectionHybridLayer. Wide residuals replay "
+                                "connection reads, connected norms, and writes "
+                                "through ResidualStreamRecomputeContext, while mHC "
+                                "uses its own mhc_recompute_manager. For mHC, select "
+                                "'mhc' in recompute_modules and configure "
+                                "mhc_recompute_layer_num instead."
+                            )
+                        layer_kwargs["residual_stream_recompute_context"] = (
+                            residual_stream_recompute_context
+                        )
+                    if mhc_manager is not None and isinstance(layer, HyperConnectionHybridLayer):
+                        layer_kwargs["mhc_recompute_manager"] = mhc_manager
+                    if ctx.return_layer_delta:
+                        layer_kwargs["_return_layer_delta"] = True
+                        layer_kwargs["_called_from_hybrid_attn_res_wrapper"] = True
+                    # The single call site of TransformerLayer / HyperConnectionHybridLayer.
+                    if ctx.observe_residuals and isinstance(layer, HyperConnectionHybridLayer):
+                        # Observe each physical boundary accurately. nn.Module's
+                        # call path keeps hooks while bypassing grouped graph replay.
+                        # Match the wrapper's __call__ state binding so an eval
+                        # observation cannot reuse a previous training manager.
+                        layer._mhc_recompute_manager = layer_kwargs.pop(
+                            "mhc_recompute_manager", None
+                        )
+                        hidden_states, _ = nn.Module.__call__(layer, hidden_states, **layer_kwargs)
+                    else:
+                        hidden_states, _ = layer(hidden_states, **layer_kwargs)
+                elif isinstance(layer, MambaLayer):
+                    layer_kwargs = dict(
+                        attention_mask=ctx.attention_mask,
+                        inference_context=ctx.inference_context,
+                        packed_seq_params=layer_packed_seq_params,
+                    )
+                    if layer_cp_metadata is not None:
+                        layer_kwargs["packed_sequence_cp_metadata"] = layer_cp_metadata
+                    if residual_stream_recompute_context is not None:
+                        layer_kwargs["residual_stream_recompute_context"] = (
+                            residual_stream_recompute_context
+                        )
+                    hidden_states = layer(hidden_states, **layer_kwargs)
+                else:  # Expert or MLP
+                    if residual_stream_recompute_context is not None:
+                        raise TypeError(
+                            "Residual-stream recomputation in HybridStack supports "
+                            "TransformerLayer and MambaLayer modules only."
+                        )
+                    hidden_states = layer(
+                        hidden_states,
+                        attention_mask=ctx.attention_mask,
+                        inference_context=ctx.inference_context,
+                        packed_seq_params=layer_packed_seq_params,
                     )
 
-        if self.residual_stream_readout is not None:
+            if isinstance(hidden_states, tuple):
+                hidden_states = hidden_states[0]
+            if not ctx.return_layer_delta:  # a delta is not a residual stream
+                observe_layer_residuals(layer, residual_accumulator, hidden_states)
+            if isinstance(layer, HyperConnectionHybridLayer) and not ctx.observe_residuals:
+                ctx.grouped_tail_to_skip = layer._get_active_te_cuda_graph_group_tail()
+            if ctx.cp_layout_state is not None:
+                final_physical_idx = (
+                    physical_layer_idx + 1
+                    if ctx.grouped_tail_to_skip is not None
+                    else physical_layer_idx
+                )
+                hidden_states = ctx.cp_layout_state.finalize_layer(
+                    final_physical_idx, hidden_states
+                )
+
+        if residual_stream_recompute_context is not None:
+            residual_stream_recompute_context.finalize(hidden_states)
+        self._finalize_mhc_recompute_layer(
+            manager=mhc_manager, hidden_states=hidden_states, is_block_end=ctx.mhc_block_ends[l_no]
+        )
+        return hidden_states
+
+    def _finalize_forward(
+        self, hidden_states: Tensor, *, attn_res_state: Optional[AttnResStageSources] = None
+    ) -> Union[Tensor, Tuple[Tensor, Tensor]]:
+        """Apply the stack readout after the layers.
+
+        Runs the wide-residual readout, the mHC output contraction (also returning the
+        multistream tensor when MTP consumes it), the final norm, and the viewless
+        pipeline-output guarantees. The readouts and the final norm follow the call's
+        ``call_post_process``.
+        """
+        post_process = self.call_post_process
+        if self.residual_stream_readout is not None and post_process:
             hidden_states = apply_module(self.residual_stream_readout)(hidden_states)
 
         mhc_multistream = None
-        if self.config.enable_mhc_connections and self.post_process and not self.is_mtp_layer:
+        if self.config.enable_mhc_connections and post_process and not self.is_mtp_layer:
             if (self.config.mtp_num_layers or 0) > 0:
                 mhc_multistream = hidden_states
             if self.config.mhc_learned_output_contract:
@@ -1225,7 +1451,7 @@ class HybridStack(MegatronModule):
                 nvtx_range_pop(msg="attn_res.pack_payload")
 
         # Final layer norm.
-        if self.post_process and self.post_layer_norm:
+        if post_process and self.post_layer_norm:
             hidden_states = self.final_norm(hidden_states)
 
         # Ensure that the tensor passed between pipeline parallel stages is
@@ -1234,7 +1460,7 @@ class HybridStack(MegatronModule):
             inp=hidden_states, requires_grad=hidden_states.requires_grad, keep_graph=True
         )
 
-        if not self.pre_process and not self.post_process and len(self.layers) == 0:
+        if not self.call_pre_process and not post_process and len(self.layers) == 0:
             # The schedule may pseudo-deallocate our output after sending it. An
             # empty stage must not return the input object itself: its shape and
             # storage are still needed to receive and propagate the gradient.

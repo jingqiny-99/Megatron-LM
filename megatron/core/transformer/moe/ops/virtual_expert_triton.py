@@ -147,6 +147,7 @@ def _plan_virtual_expert_routes_kernel(
     EP_SIZE: tl.constexpr,
     NUM_EXPERTS: tl.constexpr,
     ALIGNMENT: tl.constexpr = 1,
+    MASKED_ROUTES: tl.constexpr = False,
 ):
     """Plan histogram, placement, and stable route remapping in one 32-block launch.
 
@@ -196,6 +197,9 @@ def _plan_virtual_expert_routes_kernel(
         offsets = route_start + flat
         valid = offsets < program_end
         ids = tl.load(top_indices + offsets, mask=valid, other=0)
+        if MASKED_ROUTES:
+            tl.device_assert((~valid) | ((ids >= -1) & (ids < NUM_EXPERTS)), "invalid router ID")
+            valid = valid & (ids >= 0) & (ids < NUM_EXPERTS)
         row += tl.histogram(ids.to(tl.int32), BLOCK_NUM_EXPERTS, mask=valid)
     tl.store(histogram_rows + program * NUM_EXPERTS + experts, row, mask=valid_experts)
     tl.atomic_add(totals + experts, row, mask=valid_experts)
@@ -264,7 +268,8 @@ def _plan_virtual_expert_routes_kernel(
             axis=1,
         )
         tl.device_assert(
-            (source_total == NUM_ROUTES) | ~valid_owned_ranks,
+            (source_total <= NUM_ROUTES if MASKED_ROUTES else source_total == NUM_ROUTES)
+            | ~valid_owned_ranks,
             "virtual-expert planner: a rank's route count differs from tokens * topk",
         )
         tl.store(
@@ -390,6 +395,8 @@ def _plan_virtual_expert_routes_kernel(
         route_offsets = route_start + flat
         valid = route_offsets < program_end
         ids = tl.load(top_indices + route_offsets, mask=valid, other=0).to(tl.int32)
+        if MASKED_ROUTES:
+            valid = valid & (ids >= 0) & (ids < NUM_EXPERTS)
         packed = tl.sort(tl.where(valid, ids, NUM_EXPERTS) * ROUTE_TILE + flat, descending=False)
         sorted_ids = packed // ROUTE_TILE
         previous_ids = tl.gather(sorted_ids, tl.maximum(flat - 1, 0), axis=0)
@@ -421,7 +428,14 @@ def _plan_virtual_expert_routes_kernel(
         runtime = destination * (2 * NUM_EXPERTS_PER_GPU) + tl.where(
             remote, NUM_EXPERTS_PER_GPU + slot, ids % NUM_EXPERTS_PER_GPU
         )
-        tl.store(virtual_experts + route_offsets, runtime.to(tl.int16), mask=valid)
+        if MASKED_ROUTES:
+            tl.store(
+                virtual_experts + route_offsets,
+                tl.where(valid, runtime, -1).to(tl.int16),
+                mask=route_offsets < program_end,
+            )
+        else:
+            tl.store(virtual_experts + route_offsets, runtime.to(tl.int16), mask=valid)
         running += tl.histogram(ids, BLOCK_NUM_EXPERTS, mask=valid)
 
 
@@ -457,7 +471,10 @@ class VirtualExpertPlannerWorkspace:
     from its own, so planning needs no collective. ``scratch`` is the int32 field arena of
     :func:`_scratch_layout`; :meth:`field` views one field for inspection."""
 
-    def __init__(self, *, num_experts: int, device: torch.device, group: dist.ProcessGroup) -> None:
+    def __init__(
+        self, *, num_experts: int, device: torch.device, group: dist.ProcessGroup,
+        symm_backend: str = "NCCL",
+    ) -> None:
         _check_triton_version()
         import torch.distributed._symmetric_memory as symm_mem
 
@@ -470,8 +487,8 @@ class VirtualExpertPlannerWorkspace:
         self.rank = dist.get_rank(group=group)
         # The window needs the group's communicator (created by a first collective).
         dist.all_reduce(torch.zeros(1, device=device), group=group)
-        if symm_mem.get_backend(device) != "NCCL":
-            symm_mem.set_backend("NCCL")
+        if symm_mem.get_backend(device) != symm_backend:
+            symm_mem.set_backend(symm_backend)
         window = symm_mem.empty(ep_size * num_experts, dtype=torch.int32, device=device)
         self.histogram_handle = symm_mem.rendezvous(window, group)
         if self.histogram_handle.signal_pad_size < ep_size * 4:
@@ -499,7 +516,7 @@ class VirtualExpertPlannerWorkspace:
 
 
 def launch_virtual_expert_planner(
-    top_indices: torch.Tensor, workspace, alignment: int = 1
+    top_indices: torch.Tensor, workspace, alignment: int = 1, *, masked_routes: bool = False
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Plan one layer's routes in a fused 32-block cooperative launch.
 
@@ -521,6 +538,7 @@ def launch_virtual_expert_planner(
         router_topk,
         alignment,
         top_indices.dtype,
+        masked_routes,
         top_indices.data_ptr() % 16,
     )
     arguments = (
@@ -544,6 +562,7 @@ def launch_virtual_expert_planner(
         EP_SIZE=ep_size,
         NUM_EXPERTS=num_experts,
         ALIGNMENT=alignment,
+        MASKED_ROUTES=masked_routes,
         launch_cooperative_grid=True,
         num_warps=4,
     )
@@ -726,6 +745,7 @@ def _virtual_expert_weight_push_kernel(
     NUM_LOCAL_EXPERTS: tl.constexpr,
     WORLD: tl.constexpr,
     NUM_SMS: tl.constexpr,
+    WAIT_FOR_CONSUMERS: tl.constexpr,
 ):
     """Push every owner-local expert into its virtual-expert slots and rendezvous.
 
@@ -737,6 +757,8 @@ def _virtual_expert_weight_push_kernel(
     each section ``NUM_LOCAL_EXPERTS`` members long; the two scale sections are empty for BF16
     weights.
     """
+    if WAIT_FOR_CONSUMERS:
+        _cross_rank_barrier(signal_bases, grid_barrier, dummy_signal, rank, WORLD, NUM_SMS)
     FC1_SCALE_ARENA: tl.constexpr = NUM_LOCAL_EXPERTS * FC1_BYTES
     FC2_ARENA: tl.constexpr = FC1_SCALE_ARENA + NUM_LOCAL_EXPERTS * FC1_SCALE_BYTES
     FC2_SCALE_ARENA: tl.constexpr = FC2_ARENA + NUM_LOCAL_EXPERTS * FC2_BYTES
@@ -803,6 +825,7 @@ def _virtual_expert_grad_reduce_kernel(
     NUM_LOCAL_EXPERTS: tl.constexpr,
     WORLD: tl.constexpr,
     NUM_SMS: tl.constexpr,
+    UNIFORM_PEER_STRIDE: tl.constexpr,
 ):
     """Reduce every peer's virtual-expert gradients into native wgrad staging.
 
@@ -850,16 +873,16 @@ def _virtual_expert_grad_reduce_kernel(
 
     # One descriptor whose outermost index selects the peer: the source loop sits inside the
     # pipelined tile loop, where Triton cannot build a descriptor, so one has to reach every peer.
-    # The symmetric allocator maps each rank's arena at a fixed virtual stride; the host workspace
-    # verifies that once.
+    # The host checks whether the allocator mapped peers at a fixed positive stride.
     bases = peer_bases.to(tl.pointer_type(tl.int64))
-    base = tl.load(bases)
-    window = tl.make_tensor_descriptor(
-        base.to(tl.pointer_type(arena.dtype.element_ty)),
-        [WORLD, ARENA_ROWS, _ROW],
-        [(tl.load(bases + 1) - base) // ELEMENT_BYTES, _ROW, 1],
-        [1, TILE_ROWS, _ROW],
-    )
+    if UNIFORM_PEER_STRIDE:
+        base = tl.load(bases)
+        window = tl.make_tensor_descriptor(
+            base.to(tl.pointer_type(arena.dtype.element_ty)),
+            [WORLD, ARENA_ROWS, _ROW],
+            [(tl.load(bases + 1) - base) // ELEMENT_BYTES, _ROW, 1],
+            [1, TILE_ROWS, _ROW],
+        )
     _cross_rank_barrier(signal_bases, grid_barrier, dummy_signal, rank, WORLD, NUM_SMS)
     materialized = tl.load(virtual_experts + NUM_LOCAL_EXPERTS)
 
@@ -892,9 +915,14 @@ def _virtual_expert_grad_reduce_kernel(
             # summation order ``native + s0 + s1 + ...``.
             offset = tl.arange(0, TILE_ROWS)[None, :, None].to(tl.int64) * _ROW + tl.arange(0, _ROW)
             staged = tl.load(native + offset).to(tl.float32)
-            partial = tl.where(index == 0, staged, partial) + window.load([peer, row, 0]).to(
-                tl.float32
-            )
+            if UNIFORM_PEER_STRIDE:
+                contribution = window.load([peer, row, 0])
+            else:
+                # CUDA/VMM may map the peer windows in any order. Index the actual
+                # peer address and issue coalesced loads over the same transport tile.
+                peer_base = tl.load(bases + peer).to(tl.pointer_type(arena.dtype.element_ty))
+                contribution = tl.load(peer_base + row.to(tl.int64) * _ROW + offset)
+            partial = tl.where(index == 0, staged, partial) + contribution.to(tl.float32)
             tl.store(native + offset, partial.to(arena.dtype.element_ty), mask=index == count - 1)
     _cross_rank_barrier(signal_bases, grid_barrier, dummy_signal, rank, WORLD, NUM_SMS)
 
@@ -953,6 +981,7 @@ def launch_virtual_expert_weight_prefetch(
     sources: tuple[torch.Tensor, torch.Tensor],
     experts_to_copy: torch.Tensor,
     scale_sources: tuple[torch.Tensor, torch.Tensor] | None = None,
+    wait_for_consumers: bool = False,
 ) -> None:
     """Push BF16 or native MXFP8 owner weights into destination virtual slots.
 
@@ -997,6 +1026,7 @@ def launch_virtual_expert_weight_prefetch(
         NUM_LOCAL_EXPERTS=num_local_experts,
         WORLD=world_size,
         NUM_SMS=num_sms,
+        WAIT_FOR_CONSUMERS=wait_for_consumers,
         num_warps=_PUSH_NUM_WARPS,
         launch_cooperative_grid=True,
     )
@@ -1051,6 +1081,7 @@ def launch_virtual_expert_grad_reduce(
         NUM_LOCAL_EXPERTS=num_local_experts,
         WORLD=world_size,
         NUM_SMS=num_sms,
+        UNIFORM_PEER_STRIDE=getattr(workspace, "uniform_grad_stride", True),
         num_warps=_GRAD_NUM_WARPS,
         launch_cooperative_grid=True,
     )

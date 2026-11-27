@@ -116,6 +116,52 @@ def _validate_dsa_index_share_pipeline_layout(
             )
 
 
+def _default_dsa_kernel_backend(
+    experimental_attention_variant: Optional[str], apply_dsa_kernel_fusion: Optional[bool]
+) -> str:
+    """The DSA kernel backend when none is selected: ``cudnn`` for DSv4 hybrid attention
+    without the deprecated fusion switch, else ``none``."""
+    return (
+        "cudnn"
+        if experimental_attention_variant == "dsv4_hybrid" and apply_dsa_kernel_fusion is None
+        else "none"
+    )
+
+
+def _legacy_dsa_kernel_backend(dsa_kernel_backend: str, apply_dsa_kernel_fusion: bool) -> str:
+    """Fold the deprecated DSv4 ``apply_dsa_kernel_fusion`` switch into the backend (True maps
+    to ``cudnn``, False to ``none``); raises on a conflicting explicit backend."""
+    legacy_backend = "cudnn" if apply_dsa_kernel_fusion else "none"
+    if dsa_kernel_backend not in ("none", legacy_backend):
+        raise ValueError(
+            "Conflicting DSA kernel controls: "
+            f"apply_dsa_kernel_fusion={apply_dsa_kernel_fusion} maps to "
+            f"dsa_kernel_backend={legacy_backend!r}, but "
+            f"dsa_kernel_backend={dsa_kernel_backend!r} was also selected. "
+            "Remove apply_dsa_kernel_fusion and use dsa_kernel_backend only."
+        )
+    return legacy_backend
+
+
+def resolve_dsa_kernel_backend(
+    experimental_attention_variant: Optional[str],
+    dsa_kernel_backend: Optional[str],
+    apply_dsa_kernel_fusion: Optional[bool],
+) -> str:
+    """The ``dsa_kernel_backend`` that ``TransformerConfig.__post_init__`` resolves from the
+    raw (canonical) attention variant, backend and deprecated fusion switch, without building
+    a config (argument-time checks use it): the default when unset, then the fusion switch
+    folded in for DSv4 hybrid attention."""
+    backend = dsa_kernel_backend
+    if backend is None:
+        backend = _default_dsa_kernel_backend(
+            experimental_attention_variant, apply_dsa_kernel_fusion
+        )
+    if apply_dsa_kernel_fusion is not None and experimental_attention_variant == "dsv4_hybrid":
+        backend = _legacy_dsa_kernel_backend(backend, apply_dsa_kernel_fusion)
+    return backend
+
+
 @dataclass
 @experimental_api
 class TransformerConfig(ModelParallelConfig):
@@ -131,6 +177,208 @@ class TransformerConfig(ModelParallelConfig):
 
     num_layers: int = field(default=0, metadata={"argparse_meta": {"default": None}})
     """Number of transformer layers in a transformer block."""
+
+    loop_architecture: Literal["none", "huginn", "mor"] = "none"
+    """Experimental shared-depth decoder; num_layers counts physical layers."""
+
+    loop_prelude_layers: int = 2
+    loop_core_layers: int = 4
+    loop_iterations: int = 4
+    loop_untie_core: bool = False
+    """Fixed-depth compute baseline with a separate physical core for each iteration.
+    GPT loop: loop_core_layers x loop_iterations physical layers. Hybrid loop (role mode,
+    the carrier ablation's 'plain-inject'): the physical core holds loop_iterations equal
+    segments cut on block boundaries; segment r runs once, after its own Huginn adapter
+    [state; prelude output] -> state, and is followed by its own loop norm (the injection
+    carrier's round body with untied weights)."""
+    loop_sample_depth: bool = False
+    """Sample one depth uniformly from {1, 2, 4, 8}, shared by the TP/EP domain."""
+
+    loop_bptt_iterations: int = 0
+    """Differentiate the last K iterations; zero means full BPTT."""
+
+    loop_reuse_sparse_kv: bool = False
+    """Reuse first-pass sparse KV and selected indices alongside each later pass's own
+    local-window KV. DSv4 uses compressed slots; native DSA uses token positions."""
+
+    loop_rsbf_offload_sparse_kv: bool = False
+    """Keep native DSA first-pass KV and its consumer adjoint in pinned CPU memory between
+    uses during two-round RSBF training. Top-k indices remain on the device."""
+
+    loop_sparse_kv_window_size: int = 128
+    """Local window in tokens (including the query position) of a native DSA consumer pass.
+    DSv4 uses its existing csa_window_size."""
+
+    loop_reuse_indexer: bool = False
+    """Use the first round's causal compressed-slot selections on later rounds of a tied
+    DSv4 hybrid core. The learned indexer and its training loss run on the source round."""
+
+    loop_recompute: bool = False
+    """Checkpoint individual recurrences with non-reentrant autograd."""
+
+    loop_recompute_block_stride: Optional[int] = None
+    """Hybrid Huginn loop with loop_recompute: checkpoint every loop_recompute_block_stride core
+    sublayers of a round instead of the whole round (block checkpoints). Sublayers are counted
+    as for loop_rsbf_block_stride (symbols of the hybrid pattern, so one attention + MLP layer
+    is 2); 1 <= stride <= the sublayers one round runs (the core, or one untied segment). It
+    need not divide them (the last block is then shorter); equal to them is one block per round,
+    bitwise the same as None. The first block of a round also runs the Huginn adapter and the
+    last one the loop norm. None keeps one checkpoint per round. Math-neutral: only the saved
+    activations and the recompute granularity change."""
+
+    loop_recompute_edges: bool = False
+    """Hybrid Huginn loop with loop_recompute_block_stride: also checkpoint the prelude and the
+    coda, in blocks of the same stride. The MTP depths and the output layer keep their
+    activations."""
+
+    loop_token_execution: Literal["masked", "compact"] = "compact"
+    loop_router_balance_coeff: float = 0.01
+    loop_router_z_loss_coeff: float = 0.001
+
+    loop_prelude_sublayers: Optional[int] = None
+    """Hybrid loop: number of sublayers (symbols of the main hybrid layer pattern, without
+    '|' and the MTP part) that run once before the shared core. Set together with
+    loop_coda_sublayers; the core is the remaining sublayers. Replaces loop_prelude_layers /
+    loop_core_layers, which apply to the GPT loop only."""
+
+    loop_coda_sublayers: Optional[int] = None
+    """Hybrid loop: number of sublayers of the main hybrid layer pattern that run once after
+    the shared core. Set together with loop_prelude_sublayers."""
+
+    loop_schedule: Literal["standard", "rsbf", "ring"] = "standard"
+    """Training schedule of a hybrid Huginn loop. 'rsbf' runs training steps through the
+    round-synchronous breadth-first executor (forward_backward_loop_rsbf: per-sample exit,
+    round-input checkpoints, per-round backward items); evaluation keeps the standard
+    schedule. The other loop_rsbf_* / loop_exit_criterion / loop_depth_* / loop_min_rounds
+    fields require 'rsbf'. Under 'rsbf' every cell call has batch 1, so the MoE aux and DSA
+    indexer loss gradients are the standard schedule's at micro_batch_size 1 whatever the
+    micro_batch_size (at MBS b the standard schedule averages them over the b rows of a
+    microbatch, a 1/b smaller coefficient); their logged values match the standard schedule's
+    logs at the same micro_batch_size. 'ring' runs the loop over pipeline stages (PP > 1): the
+    main pattern carries P x k '|' segments of the unchanged layer sequence (k = 1 one chunk per
+    rank, k > 1 the standard virtual-pipeline chunks), the first one holding the prelude and the
+    last one the coda, and every round of every microbatch passes the stage ring once, so the
+    shared core weights live once, on the chunk that holds them. A ring chunk runs only through
+    the ring schedule's round views; the supported features are listed by
+    loop/guards.py (validate_loop_ring_config, validate_ring_layout)."""
+
+    loop_ring_separate_edges: bool = False
+    """Build three physical chunks per PP rank (prelude, tied core, coda) and run the native
+    interleaved schedule over prelude, first core pass, second core pass, and coda/head."""
+
+    loop_ring_recompute_plan: Optional[str] = None
+    """loop_schedule='ring': the recompute plan, one code per (pipeline stage, round view): P
+    '/'-separated groups (stage 0 first) of R x k codes, R = loop_iterations and k the virtual
+    pipeline size (round view v = r * k + j runs chunk j in round r). 'C' checkpoints the round
+    body (needs loop_recompute), 'n' keeps its activations. With loop_recompute_block_stride,
+    each 'C' view checkpoints its local core in blocks and, if loop_recompute_edges is set,
+    also checkpoints its prelude or coda. Without a stride, 'C' checkpoints the entire local
+    core and the first view's prelude. Example:
+    'CCCCCCCC/CCCCCCCn' for P = 2, k = 2, R = 4. None: every view 'C' with loop_recompute and 'n'
+    without. With loop_ring_separate_edges the four codes on each stage describe prelude,
+    core pass 1, core pass 2 and coda. Edge checkpointing also requires loop_recompute_edges."""
+
+    loop_rsbf_waves: int = 1
+    """RSBF: passes (waves) per optimizer step; gradients accumulate across waves. Must divide
+    the number of microbatches per step."""
+
+    loop_rsbf_fill: Literal["drain", "sample_order", "refill"] = "drain"
+    """RSBF: when a sample's backward chain runs. 'drain': in the backward phase of the slot
+    after its exit; 'sample_order': every chain after the last forward round, in sample order
+    (the eager reference's accumulation order). 'refill': admit new samples in input order on
+    a home replica as space becomes available, with one window for the whole update."""
+
+    loop_rsbf_refill_window: int = 2
+    """Maximum live samples per data replica when loop_rsbf_fill is 'refill'."""
+
+    loop_rsbf_rebalance: bool = True
+    """RSBF with data parallelism (one EU per DP rank, the DP group is the domain): min-move
+    rebalancing of the active samples between forward rounds (only the surplus above
+    ceil(active / EUs) moves, preferring an EU that already holds the sample's injection).
+    False keeps every sample on the EU that loaded it. Must be the same on every rank."""
+
+    loop_rsbf_move_transport: Literal["p2p", "all_to_all"] = "p2p"
+    """RSBF with data parallelism: how sample, chain and item moves travel between EUs.
+    'p2p': batch_isend_irecv on the non-empty pairs of each move phase; 'all_to_all': one
+    all_to_all_single per move phase over the whole domain."""
+
+    loop_rsbf_tail_item_moves: bool = True
+    """RSBF with data parallelism: once fewer than 2 x EUs backward items remain in a slot's
+    backward phase, move ready CORE / CODA items together with their checkpoint to idle EUs
+    (chain-parallel tail). False runs every item where its checkpoint lives."""
+
+    loop_rsbf_over_budget: Literal["raise", "warn"] = "raise"
+    """RSBF with a static per-rank MoE budget (moe_expert_rank_capacity_factor, HybridEP): what
+    happens when a dispatch overflowed the budget (tokens dropped) on any rank of the domain
+    during a step; the flags are reduced over the domain first, so every rank decides alike.
+    'raise': every rank raises at the end of the step; 'warn': the domain's first rank logs the
+    offending ranks and training continues."""
+
+    loop_rsbf_item_form: Literal["whole_round", "block", "nested"] = "whole_round"
+    """RSBF: the form of the per-round backward (CORE) item. 'whole_round': recompute the whole
+    round from its checkpointed input, then back-propagate it. 'block': the block-checkpoint
+    item; the forward sweep also stores the input of every loop_rsbf_block_stride-th core
+    sublayer, and the item recomputes and back-propagates one block of that many sublayers at a
+    time, last block first. 'nested': the item first rebuilds the round without keeping a graph,
+    storing the block inputs, then recomputes and back-propagates one block at a time (blocks of
+    loop_rsbf_block_stride core sublayers, default 1). All forms give the same gradients; they
+    trade recompute work against live activation memory."""
+
+    loop_rsbf_block_stride: Optional[int] = None
+    """RSBF: the block length of the 'block' and 'nested' item forms, in core sublayers (symbols
+    of the core part of the hybrid pattern, so one attention + MLP layer is 2). Required for
+    'block' (1 <= stride <= the core sublayers; equal to them is the whole round; it need not
+    divide them, the last block is then shorter); optional for 'nested' (1 <= stride < the core
+    sublayers, default 1); must be unset for 'whole_round'."""
+
+    loop_rsbf_coda_retain_sublayers: int = 0
+    """Keep activations for this many trailing coda sublayers in the RSBF coda item. Earlier
+    coda sublayers and the prelude use the usual edge checkpoints. Requires loop_recompute_edges.
+    A D+E decoder block has two sublayers. The separate MTP/LM head is outside this count."""
+
+    loop_rsbf_coda_recompute_mla_up_proj: bool = False
+    """RSBF: recompute the up projection and RoPE (the q / kv up-projection activations) of the
+    DSv4 attentions of the coda sublayers and the MTP layers in the coda item's backward instead
+    of keeping them (selective recompute of the coda item only). Needs
+    experimental_attention_variant='dsv4_hybrid'; gradients are unchanged."""
+
+    loop_exit_criterion: Literal["fixed", "sampled", "stratified", "online"] = "fixed"
+    """RSBF: per-sample exit. 'fixed': every sample runs loop_iterations rounds. 'sampled':
+    each sample's depth is drawn from loop_depth_probs with a counter-based generator keyed by
+    (loop_depth_seed, iteration, global sample index). 'online': decide after each core
+    visit from its gated hidden state, using loop_exit_thresholds."""
+
+    loop_exit_thresholds: Optional[List[float]] = None
+    """Online exit: stop at or below the corresponding score after each non-final round."""
+
+    loop_depth_probs: Optional[List[float]] = None
+    """RSBF, 'sampled' exit: P(depth = 1..loop_iterations); loop_iterations nonnegative values
+    summing to 1."""
+
+    loop_depth_counts: Optional[List[int]] = None
+    """Stratified exit: exact sample counts at depths 1..loop_iterations per optimizer update."""
+
+    loop_depth_group_size: int = 1
+    """Stratified exit: consecutive global sample positions sharing one assigned depth."""
+
+    loop_min_rounds: int = 1
+    """RSBF: no exit before this round (1 <= loop_min_rounds <= loop_iterations)."""
+
+    loop_depth_seed: int = 0
+    """RSBF, 'sampled' exit: seed of the counter-based depth generator."""
+
+    loop_carrier: Literal["injection", "residual", "attn_res", "gated_residual"] = "injection"
+    """Hybrid Huginn loop: what carries the state across rounds. 'injection': the Huginn
+    adapter [state; prelude output] at every round entry plus the loop norm (default).
+    'residual': the core repeated on one continuing residual stream, no adapter and no norm
+    (the 'attn_res' w = 0 reference). 'attn_res': Kimi-K3-style attention residuals with block
+    boundaries on round boundaries (LoopAttnResHybridStack, the loop_attn_res_hybrid_*_stack_spec
+    specs; eager only). 'gated_residual': continue the prelude stream and gate each core
+    pass's candidate update with its own sigmoid(linear(RMSNorm(pass input)))."""
+
+    loop_attn_res_blocks_per_round: int = 1
+    """loop_carrier='attn_res': depth blocks per round (k). Each round's core splits into k
+    equal blocks whose cuts lie on attention + MLP block boundaries."""
 
     mtp_num_layers: Optional[int] = None
     """Number of Multi-Token Prediction (MTP) Layers.
@@ -1672,7 +1920,7 @@ class TransformerConfig(ModelParallelConfig):
     TransformerEngine's transformer_engine.pytorch.ep API."""
 
     moe_virtual_expert_load_balance: bool = False
-    """Balance MoE routes by materializing virtual experts over HybridEP."""
+    """Balance physical expert placement using HybridEP or the MoK megakernel."""
 
     moe_permute_fusion_into_hybridep: bool = False
     """Fuse token rearrangement ops during token dispatching for HybridEP."""
@@ -2561,6 +2809,16 @@ class TransformerConfig(ModelParallelConfig):
     an iteration, across all microbatches and model chunks. This bounds the shared
     offload buffer, not other host allocations or allocator caches."""
 
+    moe_cuda_graph_static_budget_without_paged_stash: bool = False
+    """Opt in to Transformer Engine whole-MoE CUDA graphs on sync-free HybridEP with rank
+    capacity but without the paged stash (requires moe_paged_stash=False). The static
+    budget makes the capture sync-free, but nothing retries a step whose tokens exceed it:
+    the caller must check the token dispatcher's over-budget flag
+    (``check_over_budget()``) every step, as only the paged-stash runner does otherwise.
+    The other prerequisites are those of the paged-stash path (transformer_engine impl,
+    flex dispatcher with the hybridep backend, moe_expert_rank_capacity_factor,
+    use_transformer_engine_op_fuser)."""
+
     @classmethod
     def from_config(cls, config: "TransformerConfig") -> Self:
         """Create this config type from an existing normalized transformer config.
@@ -2947,6 +3205,37 @@ class TransformerConfig(ModelParallelConfig):
                 "enable_attention_residuals is not yet supported with: " + "; ".join(unsupported)
             )
 
+    def _validate_hybrid_loop_roles(self) -> None:
+        """Validate loop_prelude_sublayers / loop_coda_sublayers of a hybrid loop config.
+
+        The pattern-dependent role rules (block-boundary cuts, hash layers in the prelude,
+        supported sublayers) are checked when the loop stack is built.
+        """
+        prelude, coda = self.loop_prelude_sublayers, self.loop_coda_sublayers
+        if prelude is None or coda is None:
+            raise ValueError("loop_prelude_sublayers and loop_coda_sublayers must be set together")
+        if prelude < 0 or coda < 0:
+            raise ValueError("loop_prelude_sublayers and loop_coda_sublayers must be nonnegative")
+        if self.num_layers > 0 and prelude + coda >= self.num_layers:
+            raise ValueError(
+                f"Hybrid loop roles leave an empty core: loop_prelude_sublayers ({prelude}) + "
+                f"loop_coda_sublayers ({coda}) must be less than num_layers ({self.num_layers})"
+            )
+        if self.loop_untie_core and self.loop_carrier != "injection":
+            # Imported lazily: the guards module imports model code.
+            from megatron.core.transformer.loop.guards import UNTIED_CORE_CARRIER
+
+            raise ValueError(f"Hybrid loop does not support: {UNTIED_CORE_CARRIER}")
+        # Refuse the GPT layer counts rather than ignore them silently. Passing their
+        # defaults explicitly cannot be told apart from not passing them, and is harmless.
+        gpt_defaults = (TransformerConfig.loop_prelude_layers, TransformerConfig.loop_core_layers)
+        if (self.loop_prelude_layers, self.loop_core_layers) != gpt_defaults:
+            raise ValueError(
+                "Loop does not support: GPT loop layer counts in role mode "
+                "(loop_prelude_layers / loop_core_layers are GPT-loop fields; "
+                "use loop_prelude_sublayers / loop_coda_sublayers)"
+            )
+
     def __post_init__(self):
         """Python dataclass method that is used to modify attributes after initialization.
         See https://docs.python.org/3/library/dataclasses.html#post-init-processing for more
@@ -2960,6 +3249,252 @@ class TransformerConfig(ModelParallelConfig):
         ):
             self.pipeline_p2p_fixed_shape = True
         super().__post_init__()
+        hybrid_loop_roles = (
+            self.loop_prelude_sublayers is not None or self.loop_coda_sublayers is not None
+        )
+        native_dsa_loop = hybrid_loop_roles and self.experimental_attention_variant == "dsa"
+        stratified = self.loop_exit_criterion == "stratified"
+        online = self.loop_exit_criterion == "online"
+        if online:
+            if not (native_dsa_loop and self.loop_iterations == 3 and self.loop_min_rounds == 1
+                    and self.loop_carrier == "gated_residual"
+                    and self.loop_schedule in ("standard", "rsbf", "ring")
+                    and (self.loop_schedule != "ring" or self.loop_ring_separate_edges)):
+                raise ValueError("online exit requires a native gated DSA loop with three rounds")
+            if (self.loop_exit_thresholds is None or len(self.loop_exit_thresholds) != 2
+                    or not all(math.isfinite(value) for value in self.loop_exit_thresholds)):
+                raise ValueError("online exit needs two finite loop_exit_thresholds for R1 and R2")
+            if self.loop_schedule == "rsbf" and self.loop_rsbf_fill != "refill":
+                raise ValueError("online DSA RSBF requires the refill scheduling policy")
+            if self.loop_schedule in ("rsbf", "standard") and self.num_moe_experts:
+                if self.loop_schedule == "standard" and (
+                    self.moe_megakernel_backend != "mok" or self.moe_virtual_expert_load_balance
+                ):
+                    raise ValueError("standard online DSA MoE on PP1 requires owner-only MoK")
+                if "global_aux_loss" in self.moe_router_load_balancing_type:
+                    raise ValueError("online DSA on PP1 cannot synchronize a cross-replica global_aux_loss")
+            if self.loop_depth_probs is not None or self.loop_sample_depth:
+                raise ValueError("online exit uses the round output and forbids sampled depths")
+        elif self.loop_exit_thresholds is not None:
+            raise ValueError("loop_exit_thresholds require online exit")
+        if self.loop_rsbf_fill == "refill":
+            if not (online and self.loop_schedule == "rsbf" and self.loop_rsbf_waves == 1
+                    and self.loop_rsbf_refill_window >= 1):
+                raise ValueError("RSBF refill requires online exit, one wave and a positive window")
+        elif self.loop_rsbf_refill_window != 2:
+            raise ValueError("loop_rsbf_refill_window requires refill scheduling")
+        if stratified:
+            from megatron.core.transformer.loop.depth_schedule import validate_stratified_depth
+
+            if self.loop_schedule != "rsbf" and not (
+                self.loop_schedule == "ring" and self.loop_ring_separate_edges and native_dsa_loop
+            ):
+                raise ValueError("stratified exit requires RSBF or a native DSA separate-edge ring")
+            if self.loop_depth_probs is not None:
+                raise ValueError("stratified exit uses loop_depth_counts instead of loop_depth_probs")
+            validate_stratified_depth(self)
+        elif self.loop_depth_counts is not None or self.loop_depth_group_size != 1:
+            raise ValueError("loop_depth_counts and loop_depth_group_size require stratified exit")
+        if self.loop_rsbf_offload_sparse_kv and not (
+            native_dsa_loop and self.loop_schedule == "rsbf" and self.loop_reuse_sparse_kv
+            and self.loop_iterations == 2 and self.loop_exit_criterion == "fixed"
+        ):
+            raise ValueError(
+                "loop_rsbf_offload_sparse_kv requires native two-pass DSA RSBF sparse KV reuse"
+            )
+        if self.loop_ring_separate_edges and self.loop_schedule != "ring":
+            raise ValueError("loop_ring_separate_edges requires loop_schedule='ring'")
+        if native_dsa_loop:
+            single_stage = (
+                self.loop_schedule in ("standard", "rsbf")
+                and self.pipeline_model_parallel_size == 1
+                and not self.virtual_pipeline_model_parallel_size
+            )
+            separate_ring = self.loop_ring_separate_edges and self.pipeline_model_parallel_size > 1
+            if not (
+                self.multi_latent_attention
+                and self.loop_architecture == "huginn"
+                and 1 <= self.loop_iterations <= 3
+                and self.loop_exit_criterion in ("fixed", "stratified", "online")
+                and not self.loop_sample_depth
+                and not self.loop_untie_core
+                and self.loop_bptt_iterations == 0
+                and (single_stage or separate_ring)
+                and self.tensor_model_parallel_size == 1
+                and not self.sequence_parallel
+                and not self.enable_mhc_connections
+            ):
+                raise ValueError(
+                    "A native DSA hybrid loop requires MLA, one to three tied rounds, full BPTT, "
+                    "TP1 without sequence parallelism or mHC, and standard/RSBF PP1 or separate edge ring PP."
+                )
+            if self.context_parallel_size > 1 and (
+                self.attention_cp_layout != "zigzag"
+                or self.linear_cp_layout not in (None, "zigzag")
+                or self.cp_partition_mode != "zigzag"
+                or (self.dynamic_context_parallel and not (
+                    separate_ring and self.loop_exit_criterion == "fixed"
+                ))
+            ):
+                raise ValueError(
+                    "Native DSA loop CP requires uniform zigzag shards in each group. Dynamic CP requires a "
+                    "fixed-depth separate-edge ring."
+                )
+            if self.loop_reuse_indexer and not self.loop_reuse_sparse_kv:
+                raise ValueError("Native DSA index reuse requires loop_reuse_sparse_kv")
+            if self.loop_reuse_sparse_kv and self.loop_sparse_kv_window_size < 1:
+                raise ValueError("Native DSA loop_sparse_kv_window_size must be positive")
+            if (
+                self.loop_reuse_sparse_kv
+                and self.recompute_granularity == "selective"
+                and "core_attn" in (self.recompute_modules or ["core_attn"])
+            ):
+                raise ValueError(
+                    "Native DSA cross-loop KV requires loop_recompute for attention replay. "
+                    "Selective core_attn recompute does not restore the first-pass bank."
+                )
+        if self.loop_reuse_sparse_kv or self.loop_reuse_indexer:
+            # Each schedule owns the source bank within a different lifetime. The ring
+            # and RSBF validators below also enforce their schedule-specific layout.
+            if self.loop_schedule == "ring":
+                supported_layout = self.pipeline_model_parallel_size >= 2
+            else:
+                supported_layout = (
+                    self.loop_schedule in ("standard", "rsbf")
+                    and self.pipeline_model_parallel_size == 1
+                    and not self.virtual_pipeline_model_parallel_size
+                )
+            if not (
+                hybrid_loop_roles
+                and (self.experimental_attention_variant == "dsv4_hybrid" or native_dsa_loop)
+                and self.loop_architecture == "huginn"
+                and (self.loop_exit_criterion == "fixed" or (native_dsa_loop and (stratified or online)))
+                and not self.loop_sample_depth
+                and (self.loop_iterations >= 2 or (native_dsa_loop and self.loop_iterations == 1))
+                and self.loop_carrier in ("injection", "residual", "gated_residual")
+                and not self.loop_untie_core
+                and self.loop_bptt_iterations == 0
+                and supported_layout
+            ):
+                raise ValueError(
+                    "loop_reuse_sparse_kv / loop_reuse_indexer require a tied DSv4 or native DSA "
+                    "Huginn core with hybrid sublayer roles, an injection, residual or "
+                    "gated_residual carrier, full BPTT, "
+                    "and supported exit depths on standard PP1, RSBF PP1 or ring PP"
+                )
+        if self.loop_architecture != "none":
+            # Hybrid loops count roles in sublayers of the hybrid pattern
+            # (loop_prelude_sublayers / loop_coda_sublayers); the GPT layer counts
+            # (loop_prelude_layers / loop_core_layers) apply only without them.
+            if self.loop_iterations < 1 or (not hybrid_loop_roles and self.loop_core_layers < 1):
+                raise ValueError("Loop iterations and core layers must be positive")
+            if hybrid_loop_roles:
+                self._validate_hybrid_loop_roles()
+            elif not 0 <= self.loop_prelude_layers <= self.num_layers - self.loop_core_layers:
+                raise ValueError("Loop prelude/core must fit in physical num_layers")
+            if self.loop_bptt_iterations < 0:
+                raise ValueError("loop_bptt_iterations must be nonnegative")
+            if self.loop_untie_core:
+                if (
+                    self.loop_architecture != "huginn"
+                    or self.loop_sample_depth
+                    or self.loop_bptt_iterations
+                ):
+                    raise ValueError("Untied loop baseline requires fixed-depth Huginn")
+                # Role mode counts segments in the hybrid pattern (UNTIED_CORE_SEGMENTS, checked
+                # when the stack is built); the GPT bank count applies to the GPT loop only.
+                if (
+                    not hybrid_loop_roles
+                    and self.loop_prelude_layers + self.loop_core_layers * self.loop_iterations
+                    > self.num_layers
+                ):
+                    raise ValueError("Untied core banks must fit in physical num_layers")
+            if self.loop_architecture == "mor" and (
+                self.loop_sample_depth or self.loop_bptt_iterations
+            ):
+                raise ValueError("MoR uses token-choice depth and full BPTT")
+            if self.loop_carrier != "injection" and (
+                not hybrid_loop_roles or self.loop_architecture != "huginn"
+            ):
+                raise ValueError(
+                    f"loop_carrier='{self.loop_carrier}' needs a hybrid Huginn loop "
+                    "(loop_architecture='huginn' with loop_prelude_sublayers / "
+                    "loop_coda_sublayers)"
+                )
+            if self.loop_attn_res_blocks_per_round != 1 and (
+                self.loop_carrier != "attn_res" or self.loop_attn_res_blocks_per_round < 1
+            ):
+                raise ValueError(
+                    "loop_attn_res_blocks_per_round must be >= 1 and needs "
+                    "loop_carrier='attn_res'"
+                )
+            # Imported lazily: the guards module imports model code.
+            from megatron.core.transformer.loop.guards import validate_loop_carrier
+
+            validate_loop_carrier(self)
+            # Imported lazily: module.py imports this file.
+            from megatron.core.transformer.module import is_first_microbatch_tracked
+
+            if is_first_microbatch_tracked(self) and not self.disable_parameter_transpose_cache:
+                # With is_first_microbatch tracked, TE overwrites (instead of accumulating)
+                # the weight gradient on the first call of each step, and a loop calls its
+                # core layers several times per step.
+                raise ValueError(
+                    "Loop does not support: quantized loop without "
+                    "disable_parameter_transpose_cache (FP8 / FP4 / kitchen / quant_recipe "
+                    "loop configs must set disable_parameter_transpose_cache=True)"
+                )
+        elif hybrid_loop_roles:
+            raise ValueError(
+                "loop_prelude_sublayers / loop_coda_sublayers require loop_architecture"
+            )
+        elif self.loop_carrier != "injection" or self.loop_attn_res_blocks_per_round != 1:
+            raise ValueError("loop_carrier / loop_attn_res_blocks_per_round require a hybrid loop")
+        if (self.loop_recompute_block_stride is not None or self.loop_recompute_edges) and not (
+            self.loop_architecture != "none" and hybrid_loop_roles
+        ):
+            # Only the hybrid loop stack runs block checkpoints; elsewhere the fields would be
+            # ignored silently. Imported lazily: the guards module imports model code.
+            from megatron.core.transformer.loop.guards import RECOMPUTE_BLOCKS_WITHOUT_HYBRID_LOOP
+
+            raise ValueError(f"Loop does not support: {RECOMPUTE_BLOCKS_WITHOUT_HYBRID_LOOP}")
+        if self.loop_schedule == "rsbf":
+            # Imported lazily: the guards module imports model code.
+            from megatron.core.transformer.loop.guards import validate_rsbf_config
+
+            validate_rsbf_config(self)
+        else:
+            rsbf_only = [
+                name
+                for name, is_set in (
+                    ("loop_exit_criterion", self.loop_exit_criterion not in ("fixed", "stratified", "online")),
+                    ("loop_depth_probs", self.loop_depth_probs is not None),
+                    ("loop_min_rounds", self.loop_min_rounds != 1),
+                    ("loop_rsbf_waves", self.loop_rsbf_waves != 1),
+                    ("loop_rsbf_fill", self.loop_rsbf_fill != "drain"),
+                    ("loop_rsbf_rebalance", not self.loop_rsbf_rebalance),
+                    ("loop_rsbf_move_transport", self.loop_rsbf_move_transport != "p2p"),
+                    ("loop_rsbf_tail_item_moves", not self.loop_rsbf_tail_item_moves),
+                    ("loop_rsbf_over_budget", self.loop_rsbf_over_budget != "raise"),
+                    ("loop_rsbf_item_form", self.loop_rsbf_item_form != "whole_round"),
+                    ("loop_rsbf_block_stride", self.loop_rsbf_block_stride is not None),
+                    ("loop_rsbf_coda_retain_sublayers", self.loop_rsbf_coda_retain_sublayers != 0),
+                    (
+                        "loop_rsbf_coda_recompute_mla_up_proj",
+                        self.loop_rsbf_coda_recompute_mla_up_proj,
+                    ),
+                )
+                if is_set
+            ]
+            if rsbf_only:
+                raise ValueError(f"{', '.join(rsbf_only)} require loop_schedule='rsbf'")
+        if self.loop_schedule == "ring":
+            # Imported lazily: the guards module imports model code.
+            from megatron.core.transformer.loop.guards import validate_loop_ring_config
+
+            validate_loop_ring_config(self)
+        elif self.loop_ring_recompute_plan is not None:
+            raise ValueError("loop_ring_recompute_plan requires loop_schedule='ring'")
         # Dynamic CP can assign a multi-rank group even when configured CP is one.
         has_context_parallelism = self.context_parallel_size > 1 or self.dynamic_context_parallel
 
@@ -3064,11 +3599,8 @@ class TransformerConfig(ModelParallelConfig):
             )
 
         if self.dsa_kernel_backend is None:
-            self.dsa_kernel_backend = (
-                "cudnn"
-                if self.experimental_attention_variant == "dsv4_hybrid"
-                and self.apply_dsa_kernel_fusion is None
-                else "none"
+            self.dsa_kernel_backend = _default_dsa_kernel_backend(
+                self.experimental_attention_variant, self.apply_dsa_kernel_fusion
             )
 
         if self.use_transformer_engine_op_fuser and self.moe_grouped_gemm:
@@ -3340,15 +3872,9 @@ class TransformerConfig(ModelParallelConfig):
                     "instead.",
                 )
             else:
-                legacy_backend = "cudnn" if self.apply_dsa_kernel_fusion else "none"
-                if self.dsa_kernel_backend not in ("none", legacy_backend):
-                    raise ValueError(
-                        "Conflicting DSA kernel controls: "
-                        f"apply_dsa_kernel_fusion={self.apply_dsa_kernel_fusion} maps to "
-                        f"dsa_kernel_backend={legacy_backend!r}, but "
-                        f"dsa_kernel_backend={self.dsa_kernel_backend!r} was also selected. "
-                        "Remove apply_dsa_kernel_fusion and use dsa_kernel_backend only."
-                    )
+                legacy_backend = _legacy_dsa_kernel_backend(
+                    self.dsa_kernel_backend, self.apply_dsa_kernel_fusion
+                )
                 log_single_rank(
                     logger,
                     logging.WARNING,
@@ -4586,8 +5112,7 @@ class TransformerConfig(ModelParallelConfig):
             ), "moe_shortcut_parallel requires MoE to be enabled (num_moe_experts > 0)"
 
         if self.moe_virtual_expert_load_balance:
-            if self.moe_megakernel_backend == "mok":
-                raise ValueError("MOK does not support MoonEP (moe_virtual_expert_load_balance)")
+            mok = self.moe_megakernel_backend == "mok"
             MAX_VIRTUAL_EXPERT_EP_SIZE = 64
 
             def require(condition: bool, message: str) -> None:
@@ -4595,21 +5120,15 @@ class TransformerConfig(ModelParallelConfig):
                     raise ValueError(f"Virtual-expert load balancing requires {message}.")
 
             required_values = {
-                "moe_token_dispatcher_type": "flex",
-                "moe_flex_dispatcher_backend": "hybridep",
-                "moe_hybridep_routing_map_mode": "indices",
                 "bf16": True,
                 "params_dtype": torch.bfloat16,
                 "fp4": None,
                 "add_bias_linear": False,
                 "moe_grouped_gemm": True,
-                "moe_single_grouped_weight": False,
                 "moe_expert_rank_capacity_factor": None,
                 "moe_paged_stash": False,
-                "moe_use_grouped_tensor": True,
                 "gradient_accumulation_fusion": True,
                 "moe_router_dtype": "fp32",
-                "moe_router_enable_expert_bias": False,
                 "expert_tensor_parallel_size": 1,
                 "delay_wgrad_compute": False,
                 "overlap_dispatch_backward_with_experts_wgrad": False,
@@ -4620,6 +5139,21 @@ class TransformerConfig(ModelParallelConfig):
                 "moe_token_dropping": False,
                 "moe_apply_probs_on_input": False,
             }
+            if mok:
+                # The planner runs after the logical router. MoK owns dispatch,
+                # materializes no TE expert slots, and consumes logical router bias normally.
+                required_values["cuda_graph_impl"] = "none"
+            else:
+                required_values.update(
+                    {
+                        "moe_token_dispatcher_type": "flex",
+                        "moe_flex_dispatcher_backend": "hybridep",
+                        "moe_hybridep_routing_map_mode": "indices",
+                        "moe_single_grouped_weight": False,
+                        "moe_use_grouped_tensor": True,
+                        "moe_router_enable_expert_bias": False,
+                    }
+                )
             for name, value in required_values.items():
                 require(getattr(self, name) == value, f"{name}={value!r}")
             require(
@@ -5441,6 +5975,13 @@ class TransformerConfig(ModelParallelConfig):
             assert not invalid, (
                 f"Invalid choices for gtp_remat_opt_in_modules: {invalid}. "
                 f"Allowed modules are: {_allowed_gtp_remat_opt_in_modules}"
+            )
+
+        if self.moe_cuda_graph_static_budget_without_paged_stash and self.moe_paged_stash:
+            raise ValueError(
+                "moe_cuda_graph_static_budget_without_paged_stash is the static budget without "
+                "the paged stash; set moe_paged_stash=False (the paged-stash path needs no "
+                "opt-in)."
             )
 
         if self.moe_paged_stash:

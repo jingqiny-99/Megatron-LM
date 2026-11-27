@@ -1,0 +1,780 @@
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+"""Lockstep MoE across the EUs of an RSBF domain: the MoE calls of each sub-round type and the
+null items that replay their collectives.
+
+With expert parallelism the ranks of an EP group must issue the same sequence of MoE dispatch
+/ combine collectives, forward and backward. The RSBF plan runs typed sub-rounds (PRELUDE-F,
+CORE-F, CORE-B, CODA, PRELUDE-B) in which every EU of the domain runs one item of the
+sub-round's type or a null of that type. A real item calls the MoE layers of its cell (the
+prelude's, the core's, or the coda's followed by the MTP depths'), in forward order and, for the
+backward types, back-propagates through them in reverse. A null makes the same calls without
+real tokens:
+
+* it bypasses the router and the shared experts (no router statistics, no aux / z / seq-aux
+  loss, no expert-bias counts, no hash lookup; they issue no expert-parallel collective at
+  TP = 1) and feeds the dispatcher an empty routing: zero rows for the all-to-all dispatcher
+  (form "empty"; dropless only), or the nominal ``S x c`` all-excluded rows for HybridEP (form
+  "nominal": every rank passes HybridEP the same row count, and under a static per-rank budget
+  the null rank keeps the receive budget of a real item while sending nothing);
+* its experts still compute, forward and backward, the tokens other ranks route to them (the
+  null rank hosts its experts), inside the hosting sublayer's quantization contexts;
+* its leaves take the real calls' dtypes and ``requires_grad`` pattern (``LockstepSignature``),
+  so autograd builds the same functions and runs the combine, token and probs all-to-all
+  backwards in the same order; the modules are chained (each null output feeds the next), so
+  the backward visits them in reverse, as a real item's does.
+
+``build_lockstep_plan`` discovers the MoE calls per sub-round type (``LockstepPlan.by_type``)
+from the model; modules whose collective groups span one rank are not lockstep (dense models and
+EP = 1 get empty tuples, and their nulls do nothing). ``register_lockstep_module`` lets tests
+drive a stub module class through the same machinery.
+
+CORE-B items follow the round's backward plan (``CoreBackwardPlan``): a block-checkpoint item
+runs its blocks in reverse, each block's MoE calls forward and then that block's backward, and
+a nested item first rebuilds a prefix of the core forward-only. ``core_b_segments`` splits the
+CORE-B calls into those segments; the nulls (``run_null(core_plan=...)``) and the call check
+(``LockstepPlan.end_item(core_plan=...)``) follow them, so every EU of a CORE-B sub-round issues
+the same sequence. For the whole-round plan this is the single segment of stage 3.
+
+With the loop parameter store (``loop/param_store.py``) a real item runs one backward per
+*segment* (a stack sublayer, the adapter, the embedding call, the head) and the store issues
+all-gathers and reduce-scatters at fixed points of the sub-round's segment ops. A null then walks
+the same segment ops (``run_null(store_visitor=..., segment_ops=...)``): at each op it runs the
+store's events (``NullVisitor.before`` / ``after``) around the lockstep MoE calls of that segment
+(``segment_entries``: a decoder sublayer's module, or the MTP depths' modules for the head),
+forward from a fresh zero leaf at a forward op, and their backward of zeros at the segment's
+backward op. So every rank issues, for every communicator (the store's shard all-gathers and
+reduce-scatters, the EP dispatch / combine), the same calls in the same relative order, whether
+its item is real or null.
+"""
+
+import contextlib
+from dataclasses import dataclass, field
+from typing import TYPE_CHECKING, Any, Callable, ContextManager, Optional, Sequence
+
+import torch
+import torch.distributed as dist
+from torch import Tensor, nn
+
+from megatron.core.transformer.loop.rsbf_plan import SubRoundType
+
+if TYPE_CHECKING:
+    from megatron.core.transformer.loop.program import CoreBackwardPlan
+
+__all__ = [
+    "FORM_EMPTY",
+    "FORM_NOMINAL",
+    "CallSegment",
+    "LockstepAdapter",
+    "LockstepEntry",
+    "LockstepPlan",
+    "LockstepSignature",
+    "MoELockstepAdapter",
+    "build_lockstep_plan",
+    "core_b_segments",
+    "register_lockstep_module",
+    "run_null",
+    "segment_entries",
+]
+
+# Null forms (the design's form Z and form P).
+FORM_MOK = "mok"  # nominal symmetric workspace with all local routes excluded
+FORM_REAL_ONLY = "real_only"  # MoK requires one nonempty, equal-size input on every EP rank.
+FORM_EMPTY = "empty"  # zero rows (dropless all-to-all)
+FORM_NOMINAL = "nominal"  # S x c rows, every route excluded (HybridEP)
+
+UNSUPPORTED = "Loop RSBF does not support: "
+LOCKSTEP = "lockstep"  # message prefix of the lockstep checks
+# Hint of a signature mismatch whose real MoE input does not require grad.
+DETACHED_MOE_INPUT = (
+    "MoE input does not require grad: an E sublayer without a parameterized pre-op under the "
+    "detached sweep (every sublayer input of the sweep and the rebuild is detached, so an 'E' "
+    "sublayer must feed its MoE through a norm or mHC h_pre with weights)"
+)
+
+# Sub-round types whose items run a backward (nulls of these types back-propagate too).
+_BACKWARD_TYPES = frozenset((SubRoundType.CORE_B, SubRoundType.CODA, SubRoundType.PRELUDE_B))
+
+
+@dataclass
+class LockstepSignature:
+    """What a null's leaves must look like for one lockstep module: the dtypes and
+    ``requires_grad`` of the MoE input and the router probabilities, and the routing map's
+    dtype (``torch.bool`` for a ``[rows, E]`` map, an integer dtype for dense ``[rows, topk]``
+    route indices). Starts from the config rule and is confirmed by the first real call."""
+
+    hidden_dtype: torch.dtype
+    hidden_requires_grad: bool
+    probs_dtype: Optional[torch.dtype] = None
+    probs_requires_grad: bool = False
+    routing_dtype: Optional[torch.dtype] = None
+    observed: bool = False
+
+    def key(self) -> tuple:
+        """The compared fields."""
+        return (
+            self.hidden_dtype,
+            self.hidden_requires_grad,
+            self.probs_dtype,
+            self.probs_requires_grad,
+            self.routing_dtype,
+        )
+
+
+class LockstepAdapter:
+    """How the executor drives one class of lockstep modules (``MoELayer`` by default; tests
+    register stubs with ``register_lockstep_module``)."""
+
+    def groups(self, module: nn.Module) -> list:
+        """The process groups whose ranks issue the module's collectives (lockstep when any
+        spans more than one rank)."""
+        raise NotImplementedError
+
+    def form(self, module: nn.Module) -> str:
+        """``FORM_EMPTY`` or ``FORM_NOMINAL``; raises ``ValueError`` when no null form is
+        defined for the module's configuration."""
+        raise NotImplementedError
+
+    def config_signature(self, module: nn.Module) -> LockstepSignature:
+        """The null leaves' signature from the configuration (before any real call)."""
+        raise NotImplementedError
+
+    def observe(
+        self,
+        module: nn.Module,
+        on_call: Callable[[nn.Module], None],
+        on_signature: Callable[[nn.Module, LockstepSignature], None],
+    ) -> list:
+        """Install hooks reporting each real call (``on_call``, at its start) and its
+        signature (``on_signature``); returns the hook handles."""
+        raise NotImplementedError
+
+    def null_forward(
+        self, entry: "LockstepEntry", hidden: Tensor, signature: LockstepSignature
+    ) -> Tensor:
+        """One null call of ``entry.module`` on ``hidden`` (``[rows, c, H]``); returns its
+        output (the same shape)."""
+        raise NotImplementedError
+
+    def over_budget(self, module: nn.Module) -> Optional[Tensor]:
+        """The module's static-budget overflow flag (a device tensor), or None."""
+        del module
+        return None
+
+    def reset_over_budget(self, module: nn.Module) -> None:
+        """Clear the module's static-budget overflow flag."""
+        del module
+
+
+class MoELockstepAdapter(LockstepAdapter):
+    """EP collective discovery for all-to-all, HybridEP, and MoK."""
+
+    def groups(self, module):
+        if getattr(module.config, "moe_megakernel_backend", None) == "mok":
+            return [module.ep_group]
+        dispatcher = module.token_dispatcher
+        groups = []
+        for name in ("ep_group", "tp_ep_group"):
+            group = getattr(dispatcher, name, None)
+            if group is not None and all(group is not other for other in groups):
+                groups.append(group)
+        return groups
+
+    def form(self, module):
+        from megatron.core.transformer.moe.token_dispatcher import (
+            MoEAlltoAllTokenDispatcher,
+            MoEFlexTokenDispatcher,
+            _HybridEPManager,
+        )
+
+        config = module.config
+        if getattr(config, "moe_megakernel_backend", None) == "mok":
+            return FORM_MOK if config.loop_rsbf_fill == "refill" else FORM_REAL_ONLY
+        dispatcher = module.token_dispatcher
+        if config.moe_expert_capacity_factor is None:
+            if isinstance(dispatcher, MoEAlltoAllTokenDispatcher):
+                return FORM_EMPTY
+            if isinstance(dispatcher, MoEFlexTokenDispatcher) and isinstance(
+                getattr(dispatcher, "_comm_manager", None), _HybridEPManager
+            ):
+                return FORM_NOMINAL
+        raise ValueError(
+            UNSUPPORTED + f"lockstep null items for the MoE dispatcher {type(dispatcher).__name__} "
+            f"(moe_token_dispatcher_type={config.moe_token_dispatcher_type!r}, "
+            f"moe_flex_dispatcher_backend={config.moe_flex_dispatcher_backend!r}, "
+            f"moe_expert_capacity_factor={config.moe_expert_capacity_factor!r}); expert "
+            "parallelism under RSBF needs the dropless all-to-all dispatcher or flex + hybridep"
+        )
+
+    def config_signature(self, module):
+        config = module.config
+        hidden = torch.float32 if config.fp32_residual_connection else config.params_dtype
+        probs = {"fp32": torch.float32, "fp64": torch.float64}.get(config.moe_router_dtype, hidden)
+        router = module.router
+        routing = torch.bool
+        if not getattr(router, "is_hash_layer", False):
+            dense = getattr(router, "_dense_route_indices_dtype", lambda: None)()
+            if dense is not None:
+                routing = dense
+        # The MoE input is a norm output (trainable weights) and the probabilities a function
+        # of it: both require grad in training.
+        return LockstepSignature(
+            hidden_dtype=hidden,
+            hidden_requires_grad=True,
+            probs_dtype=probs,
+            probs_requires_grad=True,
+            routing_dtype=routing,
+        )
+
+    def observe(self, module, on_call, on_signature):
+        pending = {}
+
+        def before(mod, args, kwargs):
+            hidden = args[0] if args else kwargs["hidden_states"]
+            pending["hidden"] = (hidden.dtype, hidden.requires_grad)
+            on_call(mod)
+
+        def after_router(router, args, output):
+            del router, args
+            probs, routing_map = output
+            hidden_dtype, hidden_requires_grad = pending.pop("hidden", (None, False))
+            on_signature(
+                module,
+                LockstepSignature(
+                    hidden_dtype=hidden_dtype,
+                    hidden_requires_grad=hidden_requires_grad,
+                    probs_dtype=probs.dtype,
+                    probs_requires_grad=probs.requires_grad,
+                    routing_dtype=routing_map.dtype,
+                ),
+            )
+
+        return [
+            module.register_forward_pre_hook(before, with_kwargs=True),
+            module.router.register_forward_hook(after_router),
+        ]
+
+    def null_forward(self, entry, hidden, signature):
+        moe = entry.module
+        if getattr(moe.config, "moe_megakernel_backend", None) == "mok":
+            return moe.megakernel_experts.forward_null(hidden)
+        # The dispatcher stages in MoELayer.forward's order, without route() and the shared
+        # experts (no expert-parallel collectives at TP = 1).
+        moe.select_token_dispatcher()
+        config = moe.config
+        rows = hidden.shape[0] * hidden.shape[1]
+        probs = torch.zeros(
+            (rows, config.num_moe_experts),
+            dtype=signature.probs_dtype,
+            device=hidden.device,
+            requires_grad=signature.probs_requires_grad,
+        )
+        if signature.routing_dtype in (None, torch.bool):
+            routing_map = torch.zeros(
+                (rows, config.num_moe_experts), dtype=torch.bool, device=hidden.device
+            )
+        else:
+            # Dense route indices: -1 marks no route (as padding rows get).
+            routing_map = torch.full(
+                (rows, config.moe_router_topk),
+                -1,
+                dtype=signature.routing_dtype,
+                device=hidden.device,
+            )
+        hidden, probs = moe.preprocess(hidden, probs, routing_map, padding_mask=None)
+        dispatched, probs = moe.dispatch(hidden, probs)
+        output, _ = moe.routed_experts_compute(dispatched, probs)
+        output = moe.combine(output)
+        return moe.postprocess(output, shared_expert_output=None)
+
+    def over_budget(self, module):
+        check = getattr(module.token_dispatcher, "check_over_budget", None)
+        return None if check is None else check()
+
+    def reset_over_budget(self, module):
+        reset = getattr(module.token_dispatcher, "reset_over_budget", None)
+        if reset is not None:
+            reset()
+
+
+# (class, adapter), most recent registration first; MoELayer is appended lazily.
+_REGISTRY: list = []
+_MOE_REGISTERED = False
+
+
+def register_lockstep_module(cls: type, adapter: LockstepAdapter) -> Callable[[], None]:
+    """Treat instances of ``cls`` as lockstep modules driven by ``adapter`` (before the built-in
+    ``MoELayer`` adapter); returns a function that removes the registration (tests)."""
+    entry = (cls, adapter)
+    _REGISTRY.insert(0, entry)
+
+    def unregister():
+        if entry in _REGISTRY:
+            _REGISTRY.remove(entry)
+
+    return unregister
+
+
+def _adapter_for(module: nn.Module) -> Optional[LockstepAdapter]:
+    global _MOE_REGISTERED  # pylint: disable=global-statement
+    if not _MOE_REGISTERED:
+        _MOE_REGISTERED = True
+        try:
+            from megatron.core.transformer.moe.moe_layer import MoELayer
+        except ImportError:  # pragma: no cover - MoE dependencies missing
+            pass
+        else:
+            _REGISTRY.append((MoELayer, MoELockstepAdapter()))
+    for cls, adapter in _REGISTRY:
+        if isinstance(module, cls):
+            return adapter
+    return None
+
+
+def _spans_ranks(groups: Sequence) -> bool:
+    if not dist.is_initialized():
+        return False
+    return any(group is not None and dist.get_world_size(group) > 1 for group in groups)
+
+
+@dataclass(frozen=True, eq=False)
+class LockstepEntry:
+    """One MoE call of a sub-round type: the module, the hosting sublayer's config and
+    ``layer_number - 1`` (the arguments of its inner quantization context), the null form,
+    a name for messages, ``wrap``, the extra quantization context a real call of an MTP
+    depth runs in (``MultiTokenPredictionLayer.get_inner_quantization_context``), and
+    ``stack_index``, the hosting sublayer's index in its stack (the decoder's, or the MTP
+    depth's inner stack), independent of the pipeline layer offset; ``mtp``: the module is in
+    an MTP depth's stack (called inside the model head)."""
+
+    module: nn.Module
+    adapter: LockstepAdapter
+    layer_config: Any
+    layer_number: int
+    form: str
+    name: str
+    wrap: Optional[Callable[[], ContextManager]] = None
+    stack_index: int = -1
+    mtp: bool = False
+
+
+@dataclass(frozen=True)
+class CallSegment:
+    """A run of lockstep MoE calls of one item: ``entries`` forward in order, then (when
+    ``backward``) their backward in reverse."""
+
+    entries: tuple
+    backward: bool
+
+
+def core_b_segments(
+    plan: "LockstepPlan", core_plan: Optional["CoreBackwardPlan"], core_start: int
+) -> tuple:
+    """The CORE-B MoE call segments of a CORE item that follows ``core_plan``: for a nested
+    plan, first the forward-only rebuild of core sublayers ``[0, rebuild_end)``; then, for
+    each block in reverse, the block's MoE calls with its backward. Entries are selected by
+    ``stack_index - core_start``; empty segments are dropped. ``core_plan`` None (or a whole
+    round) gives the stage-3 single segment."""
+    entries = plan.by_type[SubRoundType.CORE_B]
+    if core_plan is None:
+        return (CallSegment(tuple(entries), True),) if entries else ()
+
+    def within(lo, hi):
+        return tuple(e for e in entries if lo <= e.stack_index - core_start < hi)
+
+    ranges = []
+    if core_plan.rebuild:
+        ranges.append((0, core_plan.rebuild_end, False))
+    ranges += [(block.start, block.end, True) for block in reversed(core_plan.blocks)]
+    segments = []
+    for lo, hi, backward in ranges:
+        selected = within(lo, hi)
+        if selected:
+            segments.append(CallSegment(selected, backward))
+    return tuple(segments)
+
+
+@dataclass
+class LockstepPlan:
+    """The lockstep MoE calls of each sub-round type, in forward call order, and the null
+    signatures (see the module docstring). ``budget`` lists every registered module of the
+    model (any group size) with a name, for the static-budget overflow flags."""
+
+    by_type: dict
+    signature: dict = field(default_factory=dict)
+    budget: tuple = ()
+    _names: dict = field(default_factory=dict)
+    _calls: Optional[list] = None
+    _check_every: bool = False
+
+    @property
+    def active(self) -> bool:
+        """True when some sub-round type has lockstep MoE calls."""
+        return any(self.by_type.values())
+
+    def entries(self) -> list:
+        """Every lockstep module's first entry, in plan order (prelude, core, coda, MTP)."""
+        seen, unique = set(), []
+        for kind_type in (SubRoundType.PRELUDE_F, SubRoundType.CORE_F, SubRoundType.CODA):
+            for entry in self.by_type[kind_type]:
+                if id(entry.module) not in seen:
+                    seen.add(id(entry.module))
+                    unique.append(entry)
+        return unique
+
+    # -- static budget -------------------------------------------------------------------
+
+    def reset_over_budget(self) -> None:
+        """Clear every module's overflow flag (the start of a step)."""
+        for _, module, adapter in self.budget:
+            adapter.reset_over_budget(module)
+
+    def over_budget_flags(self) -> tuple:
+        """``(names, int32 flags)`` of the modules that track a static-budget overflow (device
+        tensor, no sync), or ``([], None)``."""
+        names, flags = [], []
+        for name, module, adapter in self.budget:
+            flag = adapter.over_budget(module)
+            if flag is not None:
+                names.append(name)
+                flags.append(flag.reshape(-1)[:1].to(torch.int32))
+        if not flags:
+            return [], None
+        return names, torch.cat(flags)
+
+    # -- real-call observation -----------------------------------------------------------
+
+    @contextlib.contextmanager
+    def observing(self, record_calls: bool = False):
+        """Hooks on the lockstep modules for one step: the first real call of each module
+        confirms its null signature (a mismatch raises: a null would issue mismatched
+        collectives); with ``record_calls`` (``check_lockstep``) every real call is compared
+        and logged for ``begin_item`` / ``end_item``.
+
+        A mismatch raises on the rank of the real call, in the router hook, before that call's
+        dispatch. It is a misconfiguration (the config rule of ``config_signature`` does not
+        describe the real calls), and it is not raised on every rank at once: when the
+        module's first real call on one EU meets a null of the same sub-round on another EU
+        (typically a CODA sub-round: an EU's first CODA can be a null whenever its samples exit
+        later than other EUs'), the null rank is already inside the dispatch collective and
+        waits there until the launcher stops the job after the raising rank exits (torchrun
+        stops every worker when one fails) or the collective times out. Refusing such nulls
+        instead would reject valid runs (most sampled-depth steps have an EU whose first CODA is
+        a null), so the error is reported by the real rank only."""
+        handles = []
+        self._check_every = record_calls
+        try:
+            for entry in self.entries():
+                handles += entry.adapter.observe(
+                    entry.module, self._on_call if record_calls else _ignore, self._on_signature
+                )
+            yield self
+        finally:
+            for handle in handles:
+                handle.remove()
+            self._calls = None
+            self._check_every = False
+
+    def _on_call(self, module: nn.Module) -> None:
+        if self._calls is not None:
+            self._calls.append(module)
+
+    def _on_signature(self, module: nn.Module, observed: LockstepSignature) -> None:
+        signature = self.signature[module]
+        if signature.observed and not self._check_every:
+            return
+        if observed.key() != signature.key():
+            hint = ""
+            if signature.hidden_requires_grad and not observed.hidden_requires_grad:
+                hint = f" ({DETACHED_MOE_INPUT})"
+            raise RuntimeError(
+                f"{LOCKSTEP}: a real call of {self._names[id(module)]} has the "
+                f"signature {observed.key()} but its null items use {signature.key()} (hidden "
+                "dtype, hidden requires_grad, probs dtype, probs requires_grad, routing dtype); "
+                f"the nulls would issue mismatched expert-parallel collectives{hint}"
+            )
+        signature.observed = True
+
+    def begin_item(self) -> None:
+        """Start logging the real MoE calls of one item (``check_lockstep``)."""
+        self._calls = []
+
+    def end_item(
+        self,
+        kind_type: SubRoundType,
+        label: str,
+        *,
+        core_plan: Optional["CoreBackwardPlan"] = None,
+        core_start: int = 0,
+    ) -> None:
+        """Compare the logged real calls with the plan's calls of ``kind_type`` (CORE-B with
+        ``core_plan``: the forward calls of its segments, ``core_b_segments``)."""
+        calls, self._calls = self._calls or [], None
+        if kind_type is SubRoundType.CORE_B and core_plan is not None:
+            expected = [
+                entry.module
+                for segment in core_b_segments(self, core_plan, core_start)
+                for entry in segment.entries
+            ]
+        else:
+            expected = [entry.module for entry in self.by_type[kind_type]]
+        if len(calls) != len(expected) or any(a is not b for a, b in zip(calls, expected)):
+
+            def names(modules):
+                return [self._names.get(id(m), type(m).__name__) for m in modules]
+
+            raise RuntimeError(
+                f"{LOCKSTEP}: the real {kind_type.value} item {label} called the MoE modules "
+                f"{names(calls)} but the lockstep plan lists {names(expected)} (its nulls would "
+                "issue other collectives)"
+            )
+
+
+def _ignore(module: nn.Module) -> None:
+    del module
+
+
+def _scan(
+    stack, start: int, end: int, prefix: str, wrap, budget: list, seen: set, *, mtp: bool = False
+) -> list:
+    """The lockstep entries of ``stack.layers[start:end]`` in order (one module per sublayer
+    at most); every registered module is also added to ``budget`` once. ``mtp``: the stack is
+    an MTP depth's."""
+    entries = []
+    for index in range(start, end):
+        layer = stack.layers[index]
+        hits = []
+        for name, module in layer.named_modules():
+            adapter = _adapter_for(module)
+            if adapter is not None:
+                hits.append((name, module, adapter))
+        if not hits:
+            continue
+        if len(hits) > 1:
+            raise ValueError(
+                UNSUPPORTED + f"more than one MoE module in sublayer {prefix}.layers.{index}: "
+                f"{[name for name, _, _ in hits]}"
+            )
+        name, module, adapter = hits[0]
+        full_name = f"{prefix}.layers.{index}" + (f".{name}" if name else "")
+        if id(module) not in seen:
+            seen.add(id(module))
+            budget.append((full_name, module, adapter))
+        if not _spans_ranks(adapter.groups(module)):
+            continue
+        entries.append(
+            LockstepEntry(
+                module=module,
+                adapter=adapter,
+                layer_config=stack._execution_layer_config_list[index],
+                layer_number=layer.layer_number - 1,
+                form=adapter.form(module),
+                name=full_name,
+                wrap=wrap,
+                stack_index=index,
+                mtp=mtp,
+            )
+        )
+    return entries
+
+
+def build_lockstep_plan(program) -> LockstepPlan:
+    """The lockstep MoE calls of each sub-round type of ``program``'s model.
+
+    PRELUDE-F / PRELUDE-B: the MoE modules of the stack sublayers ``[0, P)`` (hash-routed
+    layers included); CORE-F / CORE-B: ``[P, P + K)``; CODA: ``[P + K, L)``, then for each MTP
+    depth the modules of that depth's stack (a repeated MTP layer once per depth). Raises
+    ``ValueError`` when a sublayer holds more than one MoE module, when a lockstep module has
+    no null form, when the forms differ between modules, or when a lockstep module of the model
+    is outside these layers (its calls would not be replayed by any null).
+    """
+    hybrid, stack, roles = program.hybrid, program.stack, program.roles
+    budget: list = []
+    seen: set = set()
+    prelude = _scan(stack, 0, roles.core_start, "decoder", None, budget, seen)
+    core = _scan(stack, roles.core_start, roles.core_end, "decoder", None, budget, seen)
+    coda = _scan(stack, roles.core_end, len(stack.layers), "decoder", None, budget, seen)
+    mtp = getattr(hybrid, "mtp", None)
+    depths = (getattr(program.config, "mtp_num_layers", None) or 0) if mtp is not None else 0
+    for depth in range(depths):
+        index = 0 if getattr(mtp, "mtp_use_repeated_layer", False) else depth
+        layer = mtp.layers[index]
+        inner = getattr(layer, "mtp_model_layer", None)
+        if inner is None or not hasattr(inner, "_execution_layer_config_list"):
+            raise ValueError(
+                UNSUPPORTED + f"lockstep discovery of MTP layer {index} without a hybrid stack"
+            )
+        wrap = getattr(layer, "get_inner_quantization_context", None)
+        coda = coda + _scan(
+            inner,
+            0,
+            len(inner.layers),
+            f"mtp.layers.{index}.mtp_model_layer",
+            wrap,
+            budget,
+            seen,
+            mtp=True,
+        )
+    by_type = {
+        SubRoundType.PRELUDE_F: tuple(prelude),
+        SubRoundType.PRELUDE_B: tuple(prelude),
+        SubRoundType.CORE_F: tuple(core),
+        SubRoundType.CORE_B: tuple(core),
+        SubRoundType.CODA: tuple(coda),
+    }
+    plan = LockstepPlan(by_type=by_type, budget=tuple(budget))
+    entries = plan.entries()
+    covered = {id(entry.module) for entry in entries}
+    missing = []
+    for name, module in hybrid.named_modules():
+        adapter = _adapter_for(module)
+        if adapter is not None and id(module) not in covered:
+            if _spans_ranks(adapter.groups(module)):
+                missing.append(name)
+    if missing:
+        raise ValueError(
+            UNSUPPORTED + f"expert-parallel MoE modules outside the loop's prelude / core / coda "
+            f"and MTP layers: {missing}"
+        )
+    forms = {entry.form for entry in entries}
+    if len(forms) > 1:
+        raise ValueError(UNSUPPORTED + f"lockstep MoE modules with different null forms {forms}")
+    for entry in entries:
+        plan.signature[entry.module] = entry.adapter.config_signature(entry.module)
+        plan._names[id(entry.module)] = entry.name  # pylint: disable=protected-access
+    for name, module, _ in budget:
+        plan._names.setdefault(id(module), name)  # pylint: disable=protected-access
+    return plan
+
+
+def segment_entries(entries: Sequence[LockstepEntry], segment) -> tuple:
+    """The lockstep entries a store segment (``param_store_schedule.SegmentKey``) calls, in call
+    order: a decoder sublayer's module for ``("sub", i)``, every MTP depth's modules for the
+    head, none for the adapter and the embedding call."""
+    if segment.kind == "sub":
+        return tuple(e for e in entries if not e.mtp and e.stack_index == segment.index)
+    if segment.kind == "head":
+        return tuple(e for e in entries if e.mtp)
+    return ()
+
+
+def _null_forward_chain(plan, entries, *, sequence, device, inner_context, keep_backward, output=None):
+    """The null calls of ``entries``, chained from ``output`` (a fresh zero leaf when None)."""
+    for entry in entries:
+        signature = plan.signature[entry.module]
+        if output is None:
+            if entry.form == FORM_REAL_ONLY:
+                raise RuntimeError("MoK RSBF requires a real sample on every expert rank")
+            rows = 0 if entry.form == FORM_EMPTY else sequence
+            hidden = torch.zeros(
+                (rows, 1, entry.layer_config.hidden_size),
+                dtype=signature.hidden_dtype,
+                device=device,
+                requires_grad=signature.hidden_requires_grad,
+            )
+        else:
+            # Chained: the backward visits the modules in reverse, as a real item's does.
+            hidden = output.to(signature.hidden_dtype)
+        wrap = entry.wrap() if entry.wrap is not None else contextlib.nullcontext()
+        with wrap, inner_context(entry.layer_config, entry.layer_number):
+            output = entry.adapter.null_forward(entry, hidden, signature)
+        if entry.form == FORM_MOK and not keep_backward:
+            # A sweep never backpropagates this graph. Release MoK's saved native
+            # dispatch/activation state before allocating the workspace of the next E.
+            output = output.detach().requires_grad_(output.requires_grad)
+    return output
+
+
+def _run_store_null(
+    plan: LockstepPlan,
+    kind_type: SubRoundType,
+    *,
+    store_visitor,
+    segment_ops,
+    outer_context: ContextManager,
+    inner_context: Callable[[Any, int], ContextManager],
+    sequence: int,
+    device: torch.device,
+) -> int:
+    """``run_null`` with a parameter store: the sub-round's segment ops in order, the store's
+    null events around each op's lockstep MoE calls (see the module docstring)."""
+    entries = plan.by_type[kind_type]
+    backward_type = kind_type in _BACKWARD_TYPES
+    pending: dict = {}
+    calls = 0
+    for k, op in enumerate(segment_ops):
+        store_visitor.before(k)
+        selected = segment_entries(entries, op.segment)
+        if selected and op.direction == "fwd":
+            with torch.enable_grad(), outer_context:
+                output = _null_forward_chain(
+                    plan, selected, sequence=sequence, device=device, inner_context=inner_context,
+                    keep_backward=backward_type and op.policy != "sweep",
+                )
+            calls += len(selected)
+            # A segment forwarded under "sweep" (a sweep, a nested item's rebuild) has no
+            # backward op; the others are back-propagated at their backward op.
+            if backward_type and op.policy != "sweep" and output.requires_grad:
+                pending[op.segment] = output
+        elif selected:
+            output = pending.pop(op.segment, None)
+            if output is not None:
+                with torch.enable_grad(), outer_context:
+                    torch.autograd.backward(output, torch.zeros_like(output))
+        store_visitor.after(k)
+    if pending:  # pragma: no cover - every kept forward op has its backward op
+        raise AssertionError(f"null segments {sorted(map(str, pending))} were not back-propagated")
+    return calls
+
+
+def run_null(
+    plan: LockstepPlan,
+    kind_type: SubRoundType,
+    *,
+    outer_context: ContextManager,
+    inner_context: Callable[[Any, int], ContextManager],
+    sequence: int,
+    device: torch.device,
+    core_plan: Optional["CoreBackwardPlan"] = None,
+    core_start: int = 0,
+    store_visitor=None,
+    segment_ops: Optional[Sequence] = None,
+) -> int:
+    """Run the null item of ``kind_type``: every lockstep MoE call of the type on an empty
+    input (rows per the entry's form, ``sequence`` x 1 for "nominal"), chained, then for the
+    backward types a backward of zeros through the chain. CORE-B with ``core_plan`` runs the
+    plan's segments (``core_b_segments``) in order, each chained from a fresh zero leaf and
+    back-propagated when the segment is. ``outer_context`` and
+    ``inner_context(layer_config, layer_number)`` are the stack's quantization contexts (as
+    the cells and ``HybridStack._run_layer`` enter them). Returns the number of MoE calls.
+
+    With a parameter store, ``store_visitor`` (``LoopParamStore.null_visitor(kind_type)``)
+    and ``segment_ops`` (its sub-round's segment ops): the null walks the segment ops, running
+    the store's events around each op's MoE calls (``segment_entries``), one backward of zeros
+    per segment at its backward op (the per-segment split of the real items)."""
+    if store_visitor is not None:
+        return _run_store_null(
+            plan,
+            kind_type,
+            store_visitor=store_visitor,
+            segment_ops=store_visitor.ops if segment_ops is None else segment_ops,
+            outer_context=outer_context,
+            inner_context=inner_context,
+            sequence=sequence,
+            device=device,
+        )
+    if kind_type is SubRoundType.CORE_B and core_plan is not None:
+        segments = core_b_segments(plan, core_plan, core_start)
+    else:
+        entries = plan.by_type[kind_type]
+        segments = (CallSegment(tuple(entries), kind_type in _BACKWARD_TYPES),) if entries else ()
+    calls = 0
+    for segment in segments:
+        with torch.enable_grad(), outer_context:
+            output = _null_forward_chain(
+                plan, segment.entries, sequence=sequence, device=device, inner_context=inner_context,
+                keep_backward=segment.backward,
+            )
+            if segment.backward and output.requires_grad:
+                torch.autograd.backward(output, torch.zeros_like(output))
+        calls += len(segment.entries)
+    return calls

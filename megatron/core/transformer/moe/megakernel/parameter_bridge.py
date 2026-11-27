@@ -21,7 +21,10 @@ def dummy_weight_gradient(param: nn.Parameter) -> torch.Tensor:
 
 def main_grad_buffer(param: nn.Parameter) -> torch.Tensor:
     """Return and validate an optimizer-visible FP32 or BF16 gradient buffer."""
-    main_grad = getattr(param, "main_grad", None)
+    # ZeRO-2 rotates its full gradient buckets after each reduce-scatter. Resolve the
+    # current view exactly when backward needs it, as TE's fused accumulation does.
+    get_main_grad = getattr(param, "get_main_grad", None)
+    main_grad = get_main_grad() if get_main_grad is not None else getattr(param, "main_grad", None)
     if main_grad is None:
         raise RuntimeError(
             "Megakernel gradient accumulation requires DDP to assign param.main_grad"

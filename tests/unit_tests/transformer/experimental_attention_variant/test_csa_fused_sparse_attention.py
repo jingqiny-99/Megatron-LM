@@ -21,31 +21,38 @@ from megatron.core.transformer.experimental_attention_variant.csa_utils.csa_teac
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA adapter padding requires a GPU")
 @pytest.mark.parametrize("layout", ["sbhd", "thd"])
 def test_sparse_teacher_pads_topk_and_restores_logical_width(monkeypatch, layout):
-    query = torch.randn(3, 2, 8, device="cuda")
-    key = torch.randn(4, 8, device="cuda")
+    from megatron.core.transformer.experimental_attention_variant import dsa_cudnn_kernels
+
+    # Use the real alignment helper for the Blackwell teacher dispatch. The wrapper
+    # double enforces its physical tile while the test checks the logical IDs.
+    monkeypatch.setattr(dsa_cudnn_kernels, "_current_sm", lambda: (10, 0))
+    query = torch.randn(3, 2, 512, device="cuda", dtype=torch.bfloat16)
+    key = torch.randn(4, 512, device="cuda", dtype=torch.bfloat16)
     lse = torch.zeros(3, 2, device="cuda")
     indices = torch.tensor([[0, 1, -1], [1, 2, 3], [-1, -1, -1]], device="cuda", dtype=torch.int32)
     expected_indices = indices.clone()
     seen = {}
 
     def score(q, k, denominator, topk, scale, **kwargs):
-        del q, k, denominator, scale
+        del k, denominator, scale
+        assert q.shape[-2:] == (64, 512)
+        assert kwargs["qhead_per_kv_head"] == 64
         seen['indices'] = topk.clone()
         seen['global'] = kwargs['topk_indices_global']
-        return {'target': torch.arange(8, device="cuda").float().expand(1, 3, 8)}
+        assert topk.shape[-1] % 128 == 0
+        return {'target': torch.arange(topk.shape[-1], device="cuda").float().expand(1, 3, -1)}
 
     monkeypatch.setattr(fused_csa, '_ensure_dsa_namespace', lambda: None)
     monkeypatch.setattr(
         fused_csa, '_DSA', SimpleNamespace(sparse_attn_score_recompute_wrapper=score)
     )
-    monkeypatch.setattr(fused_csa, '_get_score_recompute_topk_alignment', lambda: 8)
     if layout == "sbhd":
         query, key, lse, indices = (tensor.unsqueeze(0) for tensor in (query, key, lse, indices))
     target = fused_csa._compute_attn_target(
         query, key, lse, indices, 0.5, 2, topk_indices_global=layout == "thd"
     )
 
-    assert seen['indices'].shape == (1, 3, 8)
+    assert seen['indices'].shape == (1, 3, 128)
     assert torch.equal(seen['indices'][0, :, :3], expected_indices)
     assert torch.all(seen['indices'][..., 3:] == -1)
     assert seen['global'] == (layout == "thd")
@@ -467,7 +474,7 @@ def test_fused_dense_training_uses_full_teacher_and_compact_indices_for_backward
     fake_dsa.sparse_attention_backward_wrapper = MagicMock(side_effect=fake_sparse_backward)
     monkeypatch.setattr(fused_csa, "_DSA", fake_dsa)
 
-    output, indexer_loss = fused_csa.fused_csa_indexer_sparse_attn(
+    output, indexer_loss, indices = fused_csa.fused_csa_indexer_sparse_attn(
         query,
         kv_full,
         sink,
@@ -481,7 +488,10 @@ def test_fused_dense_training_uses_full_teacher_and_compact_indices_for_backward
         loss_coeff=1.0,
         sparse_loss=False,
         kv_offset=seqlen,
+        return_indices=True,
     )
+    torch.testing.assert_close(indices, selected)
+    assert not indices.requires_grad
     (output.sum() + indexer_loss).backward()
 
     assert flash_seen["indexer_topk"] == 0
@@ -585,8 +595,9 @@ def test_sparse_indexer_backward_preserves_invalid_minus_one(monkeypatch):
 
 @pytest.mark.parametrize("sparse_loss", [False, True])
 @pytest.mark.parametrize("include_indexer_loss", [False, True])
+@pytest.mark.parametrize("return_indices", [False, True])
 def test_zero_indexer_loss_skips_teacher_and_preserves_gradients(
-    monkeypatch, sparse_loss, include_indexer_loss
+    monkeypatch, sparse_loss, include_indexer_loss, return_indices
 ):
     """Disabling the auxiliary loss must leave only Top-K and attention work."""
     seqlen, batch, heads, dim = 8, 2, 64, 512
@@ -646,7 +657,7 @@ def test_zero_indexer_loss_skips_teacher_and_preserves_gradients(
         ),
     )
 
-    output, indexer_loss = fused_csa.fused_csa_indexer_sparse_attn(
+    output, indexer_loss, *published = fused_csa.fused_csa_indexer_sparse_attn(
         query,
         kv_full,
         sink,
@@ -660,7 +671,14 @@ def test_zero_indexer_loss_skips_teacher_and_preserves_gradients(
         loss_coeff=0.0,
         sparse_loss=sparse_loss,
         kv_offset=seqlen,
+        return_indices=return_indices,
     )
+    if return_indices:
+        (indices,) = published
+        torch.testing.assert_close(indices, selected)
+        assert not indices.requires_grad
+    else:
+        assert not published
     assert indexer_loss.shape == torch.Size([])
     assert indexer_loss.dtype == torch.float32
     assert indexer_loss.item() == 0.0
@@ -682,7 +700,11 @@ def test_zero_indexer_loss_skips_teacher_and_preserves_gradients(
         torch.testing.assert_close(indexer_input.grad, torch.zeros_like(indexer_input))
 
 
-def test_ratio4_training_dispatch_never_touches_native_dense_fallback(monkeypatch):
+@pytest.mark.parametrize("reuse", [False, True])
+def test_ratio4_training_dispatch_never_touches_native_dense_fallback(monkeypatch, reuse):
+    from contextlib import nullcontext
+
+    from megatron.core.transformer.loop.cross_loop_kv import CrossLoopPass
     import torch.nn as nn
 
     from megatron.core.transformer.experimental_attention_variant import csa as csa_module
@@ -700,6 +722,7 @@ def test_ratio4_training_dispatch_never_touches_native_dense_fallback(monkeypatc
     module.pg_collection = SimpleNamespace(cp=None)
     module.config = SimpleNamespace(
         cuda_graph_impl="none",
+        loop_reuse_indexer=reuse,
         dsa_indexer_loss_coeff=0.0,
         dsa_indexer_use_sparse_loss=False,
         calculate_per_token_loss=False,
@@ -729,7 +752,15 @@ def test_ratio4_training_dispatch_never_touches_native_dense_fallback(monkeypatc
     )
 
     expected = torch.randn(4, 1, 6)
-    fused_call = MagicMock(return_value=(expected, torch.tensor(0.0)))
+    selected = torch.tensor([[[-1], [-1], [-1], [0]]], dtype=torch.int32)
+    results = (expected, torch.tensor(0.0))
+    if reuse:
+        results += (selected,)
+    fused_call = MagicMock(return_value=results)
+    selected_attention = MagicMock(return_value=expected + 1)
+    monkeypatch.setattr(csa_module, "csa_sparse_attn", selected_attention)
+    indexer = MagicMock(wraps=module.indexer.forward_before_topk)
+    monkeypatch.setattr(module.indexer, "forward_before_topk", indexer)
     monkeypatch.setattr(csa_module, "fused_csa_indexer_sparse_attn", fused_call)
     monkeypatch.setattr(csa_module, "nvtx_range_push", lambda *_args: None)
     monkeypatch.setattr(csa_module, "nvtx_range_pop", lambda *_args: None)
@@ -754,11 +785,32 @@ def test_ratio4_training_dispatch_never_touches_native_dense_fallback(monkeypatc
     key = torch.randn(4, 1, 1, 3)
     x = torch.randn(4, 1, 5)
     qr = torch.randn(4, 1, 2)
-    actual = module.forward(query, key, key, None, x=x, qr=qr)
+    saved = {}
+    with CrossLoopPass(step=0, saved=saved).activate() if reuse else nullcontext():
+        actual = module.forward(query, key, key, None, x=x, qr=qr)
 
     assert actual is expected
-    fused_call.assert_called_once()
     assert fused_call.call_args.kwargs["cuda_graph"] is False
+    assert fused_call.call_args.kwargs["return_indices"] is reuse
+    if reuse:
+        # Fresh loop inputs must consume the source indices and current local window.
+        with CrossLoopPass(step=1, saved=saved).activate():
+            replay = module.forward(-query, -key, -key, None, x=-x, qr=-qr)
+        assert replay is selected_attention.return_value
+        selected_attention.assert_called_once()
+        torch.testing.assert_close(selected_attention.call_args.args[0], -query)
+        torch.testing.assert_close(selected_attention.call_args.args[1][:4], -key.squeeze(-2))
+        indices = selected_attention.call_args.args[3]
+        lengths = selected_attention.call_args.kwargs["topk_length"]
+        assert lengths.tolist() == [1, 2, 2, 3]
+        assert [row[:length].tolist() for row, length in zip(indices, lengths)] == [
+            [0],
+            [0, 1],
+            [1, 2],
+            [4, 2, 3],
+        ]
+    indexer.assert_called_once()
+    fused_call.assert_called_once()
 
 
 @pytest.mark.parametrize("deterministic", [False, True])
@@ -989,3 +1041,115 @@ def test_real_fused_sbhd_forward_backward_matches_native_reference(num_heads):
     torch.testing.assert_close(
         sink_fused.grad.float(), sink_native.grad.float(), rtol=5e-2, atol=5e-2
     )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+@pytest.mark.parametrize("loss_coeff", [0.0, 1e-2])
+def test_real_fused_cross_loop_selection_and_shared_kv_gradients(monkeypatch, loss_coeff):
+    """Check two FlashMLA passes against dense FP32 attention masked to the source selection."""
+    if torch.cuda.get_device_capability()[0] < 10:
+        pytest.skip("cross-loop compact indexer coverage requires SM100+")
+    cudnn = pytest.importorskip("cudnn")
+    if not hasattr(cudnn, "DSA"):
+        pytest.skip("cuDNN Frontend lacks the DSA namespace")
+    pytest.importorskip("flash_mla")
+
+    from megatron.core.transformer.experimental_attention_variant.csa import (
+        CompressedSparseAttention,
+        get_window_topk_idxs,
+    )
+
+    torch.manual_seed(491)
+    seq, batch, heads, dim, ratio, topk = 128, 1, 2, 512, 4, 16
+    options = dict(device="cuda", dtype=torch.bfloat16)
+
+    def make_input(*shape):
+        return (torch.randn(*shape, **options) * 0.25).requires_grad_()
+
+    q1, q2 = (make_input(seq, batch, heads, dim) for _ in range(2))
+    local1, local2 = (make_input(seq, batch, dim) for _ in range(2))
+    shared = make_input(seq // ratio, batch, dim)
+    sink = torch.zeros(heads, device="cuda", dtype=torch.float32, requires_grad=True)
+    window = get_window_topk_idxs(8, batch, seq, q1.device)
+    scale = dim**-0.5
+    layer = SimpleNamespace(
+        softmax_scale=scale,
+        attn_sink=sink,
+        config=SimpleNamespace(deterministic_mode=False, cuda_graph_impl="none"),
+    )
+
+    index_inputs = (
+        make_input(seq, batch, 64, 128),
+        make_input(seq // ratio, batch, 128),
+        make_input(seq, batch, 64),
+    )
+    with patch.object(fused_csa, "_indexer_topk_core", wraps=fused_csa._indexer_topk_core) as score:
+        out1, index_loss, selected = fused_csa.fused_csa_indexer_sparse_attn(
+            q1,
+            torch.cat((local1, shared)),
+            sink,
+            window,
+            *index_inputs,
+            indexer_topk=topk,
+            ratio=ratio,
+            softmax_scale=scale,
+            indexer_softmax_scale=128**-0.5,
+            kv_offset=seq,
+            loss_coeff=loss_coeff,
+            sparse_loss=True,
+            calculate_per_token_loss=True,
+            return_indices=True,
+        )
+        producer_calls = score.call_count  # A dense fallback can split source rows into chunks.
+        out2 = CompressedSparseAttention._forward_fused_selected_indices(
+            layer, q2, torch.cat((local2, shared)), seq, window, selected
+        )
+    assert producer_calls > 0 and score.call_count == producer_calls
+    valid_counts = torch.arange(1, seq + 1, device="cuda").view(1, seq, 1) // ratio
+    assert ((selected == -1) | ((selected >= 0) & (selected < valid_counts))).all()
+    assert (selected[0, -1] >= 0).sum().item() == topk < seq // ratio
+
+    # Build a dense mask and FP32 oracle so shared-row gradients accumulate in FP32.
+    # Native sparse gathers from BF16 KV would scatter-add repeated rows in BF16.
+    monkeypatch.setattr(torch.backends.cuda.matmul, "allow_tf32", False)
+    eligible_ids = torch.cat((window, torch.where(selected >= 0, seq + selected, -1)), dim=-1)
+    rows = torch.arange(seq + seq // ratio, device="cuda")
+    allowed = (eligible_ids.unsqueeze(-1) == rows).any(dim=-2)  # [batch, query, key]
+    leaves = (q1, q2, local1, local2, shared, sink)
+    refs = tuple(t.detach().float().requires_grad_() for t in leaves)
+
+    def dense_reference(q, local, compressed, attn_sink):
+        bank = torch.cat((local, compressed))
+        logits = torch.einsum("sbhd,kbd->bhsk", q, bank) * scale
+        logits = logits.masked_fill(~allowed.unsqueeze(1), -torch.inf)
+        sink_logits = attn_sink.view(1, heads, 1, 1).expand(batch, -1, seq, 1)
+        weights = torch.softmax(torch.cat((logits, sink_logits), -1), -1)[..., :-1]
+        return torch.einsum("bhsk,kbd->sbhd", weights, bank).flatten(2)
+
+    ref1 = dense_reference(refs[0], refs[2], refs[4], refs[5])
+    ref2 = dense_reference(refs[1], refs[3], refs[4], refs[5])
+    for actual, ref in ((out1, ref1), (out2, ref2)):
+        torch.testing.assert_close(actual.float(), ref, rtol=3e-2, atol=1e-2)
+    gradients = tuple(torch.randn_like(t) for t in (out1, out2))
+    assert torch.isfinite(index_loss)
+    assert (index_loss.item() != 0.0) == (loss_coeff > 0)
+    all_grads = torch.autograd.grad(
+        (out1, out2, index_loss), leaves + index_inputs, gradients + (torch.ones_like(index_loss),)
+    )
+    actual_grads = all_grads[: len(leaves)]
+    for name, grad in zip(("index_query", "index_key", "index_weights"), all_grads[len(leaves) :]):
+        assert grad.isfinite().all(), name
+        assert (grad.count_nonzero().item() != 0) == (loss_coeff > 0), name
+    reference_grads = torch.autograd.grad((ref1, ref2), refs, tuple(g.float() for g in gradients))
+    names = (
+        "query_pass_1",
+        "query_pass_2",
+        "local_kv_pass_1",
+        "local_kv_pass_2",
+        "shared_kv",
+        "sink",
+    )
+    for name, actual, ref in zip(names, actual_grads, reference_grads):
+        torch.testing.assert_close(
+            actual.float(), ref, rtol=5e-2, atol=3e-2, msg=lambda msg: f"{name} gradient: {msg}"
+        )

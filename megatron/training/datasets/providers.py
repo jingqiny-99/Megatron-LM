@@ -68,13 +68,11 @@ def is_dataset_built_on_rank(
     except AssertionError:
         # No run has registered the legacy arguments: only the run config drives placement.
         args = None
-    if (
-        getattr(args, 'use_varlen_dataset', False)
-        and getattr(args, 'varlen_sbhd_validation', False)
-        and mpu.get_tensor_model_parallel_rank() == 0
-    ):
-        # Dev-only: varlen SBHD validation needs its padding metadata on every PP stage, so
-        # every tensor-parallel rank 0 builds the dataset, not only the first and last stages.
+    needs_padding_mask = getattr(args, 'sbhd_document_packing', False) or (
+        getattr(args, 'use_varlen_dataset', False) and getattr(args, 'varlen_sbhd_validation', False)
+    )
+    if needs_padding_mask and mpu.get_tensor_model_parallel_rank() == 0:
+        # Every PP stage consumes row-tail padding metadata from its TP0 data iterator.
         return True
     config = get_run_config().model.transformer
     return is_dataset_built_on_rank_explicit(

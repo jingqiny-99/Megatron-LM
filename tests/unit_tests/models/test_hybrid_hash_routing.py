@@ -198,6 +198,13 @@ def make_stack(layers, **config_overrides):
         )
 
 
+def bind_hybrid_model_stages(model):
+    """Bind the HybridModel stages that forward calls onto a namespace model stub."""
+    for name in ("embed", "rope_ctx", "head_loss"):
+        setattr(model, name, MethodType(getattr(HybridModel, name), model))
+    return model
+
+
 def run_stack(stack, input_ids):
     hidden_states = torch.randn(4, 2, 8, requires_grad=True)
     output = HybridStack.forward(
@@ -370,6 +377,7 @@ def test_hybrid_model_passes_ids_to_decoder_only_for_hash_routing(
         mtp_process=False,
         vocab_size=128,
     )
+    bind_hybrid_model_stages(model)
     input_ids = torch.arange(8).reshape(2, 4)
     hidden_states = torch.randn(4, 2, 8)
 
@@ -423,6 +431,7 @@ def test_hybrid_model_sequence_shards_hash_ids_with_decoder_input(monkeypatch, p
         vocab_size=128,
         pg_collection=SimpleNamespace(tp=tp_group),
     )
+    bind_hybrid_model_stages(model)
     input_ids = torch.arange(8).reshape(2, 4)
     padding_mask = torch.tensor([[False, True, False, True], [True, False, True, False]])
     hidden_states = torch.randn(2, 2, 8)
@@ -499,6 +508,7 @@ def test_hybrid_model_scatters_embedding_for_sequence_parallel(monkeypatch):
         vocab_size=128,
         pg_collection=SimpleNamespace(tp=tp_group),
     )
+    bind_hybrid_model_stages(model)
     input_ids = torch.arange(8).reshape(2, 4)
     position_ids = torch.arange(4).repeat(2, 1)
 
@@ -567,6 +577,7 @@ def test_hybrid_model_shards_each_layout_padding_mask(
         mtp_process=False,
         pg_collection=SimpleNamespace(tp=tp_group),
     )
+    bind_hybrid_model_stages(model)
     hidden_states = torch.randn(4 if sequence_parallel else 8, 1, 8)
     decoder.input_tensor = hidden_states
     HybridModel.forward(

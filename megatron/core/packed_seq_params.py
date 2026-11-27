@@ -59,6 +59,8 @@ class PackedSeqParams:
     zigzag_cp_min_chunk_size: Optional[int] = field(
         default=None, compare=False, metadata={"cuda_graph_ignore": True}
     )
+    rotary_position_ids: Optional[Tensor] = None
+    """Original positions for compacted THD self-attention (CP=1 only)."""
 
     def __post_init__(self):
         """Pre-compute seq_idx for Mamba mixer CUDA graph compatibility.

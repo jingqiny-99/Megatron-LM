@@ -86,8 +86,26 @@ class TestIndexerScoringPlan:
         assert decision.plan is IndexerScoringPlan.PACKED_THD_GENERAL
         assert decision.is_fused
 
+    @pytest.mark.parametrize("cp_size", [2, 16])
+    def test_sbhd_cp_zigzag_uses_two_causal_segments(self, cp_size):
+        decision = _resolve(cp_size=cp_size, sbhd_cp_zigzag=True)
+        assert decision.plan is IndexerScoringPlan.SBHD_ZIGZAG_SEGMENTS
+        assert decision.is_fused
+
+    @pytest.mark.parametrize(
+        "facts, expected",
+        [
+            ({"segment_kernel_applicable": False}, IndexerScoringPlan.UNFUSED_BOUNDS),
+            ({"mask_is_causal": False}, IndexerScoringPlan.UNFUSED_BOUNDS),
+            ({"explicit_key_positions": True}, IndexerScoringPlan.DECLINE),
+            ({"bounds_available": False}, IndexerScoringPlan.DECLINE),
+        ],
+    )
+    def test_sbhd_cp_zigzag_requires_supported_geometry_and_bounds(self, facts, expected):
+        assert _resolve(cp_size=16, sbhd_cp_zigzag=True, **facts).plan is expected
+
     def test_context_parallel_without_packing_is_unfused_and_says_why(self):
-        """CP without packing misses every fused kernel. Measured on GB200."""
+        """Unproven query/key ordering must preserve arbitrary bounds."""
         decision = _resolve(cp_size=4)
         assert decision.plan is IndexerScoringPlan.UNFUSED_BOUNDS
         assert "packing" in decision.reason

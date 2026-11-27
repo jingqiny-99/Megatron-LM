@@ -11,6 +11,11 @@ from megatron.core.process_groups_config import (
     MultiModuleProcessGroupCollection,
     ProcessGroupCollection,
 )
+from megatron.core.transformer.forward_replay import (
+    in_forward_replay,
+    statistics_round,
+    statistics_weight,
+)
 from megatron.core.utils import get_pg_size
 
 
@@ -24,6 +29,16 @@ def _get_process_group_ranks(group) -> Optional[Tuple[int, ...]]:
         return tuple(torch.distributed.get_process_group_ranks(group))
     except (AttributeError, KeyError, RuntimeError, TypeError, ValueError):
         return None
+
+
+def _group_spans(group, subgroup) -> bool:
+    """Return whether every rank of ``subgroup`` is in ``group`` (``group`` None: the world).
+    False when the ranks cannot be read (distributed not initialized)."""
+    group_ranks = _get_process_group_ranks(group)
+    subgroup_ranks = _get_process_group_ranks(subgroup)
+    if group_ranks is None or subgroup_ranks is None:
+        return False
+    return set(subgroup_ranks) <= set(group_ranks)
 
 
 def _tracker_pp_group_matches(tracker, prefix: str, pp_group) -> bool:
@@ -154,6 +169,9 @@ class DSAIndexerLossLoggingHelper:
         # Skip indexer loss logging if layer_number is None.
         if layer_number is None:
             return
+        # An activation-recompute replay repeats a forward that already recorded.
+        if in_forward_replay():
+            return
 
         tracker = DSAIndexerLossLoggingHelper.tracker
         # Tracker must be at least max(num_layers, layer_number) so hybrid MTP layers
@@ -163,7 +181,18 @@ class DSAIndexerLossLoggingHelper:
         # lifecycle initialization retain lazy growth for backward compatibility.
         needed = max(num_layers, layer_number)
         DSAIndexerLossLoggingHelper.ensure_tracker_size(needed)
-        tracker["values"][layer_number - 1] += loss.detach()
+        weight = statistics_weight()
+        addend = loss.detach() if weight == 1.0 else loss.detach() * weight
+        tracker["values"][layer_number - 1] += addend
+        loop_round = statistics_round()
+        if loop_round is not None:
+            # Loop rounds (``forward_statistics_round``): also binned per (round, layer).
+            r, rounds = loop_round
+            DSAIndexerLossLoggingHelper.round_bins(rounds)[r - 1, layer_number - 1] += addend
+            weighted_rounds = DSAIndexerLossLoggingHelper.round_bins(rounds, cp_weighted=True)
+            weighted_rounds[r - 1, layer_number - 1].add_(
+                addend, alpha=_logging_group_size(reduce_group)
+            )
         if raw_loss is not None:
             raw_values = tracker.get("raw_values")
             if raw_values is None and tracker.get("agreed_size") is None:
@@ -172,7 +201,10 @@ class DSAIndexerLossLoggingHelper:
                 raw_values = torch.zeros_like(tracker["values"])
                 tracker["raw_values"] = raw_values
             if raw_values is not None:
-                raw_values[layer_number - 1] += raw_loss.detach()
+                # Weighted like the scaled loss, so raw = scaled / coefficient also holds
+                # under a per-sample schedule (``forward_statistics_weight``).
+                raw_addend = raw_loss.detach() if weight == 1.0 else raw_loss.detach() * weight
+                raw_values[layer_number - 1] += raw_addend
                 tracker["raw_loss_recorded"] = True
         tracker["reduce_group"] = reduce_group
         tracker["avg_group"] = avg_group
@@ -180,7 +212,7 @@ class DSAIndexerLossLoggingHelper:
             _logging_group_size(group) > 1 for group in (reduce_group, avg_group)
         )
         DSAIndexerLossLoggingHelper._accumulate_cp_weighted_loss(
-            tracker, layer_number, loss, raw_loss, _logging_group_size(reduce_group)
+            tracker, layer_number, loss, raw_loss, weight * _logging_group_size(reduce_group)
         )
 
     @staticmethod
@@ -208,7 +240,7 @@ class DSAIndexerLossLoggingHelper:
             reduce_group: The indexer loss's group for reducing the loss.
             avg_group: The indexer loss's group for averaging the loss.
         """
-        if layer_number is None:
+        if layer_number is None or in_forward_replay():
             return
 
         tracker = DSAIndexerLossLoggingHelper.tracker
@@ -222,11 +254,36 @@ class DSAIndexerLossLoggingHelper:
             sums = torch.zeros_like(tracker["values"])
             rows = torch.zeros_like(tracker["values"])
             tracker[_TAIL_MASS_KEYS[0]], tracker[_TAIL_MASS_KEYS[1]] = sums, rows
-        sums[layer_number - 1] += tail_mass_sum.detach().to(sums.dtype)
-        rows[layer_number - 1] += row_count.detach().to(rows.dtype)
+        weight = statistics_weight()
+        sums[layer_number - 1].add_(tail_mass_sum.detach().to(sums.dtype), alpha=weight)
+        rows[layer_number - 1].add_(row_count.detach().to(rows.dtype), alpha=weight)
+        for key, value in zip(_TAIL_MASS_KEYS, (tail_mass_sum, row_count)):
+            weighted = DSAIndexerLossLoggingHelper._cp_weighted_buffer(tracker, "cp_weighted_" + key)
+            if weighted is not None:
+                weighted[layer_number - 1].add_(value.detach(), alpha=weight * _logging_group_size(reduce_group))
         tracker["tail_mass_recorded"] = True
         tracker["reduce_group"] = reduce_group
         tracker["avg_group"] = avg_group
+
+    @staticmethod
+    def round_bins(rounds: int, *, cp_weighted: bool = False) -> torch.Tensor:
+        """``tracker["round_values"]``, at least ``[rounds, len(values)]`` (zeros added): the
+        losses recorded inside ``forward_statistics_round``, binned per (round, layer)."""
+        tracker = DSAIndexerLossLoggingHelper.tracker
+        values = tracker["values"]
+        key = "cp_weighted_round_values" if cp_weighted else "round_values"
+        bins = tracker.get(key)
+        if bins is None or bins.shape[0] < rounds or bins.shape[1] < values.shape[0]:
+            grown = torch.zeros(
+                max(rounds, 0 if bins is None else bins.shape[0]),
+                values.shape[0],
+                device=values.device,
+                dtype=values.dtype,
+            )
+            if bins is not None:
+                grown[: bins.shape[0], : bins.shape[1]] = bins
+            tracker[key] = bins = grown
+        return bins
 
     @staticmethod
     def clean_loss_in_tracker(preserve_groups: bool = False):
@@ -246,12 +303,14 @@ class DSAIndexerLossLoggingHelper:
         if not preserve_groups:
             tracker["reduce_group"] = None
             tracker["avg_group"] = None
-        for key in ("cp_weighted_values", "cp_weighted_raw_values"):
-            if key in tracker:
-                tracker[key].zero_()
+        for key in ("values", "raw_values", "round_values", *_TAIL_MASS_KEYS):
+            if "cp_weighted_" + key in tracker:
+                tracker["cp_weighted_" + key].zero_()
         if not preserve_groups:
             tracker["requires_dp_cp"] = False
             tracker.pop("cp_weighted_incomplete", None)
+        if tracker.get("round_values") is not None:
+            tracker["round_values"].zero_()
 
     @staticmethod
     def reduce_loss_in_tracker(
@@ -261,6 +320,8 @@ class DSAIndexerLossLoggingHelper:
         pp_group: Optional[torch.distributed.ProcessGroup] = None,
         dp_group: Optional[torch.distributed.ProcessGroup] = None,
         pg_collection: Optional[ProcessGroupCollection] = None,
+        loop_rounds: Optional[int] = None,
+        gtp_remat_group: Optional[torch.distributed.ProcessGroup] = None,
     ):
         """Collect and reduce the indexer losses across ranks.
 
@@ -286,15 +347,25 @@ class DSAIndexerLossLoggingHelper:
             pg_collection: Language-model process groups. Without a Dynamic-CP parent, selects
                 the fixed DP x CP reduction of CP-weighted contributions, which does not depend
                 on the order of runtime CP microbatches.
+            loop_rounds: The loop's round count: the per-(round, layer) bins (zeros where
+                nothing was recorded) are reduced with the same collectives as the values.
+                Must be the same on every rank.
+            gtp_remat_group: GTP weight-remat group of the language model (``pg_collection.
+                gtp_remat`` when omitted). Its ranks each run their own micro-batches, a second
+                data dimension beside ``dp_group``, so the metric is also averaged over it
+                unless the data-parallel group already spans it (``dp_gtp_remat``, which
+                training passes under the GTP-remat grid).
         """
         if pg_collection is not None and dynamic_cp_parent_group is None:
             DSAIndexerLossLoggingHelper._reduce_loss_with_fixed_dp_cp(
-                pg_collection, num_layers, pp_group=pp_group
+                pg_collection, num_layers, pp_group=pp_group, loop_rounds=loop_rounds
             )
             return
         if pg_collection is not None:
             pp_group = pg_collection.pp if pp_group is None else pp_group
             dp_group = pg_collection.dp if dp_group is None else dp_group
+            if gtp_remat_group is None:
+                gtp_remat_group = getattr(pg_collection, "gtp_remat", None)
 
         tracker = DSAIndexerLossLoggingHelper.tracker
         if pp_group is None:
@@ -369,7 +440,22 @@ class DSAIndexerLossLoggingHelper:
             # The tail-mass sums and row counts take the same path too. Every reduction step
             # scales both alike, so their ratio, the logged row mean, is unaffected.
             metric_tensors.extend(tracker[key] for key in _TAIL_MASS_KEYS)
+        if loop_rounds is not None:
+            metric_tensors.append(DSAIndexerLossLoggingHelper.round_bins(loop_rounds))
 
+        if dp_group is None and dynamic_cp_parent_group is None:
+            # Legacy fallback; explicit process-group collections are preferred.
+            dp_group = parallel_state.get_data_parallel_group(with_context_parallel=False)
+        # GTP remat ranks each carry their own micro-batches: a second data dimension beside
+        # DP (and DP x CP). The groups are orthogonal and of equal size, so averaging over the
+        # GTP group after the DP average gives the mean over every rank holding a distinct
+        # micro-batch. Skip it when the data group already spans the GTP group.
+        data_group = dp_group if dynamic_cp_parent_group is None else dynamic_cp_parent_group
+        average_over_gtp_remat = (
+            gtp_remat_group is not None
+            and get_pg_size(gtp_remat_group) > 1
+            and not _group_spans(data_group, gtp_remat_group)
+        )
         for values in metric_tensors:
             if dynamic_cp_parent_group is not None:
                 torch.distributed.all_reduce(values, group=pp_group)
@@ -388,11 +474,12 @@ class DSAIndexerLossLoggingHelper:
                         values, group=tracker['avg_group'], op=torch.distributed.ReduceOp.AVG
                     )
                 torch.distributed.all_reduce(values, group=pp_group)
-                if dp_group is None:
-                    # Legacy fallback; explicit process-group collections are preferred.
-                    dp_group = parallel_state.get_data_parallel_group(with_context_parallel=False)
                 torch.distributed.all_reduce(
                     values, group=dp_group, op=torch.distributed.ReduceOp.AVG
+                )
+            if average_over_gtp_remat:
+                torch.distributed.all_reduce(
+                    values, group=gtp_remat_group, op=torch.distributed.ReduceOp.AVG
                 )
 
     @staticmethod
@@ -452,7 +539,7 @@ class DSAIndexerLossLoggingHelper:
 
     @staticmethod
     def _accumulate_cp_weighted_loss(
-        tracker, layer_number: int, loss: torch.Tensor, raw_loss, scale: int
+        tracker, layer_number: int, loss: torch.Tensor, raw_loss, scale: float
     ) -> None:
         """Accumulate contributions weighted by their own CP reduction width.
 
@@ -472,6 +559,7 @@ class DSAIndexerLossLoggingHelper:
         pg_collection: ProcessGroupCollection,
         num_layers: Optional[int] = None,
         pp_group: Optional[torch.distributed.ProcessGroup] = None,
+        loop_rounds: Optional[int] = None,
     ) -> None:
         """Reduce CP-weighted indexer metrics over the fixed DP x CP domain.
 
@@ -530,22 +618,39 @@ class DSAIndexerLossLoggingHelper:
             tracker, size, pp_group, lazy=agreed_size is None
         ):
             metric_keys.append(("raw_values", "cp_weighted_raw_values"))
+        if DSAIndexerLossLoggingHelper._agree_tail_mass_logging(
+            tracker, size, pp_group, lazy=agreed_size is None
+        ):
+            metric_keys.extend((key, "cp_weighted_" + key) for key in _TAIL_MASS_KEYS)
+        pairs = [
+            (tracker[target], DSAIndexerLossLoggingHelper._cp_weighted_buffer(tracker, key, size))
+            for target, key in metric_keys
+        ]
+        if loop_rounds is not None:
+            pairs.append((
+                DSAIndexerLossLoggingHelper.round_bins(loop_rounds),
+                DSAIndexerLossLoggingHelper.round_bins(loop_rounds, cp_weighted=True),
+            ))
         contributing_ranks = get_pg_size(dp_cp_group)
         gtp_remat_group = getattr(pg_collection, "gtp_remat", None)
-        if gtp_remat_group is not None:
+        gtp_reduction = (
+            gtp_remat_group is not None and get_pg_size(gtp_remat_group) > 1
+            and not _group_spans(dp_cp_group, gtp_remat_group)
+        )
+        if gtp_reduction:
             contributing_ranks *= get_pg_size(gtp_remat_group)
-        for target_key, weighted_key in metric_keys:
-            weighted = DSAIndexerLossLoggingHelper._cp_weighted_buffer(tracker, weighted_key, size)
+        for target, weighted in pairs:
             torch.distributed.all_reduce(weighted, group=pp_group)
             torch.distributed.all_reduce(
                 weighted, group=dp_cp_group, op=torch.distributed.ReduceOp.SUM
             )
-            if gtp_remat_group is not None and get_pg_size(gtp_remat_group) > 1:
+            if gtp_reduction:
                 torch.distributed.all_reduce(
                     weighted, group=gtp_remat_group, op=torch.distributed.ReduceOp.SUM
                 )
-            tracker[target_key].copy_(weighted / contributing_ranks)
+            target.copy_(weighted / contributing_ranks)
 
+    @staticmethod
     def _agree_tail_mass_logging(tracker, size: int, pp_group, lazy: bool) -> bool:
         """Return whether KPool tail masses are reduced and logged for this tracker.
 
@@ -632,6 +737,7 @@ class DSAIndexerLossLoggingHelper:
         pp_group: Optional[torch.distributed.ProcessGroup] = None,
         dp_group: Optional[torch.distributed.ProcessGroup] = None,
         pg_collection: Optional[ProcessGroupCollection] = None,
+        loop_rounds: Optional[int] = None,
     ):
         """Track the sparse attention indexer metrics for logging.
 
@@ -653,6 +759,9 @@ class DSAIndexerLossLoggingHelper:
                 raw local token sums.
             pp_group: Pipeline-parallel group that owns the language model.
             dp_group: Data-parallel group that owns the language model.
+            loop_rounds: The loop's round count (``R_max``) for a depth-recurrent model: also
+                log ``"indexer loss round {r}"`` (round ``r``'s bins, normalized like
+                ``"indexer loss"``) to the writers. Must be the same on every rank.
         """
         # A bare process-group collection selects the fixed DP x CP reduction. Explicit
         # language-model groups keep the writer-group and Dynamic-CP parent reductions.
@@ -666,6 +775,8 @@ class DSAIndexerLossLoggingHelper:
             pp_group = pg_collection.pp if pp_group is None else pp_group
             dp_group = pg_collection.dp if dp_group is None else dp_group
         reduce_kwargs = {"pg_collection": pg_collection} if use_fixed_dp_cp else {}
+        gtp_remat_group = getattr(pg_collection, "gtp_remat", None)
+
         DSAIndexerLossLoggingHelper.reduce_loss_in_tracker(
             num_layers=num_layers,
             dynamic_cp_parent_group=dynamic_cp_parent_group,
@@ -673,6 +784,9 @@ class DSAIndexerLossLoggingHelper:
             pp_group=pp_group,
             dp_group=dp_group,
             **reduce_kwargs,
+            # Only pass the loop and GTP keywords when set: keeps the pre-loop call shape.
+            **({} if loop_rounds is None else {"loop_rounds": loop_rounds}),
+            **({} if gtp_remat_group is None else {"gtp_remat_group": gtp_remat_group}),
         )
         tracker = DSAIndexerLossLoggingHelper.tracker
         if "values" not in tracker:
@@ -719,6 +833,17 @@ class DSAIndexerLossLoggingHelper:
             DSAIndexerLossLoggingHelper._track_tail_mass(
                 writer, wandb_writer, total_loss_dict, iteration
             )
+
+        if loop_rounds is not None:
+            # Writers only: total_loss_dict keeps its keys.
+            bins = tracker["round_values"][:loop_rounds] * loss_scale
+            for r in range(loop_rounds):
+                key = f"indexer loss round {r + 1}"
+                value = bins[r].sum() / max(num_indexer_layers, 1)
+                if writer is not None:
+                    writer.add_scalar(key, value, iteration)
+                if wandb_writer is not None:
+                    wandb_writer.log({key: value}, iteration)
 
         DSAIndexerLossLoggingHelper.clean_loss_in_tracker(preserve_groups=preserve_groups)
 
@@ -855,6 +980,17 @@ def initialize_dsa_metric_tracker(
         tracker["raw_values"] = torch.zeros(size, device=torch.cuda.current_device())
         for key in _TAIL_MASS_KEYS:
             tracker[key] = torch.zeros(size, device=torch.cuda.current_device())
+        for key in ("values", "raw_values", *_TAIL_MASS_KEYS):
+            tracker["cp_weighted_" + key] = torch.zeros_like(tracker["values"])
+        chunks = model if isinstance(model, (list, tuple)) else [model]
+        rounds = max((
+            getattr(module.config, "loop_iterations", 0) or 0
+            for chunk in chunks for module in chunk.modules()
+            if getattr(getattr(module, "config", None), "loop_architecture", "none") != "none"
+        ), default=0)
+        if rounds:
+            DSAIndexerLossLoggingHelper.round_bins(rounds)
+            DSAIndexerLossLoggingHelper.round_bins(rounds, cp_weighted=True)
 
     tracker["agreed_size"] = size
     _record_tracker_pp_group(tracker, "agreed_size", pp_group)

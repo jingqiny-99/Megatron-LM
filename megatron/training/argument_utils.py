@@ -354,6 +354,32 @@ def _resolve_dsa_kernel_backend_cli_default(args, kw_args):
         kw_args['dsa_kernel_backend'] = 'none'
 
 
+def hybrid_pattern_attention_variant(args) -> Optional[str]:
+    """The ``experimental_attention_variant`` that ``--hybrid-layer-pattern`` implies, or None
+    when the pattern implies none (or is unset): DSv4 C/H/W symbols give ``dsv4_hybrid`` (an
+    explicit different variant raises); without an explicit variant, a DSA symbol gives ``dsa``
+    and a KDA symbol ``kda``. ``core_transformer_config_from_args`` builds the config with it,
+    and argument-time checks use it to see the variant the model will run."""
+    pattern = getattr(args, 'hybrid_layer_pattern', None)
+    if pattern is None:
+        return None
+    from megatron.core.models.hybrid.hybrid_layer_allocation import Symbols
+
+    variant = getattr(args, 'experimental_attention_variant', None)
+    if any(symbol in pattern for symbol in (Symbols.WINDOW, Symbols.CSA, Symbols.HCA)):
+        if variant not in (None, 'dsv4_hybrid'):
+            raise ValueError(
+                "Hybrid C/H/W attention requires experimental_attention_variant='dsv4_hybrid', "
+                f"got {variant!r} for pattern {pattern!r}."
+            )
+        return 'dsv4_hybrid'
+    if variant is None and Symbols.DS_ATTENTION in pattern:
+        return 'dsa'
+    if variant is None and Symbols.KDA in pattern:
+        return 'kda'
+    return None
+
+
 def _mfsdp_v2_disables_pipeline_output_dealloc(args) -> bool:
     """Whether the pipeline-output pseudo-free must stay disabled for ``args``.
 
@@ -479,6 +505,24 @@ def core_transformer_config_from_args(args, config_class=None):
         HeterogeneousTransformerConfig,
     )
 
+    if getattr(args, 'loop_architecture', 'none') != 'none' and (
+        args.use_megatron_fsdp or args.use_torch_fsdp2
+    ):
+        from megatron.core.transformer.loop.guards import is_hybrid_loop_config
+
+        # The hybrid loop trains with Megatron-FSDP v1 (accumulate mode and the other rules of
+        # guards.validate_loop_fsdp_config, checked in argument validation and by the wrapper).
+        if (
+            args.use_torch_fsdp2
+            or getattr(args, 'megatron_fsdp_version', 1) != 1
+            or not is_hybrid_loop_config(args)
+        ):
+            raise ValueError(
+                "Loop decoder supports DDP / distributed optimizer, or Megatron-FSDP v1 with a "
+                "hybrid loop (loop_prelude_sublayers / loop_coda_sublayers); not torch FSDP2, "
+                "Megatron-FSDP v2 or the GPT loop"
+            )
+
     # Config class.
     config_class = config_class or TransformerConfig
 
@@ -551,24 +595,10 @@ def core_transformer_config_from_args(args, config_class=None):
         kw_args['cp_comm_type'] = args.cp_comm_type[0]
     if args.hybrid_layer_pattern is not None:
         kw_args['is_hybrid_model'] = True
-        from megatron.core.models.hybrid.hybrid_layer_allocation import Symbols
-
         pattern = args.hybrid_layer_pattern
-        has_dsv4_attention = any(
-            symbol in pattern for symbol in (Symbols.WINDOW, Symbols.CSA, Symbols.HCA)
-        )
-        variant = getattr(args, 'experimental_attention_variant', None)
-        if has_dsv4_attention:
-            if variant not in (None, 'dsv4_hybrid'):
-                raise ValueError(
-                    "Hybrid C/H/W attention requires experimental_attention_variant='dsv4_hybrid', "
-                    f"got {variant!r} for pattern {pattern!r}."
-                )
-            kw_args['experimental_attention_variant'] = 'dsv4_hybrid'
-        elif variant is None and Symbols.DS_ATTENTION in pattern:
-            kw_args['experimental_attention_variant'] = 'dsa'
-        elif variant is None and Symbols.KDA in pattern:
-            kw_args['experimental_attention_variant'] = 'kda'
+        inferred_variant = hybrid_pattern_attention_variant(args)
+        if inferred_variant is not None:
+            kw_args['experimental_attention_variant'] = inferred_variant
 
         from megatron.training.models.deepseek_v4 import normalize_dsv4_hybrid_csa_compress_ratios
 
@@ -1183,6 +1213,8 @@ def gpt_data_config_from_args(args: Namespace, *, standalone: bool = False) -> D
         field_name: deepcopy(getattr(args, source))
         for field_name, source in _DATASET_FIELD_SOURCES.items()
     }
+    kwargs["sbhd_document_packing"] = getattr(args, "sbhd_document_packing", False)
+    kwargs["sbhd_packing_open_rows"] = getattr(args, "sbhd_packing_open_rows", 64)
     kwargs["blend"] = blend
     kwargs["blend_per_split"] = blend_per_split
     kwargs["sequences_per_dataset"] = sequences_per_dataset

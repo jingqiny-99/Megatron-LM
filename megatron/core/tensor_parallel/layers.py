@@ -883,7 +883,15 @@ class LinearWithGradAccumulationAndAsyncCommunication(torch.autograd.Function):
                 # In case of Megatron-FSDP, need to create main grad buffers in-place
                 if hasattr(weight, "__fsdp_param__"):
                     weight.main_grad = weight.get_main_grad()
-                    _wgrad_gemm(weight.main_grad, grad_output, total_input)
+                    # As in Transformer Engine, Megatron-FSDP decides per parameter whether
+                    # a use writes over the bucket (a fresh sharded-gradient bucket) or adds
+                    # into it (a persistent buffer, or accumulate mode's zeroed bucket).
+                    _wgrad_gemm(
+                        weight.main_grad,
+                        grad_output,
+                        total_input,
+                        accumulate=not getattr(weight, "overwrite_main_grad", True),
+                    )
                 else:
                     if weight.main_grad.dtype == torch.float32:
                         fused_weight_gradient_mlp_cuda.wgrad_gemm_accum_fp32(

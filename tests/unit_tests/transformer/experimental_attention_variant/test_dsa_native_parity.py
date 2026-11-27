@@ -1789,8 +1789,9 @@ def test_cudnn_split_topk_threads_multi_packed_cp_metadata(
     torch.testing.assert_close(loss_on[18], packed_seq_params.cu_seqlens_q)
     torch.testing.assert_close(loss_on[19], packed_seq_params.cu_seqlens_kv)
     assert loss_on[20:23] == (16, 16, 2)
-    assert loss_on[-2] is (config_deterministic or global_deterministic)
-    assert loss_on[-1] == dsa_cudnn_kernels.IndexerScorerOptions()
+    assert loss_on[-3] is (config_deterministic or global_deterministic)
+    assert loss_on[-2] == dsa_cudnn_kernels.IndexerScorerOptions()
+    assert loss_on[-1] is False
 
 
 def test_cudnn_indexer_topk_single_packed_cp_uses_absolute_seq_lens(monkeypatch):
@@ -1798,13 +1799,15 @@ def test_cudnn_indexer_topk_single_packed_cp_uses_absolute_seq_lens(monkeypatch)
 
     class FakeDSA:
         @staticmethod
-        def indexer_forward_wrapper(q_bshd, k_bshd, w_bsh, ratio, sm_scale):
+        def indexer_forward_wrapper(q_bshd, k_bshd, w_bsh, ratio, sm_scale, q_causal_offsets=None):
             seen["forward_shapes"].append((q_bshd.shape[1], k_bshd.shape[1]))
             b, sq, _, _ = q_bshd.shape
             sk = k_bshd.shape[1]
-            return {
-                "scores": torch.arange(sk, dtype=torch.float32).view(1, 1, sk).expand(b, sq, sk)
-            }
+            origin = 0 if q_causal_offsets is None else int(q_causal_offsets[0])
+            positions = torch.arange(sq) + origin
+            keys = torch.arange(sk, dtype=torch.float32).view(1, 1, sk)
+            scores = keys.expand(b, sq, sk).masked_fill(keys > positions.view(1, sq, 1), -torch.inf)
+            return {"scores": scores}
 
         @staticmethod
         def indexer_top_k_wrapper(scores_flat, seq_lens, top_k, next_n, return_val):
@@ -1819,6 +1822,7 @@ def test_cudnn_indexer_topk_single_packed_cp_uses_absolute_seq_lens(monkeypatch)
 
     monkeypatch.setattr(dsa_cudnn_kernels, "_ensure_dsa_namespace", lambda: None)
     monkeypatch.setattr(dsa_cudnn_kernels, "_cudnn_dsa", FakeDSA)
+    monkeypatch.setattr(dsa_cudnn_kernels, "_cudnn_frontend_version", lambda: (1, 31, 0))
     fakes.trust_stand_in_top_k_for_any_k(monkeypatch)
 
     topk_indices, topk_length, topk_scores = dsa_cudnn_kernels._indexer_topk_bshd(
@@ -1855,13 +1859,15 @@ def test_cudnn_indexer_topk_single_packed_cp_prefix_crops_keys_per_chunk(monkeyp
 
     class FakeDSA:
         @staticmethod
-        def indexer_forward_wrapper(q_bshd, k_bshd, w_bsh, ratio, sm_scale):
+        def indexer_forward_wrapper(q_bshd, k_bshd, w_bsh, ratio, sm_scale, q_causal_offsets=None):
             seen["forward_shapes"].append((q_bshd.shape[1], k_bshd.shape[1]))
             b, sq, _, _ = q_bshd.shape
             sk = k_bshd.shape[1]
-            return {
-                "scores": torch.arange(sk, dtype=torch.float32).view(1, 1, sk).expand(b, sq, sk)
-            }
+            origin = 0 if q_causal_offsets is None else int(q_causal_offsets[0])
+            positions = torch.arange(sq) + origin
+            keys = torch.arange(sk, dtype=torch.float32).view(1, 1, sk)
+            scores = keys.expand(b, sq, sk).masked_fill(keys > positions.view(1, sq, 1), -torch.inf)
+            return {"scores": scores}
 
         @staticmethod
         def indexer_top_k_wrapper(scores_flat, seq_lens, top_k, next_n, return_val):
@@ -2195,6 +2201,7 @@ def test_cudnn_split_topk_hook_uses_indexer_topk(monkeypatch):
         varlen_is_plain_causal=False,
         deterministic=False,
         scorer_options=None,
+        sbhd_cp_zigzag=False,
     ):
         seen["q_shape"] = q_bshd.shape
         seen["k_shape"] = k_bsd.shape
@@ -2348,6 +2355,7 @@ def test_cudnn_split_topk_with_loss_returns_precomputed_indexer_grads(monkeypatc
         varlen_is_plain_causal=False,
         deterministic=False,
         scorer_options=None,
+        sbhd_cp_zigzag=False,
     ):
         seen["return_scores"] = return_scores
         seen["return_topk_scores"] = return_topk_scores
@@ -2487,14 +2495,16 @@ def test_flash_mla_topk_alignment_uses_sm100_block(monkeypatch):
         dsa_cudnn_kernels._device_sm.cache_clear()
 
 
-@pytest.mark.parametrize("sm, expected", [((9, 0), 128), ((10, 0), 64)])
-def test_sparse_score_recompute_topk_alignment(monkeypatch, sm, expected):
+@pytest.mark.parametrize("sm", [(9, 0), (10, 0), (10, 3)])
+def test_sparse_score_recompute_topk_alignment(monkeypatch, sm):
     monkeypatch.setattr(dsa_cudnn_kernels, "_current_sm", lambda: sm)
 
-    assert dsa_cudnn_kernels._get_score_recompute_topk_alignment() == expected
+    assert dsa_cudnn_kernels._get_score_recompute_topk_alignment() == 128
 
 
 def test_dsa_fwd_flash_mla_pads_topk_to_flashmla_block(monkeypatch):
+    from contextlib import nullcontext
+    monkeypatch.setattr(torch.cuda.nvtx, "range", lambda *args: nullcontext())
     seen = {}
 
     def fake_flash_mla(q, kv, indices, sm_scale, d_v, attn_sink, topk_length, indexer_topk):
@@ -2719,6 +2729,7 @@ def test_cudnn_sparse_loss_uses_selected_topk_scores(monkeypatch):
         packed_cp_size=1,
         varlen_is_plain_causal=False,
         scorer_options=None,
+        sbhd_cp_zigzag=False,
     ):
         del (
             single_packed_thd_sequence,
@@ -4670,3 +4681,127 @@ def test_fused_qk_topk_backward_matches_direct_apply_arity(num_inputs: int) -> N
     )
 
     assert len(gradients) == num_inputs
+
+
+@pytest.mark.parametrize("cp_rank", [0, 5, 15])
+def test_cudnn_sbhd_zigzag_uses_absolute_causal_key_prefixes(monkeypatch, cp_rank):
+    cp_size, sq, topk = 16, 8, 6
+    sk = sq * cp_size
+    query_pos = torch.arange(sk).view(2 * cp_size, -1)[[cp_rank, 2 * cp_size - 1 - cp_rank]].flatten()
+    starts, ends = torch.zeros_like(query_pos), query_pos + 1
+    calls = []
+
+    def score(q, k, w, seq_lens, k_count, with_scores, *, query_causal_start, deterministic, topk_backend, topk_scratch_bytes):
+        calls.append((query_causal_start, k.size(1)))
+        scores = k[:, :, 0, 0].unsqueeze(1).expand(-1, q.size(1), -1)
+        scores = scores.masked_fill(scores >= seq_lens.view(1, -1, 1), -torch.inf)
+        values, indices = scores.topk(k_count)
+        return indices.int(), values
+
+    monkeypatch.setattr(dsa_cudnn_kernels, "_ensure_dsa_namespace", lambda: None)
+    monkeypatch.setattr(dsa_cudnn_kernels, "_supports_indexer_q_causal_offsets", lambda: True)
+    monkeypatch.setattr(dsa_cudnn_kernels, "_indexer_topk_from_score_chunks", score)
+    indices, lengths, values = dsa_cudnn_kernels._indexer_topk_bshd(
+        torch.ones(1, sq, 1, 1),
+        torch.arange(sk, dtype=torch.float32).view(1, sk, 1),
+        torch.ones(1, sq, 1),
+        topk,
+        varlen_starts=starts,
+        varlen_ends=ends,
+        return_scores=False,
+        return_topk_scores=True,
+        local_packed_cp_rank=cp_rank,
+        packed_cp_size=cp_size,
+        sbhd_cp_zigzag=True,
+    )
+    half = sq // 2
+    assert calls == [(int(chunk[0]), int(chunk[-1]) + 1) for chunk in query_pos.split(half)]
+    expected = query_pos.view(1, sq, 1) - torch.arange(topk)
+    torch.testing.assert_close(indices, expected.clamp_min(-1).int())
+    torch.testing.assert_close(lengths, ends.clamp_max(topk).view(1, sq).int())
+    torch.testing.assert_close(values[expected >= 0], expected[expected >= 0].float())
+
+
+@pytest.mark.parametrize("cp_rank", [0, 1])
+def test_cudnn_real_kernel_sbhd_zigzag_selection_and_loss_gradients(monkeypatch, cp_rank):
+    """Exercise both genuine cuDNN prefix calls and compare to dense causal scoring."""
+    _skip_if_fused_dsa_unavailable()
+    from megatron.core.transformer.experimental_attention_variant import dsa_kernels
+    from megatron.core.transformer.experimental_attention_variant.dsa_scoring_plan import (
+        IndexerScoringPlan,
+    )
+
+    torch.manual_seed(416)
+    device = torch.device("cuda")
+    options = {"device": device, "dtype": torch.bfloat16}
+    cp_size, sq, sk, topk = 2, 64, 128, 32
+    half = sq // 2
+    # Construct absolute positions independently of the production segment scorer.
+    query_pos = torch.arange(sk, device=device).view(2 * cp_size, half)[
+        [cp_rank, 2 * cp_size - 1 - cp_rank]
+    ].flatten()
+    starts = torch.zeros_like(query_pos, dtype=torch.int32)
+    ends = (query_pos + 1).int()
+    query = torch.randn(sq, 1, 64, 576, **options)
+    key = torch.randn(sk, 1, 1, 576, **options)
+    # A strictly increasing first key channel separates the top-k boundary. The
+    # random small residuals exercise gradients without bf16 rank ties.
+    q = 0.01 * torch.randn(sq, 1, 64, 128, **options)
+    k = 0.001 * torch.randn(sk, 1, 128, **options)
+    q[..., 0] = 1
+    k[..., 0] = torch.arange(1, sk + 1, device=device).view(-1, 1) / sk
+    weights = torch.empty(sq, 1, 64, **options).uniform_(0.06, 0.09)
+    index_inputs = [t.requires_grad_() for t in (q, k, weights)]
+    plans = []
+    monkeypatch.setattr(
+        dsa_cudnn_kernels, "report_unfused_scoring_once", lambda d, context: plans.append(d.plan)
+    )
+    pg = _SingleRankProcessGroups()
+    scale = query.size(-1) ** -0.5
+    cfg = _PackedCpCudnnConfig(calculate_per_token_loss=True)
+    idx, lengths, fused_loss = dsa_kernels.run_fused_qk_topk_with_loss(
+        config=cfg,
+        q=q,
+        k=k,
+        weights=weights,
+        index_topk=topk,
+        starts=starts,
+        ends=ends,
+        block_size=8192,
+        query=query,
+        key=key,
+        softmax_scale=scale,
+        loss_coeff=0.01,
+        pg_collection=pg,
+        query_valid_rows=None,
+        calculate_per_token_loss=True,
+        local_packed_cp_rank=cp_rank,
+        cp_size=cp_size,
+        sbhd_cp_zigzag=True,
+    )
+    assert plans == [IndexerScoringPlan.SBHD_ZIGZAG_SEGMENTS]
+    scores, ref_idx = dsa_module.fused_qk_topk_naive(
+        q, k, weights, topk, varlen_starts=starts, varlen_ends=ends
+    )
+    torch.testing.assert_close(lengths, ends.clamp_max(topk).view(1, sq))
+    torch.testing.assert_close(idx.long().sort(-1).values, ref_idx.sort(-1).values)
+    ref_loss = dsa_module.compute_dsa_indexer_loss(
+        scores,
+        ref_idx,
+        query,
+        key.expand(-1, -1, query.size(2), -1),
+        scale,
+        0.01,
+        sparse_loss=True,
+        pg_collection=pg,
+        varlen_starts=starts,
+        varlen_ends=ends,
+        calculate_per_token_loss=True,
+    )
+    torch.testing.assert_close(fused_loss, ref_loss, rtol=0.03, atol=0.0001)
+    for name, actual, expected in zip(
+        ("query", "key", "weights"),
+        torch.autograd.grad(fused_loss, index_inputs),
+        torch.autograd.grad(ref_loss, index_inputs),
+    ):
+        _assert_similarity(actual, expected, eps=0.01, label=name)

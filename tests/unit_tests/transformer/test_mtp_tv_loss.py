@@ -204,16 +204,16 @@ def test_full_vocab_tv_forward_and_gradient_match_native_reference(dtype):
     assert target_logits.grad is None
 
 
+@pytest.mark.parametrize("mtp_num_layers", [2, 7])
 @pytest.mark.parametrize("calculate_per_token_loss", [False, True])
 @pytest.mark.parametrize("masked_conditioning", [False, True])
 @pytest.mark.parametrize("separate_main_output", [False, True])
 def test_process_mtp_e2e_tv_matches_native_alignment_and_gradient(
-    calculate_per_token_loss, masked_conditioning, separate_main_output
+    mtp_num_layers, calculate_per_token_loss, masked_conditioning, separate_main_output
 ):
     """Check shifted target alignment, Eq. (13), and draft-only gradients on CPU."""
     torch.manual_seed(7)
-    mtp_num_layers = 2
-    seq_len = 6
+    seq_len = 2 * mtp_num_layers + 2
     batch_size = 1
     hidden_size = 7
     config = _make_tv_config(mtp_num_layers, hidden_size)
@@ -226,9 +226,9 @@ def test_process_mtp_e2e_tv_matches_native_alignment_and_gradient(
     hidden_actual = hidden_data.detach().clone().requires_grad_(True)
     labels = torch.zeros(batch_size, seq_len, dtype=torch.long)
     loss_mask = torch.ones(batch_size, seq_len)
-    input_mask = (
-        torch.tensor([[True, False, True, True, True, True]]) if masked_conditioning else None
-    )
+    input_mask = torch.ones_like(labels, dtype=torch.bool) if masked_conditioning else None
+    if input_mask is not None:
+        input_mask[:, 1] = False
     main_output = (
         hidden_data[:seq_len].flip(0).clone().requires_grad_(True) if separate_main_output else None
     )

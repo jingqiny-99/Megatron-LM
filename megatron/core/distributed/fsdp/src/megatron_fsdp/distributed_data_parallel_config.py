@@ -232,6 +232,31 @@ class DistributedDataParallelConfig:
     Only effective with ``outer_dp_sharding_strategy='optim'``.
     """
 
+    megatron_fsdp_accumulate_main_grad: bool = False
+    """If true, Megatron-FSDP accumulates every backward use of a parameter into the
+      parameter's unsharded gradient bucket. By default a parameter whose gradients are
+      sharded (``optim_grads`` / ``optim_grads_params`` over more than one rank) is marked
+      ``overwrite_main_grad`` at every unshard, so a fused weight-gradient kernel (Transformer
+      Engine ``fuse_wgrad_accumulation``) writes each use's gradient over the bucket and a
+      parameter used several times per microbatch keeps the gradient of its last-computed use
+      only. With this flag the bucket is zeroed on its first fetch after each allocation, every
+      use adds into it, and the reduce-scatter sends the sum. Single-use parameters get the
+      same gradients.
+    """
+
+    megatron_fsdp_reduce_scatter_per_use: bool = False
+    """If true, Megatron-FSDP reduce-scatters a sharded gradient bucket after every backward
+      use of its FSDP unit, adding each use's reduced shard into the sharded main gradient, and
+      frees the unsharded bucket before the next use. In accumulate mode alone a parameter used
+      several times per microbatch keeps its unsharded bucket from its first backward use to
+      its last; with this flag only the buckets of the units in backward (and of the queued
+      reduce-scatters) are alive. Costs one reduce-scatter per use instead of one per
+      microbatch. The DP-Outer reduction (HSDP / HFSDP) still runs once per step. Requires
+      ``megatron_fsdp_accumulate_main_grad``, a gradient-sharding strategy and no persistent
+      communication buffers; every data-parallel rank must run the same FSDP units in the same
+      order.
+    """
+
     def __post_init__(self):
         import os
 
@@ -276,3 +301,24 @@ class DistributedDataParallelConfig:
                 "fsdp_buffer_count may only be changed from its default of 2 when "
                 "fsdp_double_buffer is enabled."
             )
+
+        if self.megatron_fsdp_reduce_scatter_per_use:
+            problems = []
+            if not self.megatron_fsdp_accumulate_main_grad:
+                problems.append("megatron_fsdp_accumulate_main_grad")
+            if not {
+                self.data_parallel_sharding_strategy,
+                self.expert_data_parallel_sharding_strategy,
+            } & {"optim_grads", "optim_grads_params"}:
+                problems.append("a gradient-sharding strategy (optim_grads or optim_grads_params)")
+            if self.fsdp_double_buffer:
+                problems.append(
+                    "no persistent communication buffers (fsdp_double_buffer / nccl_ub / "
+                    "megatron_fsdp_max_pool_double_buffer)"
+                )
+            if problems:
+                raise ValueError(
+                    "[Megatron-FSDP] megatron_fsdp_reduce_scatter_per_use requires "
+                    + "; ".join(problems)
+                    + "."
+                )

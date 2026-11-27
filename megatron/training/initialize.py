@@ -484,6 +484,8 @@ def _initialize_distributed(
                     "Set both --gtp_remat-weight-remat-size and "
                     "--expert-generalized-tensor-parallel-remat-size to 1 to disable GTP."
                 )
+            from megatron.training.loop_param_store_setup import loop_param_store_grid_size
+
             # Dense grid: world_size must be divisible by
             # TP * PP * (runtime_CP / gtp_remat_num_sequence_shards) * GTP_remat.
             # Expert grid: world_size must be divisible by ETP * EP * PP * EGTP_remat.
@@ -493,7 +495,9 @@ def _initialize_distributed(
                 model_config.virtual_pipeline_model_parallel_size,
                 pipeline_model_parallel_comm_backend=model_config.pipeline_model_parallel_comm_backend,
                 use_sharp=cfg.dist.use_sharp,
-                gtp_remat_size=model_config.gtp_weight_remat_size,
+                gtp_remat_size=loop_param_store_grid_size(
+                    args, gtp_weight_remat_size=model_config.gtp_weight_remat_size
+                ),
                 expert_gtp_remat_size=model_config.expert_gtp_weight_remat_size,
                 gtp_remat_num_sequence_shards=model_config.gtp_remat_num_sequence_shards,
                 context_parallel_size=model_config.context_parallel_size,

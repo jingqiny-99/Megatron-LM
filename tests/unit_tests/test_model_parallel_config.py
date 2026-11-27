@@ -6,7 +6,7 @@ import pytest
 import torch
 
 import megatron.core.transformer.transformer_config as transformer_config_module
-from megatron.core.model_parallel_config import ModelParallelConfig
+from megatron.core.model_parallel_config import ModelParallelConfig, normalize_gtp_nccl_ub
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.training.arguments import parse_args, validate_args
 

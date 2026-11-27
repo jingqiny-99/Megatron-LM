@@ -51,6 +51,7 @@ def cpu_checkpoint_rng(monkeypatch):
     monkeypatch.setattr(tensor_parallel.random, "_set_all_rng_states", torch.set_rng_state)
 
 
+@pytest.mark.parametrize("hybrid_depths", [None, 7], ids=["gpt", "hybrid-DE7"])
 @pytest.mark.parametrize(
     "components", [[LATENT_KV], [SPARSE_ATTENTION_INDEX], BOTH_SHARED_COMPONENTS]
 )
@@ -61,6 +62,7 @@ def cpu_checkpoint_rng(monkeypatch):
 def test_full_checkpoint_preserves_sharing_gradients_and_replay_depths(
     monkeypatch,
     cpu_checkpoint_rng,
+    hybrid_depths,
     components,
     source_has_lengths,
     carrier,
@@ -73,9 +75,10 @@ def test_full_checkpoint_preserves_sharing_gradients_and_replay_depths(
     publishes again, consumers read the source's tensors.
     """
     monkeypatch.setattr(dsa_module, "build_module", lambda *_a, **_k: nn.Identity())
+    depth_count = hybrid_depths or 2
     config = _make_config(
         num_layers=3,
-        mtp_num_layers=2,
+        mtp_num_layers=depth_count,
         mtp_repeated_layer_shared_components=components,
         recompute_granularity="full",
         recompute_method=recompute_method,
@@ -93,7 +96,7 @@ def test_full_checkpoint_preserves_sharing_gradients_and_replay_depths(
     mask = torch.zeros(1) if carrier == "mask" else None
     packed = SimpleNamespace() if carrier == "packed" else None
     weight = nn.Parameter(torch.tensor(1.25))
-    inputs = [torch.randn(4, 1, 3, requires_grad=True) for _ in range(2)]
+    inputs = [torch.randn(4, 1, 3, requires_grad=True) for _ in range(depth_count)]
     decoder_inputs = [torch.randn_like(value) for value in inputs]
     seen = {True: [], False: []}
 
@@ -122,19 +125,22 @@ def test_full_checkpoint_preserves_sharing_gradients_and_replay_depths(
                 result = result + 3 * payload.latent_kv_by_layer[core.layer_number]
         return result + topk.sum().to(result.dtype)
 
+    attention = SimpleNamespace(self_attention=SimpleNamespace(core_attention=core))
     layer = SimpleNamespace(
         config=config,
         tp_group=None,  # read by precision_aware_checkpoint (#7709)
         mtp_layer_pattern=None,
-        is_hybrid_mtp=False,
-        mtp_model_layer=SimpleNamespace(self_attention=SimpleNamespace(core_attention=core)),
+        is_hybrid_mtp=hybrid_depths is not None,
+        mtp_model_layer=(
+            SimpleNamespace(layers=[attention, nn.Identity()]) if hybrid_depths else attention
+        ),
         _proj_and_transformer_layer=projected_forward,
     )
     outputs = []
     # The decoder's source layer published its top-k once for this forward.
     ordinary = dsa_module.get_dsa_index_sharing_payload(packed, mask, config)
     ordinary.topk_by_layer[core.source_layer] = torch.zeros(4, dtype=torch.int64)
-    for depth in range(2):
+    for depth in range(depth_count):
         with mtp_repeated_depth_scope(core.layer_number, depth):
             outputs.append(
                 MultiTokenPredictionLayer._checkpointed_forward(
@@ -153,23 +159,21 @@ def test_full_checkpoint_preserves_sharing_gradients_and_replay_depths(
         assert exported[0].grad_fn is not None
     # The backward replays run after the MTP block has left the depth scopes.
     assert mtp_repeated_depth(core.layer_number) is None
-    loss = outputs[1].sum() if consumer_only else sum(value.sum() for value in outputs)
+    loss = sum(value.sum() for value in (outputs[1:] if consumer_only else outputs))
     loss.backward()
 
     reference_weight = nn.Parameter(weight.detach().clone())
     reference_inputs = [value.detach().clone().requires_grad_(True) for value in inputs]
     combined = reference_inputs[0] + decoder_inputs[0]
     consumer_topk_sum = 0
-    expected_outputs = [
-        combined.square(),
-        reference_inputs[1] + decoder_inputs[1] + consumer_topk_sum,
-    ]
-    if LATENT_KV in components:
-        expected_outputs[1] = expected_outputs[1] + 3 * combined * reference_weight
-    expected_loss = (
-        expected_outputs[1].sum()
-        if consumer_only
-        else sum(value.sum() for value in expected_outputs)
+    expected_outputs = [combined.square()]
+    for depth in range(1, depth_count):
+        result = reference_inputs[depth] + decoder_inputs[depth] + consumer_topk_sum
+        if LATENT_KV in components:
+            result = result + 3 * combined * reference_weight
+        expected_outputs.append(result)
+    expected_loss = sum(
+        value.sum() for value in (expected_outputs[1:] if consumer_only else expected_outputs)
     )
     expected_loss.backward()
     for actual, expected in zip(outputs, expected_outputs):
@@ -184,7 +188,9 @@ def test_full_checkpoint_preserves_sharing_gradients_and_replay_depths(
     else:
         assert weight.grad is None
     assert all(torch.equal(indices, torch.zeros(4, dtype=torch.int64)) for indices in seen[True])
-    assert len(seen[False]) == (2 if recompute_method == "uniform" else 1)
+    assert len(seen[False]) == (depth_count - 1) * (
+        2 if hybrid_depths or recompute_method == "uniform" else 1
+    )
     assert all(torch.equal(indices, torch.zeros(4, dtype=torch.int64)) for indices in seen[False])
     assert mtp_repeated_depth(core.layer_number) is None
 
@@ -521,5 +527,110 @@ def test_real_mtp_block_full_recompute_replays_computing_indexer_loss(monkeypatc
             assert torch.isfinite(parameter.grad).all()
             assert parameter.grad.float().norm() > 0
         indexer_hook.remove()
+    finally:
+        Utils.destroy_model_parallel()
+
+
+@pytest.mark.launch_on_gb200
+def test_hybrid_seven_depths_share_dsa_and_preserve_gradients():
+    """Seven uses of one /DE with native CP2. Compare selective and whole-depth replay."""
+    from megatron.core.models.hybrid.hybrid_layer_specs import hybrid_stack_spec
+    from megatron.core.process_groups_config import ProcessGroupCollection
+    from megatron.core import parallel_state
+
+    if Utils.world_size < 2:
+        pytest.skip("The hybrid shared-MTP gate needs CP2")
+    Utils.initialize_model_parallel(tensor_model_parallel_size=1, context_parallel_size=2)
+    try:
+        model_parallel_cuda_manual_seed(8309)
+        pg = ProcessGroupCollection.use_mpu_process_groups()
+        submodules = hybrid_stack_spec.submodules
+        models = []
+        for recompute in ("selective", "full"):
+            checkpoint_args = (
+                dict(recompute_modules=["layernorm"])
+                if recompute == "selective"
+                else dict(recompute_method="uniform", recompute_num_layers=1)
+            )
+            config = _make_config(
+                mtp_num_layers=7,
+                mtp_detach_heads=True,
+                mtp_loss_type="e2e_tv",
+                mtp_repeated_layer_shared_components=BOTH_SHARED_COMPONENTS,
+                context_parallel_size=2,
+                cp_comm_type="all_gather",
+                dsa_indexer_topk_freq=1,
+                dsa_indexer_skip_topk_offset=0,
+                num_moe_experts=4,
+                moe_router_topk=2,
+                moe_ffn_hidden_size=128,
+                ffn_hidden_size=128,
+                moe_grouped_gemm=True,
+                recompute_granularity=recompute,
+                **checkpoint_args,
+            )
+            model = (
+                MultiTokenPredictionBlock(
+                    config=config,
+                    spec=submodules.mtp_block_spec,
+                    pg_collection=pg,
+                    mtp_layer_pattern="DE",
+                    mtp_num_depths=7,
+                    hybrid_submodules=submodules,
+                )
+                .bfloat16()
+                .cuda()
+            )
+            assert len(model.layers) == 1 and len(model.layers[0].mtp_model_layer.layers) == 2
+            models.append(model)
+        models[1].load_state_dict(models[0].state_dict(), strict=True)
+        torch.manual_seed(8612)
+        embedding = nn.Embedding(64, config.hidden_size, device="cuda", dtype=torch.bfloat16)
+        # CP's first chunk in sequence order and its mirrored partner.
+        rank = parallel_state.get_context_parallel_rank()
+        positions = torch.arange(32, device="cuda").reshape(4, 8)[[rank, 3 - rank]].reshape(1, 16)
+        trunk_input = torch.randn(16, 1, config.hidden_size, dtype=torch.bfloat16, device="cuda")
+        outputs = []
+        for model in models:
+            trunk = trunk_input.detach().requires_grad_()
+            attention = model.layers[0].mtp_model_layer.layers[0].self_attention
+            kv_calls, index_calls = [], []
+            kv_hook = attention.linear_kv_down_proj.register_forward_pre_hook(
+                lambda *_: kv_calls.append(torch.is_grad_enabled())
+            )
+            ind_hook = attention.core_attention.indexer.linear_wq_b.register_forward_pre_hook(
+                lambda *_: index_calls.append(torch.is_grad_enabled())
+            )
+            result = model(
+                input_ids=positions,
+                position_ids=positions,
+                hidden_states=trunk,
+                attention_mask=None,
+                embedding=lambda input_ids, position_ids: embedding(input_ids)
+                .transpose(0, 1)
+                .contiguous(),
+            )
+            assert len(kv_calls) == len(index_calls) == 1
+            # Train only from the six consumers. The source's key producer still receives a gradient.
+            result[2 * trunk.size(0) :].float().square().sum().backward()
+            assert embedding.weight.grad is None and (
+                trunk.grad is None or torch.count_nonzero(trunk.grad) == 0
+            )
+            grad = attention.linear_kv_down_proj.weight.grad
+            assert grad is not None and torch.isfinite(grad).all() and grad.float().norm() > 0
+            expected_calls = 2 if model.config.recompute_granularity == "full" else 1
+            assert len(kv_calls) == len(index_calls) == expected_calls
+            kv_hook.remove()
+            ind_hook.remove()
+            outputs.append(result.detach())
+        torch.testing.assert_close(outputs[1], outputs[0], atol=0.025, rtol=0.025)
+        for (name, left), (_, right) in zip(
+            models[0].named_parameters(), models[1].named_parameters()
+        ):
+            assert (left.grad is None) == (right.grad is None), name
+            if left.grad is not None:
+                torch.testing.assert_close(
+                    left.grad.float(), right.grad.float(), atol=0.05, rtol=0.03, msg=name
+                )
     finally:
         Utils.destroy_model_parallel()

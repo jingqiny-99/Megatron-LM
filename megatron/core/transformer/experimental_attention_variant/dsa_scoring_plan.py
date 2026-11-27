@@ -33,6 +33,9 @@ class IndexerScoringPlan(Enum):
     PLAIN_CAUSAL = "plain_causal"
     """Whole-sequence causal bounds. Reconstructible, so the single-kernel scorer runs."""
 
+    SBHD_ZIGZAG_SEGMENTS = "sbhd_zigzag_segments"
+    """Canonical nonpacked CP queries, scored against their two global causal prefixes."""
+
     PACKED_SINGLE_SEGMENTS = "packed_single_segments"
     """One sequence per pack, scored as one or more causal query/key segments."""
 
@@ -42,7 +45,7 @@ class IndexerScoringPlan(Enum):
     UNFUSED_BOUNDS = "unfused_bounds"
     """Valid row bounds exist, but no fused executor currently claims the layout.
 
-    Current cases are non-packed context parallelism, non-causal or otherwise
+    Current cases are non-canonical or unsupported non-packed CP, non-causal or otherwise
     non-reconstructible bounds, and packed causal layouts for which neither the segment
     specialization nor compatible general-THD metadata is available. This set can shrink
     as fused scorer coverage expands; scoring currently falls back to the per-head loop.
@@ -61,6 +64,7 @@ class IndexerScoringPlan(Enum):
         """Whether this plan reaches a fused scoring kernel."""
         return self in (
             IndexerScoringPlan.PLAIN_CAUSAL,
+            IndexerScoringPlan.SBHD_ZIGZAG_SEGMENTS,
             IndexerScoringPlan.PACKED_SINGLE_SEGMENTS,
             IndexerScoringPlan.PACKED_THD_GENERAL,
         )
@@ -94,6 +98,7 @@ def resolve_indexer_scoring_plan(
     single_sequence_pack: bool,
     packed_metadata_available: bool,
     segment_kernel_applicable: bool = True,
+    sbhd_cp_zigzag: bool = False,
 ) -> IndexerScoringDecision:
     """Resolve how indexer scoring should run for one attention call.
 
@@ -113,6 +118,8 @@ def resolve_indexer_scoring_plan(
         single_sequence_pack: This microbatch's pack holds exactly one sequence. This is
             the only input here that varies batch to batch.
         packed_metadata_available: ``cu_seqlens`` and max-seqlen metadata are present.
+        sbhd_cp_zigzag: The caller established canonical two-chunk SBHD query positions
+            and gathered keys in global sequence order.
         segment_kernel_applicable: The single-sequence segment kernel's structural
             preconditions hold for this call. It raises rather than declining when they
             do not, so the plan must not promise it.
@@ -132,6 +139,18 @@ def resolve_indexer_scoring_plan(
     if varlen_is_plain_causal and not packed_thd and cp_size == 1:
         return IndexerScoringDecision(
             IndexerScoringPlan.PLAIN_CAUSAL, "whole-sequence causal bounds are reconstructible"
+        )
+
+    if (
+        sbhd_cp_zigzag
+        and not packed_thd
+        and cp_size > 1
+        and mask_is_causal
+        and segment_kernel_applicable
+    ):
+        return IndexerScoringDecision(
+            IndexerScoringPlan.SBHD_ZIGZAG_SEGMENTS,
+            "SBHD zigzag queries with canonical gathered keys and causal prefixes",
         )
 
     if packed_thd and mask_is_causal:
@@ -167,7 +186,7 @@ def resolve_indexer_scoring_plan(
     if not packed_thd and cp_size > 1:
         return IndexerScoringDecision(
             IndexerScoringPlan.UNFUSED_BOUNDS,
-            "context parallelism without sequence packing has no fused scoring path",
+            "context parallelism without sequence packing requires proven zigzag geometry",
         )
     if not mask_is_causal:
         return IndexerScoringDecision(

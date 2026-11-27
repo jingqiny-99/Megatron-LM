@@ -480,6 +480,7 @@ def run_fused_dsa_attention(
     key_positions: Optional[Tensor],
     query_valid_rows: Optional[Tensor],
     varlen_is_plain_causal: bool = False,
+    sbhd_cp_zigzag: bool = False,
     use_relu: bool,
     use_local_indexer_varlen: bool = False,
     single_packed_thd_sequence: bool = False,
@@ -564,6 +565,9 @@ def run_fused_dsa_attention(
             "packed_cp_size": cp_size,
         }
 
+    if sbhd_cp_zigzag and packed_seq_params is None:
+        packed_thd_kwargs.update(packed_cp_size=cp_size, sbhd_cp_zigzag=True)
+
     output, indexer_loss = fused_indexer_sparse_attn(
         query.contiguous(),
         kv_full,
@@ -637,11 +641,11 @@ def _get_topk_alignment() -> int:
 
 
 def _get_score_recompute_topk_alignment() -> int:
-    """Minimum top-K alignment required by cuDNN sparse score recompute."""
+    """Physical top-K multiple compatible with cuDNN's sparse attention target kernel."""
     sm = _current_sm()
-    if sm[0] >= 10:
-        return 64
     if sm[0] >= 9:
+        # SM100's noncompact teacher uses 128-wide tiles for head dim 512/576.
+        # This also satisfies its 64-wide compact variants and the SM90 tile.
         return 128
     raise RuntimeError(f"cudnn fused DSA requires SM90+ (Hopper or later), got SM{sm[0]}{sm[1]}.")
 
@@ -1442,19 +1446,19 @@ def _indexer_topk_from_score_chunks(
     key_positions_i64: Optional[Tensor] = None,
     indexer_ratio: int = _INDEXER_RATIO,
     score_seq_lens: Optional[Tensor] = None,
-    bottom_right_key_start: Optional[int] = None,
+    query_causal_start: Optional[int] = None,
     deterministic: bool = False,
     topk_backend: str = "cudnn",
     topk_scratch_bytes: Optional[int] = None,
 ) -> Tuple[Tensor, Optional[Tensor]]:
     b, sq, _idx_nh, _idx_hd = q_bshd.shape
     sk = k_bshd.size(1)
-    if bottom_right_key_start is not None:
-        if bottom_right_key_start < 0:
-            raise RuntimeError("cuDNN DSA bottom-right key start must be non-negative.")
+    if query_causal_start is not None:
+        if query_causal_start < 0:
+            raise RuntimeError("cuDNN DSA query causal start must be non-negative.")
         if score_seq_lens is not None:
             raise RuntimeError(
-                "cuDNN DSA score chunks cannot combine bottom-right key cropping "
+                "cuDNN DSA score chunks cannot combine a causal query offset "
                 "with explicit score sequence lengths."
             )
     chunk_rows = _indexer_score_chunk_rows(b, sq, sk)
@@ -1472,14 +1476,14 @@ def _indexer_topk_from_score_chunks(
         score_k_bshd = k_bshd
         score_sk = sk
         chunk_topk_k = topk_k
-        if bottom_right_key_start is not None:
-            score_sk = min(sk, bottom_right_key_start + row_end)
+        if query_causal_start is not None:
+            score_sk = min(sk, query_causal_start + row_end)
             score_k_bshd = k_bshd[:, :score_sk].contiguous()
             chunk_topk_k = min(topk_k, score_sk)
         score_chunk_seq_lens = (
             None if score_seq_lens is None else score_seq_lens[row_start:row_end].contiguous()
         )
-        if bottom_right_key_start is not None:
+        if query_causal_start is not None:
             scores_chunk = _indexer_forward_bshd_bottom_right(
                 q_chunk, score_k_bshd, w_chunk, ratio=indexer_ratio
             )
@@ -2514,7 +2518,7 @@ def _packed_thd_score_column_limits(
     return torch.where(rows < cu_q[-1], limits, torch.zeros_like(limits))
 
 
-def _indexer_topk_single_packed_cp_segments(
+def _indexer_topk_single_sequence_segments(
     q_bshd: Tensor,
     k_bshd: Tensor,
     w_bsh: Tensor,
@@ -2528,7 +2532,7 @@ def _indexer_topk_single_packed_cp_segments(
     topk_backend: str = "cudnn",
     topk_scratch_bytes: Optional[int] = None,
 ) -> Tuple[Tensor, Optional[Tensor]]:
-    """Fast cuDNN top-k for one packed THD sequence split into CP front/back slices."""
+    """Fast cuDNN top-k for one sequence whose CP queries own the front/back slices."""
     b, sq, _idx_nh, _idx_hd = q_bshd.shape
     sk = k_bshd.size(1)
     local_query_len = local_packed_cp_query_len if local_packed_cp_query_len is not None else sq
@@ -2547,7 +2551,7 @@ def _indexer_topk_single_packed_cp_segments(
         local_packed_cp_query_start,
     ):
         raise RuntimeError(
-            "single packed THD segment scorer received incompatible CP/query/key geometry"
+            "single-sequence segment scorer received incompatible CP/query/key geometry"
         )
 
     half = local_query_len // 2
@@ -2572,7 +2576,7 @@ def _indexer_topk_single_packed_cp_segments(
         row_end = row_end_global - local_query_start
         if key_end <= 0 or key_end > sk:
             raise RuntimeError(
-                "single packed THD segment scorer derived invalid key prefix: "
+                "single-sequence segment scorer derived invalid key prefix: "
                 f"key_end={key_end}, sk={sk}, cp_rank={local_packed_cp_rank}, sq={sq}"
             )
         segment_topk = min(topk_k, key_end)
@@ -2585,8 +2589,8 @@ def _indexer_topk_single_packed_cp_segments(
             dtype=torch.int32,
             device=q_bshd.device,
         )
-        # Crop each score chunk's key prefix so cuDNN bottom-right masking matches
-        # these absolute row lengths without materializing scores in PyTorch.
+        # The cropped key prefix starts at global key zero. Each score chunk
+        # passes its absolute query origin to the cuDNN causal mask.
         topk_indices, topk_scores = _indexer_topk_from_score_chunks(
             q_bshd[:, row_start:row_end].contiguous(),
             k_bshd[:, :key_end].contiguous(),
@@ -2594,7 +2598,7 @@ def _indexer_topk_single_packed_cp_segments(
             seq_lens,
             segment_topk,
             return_topk_scores,
-            bottom_right_key_start=key_start + rel_start,
+            query_causal_start=key_start + rel_start,
             deterministic=deterministic,
             topk_backend=topk_backend,
             topk_scratch_bytes=topk_scratch_bytes,
@@ -2606,7 +2610,7 @@ def _indexer_topk_single_packed_cp_segments(
 
     if not indices_chunks:
         raise RuntimeError(
-            "single packed THD segment scorer query slice did not intersect any segment"
+            "single-sequence segment scorer query slice did not intersect any segment"
         )
 
     return (
@@ -3031,7 +3035,7 @@ def _segment_kernel_applicable(
     cp_rank: int,
     local_packed_cp_query_start: int,
 ) -> bool:
-    """Whether ``_indexer_topk_single_packed_cp_segments`` can take this shape.
+    """Whether ``_indexer_topk_single_sequence_segments`` can take this shape.
 
     That kernel raises rather than returning None when its preconditions fail, so the
     scoring plan has to ask before promising it. Kept next to the kernel so the two
@@ -3075,6 +3079,7 @@ def _resolve_scoring_plan_for_call(
     packed_metadata_available: bool,
     explicit_key_positions: bool,
     segment_kernel_applicable: bool = True,
+    sbhd_cp_zigzag: bool = False,
 ) -> IndexerScoringDecision:
     """Map this call's layout facts onto a scoring plan.
 
@@ -3102,6 +3107,7 @@ def _resolve_scoring_plan_for_call(
         single_sequence_pack=single_packed_thd_sequence,
         packed_metadata_available=packed_metadata_available,
         segment_kernel_applicable=segment_kernel_applicable,
+        sbhd_cp_zigzag=sbhd_cp_zigzag and starts is not None and ends is not None,
     )
 
 
@@ -3128,6 +3134,7 @@ def _indexer_topk_bshd(
     varlen_is_plain_causal: bool = False,
     deterministic: bool = False,
     scorer_options: Optional[IndexerScorerOptions] = None,
+    sbhd_cp_zigzag: bool = False,
 ) -> Tuple[Tensor, Tensor, Optional[Tensor]]:
     """BSHD-layout indexer scoring and top-K selection.
 
@@ -3204,6 +3211,7 @@ def _indexer_topk_bshd(
         ),
         starts=starts,
         ends=ends,
+        sbhd_cp_zigzag=sbhd_cp_zigzag,
         varlen_is_plain_causal=varlen_is_plain_causal,
         packed_thd=use_local_indexer_varlen or packed_cu_seqlens_q is not None,
         cp_size=packed_cp_size,
@@ -3212,17 +3220,28 @@ def _indexer_topk_bshd(
         single_packed_thd_sequence=single_packed_thd_sequence,
         packed_metadata_available=packed_metadata_available,
     )
-    if (
-        scorer_options is not None
-        and scorer_options.precision == "mxfp8"
+    # One SBHD sequence is split into two mirror-image chunks on each CP
+    # rank. Its global boundaries are exactly those of a one-document pack.
+    packed_scorer = scorer_options is not None and scorer_options.precision == "mxfp8"
+    if packed_scorer and scoring_plan.plan is IndexerScoringPlan.SBHD_ZIGZAG_SEGMENTS:
+        assert b == 1 and sk == sq * packed_cp_size
+        # Keep the metadata on device during CUDA graph capture.
+        packed_cu_seqlens_q = packed_cu_seqlens_k = torch.arange(
+            2, dtype=torch.int32, device=device
+        ).mul_(sk)
+        packed_max_seqlen_q = packed_max_seqlen_k = sk
+        scoring_plan = IndexerScoringDecision(
+            IndexerScoringPlan.PACKED_THD_GENERAL,
+            "one SBHD sequence in canonical zigzag CP order",
+        )
+    elif (
+        packed_scorer
         and scoring_plan.plan is IndexerScoringPlan.PACKED_SINGLE_SEGMENTS
         and packed_metadata_available
     ):
-        # Only the general THD scorer runs in MXFP8. A one-sequence pack is an ordinary
-        # general-THD layout, so score it there instead of rejecting the request.
         scoring_plan = IndexerScoringDecision(
             IndexerScoringPlan.PACKED_THD_GENERAL,
-            "single-sequence pack scored by the general packed THD scorer for MXFP8",
+            "single-sequence pack scored by the general THD scorer",
         )
     if (
         scoring_plan.plan is IndexerScoringPlan.PACKED_THD_GENERAL
@@ -3231,7 +3250,7 @@ def _indexer_topk_bshd(
     ):
         scoring_plan = IndexerScoringDecision(
             IndexerScoringPlan.UNFUSED_BOUNDS,
-            "cuDNN indexer_forward_wrapper lacks q_causal_offsets required for CP>1 packed THD",
+            "cuDNN indexer_forward_wrapper lacks q_causal_offsets required for causal query segments",
         )
     plan = scoring_plan.plan
     report_unfused_scoring_once(scoring_plan, "indexer scoring")
@@ -3264,8 +3283,11 @@ def _indexer_topk_bshd(
             scores = _indexer_forward_bshd_bottom_right(q_bshd, k_bshd, w_bsh, ratio=_INDEXER_RATIO)
     else:
         seq_lens = ends.clamp(max=sk).to(torch.int32).repeat(b)
-        if not return_scores and plan is IndexerScoringPlan.PACKED_SINGLE_SEGMENTS:
-            topk_indices, topk_scores = _indexer_topk_single_packed_cp_segments(
+        if not return_scores and plan in (
+            IndexerScoringPlan.SBHD_ZIGZAG_SEGMENTS,
+            IndexerScoringPlan.PACKED_SINGLE_SEGMENTS,
+        ):
+            topk_indices, topk_scores = _indexer_topk_single_sequence_segments(
                 q_bshd,
                 k_bshd,
                 w_bsh,
@@ -3462,7 +3484,8 @@ def _sbhd_to_bshd_indexer_inputs(
     """Permute the indexer inputs SBHD→BSHD once."""
     q_bshd = q_indexer.permute(1, 0, 2, 3).contiguous()
     k_bsd = k_indexer.permute(1, 0, 2).contiguous()
-    w_bsh = weights.permute(1, 0, 2).contiguous()
+    # cuDNN BF16 scoring requires matching weights even with the logits-only hook.
+    w_bsh = weights.permute(1, 0, 2).to(dtype=q_indexer.dtype).contiguous()
     return q_bshd, k_bsd, w_bsh
 
 
@@ -3487,6 +3510,7 @@ def run_fused_qk_topk(
     packed_thd_single_sequence: Optional[bool] = None,
     deterministic: bool = False,
     config: Optional["TransformerConfig"] = None,
+    sbhd_cp_zigzag: bool = False,
 ) -> Optional[Tuple[Tensor, Tensor]]:
     """Run the cuDNN fused indexer and return top-k indices for split DSA."""
     use_local_indexer_varlen, single_packed_thd_sequence = _resolve_packed_layout_flags(
@@ -3536,6 +3560,7 @@ def run_fused_qk_topk(
         varlen_is_plain_causal=varlen_is_plain_causal,
         deterministic=deterministic,
         scorer_options=_scorer_options_from_config(config),
+        sbhd_cp_zigzag=sbhd_cp_zigzag and packed_seq_params is None,
     )
     return topk_indices, topk_length
 
@@ -3983,6 +4008,7 @@ def run_fused_qk_topk_with_loss(
     packed_thd_causal_identity_layout: Optional[bool] = None,
     packed_thd_single_sequence: Optional[bool] = None,
     deterministic: bool = False,
+    sbhd_cp_zigzag: bool = False,
 ) -> Optional[Tuple[Tensor, Tensor, Tensor]]:
     """Run cuDNN fused indexer and sparse indexer loss for split DSA."""
     use_local_indexer_varlen, single_packed_thd_sequence = _resolve_packed_layout_flags(
@@ -4060,6 +4086,7 @@ def run_fused_qk_topk_with_loss(
             or torch.are_deterministic_algorithms_enabled()
         ),
         _scorer_options_from_config(config),
+        sbhd_cp_zigzag and packed_seq_params is None,
     )
 
 
@@ -4098,6 +4125,7 @@ def run_fused_qk_topk_with_scores(
     packed_seq_params: Optional["PackedSeqParams"] = None,
     cp_size: int = 1,
     varlen_is_plain_causal: bool = False,
+    sbhd_cp_zigzag: bool = False,
     packed_thd_causal_identity_layout: Optional[bool] = None,
     packed_thd_single_sequence: Optional[bool] = None,
     deterministic: bool = False,
@@ -4162,6 +4190,7 @@ def run_fused_qk_topk_with_scores(
         packed_max_seqlen_k=packed_max_seqlen_k,
         packed_cp_size=cp_size,
         varlen_is_plain_causal=varlen_is_plain_causal,
+        sbhd_cp_zigzag=sbhd_cp_zigzag and packed_seq_params is None,
         deterministic=deterministic,
         scorer_options=_scorer_options_from_config(config),
     )
@@ -5235,6 +5264,7 @@ class FusedIndexerSparseAttnFunc(torch.autograd.Function):
         packed_cp_size: int,
         tp_group,
         scorer_options: Optional[IndexerScorerOptions] = None,
+        sbhd_cp_zigzag: bool = False,
     ) -> Tuple[Tensor, Tensor]:
         """Fused forward: indexer scoring, sparse attention, KL loss, and indexer backward."""
         _ensure_dsa_namespace()
@@ -5273,6 +5303,7 @@ class FusedIndexerSparseAttnFunc(torch.autograd.Function):
             packed_max_seqlen_k=packed_max_seqlen_k,
             packed_cp_size=packed_cp_size,
             scorer_options=scorer_options,
+            sbhd_cp_zigzag=sbhd_cp_zigzag,
         )
 
         prepared_topk_length = (
@@ -5452,7 +5483,7 @@ class FusedIndexerSparseAttnFunc(torch.autograd.Function):
         #   local_packed_cp_rank, local_packed_cp_query_start,
         #   local_packed_cp_query_len, packed_cu_seqlens_q, packed_cu_seqlens_k,
         #   packed_max_seqlen_q, packed_max_seqlen_k, packed_cp_size, tp_group,
-        #   scorer_options.
+        #   scorer_options, sbhd_cp_zigzag.
         return (
             grad_query,
             grad_kv_full,
@@ -5481,6 +5512,7 @@ class FusedIndexerSparseAttnFunc(torch.autograd.Function):
             None,
             None,
             None,
+            None,  # sbhd_cp_zigzag
         )
 
 
@@ -5517,6 +5549,7 @@ class FusedQKTopKWithSparseLossFunc(torch.autograd.Function):
         varlen_is_plain_causal: bool = False,
         deterministic: bool = False,
         scorer_options: Optional[IndexerScorerOptions] = None,
+        sbhd_cp_zigzag: bool = False,
     ) -> Tuple[Tensor, Tensor, Tensor]:
         """Compute shared attention top-k metadata and sparse indexer loss."""
         _ensure_dsa_namespace()
@@ -5550,6 +5583,7 @@ class FusedQKTopKWithSparseLossFunc(torch.autograd.Function):
             varlen_is_plain_causal=varlen_is_plain_causal,
             deterministic=deterministic,
             scorer_options=scorer_options,
+            sbhd_cp_zigzag=sbhd_cp_zigzag,
         )
 
         if indexer_score_payload is None:
@@ -5612,7 +5646,7 @@ class FusedQKTopKWithSparseLossFunc(torch.autograd.Function):
         #   local_packed_cp_query_start, local_packed_cp_query_len,
         #   packed_cu_seqlens_q, packed_cu_seqlens_k, packed_max_seqlen_q,
         #   packed_max_seqlen_k, packed_cp_size, tp_group,
-        #   varlen_is_plain_causal, deterministic, scorer_options.
+        #   varlen_is_plain_causal, deterministic, scorer_options, sbhd_cp_zigzag.
         gradients = (
             grad_q_indexer,
             grad_k_indexer,
@@ -5641,6 +5675,7 @@ class FusedQKTopKWithSparseLossFunc(torch.autograd.Function):
             None,  # varlen_is_plain_causal
             None,  # deterministic
             None,  # scorer_options
+            None,  # sbhd_cp_zigzag
         )
         return gradients[: ctx.num_inputs]
 
@@ -6301,6 +6336,7 @@ def fused_indexer_sparse_attn(
     packed_cp_size: int = 1,
     tp_group=None,
     scorer_options: Optional[IndexerScorerOptions] = None,
+    sbhd_cp_zigzag: bool = False,
 ) -> Tuple[Tensor, Tensor]:
     """Fused DSv3.2 indexer, sparse attention, and optional indexer loss.
 
@@ -6351,6 +6387,7 @@ def fused_indexer_sparse_attn(
         packed_cp_size,
         tp_group,
         scorer_options,
+        sbhd_cp_zigzag,
     )
 
 

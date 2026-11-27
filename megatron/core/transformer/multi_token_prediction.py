@@ -44,6 +44,10 @@ from megatron.core.tensor_parallel.inference_layers import (
 )
 from megatron.core.transformer.attention_residual import AttentionResidual
 from megatron.core.transformer.enums import AttnMaskType, LayerType
+from megatron.core.transformer.experimental_attention_variant.dsa_masking import (
+    indexer_loss_padding_mask,
+    indexer_loss_padding_mask_in_scope,
+)
 from megatron.core.transformer.hyper_connection import learned_output_contract
 from megatron.core.transformer.module import MegatronModule, mark_keep_in_fp32
 from megatron.core.transformer.mtp_sequence_roll import (  # for backward compatibility; pylint: disable=unused-import
@@ -1944,10 +1948,18 @@ class MultiTokenPredictionLayer(MegatronModule):
         )
         self.is_hybrid_mtp = self.mtp_layer_config_list is not None
         if self.config.mtp_repeated_layer_shared_components and self.is_hybrid_mtp:
-            raise ValueError(
-                "mtp_repeated_layer_shared_components currently supports the GPT MTP path only, "
-                "not hybrid MTP layers."
+            from megatron.core.transformer.experimental_attention_variant.dsa_layer_config import (
+                DSALayerConfig,
             )
+            from megatron.core.transformer.moe.moe_layer_config import MoELayerConfig
+
+            if tuple(type(layer) for layer in self.mtp_layer_config_list) != (
+                DSALayerConfig,
+                MoELayerConfig,
+            ):
+                raise ValueError(
+                    "Hybrid repeated MTP sharing requires a /DE depth (one DSA and one MoE sublayer)."
+                )
         if self.is_hybrid_mtp and not self.mtp_layer_config_list:
             raise ValueError("Hybrid MTP layer config list must be non-empty")
         if self.is_hybrid_mtp and hybrid_submodules is None:
@@ -2093,6 +2105,17 @@ class MultiTokenPredictionLayer(MegatronModule):
                     shortcut_config.moe_shortcut_connection = False
                     shortcut_config.moe_shortcut_parallel = False
                     shortcut_config.moe_shortcut_post_norm = False
+            if (
+                self.config.mtp_repeated_layer_shared_components
+                and stack_config.recompute_granularity == "full"
+            ):
+                # One checkpoint encloses the entire /DE depth. Its latent-KV output is an
+                # explicit autograd edge into all six consuming depths. Nested checkpoints
+                # inside the stack would hide this edge from the source DSA backward.
+                stack_config = copy(stack_config)
+                stack_config.recompute_granularity = None
+                for layer_config in layer_config_list:
+                    layer_config.recompute_granularity = None
             self.mtp_model_layer = HybridStack(
                 config=stack_config,
                 submodules=hybrid_submodules,
@@ -2186,6 +2209,7 @@ class MultiTokenPredictionLayer(MegatronModule):
         roll_depth: int = 0,
         mtp_input_mask: Optional[Tensor] = None,
         _inputs_pre_aligned: bool = False,
+        return_rolled_padding_mask: bool = False,
     ):
         """Roll MTP inputs once and compute the next-depth token embeddings.
 
@@ -2203,7 +2227,11 @@ class MultiTokenPredictionLayer(MegatronModule):
             _inputs_pre_aligned: Internal block-to-layer contract indicating that
                 input, learned position, and padding fields already represent the
                 absolute shifted row for this depth.
+            return_rolled_padding_mask: Also return, as a seventh value, the rolled
+                full-length ``[b, s]`` padding mask before any sequence-parallel scatter
+                (None without a padding mask): the indexer-loss row mask of this depth.
         """
+        rolled_padding_mask = padding_mask
         if not _inputs_pre_aligned:
             cp_group = resolve_cp_group(self.cp_group, packed_seq_params)
 
@@ -2262,6 +2290,7 @@ class MultiTokenPredictionLayer(MegatronModule):
 
             if mtp_input_mask is not None:
                 mtp_input_mask = rolled_tensors[next_rolled_tensor].bool()
+            rolled_padding_mask = padding_mask
             if padding_mask is not None and self.config.sequence_parallel:
                 padding_mask = (
                     scatter_to_sequence_parallel_region(
@@ -2274,6 +2303,10 @@ class MultiTokenPredictionLayer(MegatronModule):
             # The block selects pre-aligned rows only without a conditioning mask, and
             # it scatters the aligned padding mask to the SP-local layout itself.
             assert mtp_input_mask is None, "Pre-aligned MTP inputs carry no conditioning mask."
+            if return_rolled_padding_mask and padding_mask is not None and padding_mask.shape != input_ids.shape:
+                rolled_padding_mask = gather_from_sequence_parallel_region(
+                    padding_mask.transpose(0, 1).contiguous(), tensor_parallel_output_grad=False, group=self.tp_group
+                ).transpose(0, 1).contiguous()
         decoder_input = embedding(input_ids=input_ids, position_ids=position_ids)
         if mtp_input_mask is not None:
             valid_decoder_input = mtp_input_mask.transpose(0, 1).unsqueeze(-1)
@@ -2294,6 +2327,16 @@ class MultiTokenPredictionLayer(MegatronModule):
         if not hidden_states.requires_grad:
             hidden_states.requires_grad_(True)
 
+        if return_rolled_padding_mask:
+            return (
+                input_ids,
+                position_ids,
+                padding_mask,
+                mtp_input_mask,
+                decoder_input,
+                hidden_states,
+                rolled_padding_mask,
+            )
         return input_ids, position_ids, padding_mask, mtp_input_mask, decoder_input, hidden_states
 
     def _get_precomputed_embeddings(self, decoder_input: torch.Tensor, hidden_states: torch.Tensor):
@@ -2395,14 +2438,25 @@ class MultiTokenPredictionLayer(MegatronModule):
         packed_seq_params_by_layout: Optional[dict[CPLayout, PackedSeqParams | None]] = None,
         cp_layout_plan: Optional[THDCPLayoutPlan] = None,
         attn_res_sources: Optional[tuple] = None,
+        indexer_padding_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """
         Concatenates embeddings with hidden states and then applies transformer layer forward.
+
+        ``indexer_padding_mask`` (``[b, s]`` bool, full length): when given, the transformer
+        layer runs inside ``indexer_loss_padding_mask`` of it (the depth's rolled padding mask,
+        so query rows whose input token is padding do not train its DSA indexer); None leaves
+        any enclosing scope as it is.
         """
         if self.config.sequence_parallel:
             rng_context = tensor_parallel.get_cuda_rng_tracker().fork()
         else:
             rng_context = nullcontext()
+        indexer_context = (
+            nullcontext()
+            if indexer_padding_mask is None
+            else indexer_loss_padding_mask(indexer_padding_mask)
+        )
 
         # Unlike transformer_block.py which needs to support mixed-precision in
         # different layers, currently MTP only uses a global quantization context.
@@ -2425,7 +2479,7 @@ class MultiTokenPredictionLayer(MegatronModule):
             # that when the transformer layer is cudagraphed, the
             # FP8GlobalStateManager.is_first_fp8_module() is True so that the fp8 weight caching
             # can be triggered correctly.
-            with transformer_layer_quantization_context:
+            with transformer_layer_quantization_context, indexer_context:
                 # Only AttnRes-enabled inner layers (a nested AttnRes HybridStack or
                 # the GPT AttnResTransformerLayer) accept the trunk depth-source
                 # tuple; plain MTP inner layers must not see the keyword.
@@ -2580,6 +2634,7 @@ class MultiTokenPredictionLayer(MegatronModule):
         sequence_len_offset: Optional[Tensor] = None,
         packed_seq_params_by_layout: Optional[dict[CPLayout, PackedSeqParams | None]] = None,
         cp_layout_plan: Optional[THDCPLayoutPlan] = None,
+        indexer_padding_mask: Optional[Tensor] = None,
     ):
         """Forward a legacy GPT MTP layer with activation recomputation.
 
@@ -2594,8 +2649,11 @@ class MultiTokenPredictionLayer(MegatronModule):
           ``outer_quantization_context`` block below.
         """
         assert (
-            not self.is_hybrid_mtp
-        ), "Hybrid MTP delegates full activation recomputation to its nested HybridStack."
+            not self.is_hybrid_mtp or self.config.mtp_repeated_layer_shared_components
+        ), "Ordinary hybrid MTP delegates full recomputation to its nested HybridStack."
+        layer_kwargs = (
+            {} if indexer_padding_mask is None else {"indexer_padding_mask": indexer_padding_mask}
+        )
 
         # Source shared tensors must leave checkpoint as outputs and enter consumers as
         # explicit inputs. Capturing only their payload would bypass checkpoint's
@@ -2604,8 +2662,13 @@ class MultiTokenPredictionLayer(MegatronModule):
         bind_sharing_carrier = nullcontext
         is_source = False
         shared_inputs = ()
+        # /DE puts the repeated DSA in the first physical sublayer. Its physical index is
+        # trunk_depth + 1, just as in a GPT MTP layer. The second sublayer runs its own MoE.
+        attention_layer = (
+            self.mtp_model_layer.layers[0] if self.is_hybrid_mtp else self.mtp_model_layer
+        )
         core_attention = getattr(
-            getattr(self.mtp_model_layer, "self_attention", None), "core_attention", None
+            getattr(attention_layer, "self_attention", None), "core_attention", None
         )
         layer_number = getattr(core_attention, "layer_number", None)
         # The replay runs after the MTP block has moved on; it restores this call's depth.
@@ -2697,6 +2760,7 @@ class MultiTokenPredictionLayer(MegatronModule):
                 sequence_len_offset=sequence_len_offset,
                 packed_seq_params_by_layout=packed_seq_params_by_layout,
                 cp_layout_plan=cp_layout_plan,
+                **layer_kwargs,
             )
 
             if shared_attention is not None and is_source:
@@ -2757,11 +2821,15 @@ class MultiTokenPredictionLayer(MegatronModule):
                 distribute_saved_activations=self.config.distribute_saved_activations,
             )
 
-        if self.config.recompute_method == 'uniform':
-            # A legacy GPT MTP layer is already a single Transformer-layer recompute unit.
+        if self.config.recompute_method == 'uniform' or (
+            self.is_hybrid_mtp
+            and self.config.recompute_method == 'block'
+            and self.config.recompute_num_layers > 0
+        ):
+            # A repeated /DE exports its source KV across one complete depth checkpoint.
             assert (
-                self.config.recompute_num_layers == 1
-            ), "recompute_num_layers must be 1 for MTP recompute"
+                self.is_hybrid_mtp or self.config.recompute_num_layers == 1
+            ), "recompute_num_layers must be 1 for GPT MTP recompute"
             with outer_quantization_context:
                 outputs = checkpoint_handler()
             if shared_attention is not None and is_source:
@@ -2791,6 +2859,7 @@ class MultiTokenPredictionLayer(MegatronModule):
                 sequence_len_offset=sequence_len_offset,
                 packed_seq_params_by_layout=packed_seq_params_by_layout,
                 cp_layout_plan=cp_layout_plan,
+                **layer_kwargs,
             )
         else:
             raise ValueError("Invalid activation recompute method.")
@@ -2855,16 +2924,16 @@ class MultiTokenPredictionLayer(MegatronModule):
             [s, b, h], and optionally the updated context tensor if cross-attention is used.
         """
         assert context is None, "multi token prediction + cross attention is not yet supported."
+        # Inside an indexer-loss row-mask scope (loop models, around the head), this depth's
+        # DSA indexers train on the rows whose rolled input token is real: the depth enters
+        # the scope with its rolled, full-length (pre-SP-scatter) padding mask. Outside any
+        # scope nothing changes.
+        layer_kwargs = {}
         if decoder_input is None:
             assert input_ids is not None and position_ids is not None
-            (
-                input_ids,
-                position_ids,
-                padding_mask,
-                mtp_input_mask,
-                decoder_input,
-                hidden_states,
-            ) = self._get_embeddings(
+            in_scope = indexer_loss_padding_mask_in_scope() is not None
+            embedding_kwargs = {"return_rolled_padding_mask": True} if in_scope else {}
+            embeddings = self._get_embeddings(
                 input_ids=input_ids,
                 position_ids=position_ids,
                 padding_mask=padding_mask,
@@ -2875,17 +2944,25 @@ class MultiTokenPredictionLayer(MegatronModule):
                 sequence_roll_context=sequence_roll_context,
                 roll_depth=roll_depth,
                 _inputs_pre_aligned=_inputs_pre_aligned,
+                **embedding_kwargs,
             )
+            input_ids, position_ids, padding_mask, mtp_input_mask, decoder_input, hidden_states = (
+                embeddings[:6]
+            )
+            if in_scope and embeddings[6] is not None:
+                layer_kwargs["indexer_padding_mask"] = embeddings[6]
         else:
             decoder_input, hidden_states = self._get_precomputed_embeddings(
                 decoder_input=decoder_input, hidden_states=hidden_states
             )
 
         # Legacy GPT MTP owns one outer checkpoint around its projection and Transformer
-        # layer. Hybrid MTP instead delegates full recompute to the nested HybridStack so
-        # that ``recompute_num_layers`` controls its layer chunks without nesting checkpoints.
+        # layer. An ordinary hybrid MTP delegates full recompute to its nested HybridStack.
+        # A sharing /DE depth checkpoints the enclosing depth to export source KV to consumers.
         use_outer_recompute = (
-            self.config.recompute_granularity == 'full' and self.training and not self.is_hybrid_mtp
+            self.config.recompute_granularity == 'full'
+            and self.training
+            and (not self.is_hybrid_mtp or self.config.mtp_repeated_layer_shared_components)
         )
         if use_outer_recompute:
             assert (
@@ -2908,6 +2985,7 @@ class MultiTokenPredictionLayer(MegatronModule):
                 sequence_len_offset=sequence_len_offset,
                 packed_seq_params_by_layout=packed_seq_params_by_layout,
                 cp_layout_plan=cp_layout_plan,
+                **layer_kwargs,
             )
         else:
             # Thread the depth sources only when attention residuals are on, so overrides of
@@ -2933,6 +3011,7 @@ class MultiTokenPredictionLayer(MegatronModule):
                 packed_seq_params_by_layout=packed_seq_params_by_layout,
                 cp_layout_plan=cp_layout_plan,
                 **attn_res_kwargs,
+                **layer_kwargs,
             )
 
         return hidden_states, input_ids, position_ids, padding_mask, mtp_input_mask
