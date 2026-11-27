@@ -556,9 +556,18 @@ class RingFinalize:
     per view, and the expert-bias update would find no router (a view has no submodules).
     """
 
-    def __init__(self, model_config: Any, states: Sequence[_RingChunkState]):
+    def __init__(
+        self,
+        model_config: Any,
+        states: Sequence[_RingChunkState],
+        trimmed_models: Optional[weakref.WeakSet[nn.Module]] = None,
+        *,
+        forward_only: bool = False,
+    ):
         self.model_config = model_config
         self.states = tuple(states)
+        trim = getattr(model_config, "loop_ring_trim_cache_before_first_grad_sync", False)
+        self.trimmed_models = trimmed_models if trim and not forward_only else None
         self.calls = 0
 
     def __call__(self, model, num_tokens=None, pg_collection=None, force_all_reduce=False):
@@ -577,6 +586,17 @@ class RingFinalize:
                 "Loop ring finalize: the model config's finalize_model_grads_func was cleared "
                 "during the step"
             )
+        # Views and this wrapper are short-lived. The physical model's identity
+        # outlives both, including a training-step retry after the trim succeeded.
+        if (
+            self.trimmed_models is not None
+            and chunks[0] not in self.trimmed_models
+            and torch.cuda.is_available()
+            and not torch.cuda.is_current_stream_capturing()
+            and any(param.is_cuda for chunk in chunks for param in chunk.parameters())
+        ):
+            torch.cuda.empty_cache()
+            self.trimmed_models.add(chunks[0])
         self.calls += 1
         return finalize(
             chunks, num_tokens, pg_collection=pg_collection, force_all_reduce=force_all_reduce
@@ -701,6 +721,7 @@ class LoopRingSchedule:
     def __init__(self):
         self._model_work: "weakref.WeakKeyDictionary" = weakref.WeakKeyDictionary()
         self._eager_fixed_records = weakref.WeakKeyDictionary()
+        self._trimmed_before_grad_sync = weakref.WeakSet()
         self.last_step: Optional[LoopRingStepRecord] = None
         self.iteration = 0
 
@@ -920,7 +941,9 @@ class LoopRingSchedule:
 
         # The ring config: the schedule's view of the model config (V chunks, the finalize
         # wrapper); the physical chunks keep the model config.
-        finalize = RingFinalize(model_config, states)
+        finalize = RingFinalize(
+            model_config, states, self._trimmed_before_grad_sync, forward_only=forward_only
+        )
         scheduled_laps = _scheduled_laps(layout, depths)
         views = len(scheduled_laps)
         ring_config = copy.copy(model_config)

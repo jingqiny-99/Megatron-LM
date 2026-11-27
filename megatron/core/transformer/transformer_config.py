@@ -292,6 +292,10 @@ class TransformerConfig(ModelParallelConfig):
     checkpoint on each visit, in prelude, core pass(es), coda order, shared by all PP stages.
     None uses recompute_num_layers on every visit. The MTP head keeps its own policy."""
 
+    loop_ring_trim_cache_before_first_grad_sync: bool = False
+    """Release unused CUDA allocator blocks once before this ring model first finalizes its
+    training gradients, to leave room for communication library initialization."""
+
     loop_rsbf_waves: int = 1
     """RSBF: passes (waves) per optimizer step; gradients accumulate across waves. Must divide
     the number of microbatches per step."""
@@ -3526,6 +3530,10 @@ class TransformerConfig(ModelParallelConfig):
             and self.experimental_attention_variant == "dsa"
         ):
             raise ValueError("loop_recompute_ring_gates requires the separate-edge gated GLM DSA ring")
+        if self.loop_ring_trim_cache_before_first_grad_sync and self.loop_schedule != "ring":
+            raise ValueError(
+                "loop_ring_trim_cache_before_first_grad_sync requires loop_schedule='ring'"
+            )
         if self.loop_ring_recompute_group_sizes is not None:
             if not (
                 self.loop_schedule == "ring"
