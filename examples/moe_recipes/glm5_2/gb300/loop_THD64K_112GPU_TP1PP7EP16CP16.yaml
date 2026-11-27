@@ -248,6 +248,11 @@ ARGS:
   recompute_method: null
   recompute_num_layers: null
   dsa_indexer_reuse_checkpoint_topk: null
+  loop_compact_packed_window: null
+  loop_shard_packed_sparse_kv: null
+  loop_recompute_ring_gates: null
+  moe_mok_checkpoint_forward_context: null
+  mtp_recompute_tv_heads: null
   no_overlap_p2p_communication: true
 VARIANTS:
   64k_mok40k_stage_tuned:
@@ -297,7 +302,7 @@ VARIANTS:
     <<: *source_128k
     moe_megakernel_backend_config: *mok16k
     loop_ring_recompute_plan: CCCC/CCCC/CCCC/CCCC/CCCC/CCCC/CCCC
-  1m:
+  1m: &source_1m
     seq_length: '1048576'
     global_batch_size: '8'
     accumulate_allreduce_grads_in_fp32: true
@@ -319,3 +324,25 @@ VARIANTS:
     dsa_indexer_reuse_checkpoint_topk: true
     no_overlap_p2p_communication: true
     recompute_modules: null
+  1m_mok_context: &capacity_1m_mok_context
+    <<: *source_1m
+    # The capacity runs use Megatron's native defaults for reduction, optimizer dtypes and warmup.
+    accumulate_allreduce_grads_in_fp32: null
+    main_params_dtype: null
+    main_grads_dtype: null
+    exp_avg_dtype: null
+    exp_avg_sq_dtype: null
+    megatron_fsdp_main_grads_dtype: null
+    megatron_fsdp_grad_comm_dtype: null
+    lr_warmup_iters: null
+    num_distributed_optimizer_instances: null
+    moe_megakernel_backend_config: *mok16k
+    dsa_cudnn_topk_scratch_gib: 2
+    recompute_num_layers: 8
+    loop_compact_packed_window: true
+    loop_shard_packed_sparse_kv: true
+    loop_recompute_ring_gates: true
+    moe_mok_checkpoint_forward_context: true
+  1m_mok_context_tv_heads:
+    <<: *capacity_1m_mok_context
+    mtp_recompute_tv_heads: true

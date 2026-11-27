@@ -514,3 +514,28 @@ The stage-tuned variant uses
 `Cnnn/CCnn/CCnC/CCnn/CCnn/Cnnn/CCnC` in PP rank order.
 The four positions correspond to prelude, first core visit, second core
 visit and coda. `C` checkpoints a visit and `n` retains its activations.
+
+#### 1M capacity variants on 112 GB300s
+
+The 1M capacity runs use the same 28-node placement, TP1/PP7/EP16/CP16,
+MBS1 and GBS8. Each update trains on eight packs of 1,048,576 positions with
+1,015,809 real input tokens per pack. Both variants keep two core visits,
+the trained indexer, seven shared MTP depths, distributed Muon, MXFP8 and
+the full-iteration CUDA graph.
+
+| Variant | Activation and workspace settings |
+| --- | --- |
+| `1m_mok_context` (R10) | Checkpoint all four visits in uniform blocks of up to eight physical sublayers. Use a 16,384-token MoK macrobatch and cap each DSA score slab at 2 GiB. Exchange packed window halos, retain the first-pass latent KV on its CP owner, recompute the two residual gates, and restore MoK's forward context during checkpoint replay. |
+| `1m_mok_context_tv_heads` (R11) | Same as R10, with each of the seven draft vocabulary projections and TV distances recomputed in backward. The shared teacher is projected once. |
+
+For a dry run, select the variant with the same environment as the 64K example.
+
+```bash
+python examples/moe_recipes/glm5_2/run.py \
+  examples/moe_recipes/glm5_2/gb300/loop_THD64K_112GPU_TP1PP7EP16CP16.yaml \
+  --variant 1m_mok_context --dry-run
+```
+
+For training, append `--variant 1m_mok_context` or
+`--variant 1m_mok_context_tv_heads` to the `srun_rank.sh` invocation above.
+The 112-GPU production results for these two configurations are pending.
