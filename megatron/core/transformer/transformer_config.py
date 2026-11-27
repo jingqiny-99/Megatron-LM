@@ -464,6 +464,10 @@ class TransformerConfig(ModelParallelConfig):
     mtp_recompute_tv_heads: bool = False
     """Recompute each detached draft projection and TV comparison with its true loss gradient."""
 
+    mtp_tv_head_chunk_size: int = 0
+    """Local sequence positions per draft projection and full-vocabulary TV comparison.
+    Zero projects the whole sequence. A checkpointed chunk replays independently."""
+
     mtp_loss_early_backward: bool = False
     """Run each MTP head's vocabulary projection, cross-entropy and their backward back-to-back
     during the forward pass instead of deferring the backward to the main backward pass.
@@ -3540,6 +3544,10 @@ class TransformerConfig(ModelParallelConfig):
             )
         if self.mtp_recompute_tv_heads and self.mtp_loss_type != "e2e_tv":
             raise ValueError("mtp_recompute_tv_heads requires mtp_loss_type='e2e_tv'.")
+        if self.mtp_tv_head_chunk_size < 0:
+            raise ValueError("mtp_tv_head_chunk_size must be non-negative.")
+        if self.mtp_tv_head_chunk_size and self.mtp_loss_type != "e2e_tv":
+            raise ValueError("mtp_tv_head_chunk_size requires mtp_loss_type='e2e_tv'.")
         if self.mtp_loss_type == "e2e_tv":
             if not self.mtp_detach_heads:
                 warnings.warn(

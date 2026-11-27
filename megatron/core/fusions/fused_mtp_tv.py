@@ -269,13 +269,26 @@ if HAVE_TRITON:
             tl.store(grad_draft + row_start + cols, gradient, mask=mask)
 
 
+def _tv_shapes_match(draft: Tensor, target: Tensor, addressed: bool) -> bool:
+    if addressed:
+        # Row indices select from a shared teacher and its CP halo. The draft
+        # may contain only the current sequence chunk.
+        return (
+            draft.ndim >= 2
+            and target.ndim == draft.ndim
+            and target.size(0) > 0
+            and draft.shape[1:] == target.shape[1:]
+        )
+    return draft.shape == target.shape
+
+
 def fused_mtp_tv_unavailable_reason(  # pylint: disable=too-many-return-statements
-    draft_logits: Tensor, target_logits: Tensor
+    draft_logits: Tensor, target_logits: Tensor, *, addressed: bool = False
 ) -> Optional[str]:
     """Return why the fused kernel cannot consume the two logits tensors."""
     if not HAVE_TRITON:
         return "Triton is not available"
-    if draft_logits.shape != target_logits.shape:
+    if not _tv_shapes_match(draft_logits, target_logits, addressed):
         return "draft and target logits have different shapes"
     if draft_logits.device != target_logits.device:
         return "draft and target logits are on different devices"
@@ -362,7 +375,9 @@ class _FusedVocabParallelTVDistance(torch.autograd.Function):
         target_halo_logits: Optional[Tensor],
     ) -> Tensor:
         """Run fused forward passes and preserve compact backward state."""
-        unavailable_reason = fused_mtp_tv_unavailable_reason(draft_logits, target_logits)
+        unavailable_reason = fused_mtp_tv_unavailable_reason(
+            draft_logits, target_logits, addressed=target_row_indices is not None
+        )
         if unavailable_reason is not None:
             raise RuntimeError(f"Fused MTP TV distance is unavailable: {unavailable_reason}.")
 
@@ -652,9 +667,9 @@ def vocab_parallel_tv_distance(
         A FP32 tensor with the vocabulary dimension removed. Gradients flow only to
         ``draft_logits``.
     """
-    if draft_logits.shape != target_logits.shape:
+    if not _tv_shapes_match(draft_logits, target_logits, target_row_indices is not None):
         raise ValueError(
-            "Draft and target logits must have identical shapes, got "
+            "Draft and target logits must have compatible shapes, got "
             f"{tuple(draft_logits.shape)} and {tuple(target_logits.shape)}."
         )
     if draft_logits.device != target_logits.device:
@@ -673,7 +688,10 @@ def vocab_parallel_tv_distance(
     ):
         target_logits = target_logits.detach().contiguous()
 
-    if fused_mtp_tv_unavailable_reason(draft_logits, target_logits) is None:
+    if (
+        fused_mtp_tv_unavailable_reason(draft_logits, target_logits, addressed=has_target_row_map)
+        is None
+    ):
         return _fused_vocab_parallel_tv_distance(
             draft_logits,
             target_logits,

@@ -1269,12 +1269,27 @@ def _process_mtp_e2e_tv_loss(
         config, "mtp_recompute_tv_heads", False
     )
 
-    def draft_distance(draft_hidden, target, row_indices, valid_rows, halo):
+    def draft_distance(draft_hidden, target, row_indices, valid_rows, halo, span=None):
         draft_logits, _ = output_layer(
             draft_hidden, weight=output_weight, runtime_gather_output=runtime_gather_output
         )
         if scale_logits_fn is not None:
             draft_logits = scale_logits_fn(draft_logits)
+        if span is not None:
+            start, width, shards, local_length = span
+
+            def select_rows(tensor):
+                # Sequence-parallel projections gather this slice from each TP
+                # rank in rank-major order. Keep batch and vocabulary intact.
+                return tensor.unflatten(0, (shards, local_length)).narrow(
+                    1, start, width
+                ).flatten(0, 1)
+
+            if row_indices is None:
+                target = select_rows(target)
+            else:
+                row_indices = select_rows(row_indices).contiguous()
+                valid_rows = select_rows(valid_rows).contiguous()
         if row_indices is None:
             return vocab_parallel_tv_distance(
                 draft_logits,
@@ -1291,6 +1306,36 @@ def _process_mtp_e2e_tv_loss(
             target_valid_rows=valid_rows,
             target_halo_logits=halo,
         )
+
+    def compare(*args):
+        if recompute_draft:
+            return torch_checkpoint(
+                draft_distance, *args, use_reentrant=False, preserve_rng_state=False
+            )
+        return draft_distance(*args)
+
+    def compare_depth(draft_hidden, target, row_indices, valid_rows, halo):
+        chunk_size = getattr(config, "mtp_tv_head_chunk_size", 0)
+        local_length = draft_hidden.size(0)
+        if not chunk_size or chunk_size >= local_length:
+            return compare(draft_hidden, target, row_indices, valid_rows, halo)
+        # The full teacher projection already assembled all sequence-parallel
+        # shards. Apply the same rank ordering to addresses and scalar distances.
+        shards = target.size(0) // local_length
+        chunks = []
+        for start in range(0, local_length, chunk_size):
+            hidden_chunk = draft_hidden[start : start + chunk_size]
+            width = hidden_chunk.size(0)
+            distance = compare(
+                hidden_chunk,
+                target,
+                row_indices,
+                valid_rows,
+                halo,
+                (start, width, shards, local_length),
+            )
+            chunks.append(distance.unflatten(0, (shards, width)))
+        return torch.cat(chunks, dim=1).flatten(0, 1)
 
     for mtp_layer_number in range(num_depths):
         if use_prepared_roll_rows:
@@ -1352,16 +1397,7 @@ def _process_mtp_e2e_tv_loss(
                 None,
                 None,
             )
-        if recompute_draft:
-            # Keep the shared teacher, row mapping, and draft hidden input. The full
-            # draft logits and TV sign bits are recreated only for this depth's
-            # backward, using the cotangent produced by the real prefix objective.
-            distance = torch_checkpoint(
-                draft_distance, *args, use_reentrant=False, preserve_rng_state=False
-            )
-        else:
-            distance = draft_distance(*args)
-        tv_distances.append(distance)
+        tv_distances.append(compare_depth(*args))
 
     tv_distances_tensor = torch.stack(tv_distances, dim=0)
     per_step_acceptance = 1.0 - tv_distances_tensor
