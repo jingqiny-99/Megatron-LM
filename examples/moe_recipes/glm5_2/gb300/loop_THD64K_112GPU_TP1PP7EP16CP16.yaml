@@ -343,6 +343,9 @@ VARIANTS:
     loop_shard_packed_sparse_kv: true
     loop_recompute_ring_gates: true
     moe_mok_checkpoint_forward_context: true
-  1m_mok_context_tv_heads:
+  1m_mok_context_tv_heads: &capacity_1m_tv_heads
     <<: *capacity_1m_mok_context
     mtp_recompute_tv_heads: true
+  1m_mok_context_tv_heads_linear_ce:
+    <<: *capacity_1m_tv_heads
+    cross_entropy_fusion_impl: linear

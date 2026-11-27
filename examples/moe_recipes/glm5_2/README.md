@@ -527,6 +527,7 @@ the full-iteration CUDA graph.
 | --- | --- |
 | `1m_mok_context` (R10) | Checkpoint all four visits in uniform blocks of up to eight physical sublayers. Use a 16,384-token MoK macrobatch and cap each DSA score slab at 2 GiB. Exchange packed window halos, retain the first-pass latent KV on its CP owner, recompute the two residual gates, and restore MoK's forward context during checkpoint replay. |
 | `1m_mok_context_tv_heads` (R11) | Same as R10, with each of the seven draft vocabulary projections and TV distances recomputed in backward. The shared teacher is projected once. |
+| `1m_mok_context_tv_heads_linear_ce` (R12) | Same as R11, with the Blackwell fused linear cross-entropy for the main LM head. Its backward recomputes logits in vocabulary slices. |
 
 For a dry run, select the variant with the same environment as the 64K example.
 
@@ -538,7 +539,11 @@ python examples/moe_recipes/glm5_2/run.py \
 
 For training, append `--variant 1m_mok_context` or
 `--variant 1m_mok_context_tv_heads` to the `srun_rank.sh` invocation above.
-The 112-GPU production results for these two configurations are pending.
+R10 exhausted memory during the fourth draft projection. R11 completed the
+first two microbatches' head backwards and exhausted memory in the third
+microbatch's ordinary LM loss while converting the full logits tensor to
+FP32. R12 has completed an eight-GPU training proxy and a full-size LM head
+test at 65,536 local rows and vocabulary size 154,880.
 
 An eight-GPU PP2/EP4 regression on both core visits verified that checkpoint
 replay released MoK's private MXFP8 activation storage. For identical incoming
