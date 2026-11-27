@@ -2,7 +2,7 @@
 """GLM-style two-pass text decoder using native token-level sparse MLA."""
 
 import copy
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 from contextvars import ContextVar
 from dataclasses import replace
 from types import SimpleNamespace
@@ -65,6 +65,17 @@ class GLMDSALoopStack(GLMRingStack):
                 raise ValueError(
                     "GLM loop requires alternating DSA and dense or expert FFN sublayers"
                 )
+
+    @contextmanager
+    def layer_prewarm_context(self, chunk_carriers):
+        """Share the standalone prewarm sample's indices only within this physical chunk."""
+        if "glm_index_holder" not in chunk_carriers:
+            chunk_carriers["glm_index_holder"] = SimpleNamespace(cp_layout={})
+        token = _INDEX_SHARE.set(chunk_carriers["glm_index_holder"])
+        try:
+            yield
+        finally:
+            _INDEX_SHARE.reset(token)
 
     def _run_range(self, x, start, end, ctx, label):
         # The block checkpoint closures hold ctx and the original pass label. A
@@ -171,5 +182,8 @@ def loop_hybrid_glm_dsa_stack_spec(config):
     attention = replace(attention, submodules=replace(attention.submodules, core_attention=core))
     layer = replace(layer, submodules=replace(layer.submodules, self_attention=attention))
     return replace(
-        hybrid_stack_spec, module=GLMDSALoopStack, submodules=replace(submodules, dsa_layer=layer)
+        hybrid_stack_spec,
+        module=GLMDSALoopStack,
+        # Repeated MTP has its own native layer numbers, index carrier, and latent-KV scope.
+        submodules=replace(submodules, dsa_layer=layer, mtp_stack_submodules=submodules),
     )

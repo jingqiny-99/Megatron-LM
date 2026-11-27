@@ -301,3 +301,45 @@ def test_loop_carrier_and_mtp_record_ownership():
             _INDEX_SHARE.reset(token)
     assert [r.topk_by_layer[3].item() for r in records] == [0, 1, 2]
     assert mtp.topk_by_layer[3].item() == 7
+
+
+def test_pipeline_prewarm_physical_mtp_and_loop_indexers():
+    from megatron.core.pipeline_parallel.parallel_prewarm import _discover_local_layers
+    from megatron.core.transformer.loop.glm_dsa import (
+        GLMLoopDSAttention,
+        _INDEX_SHARE,
+        loop_hybrid_glm_dsa_stack_spec,
+    )
+
+    spec = loop_hybrid_glm_dsa_stack_spec(None)
+
+    def attention(submodules):
+        return submodules.dsa_layer.submodules.self_attention.submodules.core_attention.module
+
+    assert attention(spec.submodules) is GLMLoopDSAttention
+    assert attention(spec.submodules.mtp_stack_submodules) is dsa.DSAttention
+    s0, s1 = GLMDSALoopStack.__new__(GLMDSALoopStack), GLMDSALoopStack.__new__(GLMDSALoopStack)
+    for stack in (s0, s1):
+        torch.nn.Module.__init__(stack)
+    l0, l1, d, e = range(4)
+    s0.layers = [l0]
+    s1.layers = [l1]
+    mtp = SimpleNamespace(is_hybrid_mtp=True, mtp_model_layer=SimpleNamespace(layers=[d, e]))
+    c0 = SimpleNamespace(decoder=s0)
+    c1 = SimpleNamespace(decoder=s1, mtp=SimpleNamespace(layers=[mtp]))
+    assert _discover_local_layers([c0, c1]) == [
+        (l0, False, c0),
+        (l1, False, c1),
+        (d, True, c1),
+        (e, True, c1),
+    ]
+    requests = [{}, {}]
+    with s0.layer_prewarm_context(requests[0]):
+        first = _INDEX_SHARE.get()
+        first.topk = torch.tensor([3])
+    assert _INDEX_SHARE.get() is None
+    with s0.layer_prewarm_context(requests[0]):
+        assert _INDEX_SHARE.get() is first
+    with s1.layer_prewarm_context(requests[1]):
+        assert _INDEX_SHARE.get() is not first and not hasattr(_INDEX_SHARE.get(), 'topk')
+    assert _INDEX_SHARE.get() is None

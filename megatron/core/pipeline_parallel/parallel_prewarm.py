@@ -49,7 +49,13 @@ def _discover_local_layers(model):
             local_layers.append((layer, False, chunk_with_decoder))
         if hasattr(chunk_with_decoder, 'mtp'):
             for mtp_layer in chunk_with_decoder.mtp.layers:
-                local_layers.append((mtp_layer.mtp_model_layer, True, chunk_with_decoder))
+                model_layer = mtp_layer.mtp_model_layer
+                # An ordinary MTP layer owns a TransformerLayer, while a hybrid
+                # /DE depth owns a stack of separately executable sublayers.
+                physical = (
+                    model_layer.layers if getattr(mtp_layer, "is_hybrid_mtp", False) else (model_layer,)
+                )
+                local_layers.extend((layer, True, chunk_with_decoder) for layer in physical)
     return local_layers
 
 
@@ -330,7 +336,13 @@ def prewarm_pipeline_model_parallel(
                         repeated_depth_scope = mtp_repeated_depth_scope(
                             config.num_layers + layer.layer_number, 0
                         )
-                    with inner_quantization_context, repeated_depth_scope:
+                    prewarm_context = getattr(model_chunk.decoder, "layer_prewarm_context", None)
+                    layer_scope = (
+                        prewarm_context(request_carrier_cache.setdefault(id(model_chunk), {}))
+                        if not is_mtp and prewarm_context is not None
+                        else nullcontext()
+                    )
+                    with inner_quantization_context, repeated_depth_scope, layer_scope:
                         # Keep prewarm eager even when local CUDA Graphs are enabled. This
                         # bypasses module hooks, so the training entry point rejects FSDP.
                         outputs = layer.forward(*args, **kwargs)
