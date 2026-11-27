@@ -210,13 +210,18 @@ class GLMRingStack(LoopHybridStack):
             return make_viewless_tensor(state.view_as(state), state.requires_grad, keep_graph=True)
         full = getattr(self.config, "recompute_granularity", None) == "full"
         if recompute and torch.is_grad_enabled() and (full or self.config.loop_recompute_block_stride):
+            if full:
+                sizes = getattr(self.config, "loop_ring_recompute_group_sizes", None)
+                # Bind the stride while the visit is active. Backward can run
+                # after another lap or microbatch has used this physical chunk.
+                stride = (
+                    self.config.recompute_num_layers if sizes is None else sizes[self.call_roles.lap]
+                )
+            else:
+                stride = self.config.loop_recompute_block_stride
             return self._checkpointed_blocks(
                 state, None, 0, len(self.layers), ctx, label, cross_loop_pass=scope,
-                block_stride=(
-                    self.config.recompute_num_layers
-                    if full
-                    else self.config.loop_recompute_block_stride
-                ),
+                block_stride=stride,
             )
 
         def run(x):

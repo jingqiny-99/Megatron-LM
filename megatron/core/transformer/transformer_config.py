@@ -287,6 +287,11 @@ class TransformerConfig(ModelParallelConfig):
     without. With loop_ring_separate_edges the four codes on each stage describe prelude,
     core pass 1, core pass 2 and coda. Edge checkpointing also requires loop_recompute_edges."""
 
+    loop_ring_recompute_group_sizes: Optional[List[int]] = None
+    """Full uniform recomputation on the separate-edge GLM ring: maximum local sublayers per
+    checkpoint on each visit, in prelude, core pass(es), coda order, shared by all PP stages.
+    None uses recompute_num_layers on every visit. The MTP head keeps its own policy."""
+
     loop_rsbf_waves: int = 1
     """RSBF: passes (waves) per optimizer step; gradients accumulate across waves. Must divide
     the number of microbatches per step."""
@@ -3521,6 +3526,27 @@ class TransformerConfig(ModelParallelConfig):
             and self.experimental_attention_variant == "dsa"
         ):
             raise ValueError("loop_recompute_ring_gates requires the separate-edge gated GLM DSA ring")
+        if self.loop_ring_recompute_group_sizes is not None:
+            if not (
+                self.loop_schedule == "ring"
+                and self.loop_ring_separate_edges
+                and self.recompute_granularity == "full"
+                and self.recompute_method == "uniform"
+            ):
+                raise ValueError(
+                    "loop_ring_recompute_group_sizes requires a separate-edge GLM ring "
+                    "with full uniform recomputation"
+                )
+            sizes = self.loop_ring_recompute_group_sizes
+            if (
+                not isinstance(sizes, (list, tuple))
+                or len(sizes) != self.loop_iterations + 2
+                or any(type(size) is not int or size <= 0 for size in sizes)
+            ):
+                raise ValueError(
+                    "loop_ring_recompute_group_sizes requires one positive integer per visit "
+                    f"(prelude, {self.loop_iterations} core passes, coda)"
+                )
         if self.loop_schedule == "ring":
             # Imported lazily: the guards module imports model code.
             from megatron.core.transformer.loop.guards import validate_loop_ring_config
