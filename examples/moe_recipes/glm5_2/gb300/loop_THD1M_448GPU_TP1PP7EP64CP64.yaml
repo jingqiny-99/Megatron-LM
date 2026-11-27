@@ -4,6 +4,8 @@ BASE_VARIANT: 1m
 HARDWARE:
   num_nodes: 112
   num_gpus: 448
+  nvl_domains: 7
+  ep_ranks_per_domain: 64
 ARGS:
   context_parallel_size: 64
   expert_model_parallel_size: 64
