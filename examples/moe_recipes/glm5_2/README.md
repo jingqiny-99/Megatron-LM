@@ -465,17 +465,21 @@ to the sparse index across the configured four-layer selector groups.
 
 The default workload uses TP1/PP7/EP16/CP16, MBS1, GBS56 and 63,489 real
 input tokens per 65,536-token pack. The current mock dataset appends EOD as
-a separate prediction target. Its JSON content length counts trained tokens. It uses the trained indexer, DeepGEMM
+a separate prediction target, so its JSON content length counts trained tokens.
+It uses the trained indexer, DeepGEMM
 scoring, DeepSelect, MoK, force-balanced routing, distributed Muon and a
 full-iteration graph. The loop configuration disables TE parameter transpose
 caching so that per-use weight gradients accumulate over both core visits.
 The MTP depths share latent KV and sparse indices
 within the prediction head. The benchmark uses synthetic inputs.
 
-Use 28 four-GPU nodes, the qualified runtime dependencies above and the same
-per-rank launcher. Set the four dependency/cache environment variables as in
-the original examples. Set WANDB_PROJECT and WANDB_NAME to log a curve under
-your account. To inspect the command before launch:
+Use 28 four-GPU nodes with four nodes per PP stage in one NVLink domain.
+For the Slurm launch above, use `--nodes=28 --ntasks-per-node=4 --segment=4`
+in the allocation and `--nodes=28` in the step layout. Pass
+`--ranks 112 --ranks-per-stage 16` to `check_placement.py` in step 1.
+Keep the original per-rank launcher and the four dependency/cache environment
+variables. Set `WANDB_PROJECT` and `WANDB_NAME` to log a curve under your
+account. The following command renders the 64K recipe.
 
 ```bash
 python examples/moe_recipes/glm5_2/run.py \
@@ -487,3 +491,15 @@ batches at the new PP7 placement. The `frozen_indexer` variant keeps the
 64K workload and sets the indexer loss coefficient to zero. For comparisons
 with the original recipe use warmup steps 1–3, capture at step 4, and report
 steps 13–32. For token throughput count the actual input tokens in a pack.
+
+On the 112-GPU placement, the 64K and 128K source settings exhausted memory
+on PP stage 2. Two capacity variants reached CUDA graph replay with the
+trained indexer, seven-depth MTP objective and distributed Muon enabled.
+
+| Variant | Updates | MoK macrobatch | Checkpointed visits on each stage |
+| --- | ---: | ---: | --- |
+| `64k_mok16k` | 16 | 16,384 | Prelude |
+| `128k_mok16k_recompute` | 32 | 16,384 | Prelude, both core visits, coda |
+
+Pass the variant to the same launcher, for example
+`--variant 64k_mok16k`. The 64K measurement uses updates 13–16.

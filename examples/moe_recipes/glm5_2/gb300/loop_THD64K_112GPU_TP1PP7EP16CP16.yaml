@@ -46,6 +46,8 @@ DEPENDENCIES:
       extension_path: site/deep_gemm/_C.cpython-312-aarch64-linux-gnu.so
       extension_sha256: a5e58cc6fb09d6fb48f687c3ba7e138b932ceb694a391be39e9be2f4d28e4048
 ENV_VARS:
+  CUDA_DEVICE_MAX_CONNECTIONS: '8'
+  NCCL_BUFFSIZE: '1048576'
   NCCL_NVLS_ENABLE: '0'
   NCCL_GRAPH_REGISTER: '0'
   NVTE_ALLOW_NONDETERMINISTIC_ALGO: '1'
@@ -55,7 +57,8 @@ ENV_VARS:
   NVTE_NORM_BWD_USE_CUDNN: '1'
   NVTE_NORM_FWD_USE_CUDNN: '1'
   CUDNN_PATH: /usr/lib/aarch64-linux-gnu
-  PYTORCH_CUDA_ALLOC_CONF: expandable_segments:True,graph_capture_record_stream_reuse:True
+  PYTORCH_ALLOC_CONF: &allocator expandable_segments:True,graph_capture_record_stream_reuse:True
+  PYTORCH_CUDA_ALLOC_CONF: *allocator
   TORCH_NCCL_AVOID_RECORD_STREAMS: '0'
   MEGATRON_USE_UV: '0'
   PYTHONDONTWRITEBYTECODE: '1'
@@ -247,6 +250,9 @@ ARGS:
   dsa_indexer_reuse_checkpoint_topk: null
   no_overlap_p2p_communication: true
 VARIANTS:
+  64k_mok16k:
+    train_iters: 16
+    moe_megakernel_backend_config: &mok16k '{"fwd_num_comm_sms":48,"bwd_num_comm_sms":36,"minibatch_size":4096,"macrobatch_size":16384,"schedule_capacity_multiplier":0.5,"all_gather_top_experts_chunk_bytes":2048}'
   frozen_indexer:
     dsa_indexer_loss_coeff: 0.0
   4k:
@@ -262,7 +268,7 @@ VARIANTS:
     lr_warmup_iters: '0'
     num_distributed_optimizer_instances: '1'
     varlen_mock_dataset_config_json: '{"mode":"distribution","type":"lognormal","min_seq_len":3969,"max_seq_len":3969,"mean_seq_len":3969,"lognormal_sigma":0.15}'
-  128k:
+  128k: &source_128k
     seq_length: 131072
     global_batch_size: 64
     accumulate_allreduce_grads_in_fp32: true
@@ -276,6 +282,10 @@ VARIANTS:
     num_distributed_optimizer_instances: '1'
     varlen_mock_dataset_config_json: '{"mode":"distribution","type":"lognormal","min_seq_len":126977,"max_seq_len":126977,"mean_seq_len":126977,"lognormal_sigma":0.15}'
     max_seqlen_per_dp_cp_rank: '8192'
+  128k_mok16k_recompute:
+    <<: *source_128k
+    moe_megakernel_backend_config: *mok16k
+    loop_ring_recompute_plan: CCCC/CCCC/CCCC/CCCC/CCCC/CCCC/CCCC
   1m:
     seq_length: '1048576'
     global_batch_size: '8'
