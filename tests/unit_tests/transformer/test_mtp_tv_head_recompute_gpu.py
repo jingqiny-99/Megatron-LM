@@ -112,8 +112,9 @@ def test_seven_e2e_tv_heads_remat_packed_cp2_shared_model_gradients_and_storage(
         # cotangents arise natively through the true seven-depth prefix product.
         main_grad = torch.randn_like(base)
 
-        def run(enabled):
+        def run(enabled, chunk_size=0):
             config.mtp_recompute_tv_heads = enabled
+            config.mtp_tv_head_chunk_size = chunk_size
             model.zero_grad(set_to_none=True)
             trunk = base.detach().requires_grad_()
             result = model(
@@ -134,7 +135,9 @@ def test_seven_e2e_tv_heads_remat_packed_cp2_shared_model_gradients_and_storage(
             targets = set()
             halos = set()
             saved_logits, saved_bits = {}, {}
-            prefix_grad = []
+            draft_storage = set()
+            prefix_grad = {}
+            draft_row_counts = []
             normalized = []
             prefix_losses = []
             original_tv = mtp.vocab_parallel_tv_distance
@@ -149,6 +152,8 @@ def test_seven_e2e_tv_heads_remat_packed_cp2_shared_model_gradients_and_storage(
                 calls[kind, in_backward] += 1
                 if kind == "teacher":
                     teacher_ptr = out[0].untyped_storage().data_ptr()
+                else:
+                    draft_storage.add(out[0].untyped_storage().data_ptr())
 
             def tv(draft, target, **kwargs):
                 assert (
@@ -159,7 +164,11 @@ def test_seven_e2e_tv_heads_remat_packed_cp2_shared_model_gradients_and_storage(
                 halos.add(kwargs["target_halo_logits"].untyped_storage().data_ptr())
                 distance = original_tv(draft, target, **kwargs)
                 if not in_backward:
-                    distance.register_hook(lambda g: prefix_grad.append(g.detach().clone()))
+                    index = len(draft_row_counts)
+                    draft_row_counts.append(draft.shape[0])
+                    distance.register_hook(
+                        lambda g: prefix_grad.update({index: g.detach().clone()})
+                    )
                 return distance
 
             def fused(*args, **kwargs):
@@ -170,11 +179,16 @@ def test_seven_e2e_tv_heads_remat_packed_cp2_shared_model_gradients_and_storage(
                 storage = tensor.untyped_storage()
                 if (
                     tensor.dtype == torch.bfloat16
-                    and tensor.numel() == ids.numel() * VOCAB
-                    and storage.data_ptr() != teacher_ptr
+                    and tensor.ndim == 3
+                    and tensor.shape[-1] == VOCAB
+                    and storage.data_ptr() in draft_storage
                 ):
                     saved_logits[storage.data_ptr()] = storage.nbytes()
-                if tensor.dtype == torch.uint8 and tuple(tensor.shape) == (ids.numel(), VOCAB // 8):
+                if (
+                    tensor.dtype == torch.uint8
+                    and tensor.ndim == 2
+                    and tensor.shape[-1] == VOCAB // 8
+                ):
                     saved_bits[storage.data_ptr()] = storage.nbytes()
                 return tensor.detach()
 
@@ -219,11 +233,23 @@ def test_seven_e2e_tv_heads_remat_packed_cp2_shared_model_gradients_and_storage(
                 output.backward(main_grad)
             assert output_layer.weight.grad is None and embed.weight.grad is None
             assert calls["teacher", False] == 1 and calls["teacher", True] == 0
-            assert calls["draft", False] == calls["fused", False] == DEPTHS
-            assert calls["draft", True] == calls["fused", True] == (DEPTHS if enabled else 0)
+            row_limit = chunk_size or ids.numel()
+            chunk_rows = [min(row_limit, ids.numel() - i) for i in range(0, ids.numel(), row_limit)]
+            parts = len(chunk_rows)
+            assert draft_row_counts == chunk_rows * DEPTHS
+            assert calls["draft", False] == calls["fused", False] == DEPTHS * parts
+            assert (
+                calls["draft", True] == calls["fused", True] == (DEPTHS * parts if enabled else 0)
+            )
             assert len(halos) == len(targets) == 1 and targets == {teacher_ptr}
-            assert len(prefix_losses) == len(prefix_grad) == DEPTHS
-            for grad in prefix_grad:
+            assert len(prefix_losses) == DEPTHS and len(prefix_grad) == DEPTHS * parts
+            # TV distances use [rows, batch]; reconstruct their true incoming gradients
+            # in depth and sequence order, independent of the checkpoint replay order.
+            prefix_by_depth = [
+                torch.cat([prefix_grad[d * parts + i] for i in range(parts)], dim=0)
+                for d in range(DEPTHS)
+            ]
+            for grad in prefix_by_depth:
                 assert grad.min() != grad.max() and grad.norm() > 0
             assert len(saved_logits) == len(saved_bits) == (0 if enabled else DEPTHS)
             obs = {
@@ -231,7 +257,7 @@ def test_seven_e2e_tv_heads_remat_packed_cp2_shared_model_gradients_and_storage(
                 "native_loss": normalized[0],
                 "main_grad": trunk.grad,
                 "prefix_losses": torch.stack(prefix_losses),
-                "prefix_cotangents": torch.stack(prefix_grad),
+                "prefix_cotangents": torch.stack(prefix_by_depth),
                 "hidden_grad": result.grad,
             }
             for depth, grad in enumerate(result.grad.chunk(DEPTHS + 1)):
@@ -251,6 +277,15 @@ def test_seven_e2e_tv_heads_remat_packed_cp2_shared_model_gradients_and_storage(
             assert (grad is None) == (bg[name] is None), name
             if grad is not None:
                 torch.testing.assert_close(bg[name], grad, rtol=0, atol=0, msg=name)
+        # 72 CP-local rows, with a shorter final block across the all-dummy tail.
+        c, cg, chunk_saved = run(True, chunk_size=16)
+        assert chunk_saved == (0, 0)
+        for key in a:
+            torch.testing.assert_close(c[key], a[key], rtol=0, atol=0, msg=key)
+        for name, expected in ag.items():
+            assert (expected is None) == (cg[name] is None), name
+            if expected is not None:
+                torch.testing.assert_close(cg[name], expected, rtol=0, atol=0, msg=name)
         assert any(
             "linear_kv_down_proj" in k and v is not None and v.norm() > 0 for k, v in ag.items()
         )
@@ -268,7 +303,8 @@ def test_seven_e2e_tv_heads_remat_packed_cp2_shared_model_gradients_and_storage(
 
 
 @pytest.mark.launch_on_gb200
-def test_seven_checkpointed_tv_heads_cuda_graph_replay_with_dynamic_inputs():
+@pytest.mark.parametrize("chunk_size", [0, 16])
+def test_seven_checkpointed_tv_heads_cuda_graph_replay_with_dynamic_inputs(chunk_size):
     """Capture addressed CP2 teacher halos and exact F+B, then change the graph inputs."""
     if not torch.cuda.is_available() or Utils.world_size != 2:
         pytest.skip("requires two CUDA ranks")
@@ -327,6 +363,7 @@ def test_seven_checkpointed_tv_heads_cuda_graph_replay_with_dynamic_inputs():
         # Logging happens once in native forward; its sums are validated by the model parity case.
         with patch.object(mtp.MTPLossLoggingHelper, "save_loss_to_tracker", lambda *a, **kw: None):
             config.mtp_recompute_tv_heads = True
+            config.mtp_tv_head_chunk_size = chunk_size
             warm = torch.cuda.Stream()
             warm.wait_stream(torch.cuda.current_stream())
             with torch.cuda.stream(warm):
@@ -342,6 +379,7 @@ def test_seven_checkpointed_tv_heads_cuda_graph_replay_with_dynamic_inputs():
                 expected = hidden.detach().clone().requires_grad_()
                 expected.grad = torch.empty_like(expected)
                 config.mtp_recompute_tv_heads = False
+                config.mtp_tv_head_chunk_size = 0
                 output = step(expected)
                 graph.replay()
                 torch.testing.assert_close(captured, output, rtol=0, atol=0)
