@@ -90,6 +90,7 @@ def build_gpt_datasets(
     *,
     data_config: Any = None,
     built_on_rank: Optional[Callable[..., bool]] = None,
+    validate_sbhd_packing: Optional[Callable[[Any], None]] = None,
 ):
     """Build the train, validation and test datasets from ``cfg.data``.
 
@@ -101,6 +102,8 @@ def build_gpt_datasets(
             providers), given explicitly by tests and direct callers.
         built_on_rank: the rank predicate, called with ``vp_stage`` and ``is_packed_sequence``;
             ``is_dataset_built_on_rank`` (the GPT and hybrid rule) when omitted.
+        validate_sbhd_packing: validate the model that consumes packed SBHD padding masks.
+            Entry points without this callback cannot carry these masks.
     """
     from megatron.training.global_vars import get_run_config
     from megatron.training.utils import print_rank_0
@@ -110,13 +113,20 @@ def build_gpt_datasets(
     if built_on_rank is None:
         built_on_rank = is_dataset_built_on_rank
     dataset_type, config, is_packed_sequence = data_config.builder_inputs()
+    if config.sbhd_document_packing:
+        if validate_sbhd_packing is None:
+            raise ValueError("--sbhd-document-packing is wired for pretrain_hybrid.py only")
+        validate_sbhd_packing(config)
+    # Each PP stage consumes row-tail masks in these SBHD modes, just as every
+    # stage reads offsets for THD. This predicate only affects dataset placement.
+    all_stages = is_packed_sequence or config.sbhd_document_packing or config.varlen_sbhd_validation
 
     print_rank_0("> building train, validation, and test datasets for GPT ...")
 
     train_ds, valid_ds, test_ds = BlendedMegatronDatasetBuilder(
         dataset_type,
         train_val_test_num_samples,
-        partial(built_on_rank, vp_stage=vp_stage, is_packed_sequence=is_packed_sequence),
+        partial(built_on_rank, vp_stage=vp_stage, is_packed_sequence=all_stages),
         config,
     ).build()
 

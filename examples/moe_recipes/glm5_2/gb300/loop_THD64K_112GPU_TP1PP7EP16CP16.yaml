@@ -221,6 +221,7 @@ ARGS:
   no_load_optim: true
   no_load_rng: true
   fp8_recipe: mxfp8
+  disable_parameter_transpose_cache: true
   fp8_format: e4m3
   fp8_param_gather: true
   reuse_grad_buf_for_mxfp8_param_ag: true

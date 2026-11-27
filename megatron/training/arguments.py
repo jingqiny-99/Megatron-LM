@@ -3513,7 +3513,6 @@ def _add_network_size_args(parser):
         "moe_token_dropping",
         "cuda_graph_use_single_mempool",
         "cuda_graph_retain_backward_graph",
-        "disable_parameter_transpose_cache",
         "inference_sampling_seed",
         "use_inference_optimized_layers",
         "heterogeneous_block_specs",

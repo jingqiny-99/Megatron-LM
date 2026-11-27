@@ -408,7 +408,11 @@ def test_seq_aux_loss_mbs_warning(monkeypatch):
 def test_unwired_entry_points_raise(monkeypatch):
     import pretrain_gpt
 
-    monkeypatch.setattr(pretrain_gpt, "get_args", lambda: Namespace(sbhd_document_packing=True))
+    from megatron.training import global_vars
+
+    dataset = Namespace(sbhd_document_packing=True, varlen_sbhd_validation=False)
+    data = Namespace(builder_inputs=lambda: (object, dataset, False))
+    monkeypatch.setattr(global_vars, "get_run_config", lambda: Namespace(data=data))
     with pytest.raises(ValueError, match="pretrain_hybrid.py only"):
         pretrain_gpt.train_valid_test_datasets_provider([1, 1, 1])
     try:

@@ -578,11 +578,37 @@ def test_scripts_delegate_to_the_shared_provider_body(monkeypatch):
         assert built == (1, 2, 3)
         ((positional, keywords),) = calls
         assert positional == ((8, 8, 8), 1)
-        assert keywords == {"built_on_rank": module.is_dataset_built_on_rank}
+        expected = {"built_on_rank": module.is_dataset_built_on_rank}
+        if name == "hybrid":
+            expected["validate_sbhd_packing"] = module._check_sbhd_packing_model_config
+        assert keywords == expected
         shared = module.is_dataset_built_on_rank is providers.is_dataset_built_on_rank
         assert shared is (name != "hybrid_flex")
         parameters = inspect.signature(module.is_dataset_built_on_rank).parameters
         assert {"vp_stage", "is_packed_sequence"} <= set(parameters)
+
+
+@pytest.mark.parametrize("document_packing,validation", [(True, False), (False, True)])
+def test_typed_sbhd_dataset_builds_on_every_pipeline_stage(monkeypatch, document_packing, validation):
+    """Typed placement must make the row-tail mask available without any legacy arguments."""
+    dataset = SimpleNamespace(sbhd_document_packing=document_packing, varlen_sbhd_validation=validation)
+    data = SimpleNamespace(builder_inputs=lambda: (object, dataset, False))
+    checked = []
+
+    def make_builder(dataset_type, num_samples, predicate, config):
+        assert config is dataset
+        assert predicate()
+        return SimpleNamespace(build=lambda: (1, 2, 3))
+
+    monkeypatch.setattr(providers, "BlendedMegatronDatasetBuilder", make_builder)
+    got = providers.build_gpt_datasets(
+        (8, 8, 8),
+        data_config=data,
+        built_on_rank=lambda vp_stage, is_packed_sequence: is_packed_sequence,
+        validate_sbhd_packing=checked.append,
+    )
+    assert got == (1, 2, 3)
+    assert checked == ([dataset] if document_packing else [])
 
 
 def test_shared_rank_predicate_reads_the_registered_model_config(monkeypatch):

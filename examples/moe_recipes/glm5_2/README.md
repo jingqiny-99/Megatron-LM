@@ -466,7 +466,9 @@ to the sparse index across the configured four-layer selector groups.
 The default workload uses TP1/PP7/EP16/CP16, MBS1, GBS56 and 63,488 real
 input tokens per 65,536-token pack. It uses the trained indexer, DeepGEMM
 scoring, DeepSelect, MoK, force-balanced routing, distributed Muon and a
-full-iteration graph. The MTP depths share latent KV and sparse indices
+full-iteration graph. The loop configuration disables TE parameter transpose
+caching so that per-use weight gradients accumulate over both core visits.
+The MTP depths share latent KV and sparse indices
 within the prediction head. The benchmark uses synthetic inputs.
 
 Use 28 four-GPU nodes, the qualified runtime dependencies above and the same

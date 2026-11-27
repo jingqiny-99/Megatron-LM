@@ -595,9 +595,11 @@ def train_valid_test_datasets_provider(train_val_test_num_samples, vp_stage=None
     ``pretrain_gpt.py`` and ``pretrain_hybrid_flex.py``, called with the shared rank
     predicate.
     """
-    _check_sbhd_packing_model_config(get_args())
     return build_gpt_datasets(
-        train_val_test_num_samples, vp_stage, built_on_rank=is_dataset_built_on_rank
+        train_val_test_num_samples,
+        vp_stage,
+        built_on_rank=is_dataset_built_on_rank,
+        validate_sbhd_packing=_check_sbhd_packing_model_config,
     )
 
 

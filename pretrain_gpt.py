@@ -571,11 +571,6 @@ def train_valid_test_datasets_provider(train_val_test_num_samples, vp_stage=None
     ``pretrain_hybrid.py`` and ``pretrain_hybrid_flex.py``, called with the shared rank
     predicate.
     """
-    args = get_args()
-    if getattr(args, "sbhd_document_packing", False):
-        # This entry's get_batch does not carry the row-tail padding mask to the model.
-        raise ValueError("--sbhd-document-packing is wired for pretrain_hybrid.py only")
-
     return build_gpt_datasets(
         train_val_test_num_samples, vp_stage, built_on_rank=is_dataset_built_on_rank
     )
