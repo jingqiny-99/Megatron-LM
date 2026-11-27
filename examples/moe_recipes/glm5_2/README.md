@@ -529,6 +529,7 @@ the full-iteration CUDA graph.
 | `1m_mok_context_tv_heads` (R11) | Same as R10, with each of the seven draft vocabulary projections and TV distances recomputed in backward. The shared teacher is projected once. |
 | `1m_mok_context_tv_heads_linear_ce` (R12) | Same as R11, with the Blackwell fused linear cross-entropy for the main LM head. Its backward recomputes logits in vocabulary slices. |
 | `1m_tv_chunk2048` | Use the linear main loss and split each draft projection and its TV comparison into 2,048 local sequence positions per chunk. Each chunk uses the full vocabulary and the shared teacher. |
+| `1m_tv_chunk2048_core_groups4` | Use the same workload and checkpoint at most eight local sublayers in the prelude and four on each core visit and in the coda. |
 
 For a dry run, select the variant with the same environment as the 64K example.
 
