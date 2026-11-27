@@ -274,16 +274,33 @@ def mor_router_forward_flops(tokens, hidden_size, loop_iterations):
 
 
 def head_schedule_work(stack, tokens, squared_lengths, sequence):
-    """Mark the final head term (draft logits) for replay under per-depth TV rematerialization."""
+    """Charge replay to the vocabulary projections that training reconstructs in backward."""
     terms = stack.head_work_terms(tokens, squared_lengths, sequence)
     head = getattr(stack, "_loop_head", None)
-    replay_drafts = (
-        getattr(getattr(stack, "config", None), "mtp_recompute_tv_heads", False)
-        and head is not None
-        and head[2] > 0
+    config = getattr(stack, "config", None)
+    linear_ce = (
+        head is not None
+        and getattr(config, "cross_entropy_loss_fusion", False)
+        and getattr(config, "cross_entropy_fusion_impl", None) == "linear"
     )
+    # KD consumes materialized draft logits. TV also materializes them, with
+    # its own optional checkpoint. Neither objective reprojects its teacher.
+    tv = getattr(config, "mtp_loss_type", "cross_entropy") == "e2e_tv"
+    if tv:
+        replay_drafts = getattr(config, "mtp_recompute_tv_heads", False)
+    else:
+        replay_drafts = (
+            linear_ce
+            and getattr(config, "mtp_ce_loss_weight", 1.0) > 0
+            and getattr(config, "mtp_kl_loss_weight", 0.0) == 0
+        )
     for index, (work, backward_factor) in enumerate(terms):
-        yield work, backward_factor, replay_drafts and index == len(terms) - 1
+        # The first term is the LM projection. With MTP the final term is the
+        # sum of all draft projections. LinearCE recreates each vocab split once.
+        replay = (index == 0 and linear_ce) or (
+            replay_drafts and head is not None and head[2] > 0 and index == len(terms) - 1
+        )
+        yield work, backward_factor, replay
 
 
 def logits_forward_flops(tokens, hidden_size, vocab_size):
