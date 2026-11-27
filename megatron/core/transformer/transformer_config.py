@@ -857,7 +857,8 @@ class TransformerConfig(ModelParallelConfig):
     """Per-launch workspace budget in GiB for DSA indexer selection.
 
     The packed DeepGEMM scorer also limits its BF16 score slab to this budget, accounting for
-    the 1024-byte row stride. It uses at least one aligned 128-query group when multiple slabs
+    its physical key tiles, 1024-byte row stride and padded query rows. It uses at least
+    one aligned 128-query group when multiple slabs
     are required. Each query still scores its full visible key range. DeepSelect reads the slab
     in place. If cuDNN handles selection, its scratch can coexist with the slab.
 

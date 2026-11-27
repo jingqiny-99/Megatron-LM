@@ -2147,8 +2147,9 @@ def _deepgemm_row_chunks(
 ) -> list[tuple[int, int]]:
     """Partition independent queries by kernel limits and physical BF16 score bytes.
 
-    A slab covers every candidate key for each query. DeepGEMM pads the BF16
-    score row stride to 1024 bytes. Chunk starts use 128-row alignment for the
+    A slab covers every candidate key for each query. The SM100 MXFP8 provider
+    pads its 384-key tile to a 1024-byte stride and its row count to 128/H.
+    Chunk starts use 128-row alignment for the
     TE and DeepGEMM inputs. One aligned group is the minimum for long inputs.
     DeepSelect reads the scores in place. A cuDNN selection fallback has its
     own bounded scratch allocation, which can coexist with the score slab.
@@ -2159,9 +2160,14 @@ def _deepgemm_row_chunks(
     )
     if score_width:
         score_alignment = dsa_deepgemm_scorer.LOGITS_ROW_ALIGNMENT_BYTES
-        row_bytes = ((2 * score_width + score_alignment - 1) // score_alignment) * score_alignment
+        # DeepGEMM csrc/apis/attention.hpp allocates [align(Sq, 128/H),
+        # align(align(Sk, kMQALogitsSplitKV), 1024/sizeof(BF16))] before slicing.
+        tiled_width = round_up_to_nearest_multiple(score_width, 384)
+        row_bytes = round_up_to_nearest_multiple(2 * tiled_width, score_alignment)
         budget = _TOPK_WRAPPER_MAX_SCRATCH_BYTES if scratch_bytes is None else scratch_bytes
-        limit = min(limit, max(alignment, budget // row_bytes))
+        q_tile = 128 // num_heads
+        rows = (budget // row_bytes // q_tile) * q_tile
+        limit = min(limit, max(alignment, rows))
     if n_rows <= limit:
         return [(0, n_rows)]
     step = limit // alignment * alignment

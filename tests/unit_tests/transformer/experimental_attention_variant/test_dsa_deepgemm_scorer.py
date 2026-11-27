@@ -877,7 +877,8 @@ def test_row_chunks_respect_the_te_mxfp8_cast_limit(monkeypatch, heads):
 @pytest.mark.parametrize(
     "n_rows,width,budget,expected_first",
     [
-        (65536, 1048576, 8 << 30, 4096),
+        (65536, 1048576, 8 << 30, 3968),
+        (16384, 32768, 64 << 20, 896),
         (65536, 1048577, 8 << 30, 3968),
         (8192, 131072, 8 << 30, 8192),
         (1025, 4097, 1024, 128),
@@ -890,10 +891,13 @@ def test_deepgemm_score_slab_bounds_physical_stride(n_rows, width, budget, expec
     assert rows[0] == (0, expected_first)
     assert rows[-1][1] == n_rows
     assert all(left[1] == right[0] for left, right in zip(rows, rows[1:]))
-    physical_bytes = ((2 * width + 1023) // 1024) * 1024
+    tiled = ((width + 383) // 384) * 384
+    physical_bytes = ((2 * tiled + 1023) // 1024) * 1024
     for start, end in rows:
         assert start % 128 == 0
-        assert (end - start) * physical_bytes <= max(budget, 128 * physical_bytes)
+        q_tile = 128 // HEADS
+        physical_rows = ((end - start + q_tile - 1) // q_tile) * q_tile
+        assert physical_rows * physical_bytes <= max(budget, 128 * physical_bytes)
 
 
 @pytest.mark.parametrize("cp_size, cp_rank", [(1, 0), (2, 1)])
