@@ -148,11 +148,12 @@ def _mla_rope_fwd_inplace_kernel(
         seq_num: number of sequences for thd format, not used for sbhd format
         cu_seqlens_q: [seq_num + 1] accumulated sequence lengths for thd format
     """
-    pid_m = tl.program_id(axis=0)
+    # A long-context row may start beyond 2**31 elements of the flattened activation.
+    pid_m = tl.program_id(axis=0).to(tl.int64)
     pid_head = tl.program_id(axis=1)
 
     if position_ids is not None:
-        token_idx = tl.load(position_ids + pid_m)
+        token_idx = tl.load(position_ids + pid_m).to(tl.int64)
     elif cu_seqlens_q is None:
         token_idx = pid_m // batch_size
     elif HAS_THD_GLOBAL_START:
@@ -273,11 +274,11 @@ def _mla_rope_bwd_kernel(
     Output:
         DO_OUT: same shape and strides as DO_IN
     """
-    pid_m = tl.program_id(axis=0)
+    pid_m = tl.program_id(axis=0).to(tl.int64)
     pid_head = tl.program_id(axis=1)
 
     if position_ids is not None:
-        token_idx = tl.load(position_ids + pid_m)
+        token_idx = tl.load(position_ids + pid_m).to(tl.int64)
     elif cu_seqlens_q is None:
         token_idx = pid_m // batch_size
     elif HAS_THD_GLOBAL_START:
@@ -782,7 +783,7 @@ def _mla_rope_concat_fwd_kernel(
     BLOCK_H: tl.constexpr,
 ):
     """Concatenate the non-RoPE part with a rotated positional part."""
-    pid_m = tl.program_id(axis=0)
+    pid_m = tl.program_id(axis=0).to(tl.int64)
     pid_head = tl.program_id(axis=1)
 
     if IS_THD:
@@ -873,7 +874,7 @@ def _mla_rope_concat_bwd_kernel(
     BLOCK_H: tl.constexpr,
 ):
     """Split the output gradient and apply the inverse rotation."""
-    pid_m = tl.program_id(axis=0)
+    pid_m = tl.program_id(axis=0).to(tl.int64)
     pid_head = tl.program_id(axis=1)
 
     if IS_THD:
@@ -1124,7 +1125,7 @@ def _mla_rope_fwd_kv_split_kernel(
             or [total_seq_len, head_num, emb_dim + k_dim]
         O_VALUE: [seq_len, batch_size, head_num, v_dim] or [total_seq_len, head_num, v_dim]
     """
-    pid_m = tl.program_id(axis=0)
+    pid_m = tl.program_id(axis=0).to(tl.int64)
     pid_head = tl.program_id(axis=1)
 
     if cu_seqlens_kv is None:
@@ -1254,7 +1255,7 @@ def _mla_rope_bwd_kv_split_kernel(
             or [total_seq_len, head_num, k_dim + v_dim]
         dEMB: [seq_len, batch_size, emb_dim] or [total_seq_len, emb_dim]
     """
-    pid_m = tl.program_id(axis=0)
+    pid_m = tl.program_id(axis=0).to(tl.int64)
     pid_head = tl.program_id(axis=1)
 
     if cu_seqlens_kv is None:
