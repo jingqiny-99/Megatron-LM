@@ -528,6 +528,7 @@ the full-iteration CUDA graph.
 | `1m_mok_context` (R10) | Checkpoint all four visits in uniform blocks of up to eight physical sublayers. Use a 16,384-token MoK macrobatch and cap each DSA score slab at 2 GiB. Exchange packed window halos, retain the first-pass latent KV on its CP owner, recompute the two residual gates, and restore MoK's forward context during checkpoint replay. |
 | `1m_mok_context_tv_heads` (R11) | Same as R10, with each of the seven draft vocabulary projections and TV distances recomputed in backward. The shared teacher is projected once. |
 | `1m_mok_context_tv_heads_linear_ce` (R12) | Same as R11, with the Blackwell fused linear cross-entropy for the main LM head. Its backward recomputes logits in vocabulary slices. |
+| `1m_tv_chunk2048` | Use the linear main loss and split each draft projection and its TV comparison into 2,048 local sequence positions per chunk. Each chunk uses the full vocabulary and the shared teacher. |
 
 For a dry run, select the variant with the same environment as the 64K example.
 

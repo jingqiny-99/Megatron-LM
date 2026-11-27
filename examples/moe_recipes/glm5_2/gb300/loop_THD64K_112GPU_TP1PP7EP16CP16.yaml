@@ -168,6 +168,7 @@ ARGS:
   expert_model_parallel_size: '16'
   cross_entropy_loss_fusion: true
   cross_entropy_fusion_impl: native
+  mtp_tv_head_chunk_size: null
   manual_gc: true
   manual_gc_interval: 10
   lr_warmup_samples: 0
@@ -346,6 +347,9 @@ VARIANTS:
   1m_mok_context_tv_heads: &capacity_1m_tv_heads
     <<: *capacity_1m_mok_context
     mtp_recompute_tv_heads: true
-  1m_mok_context_tv_heads_linear_ce:
+  1m_mok_context_tv_heads_linear_ce: &capacity_1m_linear_ce
     <<: *capacity_1m_tv_heads
     cross_entropy_fusion_impl: linear
+  1m_tv_chunk2048:
+    <<: *capacity_1m_linear_ce
+    mtp_tv_head_chunk_size: 2048
