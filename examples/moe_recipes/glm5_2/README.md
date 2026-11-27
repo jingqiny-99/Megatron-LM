@@ -588,3 +588,13 @@ export GLM52_MASTER_ADDR GLM52_MASTER_PORT=29500
 Run the prewarm and training commands from steps 2 and 3 with this
 `GLM52_RECIPE`. The first three updates warm up the model, update 4 captures
 the graph, and updates 13–32 provide the steady-state timing window.
+
+Pass `--variant capacity` to `run.py` or `srun_rank.sh` with this 448-GPU
+recipe to apply the 112-GPU `1m_tv_chunk2048_initial_sync` memory settings
+on CP64/EP64. It uses a 16,384-token MoK macrobatch, a 2-GiB indexer
+scratch limit, sharded first-pass sparse KV, and a compact second-pass window.
+It checkpoints the ring gates and MoK forward context, uses sublayer groups of
+8/4/4/4 for the prelude, two core visits and coda, and trims the allocator
+cache before the first gradient synchronization. The main head uses linear
+cross-entropy and the seven MTP heads recompute vocabulary projections in
+chunks of 2,048 local sequence positions.

@@ -1,6 +1,8 @@
 # Each of seven physical PP stages occupies 16 four-GPU nodes in one NVLink domain.
 BASE_RECIPE: loop_THD64K_112GPU_TP1PP7EP16CP16.yaml
 BASE_VARIANT: 1m
+BASE_VARIANTS:
+  capacity: 1m_tv_chunk2048_initial_sync
 HARDWARE:
   num_nodes: 112
   num_gpus: 448

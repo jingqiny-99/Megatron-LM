@@ -64,13 +64,18 @@ def _read_recipe(path: Path, ancestors: tuple[Path, ...] = ()) -> dict:
     if parent.resolve() in ancestors:
         raise ValueError(f'Cyclic BASE_RECIPE reference to {parent.name}.')
     base = _read_recipe(parent, ancestors)
+    # A parent's named workload is resolved before applying the child's shared rank layout.
+    variants = {
+        name: {**_variant_arguments(base, source), **recipe['ARGS']}
+        for name, source in recipe.get('BASE_VARIANTS', {}).items()
+    }
     dependencies = dict(base['DEPENDENCIES'])
     dependencies['hardware'] = {**dependencies['hardware'], **recipe['HARDWARE']}
     return {
         **base,
         'DEPENDENCIES': dependencies,
         'ARGS': {**_variant_arguments(base, recipe.get('BASE_VARIANT')), **recipe['ARGS']},
-        'VARIANTS': recipe.get('VARIANTS', {}),
+        'VARIANTS': {**variants, **recipe.get('VARIANTS', {})},
     }
 
 
