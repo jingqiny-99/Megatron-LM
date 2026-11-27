@@ -169,3 +169,45 @@ def test_native_dsa_rounds_and_gradients(fused, packed, monkeypatch):
             assert (observed.float() - desired).norm() <= 0.03 * desired.norm()
         else:
             torch.testing.assert_close(observed, desired, atol=2e-5, rtol=2e-5)
+
+
+def test_compact_support_respects_source_views_masks_boundaries_and_visit_lifetime():
+    from megatron.core.transformer.experimental_attention_variant.dsa_loop_kv import (
+        compact_loop_source_topk,
+    )
+    from megatron.core.transformer.loop.cross_loop_kv import CrossLoopPass
+
+    raw = torch.tensor([[[0, -1], [0, 1]]], dtype=torch.int32)
+    counts = torch.tensor([[1, 2]], dtype=torch.int32)
+    ends = torch.tensor([1, 2])
+    starts = torch.zeros_like(ends)
+    valid = torch.tensor([[True, False]])
+    source = CrossLoopPass(0, {})
+
+    def compact(src=source, indices=raw, lengths=counts, begin=starts, end=ends, mask=valid):
+        return compact_loop_source_topk(
+            src, indices, lengths, causal_starts=begin, causal_ends=end, valid_rows=mask
+        )
+
+    first = compact()
+    second = compact(indices=raw.view_as(raw))
+    assert all(x is y for x, y in zip(first, second))
+    assert first[0].tolist() == [[[0, -1], [-1, -1]]]
+
+    for changed in (
+        dict(indices=raw.clone()), dict(lengths=counts.clone()),
+        dict(begin=starts.clone()), dict(end=ends.clone()), dict(mask=valid.clone()),
+        dict(src=CrossLoopPass(0, {})),
+    ):
+        current = compact()
+        new = compact(**changed)
+        assert all(x is not y for x, y in zip(current, new))
+
+    before = compact()
+    valid[0, 1] = True
+    mutated = compact()
+    assert mutated[0] is not before[0]
+    assert mutated[0].tolist() == raw.tolist()
+    source.finish_source()
+    replay = compact()
+    assert all(x is not y for x, y in zip(mutated, replay))
