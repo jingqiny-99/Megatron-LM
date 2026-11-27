@@ -39,6 +39,7 @@ from megatron.core.transformer.attention_residual import (
     is_attn_res_block_start,
 )
 from megatron.core.transformer.enums import CudaGraphModule, InferenceCudaGraphScope, LayerType
+from megatron.core.transformer.forward_replay import routing_tape_active
 from megatron.core.transformer.identity_op import IdentityFuncOp, IdentityOp
 from megatron.core.transformer.mlp import MLP
 from megatron.core.transformer.module import GraphableMegatronModule, TwoStageAttentionLayer
@@ -1080,7 +1081,10 @@ class _TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageA
             self.input_layernorm, IdentityOp
         )
         self._input_layernorm_checkpoint_active = (
-            self.recompute_input_layernorm
+            # The enclosing loop checkpoint rematerializes this call's saved tensors.
+            # An inner no-output checkpoint would release the newly rebuilt norm
+            # storage before the original attention backward can read it.
+            (self.recompute_input_layernorm and not routing_tape_active())
             or replay_input_layernorm
             or (mhc_recompute_manager is not None and self.mhc_checkpoint_input_layernorm)
         )
@@ -1357,7 +1361,9 @@ class _TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageA
             self.pre_mlp_layernorm, IdentityOp
         )
         checkpoint_pre_mlp_layernorm = (
-            self.recompute_pre_mlp_layernorm
+            # In a non-reentrant loop block the outer replay owns this activation.
+            # Releasing its storage here also invalidates MoK's saved input view.
+            (self.recompute_pre_mlp_layernorm and not routing_tape_active())
             or replay_pre_mlp_layernorm
             or (mhc_recompute_manager is not None and self.mhc_checkpoint_pre_mlp_layernorm)
         )
@@ -1378,6 +1384,8 @@ class _TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageA
                     apply_module(self.pre_mlp_layernorm), hidden_states
                 )
         else:
+            # A tied core can alternate between checkpointed and retained visits.
+            self.pre_mlp_norm_checkpoint = None
             with self.mlp_norm_manager as hidden_states:
                 pre_mlp_layernorm_output = apply_module(self.pre_mlp_layernorm)(hidden_states)
 

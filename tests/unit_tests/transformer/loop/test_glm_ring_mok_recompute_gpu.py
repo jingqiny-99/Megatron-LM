@@ -24,11 +24,13 @@ from tests.unit_tests.transformer.loop import test_glm_ring_mok_pp_gpu as layout
 from tests.unit_tests.transformer.loop.hybrid_loop_utils import CUDA
 
 
-def _models(plans):
+def _models(plans, *, layernorm=False):
     config = replace(
         moe.config(2),
         linear_cp_mode=None,
         linear_cp_layout=None,
+        recompute_granularity="selective" if layernorm else None,
+        recompute_modules=["layernorm"] if layernorm else None,
         loop_recompute=True,
         loop_recompute_edges=True,
         loop_recompute_block_stride=4,
@@ -38,7 +40,7 @@ def _models(plans):
         return moe.models(2)
 
 
-def _run(models, offsets, batches, plan):
+def _run(models, offsets, batches, plan, *, norm_calls=None):
     ids = [i for i, _ in batches]
     records, retained, forward_calls = {}, {}, Counter()
     actual, expected = Counter(), Counter()
@@ -113,6 +115,14 @@ def _run(models, offsets, batches, plan):
 
     with ExitStack() as hooks:
         for vp, (chunk, offset) in enumerate(zip(models, offsets, strict=True)):
+            if norm_calls is not None:
+                # VP1 is the physical core visited twice per sample. Count distinct norm
+                # executions so a config silently discarding selective recompute fails.
+                for name, norm in chunk.decoder.named_modules():
+                    if name.endswith(("input_layernorm", "pre_mlp_layernorm")) and next(norm.parameters(), None) is not None:
+                        def count_norm(module, inputs, key=(vp, name)):
+                            norm_calls[key] += 1
+                        hooks.callback(norm.register_forward_pre_hook(count_norm).remove)
             for name, layer in chunk.named_modules():
                 if isinstance(layer, GLMLoopDSAttention):
                     for lap in ((0,), (1, 2), (3,))[vp]:
@@ -159,7 +169,7 @@ def _run(models, offsets, batches, plan):
     return layout._Step(dict(losses), layout._copy(mtp), observed, grads, biases)
 
 
-def _compare_plans(reference_plans, candidate_plans):
+def _compare_plans(reference_plans, candidate_plans, *, selective_layernorm=False):
     with moe.parallel(2):
         ep = ps.get_expert_model_parallel_rank()
         stage = ps.get_pipeline_model_parallel_rank()
@@ -178,12 +188,18 @@ def _compare_plans(reference_plans, candidate_plans):
                             for i in range(local):
                                 fc.get_parameter(f"weight{i}").mul_(0.75 + 0.025 * (ep * local + i))
         weights = [{n: layout._copy(v) for n, v in m.state_dict().items()} for m in models]
-        reference = _run(models, offsets, batches, reference_plans[stage])
+        ref_calls = Counter() if selective_layernorm else None
+        test_calls = Counter() if selective_layernorm else None
+        reference = _run(models, offsets, batches, reference_plans[stage], norm_calls=ref_calls)
         del models
-        models = _models(candidate_plans)
+        models = _models(candidate_plans, layernorm=selective_layernorm)
         for model, state in zip(models, weights, strict=True):
             model.load_state_dict(state, strict=True)
-        candidate = _run(models, offsets, batches, candidate_plans[stage])
+        candidate = _run(models, offsets, batches, candidate_plans[stage], norm_calls=test_calls)
+        if selective_layernorm:
+            core_keys = [key for key in test_calls if key[0] == 1]
+            counts = ring._gather_objects([(ref_calls[k], test_calls[k]) for k in core_keys])
+            assert all(any(replayed > saved > 0 for saved, replayed in rank) for rank in counts), counts
 
         # The layout oracle expects the complete logical reference for this EP owner.
         # Gather only its two PP stages. The MTP tail duplicates the input embedding.
@@ -223,3 +239,10 @@ def test_mok_two_pass_ccnc_matches_cccc():
 )
 def test_mok_selective_activation_plans_match_ccnc(candidate):
     _compare_plans(("CCnC", "CCnC"), candidate)
+
+
+@pytest.mark.skipif(not CUDA or ring.WORLD != moe.SAMPLES, reason="requires eight CUDA ranks")
+def test_fixed_ring_edge_checkpoint_with_selective_layernorm_matches_saved_norms():
+    """Keep PP2/EP4, two real core visits, shared KV, edge checkpoints and weights fixed."""
+    plans = ("CnnC", "CnnC")
+    _compare_plans(plans, plans, selective_layernorm=True)

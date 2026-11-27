@@ -419,7 +419,9 @@ def validate_hybrid_loop_config(config: "TransformerConfig") -> None:
         or (
             selective
             and any(
-                module not in _LOOP_RULED_RECOMPUTE_MODULES for module in _recompute_modules(config)
+                module not in _LOOP_RULED_RECOMPUTE_MODULES
+                and not (module == "layernorm" and fixed_glm_ring(config))
+                for module in _recompute_modules(config)
             )
         ),
         # GTP gathers a weight before every use and reduce-scatters its gradient after every

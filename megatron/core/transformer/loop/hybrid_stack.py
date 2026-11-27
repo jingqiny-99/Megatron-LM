@@ -1369,6 +1369,10 @@ class LoopHybridStack(HybridStack):
         terms = [(logits, 2)]
         if not mtp_depths:
             return terms
+        if getattr(self.config, "mtp_loss_type", None) == "e2e_tv":
+            # The prediction objective projects the trunk hidden state a second
+            # time under no_grad to obtain its teacher probability distribution.
+            terms.append((logits, 0))
         depth_work = flops.mtp_depth_extra_forward_flops(tokens, hidden)
         for symbol in mtp_symbols:
             if symbol != Symbols.DS_ATTENTION:

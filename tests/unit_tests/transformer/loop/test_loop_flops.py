@@ -293,9 +293,13 @@ def test_glm_dsa_cp_counts_global_pairs_for_local_query_rows(cp_size, source):
         context_parallel_size=cp_size,
     )
     attention = SimpleNamespace(core_attention=SimpleNamespace(indexer=object()))
-    stack = SimpleNamespace(
-        _loop_flop_rows=[("D", cfg, None)], layers=[SimpleNamespace(self_attention=attention)]
-    )
+    from torch import nn
+
+    stack = GLMDSALoopStack.__new__(GLMDSALoopStack)
+    nn.Module.__init__(stack)
+    stack.config = cfg
+    stack._loop_flop_rows = [("D", cfg, None)]
+    stack.layers = [SimpleNamespace(self_attention=attention)]
     flops_per_rank = GLMDSALoopStack._layer_forward_flops(
         stack,
         0,
@@ -313,3 +317,16 @@ def test_glm_dsa_cp_counts_global_pairs_for_local_query_rows(cp_size, source):
         if source:
             expected_macs += 3 * 2 * 3 + 8 * 3 + 8 * 2 + 2 * 3 * position
     assert cp_size * flops_per_rank == 2 * batch * expected_macs
+
+
+def test_e2e_tv_teacher_projects_once_without_weight_or_input_gradient():
+    from megatron.core.transformer.loop.hybrid_stack import LoopHybridStack
+
+    vocab = 256
+    cfg = _config(mtp_loss_type="e2e_tv", mtp_detach_heads=True)
+    stack = SimpleNamespace(config=cfg, _loop_head=(vocab, "", 7))
+    terms = LoopHybridStack.head_work_terms(stack, T, Q, S)
+    logits = 2 * T * H * vocab
+    assert terms.count((logits, 0)) == 1
+    cfg.mtp_loss_type = "cross_entropy"
+    assert (logits, 0) not in LoopHybridStack.head_work_terms(stack, T, Q, S)
