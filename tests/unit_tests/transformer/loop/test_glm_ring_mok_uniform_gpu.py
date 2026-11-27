@@ -18,10 +18,12 @@ from tests.unit_tests.transformer.loop import test_glm_ring_mok_recompute_gpu as
 from tests.unit_tests.transformer.loop.hybrid_loop_utils import CUDA
 
 
-@pytest.mark.skipif(not CUDA or checkpoint.ring.WORLD != 8, reason="requires eight CUDA ranks")
-def test_full_uniform_four_sublayers_matches_one_with_trained_indexer(monkeypatch):
+pytestmark = pytest.mark.skipif(not CUDA or checkpoint.ring.WORLD != 8, reason="requires eight CUDA ranks")
+
+
+def _check_uniform_sublayers(monkeypatch, group_size):
     """Compare real block boundaries as well as losses, routes, shared KV and all weight grads."""
-    strides = iter((1, 4))
+    strides = iter((1, group_size))
     ranges = Counter()
     indexer_grads = Counter()
     selector_calls = Counter()
@@ -31,7 +33,7 @@ def test_full_uniform_four_sublayers_matches_one_with_trained_indexer(monkeypatc
     def models(plans, *, layernorm=False):
         size = next(strides)
         # The actual fused DSA path records a source selection and score payload for its
-        # checkpoint replay. A four-sublayer group spans D/E/D/E on the shared core.
+        # checkpoint replay. Every multi-sublayer group spans DSA and MoE on the shared core.
         config = replace(
             moe.config(2),
             num_attention_heads=64,
@@ -98,7 +100,7 @@ def test_full_uniform_four_sublayers_matches_one_with_trained_indexer(monkeypatc
     monkeypatch.setattr(GLMDSALoopStack, "_run_range", record_ranges)
     plans = ("CCCC", "CCCC")
     checkpoint._compare_plans(plans, plans)
-    assert indexer_grads[1] == indexer_grads[4] > 0
+    assert indexer_grads[1] == indexer_grads[group_size] > 0
     assert selector_calls[True, False] > 0
     assert not any(
         count for (source, replay), count in selector_calls.items() if source is False or replay
@@ -106,7 +108,7 @@ def test_full_uniform_four_sublayers_matches_one_with_trained_indexer(monkeypatc
 
     # The same logical visits ran forward and backward exactly once per local sublayer.
     visits = {}
-    for size in (1, 4):
+    for size in (1, group_size):
         covered = Counter()
         for (stride, label, first, end, replay), count in ranges.items():
             if stride == size:
@@ -115,13 +117,25 @@ def test_full_uniform_four_sublayers_matches_one_with_trained_indexer(monkeypatc
                     covered[label, sublayer, replay] += count
         assert covered
         visits[size] = covered
-    assert visits[1] == visits[4]
+    assert visits[1] == visits[group_size]
     assert all(
-        count == 1 and visits[4][label, layer, not replay] == 1
-        for (label, layer, replay), count in visits[4].items()
+        count == 1 and visits[group_size][label, layer, not replay] == 1
+        for (label, layer, replay), count in visits[group_size].items()
     )
-    assert any(stride == 4 and end - first >= 2 for stride, label, first, end, replay in ranges)
+    # The longer PP stage owns eight consecutive core sublayers. A group must span
+    # its full requested width there, and stop at the shorter stage boundary on its peer.
+    longest_visit = max(layer for label, layer, replay in visits[1]) + 1
+    candidate_widths = [end - first for size, label, first, end, replay in ranges if size == group_size]
+    assert max(candidate_widths) == min(group_size, longest_visit)
     print(
-        f"verified {len(visits[4])} original/replay sublayer visits, "
-        f"{indexer_grads[4]} nonzero indexer gradients and {sum(selector_calls.values())} selections"
+        f"uniform {group_size}: verified {len(visits[group_size])} original/replay sublayer visits, "
+        f"{indexer_grads[group_size]} nonzero indexer gradients and {sum(selector_calls.values())} selections"
     )
+
+
+def test_full_uniform_four_sublayers_matches_one_with_trained_indexer(monkeypatch):
+    _check_uniform_sublayers(monkeypatch, group_size=4)
+
+
+def test_full_uniform_eight_sublayers_matches_one_with_trained_indexer(monkeypatch):
+    _check_uniform_sublayers(monkeypatch, group_size=8)
