@@ -539,3 +539,10 @@ python examples/moe_recipes/glm5_2/run.py \
 For training, append `--variant 1m_mok_context` or
 `--variant 1m_mok_context_tv_heads` to the `srun_rank.sh` invocation above.
 The 112-GPU production results for these two configurations are pending.
+
+An eight-GPU PP2/EP4 regression on both core visits verified that checkpoint
+replay released MoK's private MXFP8 activation storage. For identical incoming
+gradients, the original and replayed native calls produced bitwise-equal input,
+route and expert weight gradients. The maximum whole-model gradient discrepancy
+in a separate MXFP8 run was 5.75% across settings and 5.78% when repeating the
+original setting. Both exceed the comparison's 2% relative L2 threshold.
