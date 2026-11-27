@@ -463,8 +463,9 @@ to the sparse index across the configured four-layer selector groups.
 | 5 | 19–22 | 47–50 | 75–78 |
 | 6 | 23–26 | 51–54 | Shared MTP7, output and loss |
 
-The default workload uses TP1/PP7/EP16/CP16, MBS1, GBS56 and 63,488 real
-input tokens per 65,536-token pack. It uses the trained indexer, DeepGEMM
+The default workload uses TP1/PP7/EP16/CP16, MBS1, GBS56 and 63,489 real
+input tokens per 65,536-token pack. The current mock dataset appends EOD as
+a separate prediction target. Its JSON content length counts trained tokens. It uses the trained indexer, DeepGEMM
 scoring, DeepSelect, MoK, force-balanced routing, distributed Muon and a
 full-iteration graph. The loop configuration disables TE parameter transpose
 caching so that per-use weight gradients accumulate over both core visits.

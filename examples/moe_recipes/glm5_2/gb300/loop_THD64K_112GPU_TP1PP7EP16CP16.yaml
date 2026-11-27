@@ -245,7 +245,7 @@ ARGS:
   recompute_method: null
   recompute_num_layers: null
   dsa_indexer_reuse_checkpoint_topk: null
-  no_overlap_p2p_communication: null
+  no_overlap_p2p_communication: true
 VARIANTS:
   frozen_indexer:
     dsa_indexer_loss_coeff: 0.0

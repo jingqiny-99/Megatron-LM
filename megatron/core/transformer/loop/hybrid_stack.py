@@ -901,18 +901,20 @@ class LoopHybridStack(HybridStack):
         tokens = sequence * batch
         rows = float(tokens * depth)
         core = self.loop_roles.core
+        # Scalar fills execute on the capture stream. A tensor constructor
+        # from a Python scalar can copy via pageable host memory during capture.
         self.loop_metrics = {
-            "loop depth": torch.tensor(float(depth), device=device),
-            "loop active token layers": torch.as_tensor(rows * core, device=device),
-            "loop backward token layers": torch.as_tensor(
-                rows * core if grad else 0.0, device=device
+            "loop depth": torch.full((), float(depth), dtype=torch.float32, device=device),
+            "loop active token layers": torch.full((), rows * core, dtype=torch.float32, device=device),
+            "loop backward token layers": torch.full(
+                (), rows * core if grad else 0.0, dtype=torch.float32, device=device
             ),
         }
         for phase, value in zip(
             ("forward", "backward", "recompute"), (forward, backward, recompute)
         ):
-            self.loop_metrics[f"loop {phase} flops per token"] = (
-                torch.as_tensor(value, dtype=torch.float32, device=device) / tokens
+            self.loop_metrics[f"loop {phase} flops per token"] = torch.full(
+                (), value / tokens, dtype=torch.float32, device=device
             )
 
     def _ring_add_work(self, work, *, recompute, backward_factor=2):
