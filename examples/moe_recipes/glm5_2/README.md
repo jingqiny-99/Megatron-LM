@@ -556,3 +556,35 @@ gradients, the original and replayed native calls produced bitwise-equal input,
 route and expert weight gradients. The maximum whole-model gradient discrepancy
 in a separate MXFP8 run was 5.75% across settings and 5.78% when repeating the
 original setting. Both exceed the comparison's 2% relative L2 threshold.
+
+### Two-pass 1M loop on 448 GB300 GPUs
+
+This recipe uses TP1/PP7/CP64/EP64 and DP1 on 112 four-GPU nodes. The 78
+physical decoder blocks follow the stage map above. Each sample visits the
+28 shared core blocks twice. It keeps the trained indexer, the first pass's
+sparse KV and indices, the second pass's 128-token window, and all seven
+shared MTP depths with the E2E-TV loss. Each optimizer update processes eight
+1,048,576-position packs with 1,015,809 real tokens apiece. Dynamic CP assigns
+16,384 positions to each rank. The recipe runs 32 updates with distributed
+Muon, MXFP8 MoK (minibatch 4,096 and macrobatch 131,072), full uniform
+checkpointing at one sublayer and a full-iteration CUDA graph.
+
+Use the dependency exports and the per-rank launcher in the Slurm instructions
+above. Allocate seven 16-node segments with
+`--nodes=112 --ntasks-per-node=4 --gpus-per-node=4 --segment=16 --exclusive`.
+Set `--nodes=112` in `LAYOUT` and use the same layout for the placement probe
+and training. Each consecutive group of 64 ranks must occupy one NVLink domain.
+Select the recipe, render its command, and pass the placement probe from
+step 1 to the checker with the 448-rank geometry.
+
+```bash
+export GLM52_RECIPE=examples/moe_recipes/glm5_2/gb300/loop_THD1M_448GPU_TP1PP7EP64CP64.yaml
+python3 examples/moe_recipes/glm5_2/run.py "${GLM52_RECIPE}" --dry-run
+GLM52_MASTER_ADDR=$(python3 examples/moe_recipes/glm5_2/check_placement.py \
+  "${GLM52_RUN_DIR}/placement-${SLURM_JOB_ID}.txt" --ranks 448 --ranks-per-stage 64)
+export GLM52_MASTER_ADDR GLM52_MASTER_PORT=29500
+```
+
+Run the prewarm and training commands from steps 2 and 3 with this
+`GLM52_RECIPE`. The first three updates warm up the model, update 4 captures
+the graph, and updates 13–32 provide the steady-state timing window.

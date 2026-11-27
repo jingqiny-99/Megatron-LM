@@ -38,6 +38,42 @@ def _arguments(values: dict) -> list[str]:
     return result
 
 
+def _variant_arguments(recipe: dict, variant: str | None) -> dict:
+    arguments = dict(recipe['ARGS'])
+    if variant is not None:
+        variants = recipe.get('VARIANTS', {})
+        if variant not in variants:
+            raise ValueError(f'Unknown variant {variant!r}; the recipe defines {sorted(variants)}.')
+        unknown = sorted(set(variants[variant]) - set(arguments))
+        if unknown:
+            raise ValueError(f'Variant {variant!r} sets arguments absent from ARGS: {unknown}.')
+        arguments.update(variants[variant])
+    return arguments
+
+
+def _read_recipe(path: Path, ancestors: tuple[Path, ...] = ()) -> dict:
+    """A topology recipe may reuse a sibling's workload and override its rank layout."""
+    recipe = yaml.safe_load(path.read_text())
+    if 'BASE_RECIPE' not in recipe:
+        return recipe
+
+    parent = path.with_name(recipe['BASE_RECIPE'])
+    if parent.resolve().parent != path.resolve().parent:
+        raise ValueError('BASE_RECIPE must be a file in the same directory.')
+    ancestors = (*ancestors, path.resolve())
+    if parent.resolve() in ancestors:
+        raise ValueError(f'Cyclic BASE_RECIPE reference to {parent.name}.')
+    base = _read_recipe(parent, ancestors)
+    dependencies = dict(base['DEPENDENCIES'])
+    dependencies['hardware'] = {**dependencies['hardware'], **recipe['HARDWARE']}
+    return {
+        **base,
+        'DEPENDENCIES': dependencies,
+        'ARGS': {**_variant_arguments(base, recipe.get('BASE_VARIANT')), **recipe['ARGS']},
+        'VARIANTS': recipe.get('VARIANTS', {}),
+    }
+
+
 def main() -> None:
     """Translate ENV_VARS and ARGS without importing the GPU training stack."""
     parser = argparse.ArgumentParser(description=__doc__)
@@ -57,20 +93,11 @@ def main() -> None:
         help="Fill DG_JIT_CACHE_DIR with DeepGEMM's indexer kernels on one GPU; do not train.",
     )
     options = parser.parse_args()
-    with options.recipe.open() as stream:
-        recipe = yaml.safe_load(stream)
-
-    arguments = dict(recipe['ARGS'])
-    if options.variant is not None:
-        variants = recipe.get('VARIANTS', {})
-        if options.variant not in variants:
-            parser.error(
-                f'Unknown variant {options.variant!r}; the recipe defines {sorted(variants)}.'
-            )
-        unknown = sorted(set(variants[options.variant]) - set(arguments))
-        if unknown:
-            parser.error(f'Variant {options.variant!r} sets arguments absent from ARGS: {unknown}.')
-        arguments.update(variants[options.variant])
+    try:
+        recipe = _read_recipe(options.recipe)
+        arguments = _variant_arguments(recipe, options.variant)
+    except ValueError as error:
+        parser.error(str(error))
 
     root = Path(__file__).resolve().parents[3]
     environment = dict(os.environ, MEGATRON_ROOT=str(root))

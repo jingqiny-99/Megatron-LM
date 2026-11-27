@@ -1,0 +1,20 @@
+# Each of seven physical PP stages occupies 16 four-GPU nodes in one NVLink domain.
+BASE_RECIPE: loop_THD64K_112GPU_TP1PP7EP16CP16.yaml
+BASE_VARIANT: 1m
+HARDWARE:
+  num_nodes: 112
+  num_gpus: 448
+ARGS:
+  context_parallel_size: 64
+  expert_model_parallel_size: 64
+  max_seqlen_per_dp_cp_rank: 16384
+  # Use the native reduction, optimizer precision and warmup defaults for this run.
+  accumulate_allreduce_grads_in_fp32: null
+  main_params_dtype: null
+  main_grads_dtype: null
+  exp_avg_dtype: null
+  exp_avg_sq_dtype: null
+  megatron_fsdp_main_grads_dtype: null
+  megatron_fsdp_grad_comm_dtype: null
+  lr_warmup_iters: null
+  num_distributed_optimizer_instances: null
