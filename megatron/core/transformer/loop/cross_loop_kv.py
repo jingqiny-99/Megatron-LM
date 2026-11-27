@@ -23,7 +23,16 @@ class CrossLoopPass:
 
     def __init__(self, step: int, saved: dict[tuple[nn.Module, str], Tensor]) -> None:
         self.is_source = step == 0
+        self._source_support = None
         self._saved: dict[tuple[nn.Module, str], Tensor] | None = saved
+
+    def compact_source(self, signature, owners, build):
+        """Share one immutable support within the open source visit; keep its inputs alive."""
+        if not self.is_source or self._saved is None:
+            return build()
+        if self._source_support is None or self._source_support[0] != signature:
+            self._source_support = signature, owners, build()
+        return self._source_support[2]
 
     @contextmanager
     def activate(self) -> Iterator[None]:
@@ -43,6 +52,7 @@ class CrossLoopPass:
     def finish_source(self) -> None:
         """A producer checkpoint may replay, but must not retain its own autograd graph."""
         if self.is_source:
+            self._source_support = None
             self._saved = None
 
     def read(self, module: nn.Module, name: str) -> Tensor:

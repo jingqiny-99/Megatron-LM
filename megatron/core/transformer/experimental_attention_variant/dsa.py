@@ -51,7 +51,7 @@ from megatron.core.transformer.experimental_attention_variant.head_batched_matmu
     head_batched_matmul,
 )
 from megatron.core.transformer.experimental_attention_variant.dsa_loop_kv import (
-    compact_source_topk,
+    compact_loop_source_topk,
     gather_zigzag_window_kv,
     two_bank_topk,
     zigzag_window_positions,
@@ -6515,9 +6515,21 @@ class DSAttention(MegatronModule):
         # ===================================
         finish_cp_kv_gather()
         if loop_pass is not None:
-            shared_indices, shared_lengths = compact_source_topk(
-                topk_indices, topk_length, causal_ends=varlen_ends,
-                causal_starts=varlen_starts if packed_thd else None, valid_rows=query_valid_rows
+            packed_layout = None
+            if packed_thd and attn_mask_type == AttnMaskType.causal:
+                # These are the inputs to build_dsattention_forward_mask's packed branch
+                # and the packed real-token mask. Include CP ownership and document bounds.
+                packed_layout = (
+                    packed_seq_params, packed_seq_params.cu_seqlens_q,
+                    packed_seq_params.cu_seqlens_q_padded, packed_seq_params.cu_seqlens_kv,
+                    packed_seq_params.cu_seqlens_kv_padded,
+                    getattr(packed_seq_params, "real_token_mask_q", None), packed_query_positions,
+                    attention_mask, cp_group, self.cp_comm_type, cp_size, cp_rank, b, sq, skv,
+                )
+            shared_indices, shared_lengths = compact_loop_source_topk(
+                loop_pass, topk_indices, topk_length, causal_ends=varlen_ends,
+                causal_starts=varlen_starts if packed_thd else None, valid_rows=query_valid_rows,
+                packed_layout=packed_layout,
             )
             loop_pass.publish(self, "dsa_latent", key)
             loop_pass.publish(self, "dsa_topk", shared_indices)

@@ -34,6 +34,45 @@ def compact_source_topk(
     return compacted.masked_fill_(compacted == sentinel, -1), valid.sum(-1, dtype=torch.int32)
 
 
+
+def _support_identity(value):
+    if isinstance(value, Tensor):
+        # A new view of precisely the same region may be used by a skip layer. Keep
+        # the tensor alive in the pass and reject changed versions, offsets or strides.
+        base = value if value._base is None else value._base
+        return (
+            "view", id(base), value._version, tuple(value.shape), value.stride(),
+            value.storage_offset(), value.dtype, value.is_conj(), value.is_neg(),
+        )
+    if value is None or isinstance(value, (bool, int, str)):
+        return ("value", value)
+    return ("object", id(value))
+
+
+def compact_loop_source_topk(
+    loop_pass, indices, lengths, *, causal_ends, causal_starts=None, valid_rows=None,
+    packed_layout=None,
+):
+    """Reuse a source selector's compact support for adjacent physical layers in this visit."""
+    def build():
+        return compact_source_topk(
+            indices, lengths, causal_ends=causal_ends, causal_starts=causal_starts,
+            valid_rows=valid_rows,
+        )
+
+    if lengths is None or valid_rows is None:
+        return build()
+    # A causal THD layout is defined by its document offsets, query mapping and row mask.
+    # Its derived per-layer bounds are freshly materialized. Other layouts require
+    # identity of the actual bounds and mask. No device reads occur during capture.
+    geometry = (causal_ends, causal_starts, valid_rows) if packed_layout is None else packed_layout
+    owners = (indices, lengths, *geometry)
+    if any(isinstance(v, Tensor) and (v.layout != torch.strided or v.is_inference()) for v in owners):
+        return build()
+    signature = tuple(_support_identity(v) for v in owners)
+    return loop_pass.compact_source(signature, owners, build)
+
+
 def two_bank_topk(
     indices: Tensor,
     lengths: Tensor,
