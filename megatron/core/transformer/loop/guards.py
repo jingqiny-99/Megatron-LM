@@ -413,7 +413,7 @@ def validate_hybrid_loop_config(config: "TransformerConfig") -> None:
             and not (
                 fixed_glm_ring(config)
                 and config.recompute_method == "uniform"
-                and config.recompute_num_layers == 1
+                and (config.recompute_num_layers or 0) > 0
             )
         )
         or (

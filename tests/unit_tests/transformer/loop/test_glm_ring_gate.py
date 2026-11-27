@@ -209,3 +209,36 @@ def test_stratified_laps_skip_exited_core_and_backpropagate_two_sparse_reads(dep
         strict=True,
     ):
         torch.testing.assert_close(check.grad, ref.grad)
+
+
+@pytest.mark.parametrize("width, bounds", [(1, [(i, i + 1) for i in range(6)]), (4, [(0, 4), (4, 6)])])
+def test_full_uniform_groups_remain_local_and_replay_in_reverse(width, bounds):
+    from functools import partial
+
+    from megatron.core.transformer.loop.hybrid_stack import LoopHybridStack
+
+    config = SimpleNamespace(
+        recompute_granularity="full", recompute_num_layers=width, loop_carrier="gated_residual"
+    )
+    calls = []
+
+    def run_range(x, first, last, ctx, label):
+        calls.append((first, last))
+        for _ in range(first, last):
+            x = x.sin()
+        return x
+
+    stack = SimpleNamespace(config=config, layers=range(6), _run_range=run_range)
+    stack._checkpointed_blocks = partial(LoopHybridStack._checkpointed_blocks, stack)
+    x = torch.tensor([0.5], requires_grad=True)
+    y = GLMRingStack._ring_local_layers(stack, x, None, "visit", None, True)
+    assert calls == bounds
+    y.sum().backward()
+    assert calls == bounds + list(reversed(bounds))
+    source = x.detach().requires_grad_(True)
+    reference = source
+    for _ in range(6):
+        reference = reference.sin()
+    reference.sum().backward()
+    torch.testing.assert_close(y, reference, rtol=0, atol=0)
+    torch.testing.assert_close(x.grad, source.grad, rtol=0, atol=0)

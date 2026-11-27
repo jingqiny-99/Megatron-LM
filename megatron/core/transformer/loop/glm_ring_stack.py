@@ -182,7 +182,11 @@ class GLMRingStack(LoopHybridStack):
         if recompute and torch.is_grad_enabled() and (full or self.config.loop_recompute_block_stride):
             return self._checkpointed_blocks(
                 state, None, 0, len(self.layers), ctx, label, cross_loop_pass=scope,
-                block_stride=1 if full else self.config.loop_recompute_block_stride,
+                block_stride=(
+                    self.config.recompute_num_layers
+                    if full
+                    else self.config.loop_recompute_block_stride
+                ),
             )
 
         def run(x):
