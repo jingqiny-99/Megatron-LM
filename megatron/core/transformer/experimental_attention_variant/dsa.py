@@ -5409,6 +5409,19 @@ class DSAttention(MegatronModule):
                 layout_cache=layout_cache,
             )
 
+        # A later visit can reconstruct the original canonical first-pass bank with the
+        # same CP gather and permutation. Storing the local producer also lets each
+        # consumer's reduce-scatter deliver its KV gradient to the source rank.
+        shard_source_kv = (
+            loop_pass is not None
+            and packed_thd
+            and cp_size > 1
+            and self.cp_comm_type == "allgather"
+            and kv_reorder_idx is not None
+            and key.size(0) == cp_local_sequence_rows
+            and getattr(self.config, "loop_shard_packed_sparse_kv", False)
+        )
+        source_kv_shard = key if shard_source_kv and loop_pass.is_source else None
         local_cp_kv_lens = {cp_local_sequence_rows}
         local_cp_kv_len = None
         # The deferred CP K/V gather (_DeferredCpKvGather) while it is in flight, else None;
@@ -5643,6 +5656,12 @@ class DSAttention(MegatronModule):
             # either the compact local+halo bank or the complete gathered bank.
             finish_cp_kv_gather()
             prefix_key = loop_pass.read(self, "dsa_latent")
+            if shard_source_kv:
+                prefix_key = _permute_rows(
+                    gather_from_sequence_parallel_region(prefix_key, group=cp_group),
+                    kv_reorder_idx,
+                    kv_reorder_inv_idx,
+                )
             if prefix_key.shape != (skv, *key.shape[1:]):
                 raise ValueError("First and second DSA passes require identical KV geometry")
             window_ends = varlen_ends
@@ -6569,7 +6588,9 @@ class DSAttention(MegatronModule):
                 causal_starts=varlen_starts if packed_thd else None, valid_rows=query_valid_rows,
                 packed_layout=packed_layout,
             )
-            loop_pass.publish(self, "dsa_latent", key)
+            loop_pass.publish(
+                self, "dsa_latent", key if source_kv_shard is None else source_kv_shard
+            )
             loop_pass.publish(self, "dsa_topk", shared_indices)
             loop_pass.publish(self, "dsa_topk_length", shared_lengths)
         output = _run_sparse_attention(
