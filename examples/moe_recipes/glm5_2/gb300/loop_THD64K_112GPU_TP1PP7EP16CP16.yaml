@@ -250,6 +250,8 @@ ARGS:
   dsa_indexer_reuse_checkpoint_topk: null
   no_overlap_p2p_communication: true
 VARIANTS:
+  64k_mok40k_recompute:
+    loop_ring_recompute_plan: CCnC/CCnC/CCnC/CCnC/CCnC/CCnC/CCnC
   64k_mok16k:
     train_iters: 16
     moe_megakernel_backend_config: &mok16k '{"fwd_num_comm_sms":48,"bwd_num_comm_sms":36,"minibatch_size":4096,"macrobatch_size":16384,"schedule_capacity_multiplier":0.5,"all_gather_top_experts_chunk_bytes":2048}'

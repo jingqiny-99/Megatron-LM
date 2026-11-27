@@ -493,13 +493,15 @@ with the original recipe use warmup steps 1–3, capture at step 4, and report
 steps 13–32. For token throughput count the actual input tokens in a pack.
 
 On the 112-GPU placement, the 64K and 128K source settings exhausted memory
-on PP stage 2. Two capacity variants reached CUDA graph replay with the
+on PP stage 2. The following capacity variants reached CUDA graph replay with the
 trained indexer, seven-depth MTP objective and distributed Muon enabled.
 
 | Variant | Updates | MoK macrobatch | Checkpointed visits on each stage |
 | --- | ---: | ---: | --- |
+| `64k_mok40k_recompute` | 32 | 40,960 | Prelude, first core visit, coda |
 | `64k_mok16k` | 16 | 16,384 | Prelude |
 | `128k_mok16k_recompute` | 32 | 16,384 | Prelude, both core visits, coda |
 
 Pass the variant to the same launcher, for example
-`--variant 64k_mok16k`. The 64K measurement uses updates 13–16.
+`--variant 64k_mok40k_recompute`. Use updates 13–32 for this configuration
+and updates 13–16 for the shorter `64k_mok16k` run.
