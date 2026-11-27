@@ -272,6 +272,9 @@ class TransformerConfig(ModelParallelConfig):
     """Build three physical chunks per PP rank (prelude, tied core, coda) and run the native
     interleaved schedule over prelude, first core pass, second core pass, and coda/head."""
 
+    loop_recompute_ring_gates: bool = False
+    """Checkpoint each terminal GLM ring residual gate independently of the local layers."""
+
     loop_ring_recompute_plan: Optional[str] = None
     """loop_schedule='ring': the recompute plan, one code per (pipeline stage, round view): P
     '/'-separated groups (stage 0 first) of R x k codes, R = loop_iterations and k the virtual
@@ -3500,6 +3503,13 @@ class TransformerConfig(ModelParallelConfig):
             ]
             if rsbf_only:
                 raise ValueError(f"{', '.join(rsbf_only)} require loop_schedule='rsbf'")
+        if self.loop_recompute_ring_gates and not (
+            self.loop_schedule == "ring"
+            and self.loop_ring_separate_edges
+            and self.loop_carrier == "gated_residual"
+            and self.experimental_attention_variant == "dsa"
+        ):
+            raise ValueError("loop_recompute_ring_gates requires the separate-edge gated GLM DSA ring")
         if self.loop_schedule == "ring":
             # Imported lazily: the guards module imports model code.
             from megatron.core.transformer.loop.guards import validate_loop_ring_config

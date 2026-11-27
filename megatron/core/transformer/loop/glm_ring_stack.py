@@ -4,6 +4,7 @@
 from contextlib import nullcontext
 
 import torch
+from torch.utils.checkpoint import checkpoint
 
 from megatron.core.transformer.forward_replay import forward_statistics_round
 from megatron.core.transformer.loop.guards import validate_hybrid_loop_inputs
@@ -59,7 +60,11 @@ class GLMRingStack(LoopHybridStack):
             recompute,
         )
         if core and self.loop_ring.round_end:
-            yield self.round_extra_forward_flops(tokens), 2, False
+            yield (
+                self.round_extra_forward_flops(tokens),
+                2,
+                getattr(self.config, "loop_recompute_ring_gates", False),
+            )
         if lap == self.config.loop_iterations + 1 and self.loop_ring.round_end:
             for value, factor in self.head_work_terms(tokens, tokens * sequence, sequence):
                 yield value, factor, False
@@ -152,7 +157,14 @@ class GLMRingStack(LoopHybridStack):
                     if call.gate_banks is None or key not in call.gate_banks:
                         raise RuntimeError(f"Missing GLM pass input for {key}")
                     entry = call.gate_banks[key]
-                    state = self.loop_gates[lap - 1](ring_injection_use(entry), state)
+                    previous = ring_injection_use(entry)
+                gate = self.loop_gates[lap - 1]
+                if getattr(self.config, "loop_recompute_ring_gates", False) and torch.is_grad_enabled():
+                    state = checkpoint(
+                        gate, previous, state, use_reentrant=False, preserve_rng_state=False
+                    )
+                else:
+                    state = gate(previous, state)
                     if call.online_exit is not None and call.online_exit.gate(
                         call.microbatch, lap, state, padding_mask=ctx.padding_mask
                     ):
@@ -171,6 +183,21 @@ class GLMRingStack(LoopHybridStack):
                 self.set_ring_model_work(sequence, batch, call.model_work)
             self._ring_head_metrics(state.device, sequence, batch, depth=depth)
         return state
+
+    def _run_sublayer(self, index, x, ctx, label):
+        try:
+            return super()._run_sublayer(index, x, ctx, label)
+        except torch.OutOfMemoryError as exc:
+            if self.loop_ring is not None:
+                from megatron.core.transformer.forward_replay import in_forward_replay
+
+                physical = self.pp_layer_offset + index + 1
+                exc.add_note(
+                    f"GLM ring PP rank {self.pg_collection.pp.rank()}: {label}, "
+                    f"local sublayer {index}, global sublayer {physical} "
+                    f"({self.layer_type_list[index]}), replay={in_forward_replay()}"
+                )
+            raise
 
     def _ring_local_layers(self, state, ctx, label, scope, recompute):
         """Bind the same per-pass KV and selection context inside original and replayed layers."""

@@ -242,3 +242,27 @@ def test_full_uniform_groups_remain_local_and_replay_in_reverse(width, bounds):
     reference.sum().backward()
     torch.testing.assert_close(y, reference, rtol=0, atol=0)
     torch.testing.assert_close(x.grad, source.grad, rtol=0, atol=0)
+
+
+def test_oom_reports_physical_sublayer_and_original_ring_visit(monkeypatch):
+    from megatron.core.transformer.loop.hybrid_stack import LoopHybridStack
+
+    cause = torch.OutOfMemoryError("original allocation message")
+
+    def fail(*args):
+        raise cause
+
+    monkeypatch.setattr(LoopHybridStack, "_run_sublayer", fail)
+    stack = object.__new__(GLMRingStack)
+    nn.Module.__init__(stack)
+    stack.loop_ring = SimpleNamespace(role="core")
+    stack.pg_collection = SimpleNamespace(pp=SimpleNamespace(rank=lambda: 6))
+    stack.pp_layer_offset = 100
+    monkeypatch.setattr(GLMRingStack, "layer_type_list", property(lambda self: "DEDE"))
+    with pytest.raises(torch.OutOfMemoryError) as err:
+        stack._run_sublayer(2, None, None, "loop_hybrid/mb=3/core/lap=2")
+    assert err.value is cause
+    assert err.value.__notes__ == [
+        "GLM ring PP rank 6: loop_hybrid/mb=3/core/lap=2, local sublayer 2, "
+        "global sublayer 103 (D), replay=False"
+    ]
