@@ -714,3 +714,11 @@ if __name__ == "__main__":
         forward_step,
         store=store,
     )
+    if (
+        full_config.model.transformer.cuda_graph_impl == "full_iteration"
+        and torch.distributed.is_initialized()
+    ):
+        # pretrain has released the captured graphs on every rank. Close the
+        # remaining NCCL groups in PyTorch's collective order while all ranks
+        # are alive, before the interpreter starts destroying their references.
+        torch.distributed.destroy_process_group()

@@ -700,7 +700,7 @@ class LoopRingSchedule:
 
     def __init__(self):
         self._model_work: "weakref.WeakKeyDictionary" = weakref.WeakKeyDictionary()
-        self._eager_fixed_records = {}
+        self._eager_fixed_records = weakref.WeakKeyDictionary()
         self.last_step: Optional[LoopRingStepRecord] = None
         self.iteration = 0
 
@@ -1022,11 +1022,12 @@ class LoopRingSchedule:
         # and geometry. Reading a NCCL result on the host inside capture is illegal.
         full_graph = getattr(model_config, "cuda_graph_impl", "none") == "full_iteration"
         if full_graph:
-            signature = (states[0].model, num_microbatches, views, forward_only, tuple(model_work))
+            records = self._eager_fixed_records.setdefault(states[0].model, {})
+            signature = (num_microbatches, views, forward_only, tuple(model_work))
         if full_graph and torch.cuda.is_current_stream_capturing():
-            if signature not in self._eager_fixed_records:
+            if signature not in records:
                 raise RuntimeError("Warm up the fixed ring schedule before capturing this geometry")
-            self.last_step = self._eager_fixed_records[signature]
+            self.last_step = records[signature]
         else:
             self.last_step = self._reduce_counts(
                 counts,
@@ -1041,7 +1042,7 @@ class LoopRingSchedule:
                 online_decisions=online_exit.records() if online_exit is not None else (),
             )
             if full_graph:
-                self._eager_fixed_records[signature] = self.last_step
+                records[signature] = self.last_step
         return output
 
     # -------------------------------------------------------------------------- step end
