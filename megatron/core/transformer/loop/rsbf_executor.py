@@ -2283,9 +2283,11 @@ class LoopRSBFExecutor:
             coda_recompute = stack.range_forward_flops(
                 roles.core_end, len(stack.layers) - retained, tokens, squared, sequence
             )
-        for work, factor in stack.head_work_terms(tokens, squared, sequence):
+        for work, factor, replay in flops.head_schedule_work(stack, tokens, squared, sequence):
             coda = coda + work
             coda_backward = coda_backward + factor * work
+            if replay:
+                coda_recompute = coda_recompute + work
         for attention in self.program.coda_recompute_attentions():
             coda_recompute = coda_recompute + flops.dsv4_up_proj_forward_flops(
                 attention.config, tokens

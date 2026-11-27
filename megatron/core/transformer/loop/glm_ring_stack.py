@@ -7,6 +7,7 @@ import torch
 from torch.utils.checkpoint import checkpoint
 
 from megatron.core.transformer.forward_replay import forward_statistics_round
+from megatron.core.transformer.loop import flops
 from megatron.core.transformer.loop.guards import validate_hybrid_loop_inputs
 from megatron.core.transformer.loop.hybrid_stack import LoopHybridStack
 from megatron.core.transformer.loop.ring_pp import (
@@ -66,8 +67,7 @@ class GLMRingStack(LoopHybridStack):
                 getattr(self.config, "loop_recompute_ring_gates", False),
             )
         if lap == self.config.loop_iterations + 1 and self.loop_ring.round_end:
-            for value, factor in self.head_work_terms(tokens, tokens * sequence, sequence):
-                yield value, factor, False
+            yield from flops.head_schedule_work(self, tokens, tokens * sequence, sequence)
 
     def ring_microbatch_work(self, sequence, batch, codes, *, depth=None):
         if not getattr(self.config, "loop_ring_separate_edges", False):

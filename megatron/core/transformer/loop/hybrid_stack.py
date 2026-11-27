@@ -877,8 +877,10 @@ class LoopHybridStack(HybridStack):
             ),
             recompute=self._ring_edge_recomputed(call.checkpoint, prelude=False),
         )
-        for work, backward_factor in self.head_work_terms(tokens, squared_lengths, sequence):
-            self._ring_add_work(work, recompute=False, backward_factor=backward_factor)
+        for work, backward_factor, replay in flops.head_schedule_work(
+            self, tokens, squared_lengths, sequence
+        ):
+            self._ring_add_work(work, recompute=replay, backward_factor=backward_factor)
         if call.checkpoint:
             return self._run_edge(state, local.core_end, len(self.layers), ctx, f"{label}/coda")
         return self._run_range(state, local.core_end, len(self.layers), ctx, f"{label}/coda")
@@ -982,8 +984,10 @@ class LoopHybridStack(HybridStack):
                 ),
                 self._ring_edge_recomputed(codes[-1] == "C", prelude=False),
             )
-            for value, backward_factor in self.head_work_terms(tokens, squared_lengths, sequence):
-                add(value, False, backward_factor)
+            for value, backward_factor, replay in flops.head_schedule_work(
+                self, tokens, squared_lengths, sequence
+            ):
+                add(value, replay, backward_factor)
         return tuple(work)
 
     def set_ring_model_work(self, sequence: int, batch: int, work) -> None:
@@ -1318,8 +1322,10 @@ class LoopHybridStack(HybridStack):
 
     def _record_head(self, tokens, squared_lengths, sequence):
         """Record the output layer and the MTP depths (set by ``set_loop_head_flops``)."""
-        for work, backward_factor in self.head_work_terms(tokens, squared_lengths, sequence):
-            self._add_work(work, backward_factor=backward_factor)
+        for work, backward_factor, replay in flops.head_schedule_work(
+            self, tokens, squared_lengths, sequence
+        ):
+            self._add_work(work, backward_factor=backward_factor, recompute=replay)
 
     def range_forward_flops(
         self,

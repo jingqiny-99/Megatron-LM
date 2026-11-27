@@ -273,6 +273,19 @@ def mor_router_forward_flops(tokens, hidden_size, loop_iterations):
     return 2 * tokens * hidden_size * (hidden_size + loop_iterations)
 
 
+def head_schedule_work(stack, tokens, squared_lengths, sequence):
+    """Mark the final head term (draft logits) for replay under per-depth TV rematerialization."""
+    terms = stack.head_work_terms(tokens, squared_lengths, sequence)
+    head = getattr(stack, "_loop_head", None)
+    replay_drafts = (
+        getattr(getattr(stack, "config", None), "mtp_recompute_tv_heads", False)
+        and head is not None
+        and head[2] > 0
+    )
+    for index, (work, backward_factor) in enumerate(terms):
+        yield work, backward_factor, replay_drafts and index == len(terms) - 1
+
+
 def logits_forward_flops(tokens, hidden_size, vocab_size):
     """One output-layer (logit) projection."""
     return 2 * tokens * hidden_size * vocab_size

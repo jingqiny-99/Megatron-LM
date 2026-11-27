@@ -12,6 +12,7 @@ from typing import TYPE_CHECKING, Callable, Iterator, List, Optional, Sequence, 
 import torch
 import torch.nn as nn
 from torch import Tensor
+from torch.utils.checkpoint import checkpoint as torch_checkpoint
 
 from megatron.core import InferenceParams, parallel_state, tensor_parallel
 from megatron.core.context_parallel import ContextParallelBatch, convert_cp_layout
@@ -1264,6 +1265,32 @@ def _process_mtp_e2e_tv_loss(
     original_num_tokens = original_loss_mask.sum() if config.calculate_per_token_loss else None
     chain_valid = torch.ones_like(loss_mask, dtype=torch.bool)
     tv_distances = []
+    recompute_draft = is_training and torch.is_grad_enabled() and getattr(
+        config, "mtp_recompute_tv_heads", False
+    )
+
+    def draft_distance(draft_hidden, target, row_indices, valid_rows, halo):
+        draft_logits, _ = output_layer(
+            draft_hidden, weight=output_weight, runtime_gather_output=runtime_gather_output
+        )
+        if scale_logits_fn is not None:
+            draft_logits = scale_logits_fn(draft_logits)
+        if row_indices is None:
+            return vocab_parallel_tv_distance(
+                draft_logits,
+                target,
+                tp_group=tp_group,
+                logits_are_vocab_sharded=logits_are_vocab_sharded,
+            )
+        return vocab_parallel_tv_distance(
+            draft_logits,
+            target,
+            tp_group=tp_group,
+            logits_are_vocab_sharded=logits_are_vocab_sharded,
+            target_row_indices=row_indices,
+            target_valid_rows=valid_rows,
+            target_halo_logits=halo,
+        )
 
     for mtp_layer_number in range(num_depths):
         if use_prepared_roll_rows:
@@ -1309,34 +1336,32 @@ def _process_mtp_e2e_tv_loss(
                 chain_valid &= mtp_input_mask
         chain_valid &= current_loss_mask.bool()
 
-        draft_logits, _ = output_layer(
-            hidden_states_list[mtp_layer_number + 1],
-            weight=output_weight,
-            runtime_gather_output=runtime_gather_output,
-        )
-        if scale_logits_fn is not None:
-            draft_logits = scale_logits_fn(draft_logits)
         if use_prepared_roll_rows:
-            tv_distances.append(
-                vocab_parallel_tv_distance(
-                    draft_logits,
-                    target_address.source,
-                    tp_group=tp_group,
-                    logits_are_vocab_sharded=logits_are_vocab_sharded,
-                    target_row_indices=target_address.row_indices,
-                    target_valid_rows=target_address.valid_rows,
-                    target_halo_logits=target_address.halo,
-                )
+            args = (
+                hidden_states_list[mtp_layer_number + 1],
+                target_address.source,
+                target_address.row_indices,
+                target_address.valid_rows,
+                target_address.halo,
             )
         else:
-            tv_distances.append(
-                vocab_parallel_tv_distance(
-                    draft_logits,
-                    target_logits.permute(2, 0, 1),
-                    tp_group=tp_group,
-                    logits_are_vocab_sharded=logits_are_vocab_sharded,
-                )
+            args = (
+                hidden_states_list[mtp_layer_number + 1],
+                target_logits.permute(2, 0, 1),
+                None,
+                None,
+                None,
             )
+        if recompute_draft:
+            # Keep the shared teacher, row mapping, and draft hidden input. The full
+            # draft logits and TV sign bits are recreated only for this depth's
+            # backward, using the cotangent produced by the real prefix objective.
+            distance = torch_checkpoint(
+                draft_distance, *args, use_reentrant=False, preserve_rng_state=False
+            )
+        else:
+            distance = draft_distance(*args)
+        tv_distances.append(distance)
 
     tv_distances_tensor = torch.stack(tv_distances, dim=0)
     per_step_acceptance = 1.0 - tv_distances_tensor

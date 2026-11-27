@@ -461,6 +461,9 @@ class TransformerConfig(ModelParallelConfig):
     since a single depth has nothing to mix. Model constructors validate this
     against the resolved architecture."""
 
+    mtp_recompute_tv_heads: bool = False
+    """Recompute each detached draft projection and TV comparison with its true loss gradient."""
+
     mtp_loss_early_backward: bool = False
     """Run each MTP head's vocabulary projection, cross-entropy and their backward back-to-back
     during the forward pass instead of deferring the backward to the main backward pass.
@@ -3535,6 +3538,8 @@ class TransformerConfig(ModelParallelConfig):
                 "mtp_loss_type must be one of 'cross_entropy' or 'e2e_tv', "
                 f"got {self.mtp_loss_type!r}."
             )
+        if self.mtp_recompute_tv_heads and self.mtp_loss_type != "e2e_tv":
+            raise ValueError("mtp_recompute_tv_heads requires mtp_loss_type='e2e_tv'.")
         if self.mtp_loss_type == "e2e_tv":
             if not self.mtp_detach_heads:
                 warnings.warn(
