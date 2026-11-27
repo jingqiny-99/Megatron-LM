@@ -158,13 +158,16 @@ class GLMRingStack(LoopHybridStack):
                         raise RuntimeError(f"Missing GLM pass input for {key}")
                     entry = call.gate_banks[key]
                     previous = ring_injection_use(entry)
-                gate = self.loop_gates[lap - 1]
-                if getattr(self.config, "loop_recompute_ring_gates", False) and torch.is_grad_enabled():
-                    state = checkpoint(
-                        gate, previous, state, use_reentrant=False, preserve_rng_state=False
-                    )
-                else:
-                    state = gate(previous, state)
+                    gate = self.loop_gates[lap - 1]
+                    if (
+                        getattr(self.config, "loop_recompute_ring_gates", False)
+                        and torch.is_grad_enabled()
+                    ):
+                        state = checkpoint(
+                            gate, previous, state, use_reentrant=False, preserve_rng_state=False
+                        )
+                    else:
+                        state = gate(previous, state)
                     if call.online_exit is not None and call.online_exit.gate(
                         call.microbatch, lap, state, padding_mask=ctx.padding_mask
                     ):

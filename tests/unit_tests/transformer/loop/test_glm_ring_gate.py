@@ -104,7 +104,10 @@ def test_pass_input_survives_send_and_gate_gradients_join_the_source(training):
 
 @pytest.mark.parametrize("depth", [1, 2, 3])
 @pytest.mark.parametrize("online", [False, True], ids=["known", "online"])
-def test_stratified_laps_skip_exited_core_and_backpropagate_two_sparse_reads(depth, online):
+@pytest.mark.parametrize("checkpoint_gate", [False, True], ids=["gate", "checkpoint_gate"])
+def test_stratified_laps_skip_exited_core_and_backpropagate_two_sparse_reads(
+    depth, online, checkpoint_gate
+):
     from megatron.core.transformer.loop.hybrid_stack import LoopHybridStack
     from megatron.core.transformer.loop.ring_online import RingOnlineExit
     from megatron.core.transformer.loop.ring_pp import LoopRingCall
@@ -117,6 +120,7 @@ def test_stratified_laps_skip_exited_core_and_backpropagate_two_sparse_reads(dep
         init_method=nn.init.xavier_uniform_,
         loop_iterations=3,
         loop_exit_criterion="online" if online else "stratified",
+        loop_recompute_ring_gates=checkpoint_gate,
         loop_exit_thresholds=[1e6 if r == depth else -1e6 for r in (1, 2)],
         loop_recompute_edges=False,
         loop_ring_separate_edges=True,
