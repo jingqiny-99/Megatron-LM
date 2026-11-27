@@ -136,9 +136,16 @@ def zigzag_window_positions(
     local_rows: int, cp_size: int, cp_rank: int, window: int, device: torch.device
 ) -> tuple[Tensor, Tensor]:
     """Map compact second-bank offsets to global token positions for masking and selection."""
+    positions, ends = _zigzag_window_rows(local_rows, cp_size, cp_rank, window, device)
+    prefix = torch.arange(local_rows * cp_size, device=device, dtype=torch.int64)
+    return torch.cat([prefix, *positions]), torch.cat(ends)
+
+
+def _zigzag_window_rows(
+    local_rows: int, cp_size: int, cp_rank: int, window: int, device: torch.device
+) -> tuple[list[Tensor], list[Tensor]]:
     chunk = local_rows // 2
-    global_rows = local_rows * cp_size
-    positions = [torch.arange(global_rows, device=device, dtype=torch.int64)]
+    positions = []
     ends = []
     offset = 0
     for ordinal in (cp_rank, 2 * cp_size - 1 - cp_rank):
@@ -150,4 +157,56 @@ def zigzag_window_positions(
         first_end = offset + halo + 1
         ends.append(torch.arange(first_end, first_end + chunk, device=device, dtype=torch.int32))
         offset += halo + chunk
+    return positions, ends
+
+
+def gather_packed_window_kv(
+    key: Tensor, offsets: tuple[int, ...], window: int, cp_group
+) -> Tensor:
+    """Fetch the preceding halo per packed document, with reduce-scatter of its adjoint.
+
+    A short document can span multiple owner chunks within a single window.
+    Gather that document in canonical order. The other documents keep their
+    two local chunks and only the preceding W-1 tokens of each.
+    """
+    compact = []
+    cp_size = cp_group.size()
+    for start, end in zip(offsets, offsets[1:]):
+        if end == start:
+            continue
+        doc = key[start // cp_size : end // cp_size]
+        half = doc.size(0) // 2
+        if window - 1 <= half:
+            compact.append(gather_zigzag_window_kv(doc, window, cp_group))
+        else:
+            full = gather_from_sequence_parallel_region(doc.contiguous(), group=cp_group)
+            pairs = full.unflatten(0, (cp_size, 2, half))
+            compact.extend((pairs[:, 0].flatten(0, 1), pairs[:, 1].flip(0).flatten(0, 1)))
+    return compact[0] if len(compact) == 1 else torch.cat(compact)
+
+
+def packed_window_positions(
+    offsets: tuple[int, ...], cp_size: int, cp_rank: int, window: int, device: torch.device
+) -> tuple[Tensor, Tensor]:
+    """Absolute positions for the sparse+current banks and current-bank ends per local query."""
+    positions = [torch.arange(offsets[-1], device=device, dtype=torch.int64)]
+    ends = []
+    current_offset = 0
+    for start, end in zip(offsets, offsets[1:]):
+        length = end - start
+        if length == 0:
+            continue
+        local = length // cp_size
+        half = local // 2
+        if window - 1 <= half:
+            rows, doc_ends = _zigzag_window_rows(local, cp_size, cp_rank, window, device)
+        else:
+            rows = [torch.arange(length, device=device, dtype=torch.int64)]
+            doc_ends = [
+                torch.arange(i * half + 1, (i + 1) * half + 1, dtype=torch.int32, device=device)
+                for i in (cp_rank, 2 * cp_size - 1 - cp_rank)
+            ]
+        positions.extend(row + start for row in rows)
+        ends.extend(doc_end + current_offset for doc_end in doc_ends)
+        current_offset += sum(row.numel() for row in rows)
     return torch.cat(positions), torch.cat(ends)

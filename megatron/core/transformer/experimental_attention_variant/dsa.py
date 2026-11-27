@@ -52,7 +52,9 @@ from megatron.core.transformer.experimental_attention_variant.head_batched_matmu
 )
 from megatron.core.transformer.experimental_attention_variant.dsa_loop_kv import (
     compact_loop_source_topk,
+    gather_packed_window_kv,
     gather_zigzag_window_kv,
+    packed_window_positions,
     two_bank_topk,
     zigzag_window_positions,
 )
@@ -5425,7 +5427,26 @@ class DSAttention(MegatronModule):
             and sq % 2 == 0
             and 0 < self.config.loop_sparse_kv_window_size <= sq // 2 + 1
         )
-        if cp_size > 1 and not compact_window:
+        packed_window_offsets = None
+        if (
+            loop_pass is not None
+            and not loop_pass.is_source
+            and packed_thd
+            and getattr(self.config, "loop_compact_packed_window", False)
+            and cp_size > 1
+            and self.cp_comm_type == "allgather"
+            and getattr(packed_seq_params, "cp_partition_mode", "zigzag") == "zigzag"
+            and not sequence_parallel_query_is_local
+            and attention_mask is None
+            and key.size(0) == sq
+            and host_cu_q is not None
+            and host_cu_kv is not None
+            and tuple(host_cu_q) == tuple(host_cu_kv)
+            and host_cu_q[0] == 0
+            and host_cu_q[-1] == sq * cp_size
+        ):
+            packed_window_offsets = tuple(host_cu_q)
+        if cp_size > 1 and not compact_window and packed_window_offsets is None:
             assert (
                 self.cp_comm_type == "allgather"
             ), "DSAttention context parallelism currently supports cp_comm_type=allgather only."
@@ -5540,7 +5561,7 @@ class DSAttention(MegatronModule):
 
         if cp_kv_gather is None:
             capture_mtp_latent_kv()
-        if compact_window:
+        if compact_window or packed_window_offsets is not None:
             skv = sq * cp_size
 
         if not packed_thd and sequence_parallel_query_is_local:
@@ -5625,7 +5646,24 @@ class DSAttention(MegatronModule):
             if prefix_key.shape != (skv, *key.shape[1:]):
                 raise ValueError("First and second DSA passes require identical KV geometry")
             window_ends = varlen_ends
-            if compact_window:
+            window_starts = varlen_starts if packed_thd else None
+            if packed_window_offsets is not None:
+                window = self.config.loop_sparse_kv_window_size
+                key = gather_packed_window_kv(key, packed_window_offsets, window, cp_group)
+                bank_positions, window_ends = self._memoized(
+                    layout_cache,
+                    (
+                        "packed_window_positions", packed_window_offsets, cp_size, cp_rank,
+                        window, query.device,
+                    ),
+                    lambda: packed_window_positions(
+                        packed_window_offsets, cp_size, cp_rank, window, query.device
+                    ),
+                )
+                # The global causal bounds include the true document start. Translate
+                # just its visible window to the coordinate system of the compact bank.
+                window_starts = window_ends - (varlen_ends - varlen_starts).clamp(max=window)
+            elif compact_window:
                 window = self.config.loop_sparse_kv_window_size
                 key = gather_zigzag_window_kv(key, window, cp_group)
                 bank_positions, window_ends = self._memoized(
@@ -5640,7 +5678,7 @@ class DSAttention(MegatronModule):
                 loop_pass.read(self, "dsa_topk_length"),
                 self.config.loop_sparse_kv_window_size,
                 causal_ends=window_ends,
-                causal_starts=varlen_starts if packed_thd else None,
+                causal_starts=window_starts,
                 valid_rows=query_valid_rows,
                 bank_size=skv,
             )

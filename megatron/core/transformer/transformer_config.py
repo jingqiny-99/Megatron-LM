@@ -201,6 +201,9 @@ class TransformerConfig(ModelParallelConfig):
     """Reuse first-pass sparse KV and selected indices alongside each later pass's own
     local-window KV. DSv4 uses compressed slots; native DSA uses token positions."""
 
+    loop_compact_packed_window: bool = False
+    """Exchange the local causal window of a recurrent DSA pass across packed zigzag CP ranks."""
+
     loop_rsbf_offload_sparse_kv: bool = False
     """Keep native DSA first-pass KV and its consumer adjoint in pinned CPU memory between
     uses during two-round RSBF training. Top-k indices remain on the device."""
