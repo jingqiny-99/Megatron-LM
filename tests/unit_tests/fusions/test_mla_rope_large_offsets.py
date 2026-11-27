@@ -43,6 +43,7 @@ def test_concat_long_packed_mla_rows_and_adjoints():
     del phase
 
     gen = torch.Generator(device=device).manual_seed(2026)
+
     def values(shape):
         tensor = torch.empty(shape, dtype=torch.bfloat16, device=device)
         return tensor.random_(-16, 17, generator=gen)
@@ -56,17 +57,36 @@ def test_concat_long_packed_mla_rows_and_adjoints():
 
     # Comparing in row blocks keeps the independent reference far below the model's HBM footprint.
     # Split exactly around the first wrapped address to also identify a boundary failure directly.
-    boundaries = sorted({*range(0, rows, 1024), first_wrapped_row - 1, first_wrapped_row,
-                         first_wrapped_row + 1, rows})
+    boundaries = sorted(
+        {
+            *range(0, rows, 1024),
+            first_wrapped_row - 1,
+            first_wrapped_row,
+            first_wrapped_row + 1,
+            rows,
+        }
+    )
     for start, end in zip(boundaries, boundaries[1:]):
         span = slice(start, end)
-        cos_rows = cos[position[span], None, :rotary // 2]
-        sin_rows = sin[position[span], None, :rotary // 2]
+        cos_rows = cos[position[span], None, : rotary // 2]
+        sin_rows = sin[position[span], None, : rotary // 2]
         even, odd = rope[span, :, 0::2].detach(), rope[span, :, 1::2].detach()
         left, right = dy[span, :, content:].chunk(2, dim=-1)
         assert torch.equal(out[span, :, :content], nope[span]), (start, end, "content")
-        assert torch.equal(out[span, :, content:content + rotary // 2], even*cos_rows - odd*sin_rows), (start, end, "rotation left")
-        assert torch.equal(out[span, :, content + rotary // 2:], odd*cos_rows + even*sin_rows), (start, end, "rotation right")
+        assert torch.equal(
+            out[span, :, content : content + rotary // 2], even * cos_rows - odd * sin_rows
+        ), (start, end, "rotation left")
+        assert torch.equal(
+            out[span, :, content + rotary // 2 :], odd * cos_rows + even * sin_rows
+        ), (start, end, "rotation right")
         assert torch.equal(dnope[span], dy[span, :, :content]), (start, end, "dcontent")
-        assert torch.equal(drope[span, :, 0::2], left*cos_rows + right*sin_rows), (start, end, "drotation even")
-        assert torch.equal(drope[span, :, 1::2], right*cos_rows - left*sin_rows), (start, end, "drotation odd")
+        assert torch.equal(drope[span, :, 0::2], left * cos_rows + right * sin_rows), (
+            start,
+            end,
+            "drotation even",
+        )
+        assert torch.equal(drope[span, :, 1::2], right * cos_rows - left * sin_rows), (
+            start,
+            end,
+            "drotation odd",
+        )
