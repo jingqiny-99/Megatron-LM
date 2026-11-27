@@ -406,6 +406,9 @@ class LoggerConfig:
     log_memory_interval: int | None = None
     """Report memory interval."""
 
+    log_packed_sequence_stats: bool = False
+    """Log each update's real input-token count and sum of squared document lengths."""
+
     log_device_memory_used: bool = False
     """Log device memory used (as reported by nvidia-smi)."""
 

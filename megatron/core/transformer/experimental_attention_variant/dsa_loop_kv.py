@@ -9,8 +9,12 @@ from megatron.core.tensor_parallel.mappings import gather_from_sequence_parallel
 
 
 def compact_source_topk(
-    indices: Tensor, lengths: Tensor | None, *, causal_ends: Tensor, causal_starts: Tensor | None = None,
-    valid_rows: Tensor | None = None
+    indices: Tensor,
+    lengths: Tensor | None,
+    *,
+    causal_ends: Tensor,
+    causal_starts: Tensor | None = None,
+    valid_rows: Tensor | None = None,
 ) -> tuple[Tensor, Tensor]:
     """Preserve the first pass's support, including its backend's padding convention."""
     if lengths is not None:
@@ -31,8 +35,14 @@ def compact_source_topk(
 
 
 def two_bank_topk(
-    indices: Tensor, lengths: Tensor, window_size: int, *, causal_ends: Tensor, bank_size: int,
-    causal_starts: Tensor | None = None, valid_rows: Tensor | None = None
+    indices: Tensor,
+    lengths: Tensor,
+    window_size: int,
+    *,
+    causal_ends: Tensor,
+    bank_size: int,
+    causal_starts: Tensor | None = None,
+    valid_rows: Tensor | None = None,
 ) -> tuple[Tensor, Tensor]:
     """Join two sorted, disjoint index ranges in one compact prefix per batch/query."""
     batch, rows, k = indices.shape

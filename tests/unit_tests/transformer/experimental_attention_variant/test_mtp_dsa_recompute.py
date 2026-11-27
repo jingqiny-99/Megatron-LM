@@ -553,14 +553,15 @@ def test_hybrid_seven_depths_share_dsa_and_preserve_gradients():
                 else dict(recompute_method="uniform", recompute_num_layers=1)
             )
             config = _make_config(
+                num_layers=156,
                 mtp_num_layers=7,
                 mtp_detach_heads=True,
                 mtp_loss_type="e2e_tv",
                 mtp_repeated_layer_shared_components=BOTH_SHARED_COMPONENTS,
                 context_parallel_size=2,
                 cp_comm_type="all_gather",
-                dsa_indexer_topk_freq=1,
-                dsa_indexer_skip_topk_offset=0,
+                dsa_indexer_topk_freq=4,
+                dsa_indexer_skip_topk_offset=3,
                 num_moe_experts=4,
                 moe_router_topk=2,
                 moe_ffn_hidden_size=128,
@@ -594,6 +595,8 @@ def test_hybrid_seven_depths_share_dsa_and_preserve_gradients():
         for model in models:
             trunk = trunk_input.detach().requires_grad_()
             attention = model.layers[0].mtp_model_layer.layers[0].self_attention
+            assert attention.core_attention.layer_number == 157
+            assert not attention.core_attention.skip_topk
             kv_calls, index_calls = [], []
             kv_hook = attention.linear_kv_down_proj.register_forward_pre_hook(
                 lambda *_: kv_calls.append(torch.is_grad_enabled())

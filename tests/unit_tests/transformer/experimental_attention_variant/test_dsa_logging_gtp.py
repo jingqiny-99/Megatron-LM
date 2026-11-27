@@ -85,7 +85,11 @@ def test_gtp_group_is_read_from_pg_collection(recorded):
     pg_collection = SimpleNamespace(pp=PP, dp=DP, gtp_remat=GTP)
     DSAIndexerLossLoggingHelper.reduce_loss_in_tracker(pg_collection=pg_collection)
     # The fixed DP x CP path sums weighted losses, then divides by its contributor count.
-    assert recorded == [("pp", None), ("dp", torch.distributed.ReduceOp.SUM), ("gtp_remat", torch.distributed.ReduceOp.SUM)]
+    assert recorded == [
+        ("pp", None),
+        ("dp", torch.distributed.ReduceOp.SUM),
+        ("gtp_remat", torch.distributed.ReduceOp.SUM),
+    ]
 
 
 def test_dynamic_cp_parent_is_extended_by_gtp(recorded):
@@ -123,3 +127,28 @@ def test_track_indexer_metrics_passes_gtp_group(monkeypatch):
         assert "gtp_remat_group" not in seen
     finally:
         DSAIndexerLossLoggingHelper.tracker = {}
+
+
+def test_fixed_dp_cp_preserves_weighted_round_loss(recorded):
+    from megatron.core.transformer.forward_replay import (
+        forward_statistics_round,
+        forward_statistics_weight,
+    )
+
+    logger = DSAIndexerLossLoggingHelper
+    logger.tracker["values"].zero_()
+    local = SimpleNamespace(size=lambda: 2)
+    for r, value, weight in [(1, 3.0, 0.5), (2, 7.0, 0.25)]:
+        with forward_statistics_round(r, 2), forward_statistics_weight(weight):
+            logger.save_loss_to_tracker(torch.tensor(value), 1, 2, reduce_group=local)
+    logger.reduce_loss_in_tracker(
+        pg_collection=SimpleNamespace(pp=PP, dp=DP_GTP, dp_cp=DP_GTP, gtp_remat=GTP), loop_rounds=2
+    )
+    # The fake all-reduce preserves local entries; fixed DPxCP divides by its four ranks.
+    torch.testing.assert_close(logger.tracker["round_values"][:, 0], torch.tensor([0.75, 0.875]))
+    torch.testing.assert_close(
+        logger.tracker["values"][0], logger.tracker["round_values"][:, 0].sum()
+    )
+    assert recorded == [("pp", None), ("dp_gtp_remat", torch.distributed.ReduceOp.SUM)] * 2
+    logger.clean_loss_in_tracker()
+    assert torch.count_nonzero(logger.tracker["cp_weighted_round_values"]) == 0

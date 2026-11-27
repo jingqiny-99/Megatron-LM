@@ -971,6 +971,14 @@ def test_dynamic_cp1_dev_contract_certifies_and_finalizes_after_static_round_tri
     assert packed_seq_params.cp_singleton_group is singleton
     assert resolve_cp_group(static_cp_group, packed_seq_params) is singleton
 
+    config.linear_cp_layout = config.attention_cp_layout = "zigzag"
+    hybrid_batch = get_batch_on_this_rank_for_sequence_packing(
+        iter([static_batch]), config=config, return_context_parallel_batch=True
+    )
+    assert hybrid_batch.get_batch()["tokens"] is static_batch["tokens"]
+    assert hybrid_batch.get_packed_seq_params().cp_singleton_group is singleton
+    assert hybrid_batch.get_batch()["cu_seqlens"].data_ptr() == static_batch["cu_seqlens"].data_ptr()
+
 
 class TestThdStaticPPCommunicationShapes:
     """Full-iteration THD mode replaces the P2P shape handshake with static shapes."""

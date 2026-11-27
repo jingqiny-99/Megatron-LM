@@ -2096,6 +2096,12 @@ class MultiTokenPredictionLayer(MegatronModule):
                 if self.config.keep_mtp_in_bf16:
                     layer_config.fp4 = None
                     layer_config.fp8 = None
+            if self.config.mtp_repeated_layer_shared_components:
+                # The hybrid trunk's cross-layer index cache belongs to its own loop scope.
+                # /DE depth zero must start a new selector. Hybrid IDs count the D and E
+                # sublayers separately, so using that ID in the trunk's top-k cadence can
+                # incorrectly turn the source into a skip layer (e.g. sublayer 157).
+                layer_config_list[0].dsa_indexer_skip_topk_offset = self.config.num_layers + 1
             stack_config = self.config
             if self.config.moe_shortcut_disable_mtp:
                 # The stack groups its layers from its own config, and each layer reads its

@@ -1076,6 +1076,7 @@ def test_split_hooks_forward_the_configured_precision(monkeypatch):
         loss_coeff=0.01,
         pg_collection=SimpleNamespace(tp=None),
         config=config,
+        sbhd_cp_zigzag=True,
         **bounds,
     )
-    assert applied["args"][-1] == dsa_cudnn_kernels.IndexerScorerOptions(True, "mxfp8")
+    assert applied["args"][-2:] == (dsa_cudnn_kernels.IndexerScorerOptions(True, "mxfp8"), True)

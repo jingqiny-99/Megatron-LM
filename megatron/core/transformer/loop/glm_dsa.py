@@ -2,13 +2,18 @@
 """GLM-style two-pass text decoder using native token-level sparse MLA."""
 
 import copy
+from contextlib import nullcontext
 from contextvars import ContextVar
 from dataclasses import replace
 from types import SimpleNamespace
 
 from megatron.core.models.hybrid.hybrid_layer_specs import hybrid_stack_spec
 from megatron.core.models.hybrid.layers.utils import Symbols
-from megatron.core.transformer.experimental_attention_variant.dsa import DSAttention
+from megatron.core.transformer.experimental_attention_variant.dsa import (
+    DSAttention,
+    dsa_nonreentrant_checkpoint_scope,
+)
+from megatron.core.transformer.forward_replay import in_forward_replay, routing_tape_active
 from megatron.core.transformer.loop.flops import native_dsa_forward_work
 from megatron.core.transformer.loop.glm_ring_stack import GLMRingStack
 
@@ -71,9 +76,20 @@ class GLMDSALoopStack(GLMRingStack):
             # All layers and replays see the same fixed SBHD shard geometry. Sparse
             # selections still have a separate holder per pass and sample.
             holders[label] = SimpleNamespace(cp_layout=holders.setdefault("sbhd_cp_layout", {}))
-        token = _INDEX_SHARE.set(holders[label])
+        carrier = holders[label]
+        checkpoint = nullcontext()
+        if self.config.dsa_indexer_reuse_checkpoint_topk and routing_tape_active():
+            # A pass may have several disjoint block checkpoints, replayed in reverse order.
+            # The holder is specific to this physical stack, sample and logical visit.
+            owners = vars(carrier).setdefault("checkpoint_owners", {})
+            key = (start, end)
+            if not in_forward_replay():
+                owners[key] = object()
+            checkpoint = dsa_nonreentrant_checkpoint_scope(owners[key], replay=in_forward_replay())
+        token = _INDEX_SHARE.set(carrier)
         try:
-            return super()._run_range(x, start, end, ctx, label)
+            with checkpoint:
+                return super()._run_range(x, start, end, ctx, label)
         finally:
             _INDEX_SHARE.reset(token)
 
@@ -89,6 +105,43 @@ class GLMDSALoopStack(GLMRingStack):
         # All native attention layers use one KV entry per token.
         return None
 
+    def _ring_lap_work(self, lap, checkpoint, sequence, batch):
+        """Split the selector from the ordinary F/B and the small gate/head terms."""
+        terms = super()._ring_lap_work(lap, checkpoint, sequence, batch)
+        body, _, replay = next(terms)
+        tokens = sequence * batch
+        total_select = 0
+        selector_terms = []
+        reuse_first = 1 < lap <= self.config.loop_iterations and self._cross_loop_attention_layers
+        if not reuse_first:
+            for i, (symbol, config, _) in enumerate(self._loop_flop_rows):
+                if (
+                    symbol != Symbols.DS_ATTENTION
+                    or self.layers[i].self_attention.core_attention.indexer is None
+                ):
+                    continue
+                _, select = native_dsa_forward_work(
+                    config, tokens, self._ring_global_sequence(sequence)
+                )
+                total_select += select
+                train = bool(config.dsa_indexer_loss_coeff)
+                compute_replay = replay and not config.dsa_indexer_reuse_checkpoint_topk
+                if replay and config.dsa_indexer_reuse_checkpoint_topk and train:
+                    # The KL still projects the BF16 Q/K/weights in replay, but reads the
+                    # original dense selection and sparse-loss log probabilities.
+                    dim, heads = config.dsa_indexer_head_dim, config.dsa_indexer_n_heads
+                    projection = (
+                        2
+                        * tokens
+                        * (config.q_lora_rank * heads * dim + config.hidden_size * (dim + heads))
+                    )
+                    selector_terms.append((projection, 2, True))
+                    select -= projection
+                selector_terms.append((select, 2 if train else 0, compute_replay))
+        yield body - total_select, 2, replay
+        yield from selector_terms
+        yield from terms
+
     def _layer_forward_flops(
         self, index, tokens, squared_lengths, sequence, arbitrary_mask, cross_loop_pass=None
     ):
@@ -100,7 +153,9 @@ class GLMDSALoopStack(GLMRingStack):
         recurrent_read = cross_loop_pass is not None and not cross_loop_pass.is_source
         has_indexer = self.layers[index].self_attention.core_attention.indexer is not None
         attention, indexer = native_dsa_forward_work(
-            config, tokens, self._ring_global_sequence(sequence),
+            config,
+            tokens,
+            self._ring_global_sequence(sequence),
             select=has_indexer and not recurrent_read,
             window=config.loop_sparse_kv_window_size if recurrent_read else 0,
         )

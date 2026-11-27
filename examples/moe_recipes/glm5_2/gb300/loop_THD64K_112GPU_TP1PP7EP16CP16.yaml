@@ -90,7 +90,6 @@ ARGS:
   position_embedding_type: rope
   rope_type: rope
   rotary_base: 8000000
-  no_rope_fusion: true
   multi_latent_attention: true
   q_lora_rank: 2048
   kv_lora_rank: 512
@@ -159,6 +158,7 @@ ARGS:
   eval_interval: 10000
   log_interval: 1
   log_throughput: true
+  log_packed_sequence_stats: true
   log_memory_max_over_ranks: true
   log_memory_interval: '1'
   log_device_memory_used: true

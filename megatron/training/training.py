@@ -8006,8 +8006,24 @@ def train(
             consume_seqlen_stats_in_iteration()
         )
         packed_sequence_stats = None
-        if getattr(args, 'log_packed_sequence_stats', False):
-            packed_sequence_stats = consume_packed_sequence_stats_in_iteration()
+        if cfg.logger.log_packed_sequence_stats:
+            if cfg.model.transformer.sequence_packing_scheduler is not None:
+                # The scheduler counted original documents before CP sharding,
+                # VPP replay and tail padding. These totals are already global.
+                packed_sequence_stats = {
+                    "packed_sequence/total_tokens": total_real_tokens_in_batch,
+                    "packed_sequence/seqlen_squared_sum": seqlen_squared_sum_in_batch,
+                    "packed_sequence/input_samples": iteration_sequences,
+                }
+                if iteration % cfg.logger.log_interval == 0:
+                    print_rank_last(
+                        f"packed sequence stats iteration {iteration}: "
+                        f"tokens={total_real_tokens_in_batch} "
+                        f"squared_lengths={seqlen_squared_sum_in_batch} "
+                        f"input_samples={iteration_sequences}"
+                    )
+            else:
+                packed_sequence_stats = consume_packed_sequence_stats_in_iteration()
         (
             vision_total_tokens_in_batch,
             vision_seqlen_squared_sum_in_batch,

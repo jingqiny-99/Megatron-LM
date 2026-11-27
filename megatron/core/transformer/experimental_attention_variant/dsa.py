@@ -4132,6 +4132,20 @@ def dsa_checkpoint_phase_wrapper(function):
             _CURRENT_DSA_CHECKPOINT_CALL.reset(token)
 
     return wrapped
+
+
+@contextmanager
+def dsa_nonreentrant_checkpoint_scope(owner, *, replay):
+    """Attach an explicit owner to one GLM block's gradient-enabled forward and replay."""
+    phase = CheckpointPhase.REPLAY if replay else CheckpointPhase.FIRST_FORWARD
+    call = _DSACheckpointCall(phase, owner=owner)
+    token = _CURRENT_DSA_CHECKPOINT_CALL.set(call)
+    try:
+        yield
+    finally:
+        _CURRENT_DSA_CHECKPOINT_CALL.reset(token)
+
+
 _MTP_SHARING_ATTR = "_dsa_mtp_repeated_sharing"
 
 
@@ -6262,30 +6276,35 @@ class DSAttention(MegatronModule):
             ):
                 starts_i32, ends_i32 = fused_bounds
                 block_size = int(getattr(self, "fused_indexer_block_size", 8192))
-                fused_topk_with_scores = dsa_kernels.run_fused_qk_topk_with_scores(
-                    self.config,
-                    q,
-                    k,
-                    weights,
-                    self.index_topk,
-                    starts_i32,
-                    ends_i32,
-                    block_size=max(1, block_size),
-                    use_relu=self.config.dsa_indexer_scoring_relu,
-                    use_local_indexer_varlen=use_local_indexer_varlen,
-                    single_packed_thd_sequence=single_packed_thd_sequence,
-                    local_packed_cp_rank=cp_rank,
-                    local_packed_cp_query_start=local_packed_cp_query_start,
-                    local_packed_cp_query_len=local_packed_cp_query_len,
-                    packed_seq_params=packed_seq_params,
-                    cp_size=cp_size,
-                    varlen_is_plain_causal=varlen_is_plain_causal,
-                    sbhd_cp_zigzag=sbhd_cp_zigzag,
-                    query=query,
-                    key=key if cp_kv_gather is None else cp_kv_gather.key_shape_twin(key),
-                )
+                with torch.no_grad():
+                    fused_topk_with_scores = dsa_kernels.run_fused_qk_topk_with_scores(
+                        self.config,
+                        q,
+                        k,
+                        weights,
+                        self.index_topk,
+                        starts_i32,
+                        ends_i32,
+                        block_size=max(1, block_size),
+                        use_relu=self.config.dsa_indexer_scoring_relu,
+                        use_local_indexer_varlen=use_local_indexer_varlen,
+                        single_packed_thd_sequence=single_packed_thd_sequence,
+                        local_packed_cp_rank=cp_rank,
+                        local_packed_cp_query_start=local_packed_cp_query_start,
+                        local_packed_cp_query_len=local_packed_cp_query_len,
+                        packed_seq_params=packed_seq_params,
+                        cp_size=cp_size,
+                        varlen_is_plain_causal=varlen_is_plain_causal,
+                        sbhd_cp_zigzag=sbhd_cp_zigzag,
+                        query=query,
+                        key=key if cp_kv_gather is None else cp_kv_gather.key_shape_twin(key),
+                    )
                 if fused_topk_with_scores is not None:
                     topk_indices, topk_length, deferred_loss_topk_scores = fused_topk_with_scores
+                    if checkpoint_phase is CheckpointPhase.FIRST_FORWARD:
+                        # Non-reentrant checkpoints compute their original KL with grad on.
+                        # Keep the very same score payload this pass supplied to its KL.
+                        topk_scores = deferred_loss_topk_scores
             if topk_indices is None:
                 finish_cp_kv_gather()
             if sparse_indexer_loss and fused_bounds is not None and topk_indices is None:

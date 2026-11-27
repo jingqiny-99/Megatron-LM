@@ -61,9 +61,15 @@ def test_native_dsa_rounds_and_gradients(fused, packed, monkeypatch):
         real[[6, 15, 16]] = False
         cu = torch.tensor([0, 6, 14], device=device, dtype=torch.int32)
         padded = torch.tensor([0, 7, 17], device=device, dtype=torch.int32)
-        packed_params = PackedSeqParams(qkv_format="thd", cu_seqlens_q=cu, cu_seqlens_kv=cu,
-                                        cu_seqlens_q_padded=padded, cu_seqlens_kv_padded=padded,
-                                        max_seqlen_q=10, max_seqlen_kv=10)
+        packed_params = PackedSeqParams(
+            qkv_format="thd",
+            cu_seqlens_q=cu,
+            cu_seqlens_kv=cu,
+            cu_seqlens_q_padded=padded,
+            cu_seqlens_kv_padded=padded,
+            max_seqlen_q=10,
+            max_seqlen_kv=10,
+        )
         if packed == "mask":
             packed_params.real_token_mask_q = real
     rank, rope = (512, 64) if fused else (4, 2)
@@ -117,7 +123,15 @@ def test_native_dsa_rounds_and_gradients(fused, packed, monkeypatch):
 
     def run(query, key):
         return module(
-            query, key, None, None, x, x, attn_mask_type=AttnMaskType.causal, up_v_weight=up, packed_seq_params=packed_params
+            query,
+            key,
+            None,
+            None,
+            x,
+            x,
+            attn_mask_type=AttnMaskType.causal,
+            up_v_weight=up,
+            packed_seq_params=packed_params,
         )
 
     bank = {}
@@ -142,7 +156,9 @@ def test_native_dsa_rounds_and_gradients(fused, packed, monkeypatch):
     inputs = (q1, key1, q2, key2, up)
     r_q1, r_k1, r_q2, r_k2, r_up = refs = [t.detach().float().requires_grad_() for t in inputs]
     ref1 = torch.cat([_dense_reference(r_q1[t], r_k1[t], None, r_up, k, window) for t in documents])
-    ref2 = torch.cat([_dense_reference(r_q2[t], r_k1[t], r_k2[t], r_up, k, window) for t in documents])
+    ref2 = torch.cat(
+        [_dense_reference(r_q2[t], r_k1[t], r_k2[t], r_up, k, window) for t in documents]
+    )
     ref2 = ref2.masked_fill(~real[:, None, None], 0)
     gradients = tuple(torch.randn_like(t) * real[:, None, None] for t in (out1, out2))
     actual = torch.autograd.grad((out1, out2), inputs, gradients)

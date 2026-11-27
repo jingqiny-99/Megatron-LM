@@ -6,7 +6,7 @@ from typing import Any, Callable, Dict, List, Optional, Sequence, Type
 
 import torch
 
-from megatron.core.context_parallel import get_batches_on_this_cp_rank
+from megatron.core.context_parallel import ContextParallelBatch, get_batches_on_this_cp_rank
 from megatron.core.context_parallel.groups import get_valid_dynamic_context_parallel_group_sizes
 from megatron.core.context_parallel_layout import ThdCpRoute, finalize_packed_seq_params
 from megatron.core.datasets.data_schedule_utils import (
@@ -1188,7 +1188,21 @@ def get_batch_on_this_rank_for_sequence_packing(
         if isinstance(prefetched_batch, dict) and prefetched_batch.get(
             THD_FULL_ITERATION_STATIC_BATCH_KEY, False
         ):
-            return _unpack_thd_full_iteration_static_batch(prefetched_batch)
+            values = _unpack_thd_full_iteration_static_batch(prefetched_batch)
+            if not return_context_parallel_batch:
+                return values
+            # Hybrid forward consumes the layout-keyed batch API. The graph
+            # loader already partitioned these tensors and finalized the routes.
+            if config is None or config.linear_cp_layout != config.attention_cp_layout:
+                raise ValueError("Static packed hybrid batches require one physical CP layout")
+            tokens, labels, loss_mask, attention_mask, positions, packed, padding_mask = values
+            batch = dict(
+                tokens=tokens, labels=labels, loss_mask=loss_mask,
+                attention_mask=attention_mask, position_ids=positions, padding_mask=padding_mask,
+                cu_seqlens=packed.cu_seqlens_q.unsqueeze(0),
+                cu_seqlens_padded=packed.cu_seqlens_q_padded.unsqueeze(0),
+            )
+            return ContextParallelBatch.from_single_layout(config.linear_cp_layout, batch, packed)
 
     if pg_collection is None:
         raise ValueError("pg_collection is required for sequence packing")

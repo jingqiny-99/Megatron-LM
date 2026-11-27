@@ -31,7 +31,9 @@ def cp_group():
 @pytest.mark.parametrize("fused", [False, True], ids=["fp32", "cudnn_flashmla"])
 @pytest.mark.parametrize("packed", [False, True], ids=["sbhd", "padded_thd"])
 @pytest.mark.parametrize("window", [1, 4, 6], ids=["local", "halo", "multi_chunk"])
-def test_global_indices_window_and_remote_kv_gradients(cp_group, fused, window, packed, monkeypatch):
+def test_global_indices_window_and_remote_kv_gradients(
+    cp_group, fused, window, packed, monkeypatch
+):
     # The dense reference and the sharded attention multiply different GEMM
     # shapes. Use FP32 accumulators and operands for the FP32 comparison.
     monkeypatch.setenv("NVIDIA_TF32_OVERRIDE", "0")
@@ -55,9 +57,15 @@ def test_global_indices_window_and_remote_kv_gradients(cp_group, fused, window, 
         pos = torch.cat([part for doc in chunks for part in (doc[rank], doc[2 * size - rank - 1])])
         cu = torch.tensor([0, half - 1, seq - 3], device="cuda", dtype=torch.int32)
         padded = torch.tensor([0, half, seq], device="cuda", dtype=torch.int32)
-        packed_params = PackedSeqParams(qkv_format="thd", cu_seqlens_q=cu, cu_seqlens_kv=cu,
-                                        cu_seqlens_q_padded=padded, cu_seqlens_kv_padded=padded,
-                                        max_seqlen_q=half, max_seqlen_kv=half)
+        packed_params = PackedSeqParams(
+            qkv_format="thd",
+            cu_seqlens_q=cu,
+            cu_seqlens_kv=cu,
+            cu_seqlens_q_padded=padded,
+            cu_seqlens_kv_padded=padded,
+            max_seqlen_q=half,
+            max_seqlen_kv=half,
+        )
         packed_params.real_token_mask_q = real[pos]
     latent, rope = (512, 64) if fused else (4, 2)
     dtype = torch.bfloat16 if fused else torch.float32
@@ -175,7 +183,9 @@ def test_global_indices_window_and_remote_kv_gradients(cp_group, fused, window, 
         (ref1, ref2), [*complete, projection], [g.float() for g in adjoints]
     )
     assert calls == [1]
-    torch.testing.assert_close(lengths.long(), ((pos - starts[pos] + 1).clamp_max(k) * real[pos])[None, :])
+    torch.testing.assert_close(
+        lengths.long(), ((pos - starts[pos] + 1).clamp_max(k) * real[pos])[None, :]
+    )
     columns = torch.arange(k, device="cuda")
     valid = columns < lengths[..., None]
     observed_ids = saved_ids.long().masked_fill(~valid, seq).sort(-1).values
