@@ -956,8 +956,17 @@ def get_pp_rank_microbatches(
     forward_only=False,
     overlap_moe_expert_parallel_comm=False,
     p2p_communicator: Optional[P2PCommunicator] = None,
+    *,
+    batch_p2p_comm: bool = False,
 ):
-    """Get the number of total, warmup, and remaining microbatches in PP scheduling."""
+    """Return total visits, whether to receive the first gradient in cooldown, warmup and steady visits.
+
+    A batched P2P rank whose last forward lands exactly at the ordinary 1F1B
+    boundary receives its first gradient in that same NCCL group. Although it
+    has zero local steady visits, its next stage already sends a backward tensor
+    while receiving the last activation. A genuinely truncated warmup still
+    receives the first gradient separately in cooldown.
+    """
     if p2p_communicator is not None:
         pipeline_parallel_size = p2p_communicator.pp_group.size()
         pipeline_parallel_rank = p2p_communicator.pp_group.rank()
@@ -970,7 +979,7 @@ def get_pp_rank_microbatches(
         )
 
     total_num_microbatches = num_microbatches * num_model_chunks
-    are_all_microbatches_in_warmup = False
+    receive_first_grad_in_cooldown = False
 
     if forward_only:
         num_warmup_microbatches = total_num_microbatches
@@ -997,13 +1006,18 @@ def get_pp_rank_microbatches(
         num_warmup_microbatches = 0
 
     if num_warmup_microbatches >= total_num_microbatches:
+        receive_first_grad_in_cooldown = not (
+            batch_p2p_comm
+            and not forward_only
+            and virtual_pipeline_parallel_size is not None
+            and num_warmup_microbatches == total_num_microbatches
+        )
         num_warmup_microbatches = total_num_microbatches
-        are_all_microbatches_in_warmup = True
     num_microbatches_remaining = total_num_microbatches - num_warmup_microbatches
 
     return (
         total_num_microbatches,
-        are_all_microbatches_in_warmup,
+        receive_first_grad_in_cooldown,
         num_warmup_microbatches,
         num_microbatches_remaining,
     )
@@ -1367,7 +1381,7 @@ def forward_backward_pipelining_with_interleaving(
     num_model_chunks = len(model)
     (
         total_num_microbatches,
-        are_all_microbatches_in_warmup,
+        receive_first_grad_in_cooldown,
         num_warmup_microbatches,
         num_microbatches_remaining,
     ) = get_pp_rank_microbatches(
@@ -1377,6 +1391,7 @@ def forward_backward_pipelining_with_interleaving(
         forward_only=forward_only,
         overlap_moe_expert_parallel_comm=config.overlap_moe_expert_parallel_comm,
         p2p_communicator=p2p_communicator,
+        batch_p2p_comm=config.batch_p2p_comm and not config.overlap_p2p_comm,
     )
 
     # Checkpoint the activations of partial Transformer layers in a number of micro-batches
@@ -1811,7 +1826,7 @@ def forward_backward_pipelining_with_interleaving(
                 k == (num_warmup_microbatches - 1)
                 and not config.overlap_p2p_comm
                 and not forward_only
-                and not are_all_microbatches_in_warmup
+                and not receive_first_grad_in_cooldown
             ):
                 input_tensor_grad = None
                 recv_next = True
@@ -1874,7 +1889,7 @@ def forward_backward_pipelining_with_interleaving(
             if (
                 k == (num_warmup_microbatches - 1)
                 and not forward_only
-                and not are_all_microbatches_in_warmup
+                and not receive_first_grad_in_cooldown
             ):
                 input_tensor_grad = None
                 recv_next = True
@@ -2135,7 +2150,7 @@ def forward_backward_pipelining_with_interleaving(
             for bwd_wait_handle in bwd_wait_handles.values():
                 bwd_wait_handle.wait()
 
-        if are_all_microbatches_in_warmup:
+        if receive_first_grad_in_cooldown:
             output_tensor_grads[num_model_chunks - 1].append(
                 p2p_communicator.recv_backward(
                     tensor_shape,
