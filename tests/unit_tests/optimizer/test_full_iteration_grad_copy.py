@@ -27,6 +27,48 @@ from megatron.core.transformer.transformer_config import TransformerConfig
 from tests.unit_tests.test_utilities import Utils
 
 
+def test_graph_reset_destroys_live_grad_copy_before_its_parent(monkeypatch):
+    """A live Muon optimizer and other Python aliases cannot delay NCCL graph release."""
+    from megatron.core import full_cuda_graph
+
+    events = []
+
+    class RecordingGraph:
+        def __init__(self, name):
+            self.name = name
+
+        def reset(self):
+            events.append(self.name)
+
+    train = RecordingGraph("training")
+    child = RecordingGraph("optimizer")
+    validation = RecordingGraph("validation")
+    copier = FullIterationGradCopy()
+    copier.forward_backward_graph = train
+    copier.graph = child
+    copier.outputs = [(object(), object())]
+    copier.source_signature = (1,)
+    monkeypatch.setattr(
+        FullCudaGraphWrapper, "cuda_graph", {"training": train, "validation": validation}
+    )
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda: None)
+    monkeypatch.setattr(
+        full_cuda_graph,
+        "get_rerun_state_machine",
+        lambda: SimpleNamespace(clear_deferred_validations=lambda stage: None),
+    )
+
+    FullCudaGraphWrapper.reset_cuda_graph("validation")
+    assert events == ["validation"]
+    assert copier.graph is child
+    FullCudaGraphWrapper.reset_cuda_graph("training")
+    assert events == ["validation", "optimizer", "training"]
+    assert copier.graph is None and copier.forward_backward_graph is None
+    assert copier.source_signature is None and not copier.outputs
+    FullCudaGraphWrapper.reset_cuda_graph()
+    assert events == ["validation", "optimizer", "training"]
+
+
 def make_optimizer(dtype, reuse=True, precision_aware=False):
     optimizer = DistributedOptimizer.__new__(DistributedOptimizer)
     # Converted shards must use the large-block allocator pool, like F/B scratch.

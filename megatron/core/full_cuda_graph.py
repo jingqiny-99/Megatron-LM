@@ -4,6 +4,7 @@
 
 import gc
 import logging
+import weakref
 from collections.abc import Callable, Iterable, Sequence
 from typing import Optional
 
@@ -19,7 +20,7 @@ from megatron.core.tensor_parallel.random import (
     is_graph_safe_cuda_rng_tracker,
     prime_cuda_rng_states_for_graph_capture,
 )
-from megatron.core.transformer.cuda_graphs import capture_constants
+from megatron.core.transformer.cuda_graphs import capture_constants, release_capture_constants
 from megatron.core.transformer.experimental_attention_variant import dsa_logging
 
 logger = logging.getLogger(__name__)
@@ -79,11 +80,29 @@ class FullIterationGradCopy:
     their values may be overwritten by the next forward/backward replay.
     """
 
+    _instances = weakref.WeakSet()
+
     def __init__(self) -> None:
+        self._instances.add(self)
         self.graph = None
         self.forward_backward_graph = None
         self.outputs: list[tuple[torch.Tensor, torch.Tensor]] = []
         self.source_signature = None
+
+    def _release_graph(self):
+        if self.graph is not None:
+            self.graph.reset()
+        self.graph = None
+        self.outputs = []
+        self.source_signature = None
+        self.forward_backward_graph = None
+
+    @classmethod
+    def release_for_graph(cls, forward_backward_graph):
+        """Retire conversions sharing this F/B graph's pool before destroying its owner."""
+        for copier in cls._instances:
+            if copier.forward_backward_graph is forward_backward_graph:
+                copier._release_graph()
 
     @torch.no_grad()
     def copy(
@@ -118,9 +137,7 @@ class FullIterationGradCopy:
             # reset_cuda_graph() can discard the training graph without rebuilding
             # the optimizer. Conversion state belongs to that graph's pool and must
             # be rebuilt if training is warmed up or captured again.
-            self.graph = None
-            self.outputs = []
-            self.source_signature = None
+            self._release_graph()
             self.forward_backward_graph = fb_graph
         stream = get_shared_capture_stream()
         if fb_graph is None:
@@ -878,8 +895,13 @@ class FullCudaGraphWrapper:
         for reset_stage in ('training', 'validation'):
             if stage is not None and stage != reset_stage:
                 continue
-            if cls.cuda_graph[reset_stage] is not None:
-                del cls.cuda_graph[reset_stage]
+            graph = cls.cuda_graph[reset_stage]
+            if graph is not None:
+                FullIterationGradCopy.release_for_graph(graph)
+                # Other Python references can outlive the scheduler. Release the
+                # CUDA executable and its captured NCCL communicators now.
+                graph.reset()
+                release_capture_constants(graph)
                 cls.cuda_graph[reset_stage] = None
             cls.result[reset_stage] = None
             cls.curr_iteration[reset_stage] = 0
