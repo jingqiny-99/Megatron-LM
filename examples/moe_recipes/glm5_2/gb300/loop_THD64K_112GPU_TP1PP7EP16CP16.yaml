@@ -171,6 +171,9 @@ ARGS:
   mtp_tv_head_chunk_size: null
   loop_ring_recompute_group_sizes: null
   loop_ring_trim_cache_before_first_grad_sync: null
+  chunked_optimizer_state_offload: null
+  optimizer_state_offload_fraction: null
+  optimizer_state_offload_chunk_size_mb: null
   manual_gc: true
   manual_gc_interval: 10
   lr_warmup_samples: 0
@@ -358,6 +361,14 @@ VARIANTS:
   1m_tv_chunk2048_core_groups4: &capacity_1m_core_groups4
     <<: *capacity_1m_tv_chunk2048
     loop_ring_recompute_group_sizes: [8, 4, 4, 4]
-  1m_tv_chunk2048_initial_sync:
+  1m_tv_chunk2048_initial_sync: &capacity_1m_initial_sync
     <<: *capacity_1m_core_groups4
     loop_ring_trim_cache_before_first_grad_sync: true
+  1m_eager_muon_offload:
+    <<: *capacity_1m_initial_sync
+    cuda_graph_impl: none
+    cuda_graph_static_dynamic_cp: null
+    cuda_graph_warmup_steps: null
+    chunked_optimizer_state_offload: true
+    optimizer_state_offload_fraction: 0.75
+    optimizer_state_offload_chunk_size_mb: 256

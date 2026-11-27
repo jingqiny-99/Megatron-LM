@@ -519,9 +519,10 @@ visit and coda. `C` checkpoints a visit and `n` retains its activations.
 
 The 1M capacity runs use the same 28-node placement, TP1/PP7/EP16/CP16,
 MBS1 and GBS8. Each update trains on eight packs of 1,048,576 positions with
-1,015,809 real input tokens per pack. Both variants keep two core visits,
-the trained indexer, seven shared MTP depths, distributed Muon, MXFP8 and
-the full-iteration CUDA graph.
+1,015,809 real input tokens per pack. All variants keep two core visits,
+the trained indexer, seven shared MTP depths, distributed Muon and MXFP8.
+Full-iteration CUDA graph capture is enabled for the variants through
+`1m_tv_chunk2048_initial_sync`.
 
 | Variant | Activation and workspace settings |
 | --- | --- |
@@ -531,6 +532,7 @@ the full-iteration CUDA graph.
 | `1m_tv_chunk2048` | Use the linear main loss and split each draft projection and its TV comparison into 2,048 local sequence positions per chunk. Each chunk uses the full vocabulary and the shared teacher. |
 | `1m_tv_chunk2048_core_groups4` | Use the same workload and checkpoint at most eight local sublayers in the prelude and four on each core visit and in the coda. |
 | `1m_tv_chunk2048_initial_sync` | Use the same grouping and release unused allocator blocks before the first training gradient synchronization. |
+| `1m_eager_muon_offload` | Run eagerly and offload 75% of eligible optimizer state to host memory between updates. The native offloader uses a 256 MiB tensor-state chunk target. |
 
 For a dry run, select the variant with the same environment as the 64K example.
 
