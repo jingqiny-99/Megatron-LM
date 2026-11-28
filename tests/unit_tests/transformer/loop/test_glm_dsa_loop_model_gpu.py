@@ -227,11 +227,25 @@ def _run(model, rows, reuse, monkeypatch):
     return [loss.detach() for loss in losses], grads
 
 
-@pytest.mark.parametrize("reuse", [False, True])
-def test_native_two_pass_training_with_checkpointed_groups(reuse, monkeypatch):
+@pytest.mark.parametrize(
+    "reuse,visit_groups", [(False, None), (True, None), (True, [8, 4, 2, 8])]
+)
+def test_native_two_pass_training_with_checkpointed_groups(reuse, visit_groups, monkeypatch):
     torch.manual_seed(54)
     reference = _model(reuse, False)
-    checkpointed = _model(reuse, True)
+    full = (
+        dict(
+            recompute_granularity="full", recompute_method="uniform", recompute_num_layers=8,
+            loop_ring_recompute_group_sizes=visit_groups, loop_recompute_ring_gates=True,
+        )
+        if visit_groups is not None else {}
+    )
+    checkpointed = _model(reuse, True, **full)
+    for block_index, layer in enumerate(checkpointed.decoder.layers):
+        is_core = 1 + block_index // 2 in CORE
+        for module in layer.modules():
+            if hasattr(module, "is_first_microbatch"):
+                assert bool(getattr(module, "is_repeated_layer", False)) == is_core
     checkpointed.load_state_dict(reference.state_dict())
     rows = [torch.randint(VOCAB, (1, SEQUENCE + 1), device="cuda") for _ in range(2)]
     losses, grads = _run(reference, rows, reuse, monkeypatch)
