@@ -36,9 +36,11 @@ class GLMRingStack(LoopHybridStack):
     _owns_full_recompute = True
 
     def _lap_uses_checkpoint(self, checkpoint, core):
-        return getattr(self.config, "recompute_granularity", None) == "full" or (
-            checkpoint and (core or self.config.loop_recompute_edges)
-        )
+        if getattr(self.config, "recompute_granularity", None) == "full":
+            # Full uniform supplies the grouping. An explicit stage plan chooses
+            # which visits to group, while the native default checkpoints every visit.
+            return checkpoint or getattr(self.config, "loop_ring_recompute_plan", None) is None
+        return checkpoint and (core or self.config.loop_recompute_edges)
 
     def _ring_lap_work(self, lap, checkpoint, sequence, batch):
         """Yield (forward FLOPs, backward factor, recomputed) for this physical call."""

@@ -10,6 +10,7 @@ import torch
 
 from megatron.core.transformer.forward_replay import in_forward_replay
 from megatron.core.transformer.loop.glm_ring_stack import GLMRingStack
+from megatron.core.transformer.loop.guards import resolve_loop_ring_recompute_plan
 from megatron.core.transformer.loop.ring_pp import LoopRingCall, loop_ring_call
 from megatron.core.transformer.transformer_config import TransformerConfig
 from tests.unit_tests.transformer.loop.test_glm_dsa_loop_ring_layout import (
@@ -65,9 +66,12 @@ def test_visit_boundaries_replay_tied_weights_and_work():
     ctx = SimpleNamespace(attention_mask=None, packed_seq_params=None, inference_context=None)
     base = torch.linspace(-0.6, 0.7, 12, dtype=torch.float64).view(3, 1, 4)
 
-    def run(sizes):
+    def run(sizes, plan=None, stage=0):
         cfg = SimpleNamespace(
+            pipeline_model_parallel_size=2,
             loop_ring_separate_edges=True,
+            loop_ring_recompute_plan=plan,
+            loop_recompute=plan is not None,
             loop_iterations=2,
             loop_exit_criterion="fixed",
             loop_carrier="gated_residual",
@@ -112,7 +116,7 @@ def test_visit_boundaries_replay_tied_weights_and_work():
 
         x = base.clone().requires_grad_()
         y = x
-        # Full/uniform has its existing precedence over both plan codes.
+        codes = resolve_loop_ring_recompute_plan(cfg)[stage]
         for lap, physical in enumerate(visits):
             stack = stacks[physical]
             call = LoopRingCall(
@@ -122,7 +126,7 @@ def test_visit_boundaries_replay_tied_weights_and_work():
                 round=max(0, lap - 1),
                 lap=lap,
                 microbatch=0,
-                checkpoint=lap in (0, 2),
+                checkpoint=codes[lap] == "C",
             )
             with loop_ring_call(stack, call):
                 y = GLMRingStack._ring_layer_loop(stack, y, ctx)
@@ -133,15 +137,21 @@ def test_visit_boundaries_replay_tied_weights_and_work():
             label = f"loop_hybrid/mb=0/{roles[physical]}/lap={lap}"
             width = 8 if sizes is None else sizes[lap]
             bounds = [(i, min(i + width, lens[physical])) for i in range(0, lens[physical], width)]
-            assert traces[label, False] == bounds
-            assert traces[label, True] == bounds[::-1]
-        for physical, (stack, codes) in enumerate(zip(stacks, [("C",), ("n", "C"), ("n",)])):
-            analytic = GLMRingStack.ring_microbatch_work(stack, len(base), 1, codes)
+            replay = plan is None or codes[lap] == "C"
+            assert traces[label, False] == (bounds if replay else [(0, lens[physical])])
+            assert traces.get((label, True), []) == (bounds[::-1] if replay else [])
+        for physical, stack in enumerate(stacks):
+            physical_codes = [code for code, chunk in zip(codes, visits) if chunk == physical]
+            analytic = GLMRingStack.ring_microbatch_work(stack, len(base), 1, physical_codes)
             f = len(base) * lens[physical] * visits.count(physical)
-            assert analytic == tuple(stack._ring_work) == (f, 2 * f, f)
+            checkpointed_visits = len(physical_codes) if plan is None else physical_codes.count("C")
+            replay_work = len(base) * lens[physical] * checkpointed_visits
+            assert analytic == tuple(stack._ring_work) == (f, 2 * f, replay_work)
         return y.detach(), x.grad, *[w.grad for w in weights]
 
     expected = run(None)
+    plans_and_stages = ((None, 0), ("CCCC/CCCC", 0), ("nCnC/CnCn", 0), ("nCnC/CnCn", 1))
     for sizes in ([8, 8, 8, 8], [8, 8, 2, 4]):
-        for got, ref in zip(run(sizes), expected, strict=True):
-            torch.testing.assert_close(got, ref, atol=0, rtol=0)
+        for plan, stage in plans_and_stages:
+            for got, ref in zip(run(sizes, plan, stage), expected, strict=True):
+                torch.testing.assert_close(got, ref, atol=0, rtol=0)
