@@ -196,6 +196,13 @@ class LoopResidualGate(nn.Module):
         return torch.lerp(previous, candidate, beta)
 
 
+def _metric_scalar(value, device):
+    # A host scalar passed to tensor/as_tensor creates a pageable H2D copy during graph capture.
+    if isinstance(value, torch.Tensor):
+        return value.to(device=device, dtype=torch.float32)
+    return torch.full((), value, dtype=torch.float32, device=device)
+
+
 def _local_glm_full_recompute(config):
     return getattr(config, "recompute_granularity", None) == "full" and fixed_glm_standard(config)
 
@@ -597,7 +604,7 @@ class LoopHybridStack(HybridStack):
             )
             for phase, value in zip(("forward", "backward", "recompute"), self._work):
                 self.loop_metrics[f"loop {phase} flops per token"] = (
-                    torch.as_tensor(value, dtype=torch.float32, device=hidden_states.device)
+                    _metric_scalar(value, hidden_states.device)
                     / tokens
                 )
             # Carrier diagnostics (enable_carrier_diagnostics): merged, never rebound. Every
@@ -1703,16 +1710,16 @@ class LoopHybridStack(HybridStack):
         if depths is None:
             row_rounds = float(tokens * depth)
             backward_rounds = float(tokens * min(depth, differentiated))
-            mean_depth = torch.tensor(float(depth), device=device)
+            mean_depth = _metric_scalar(float(depth), device)
         else:
             row_rounds = depths.sum().float() * sequence
             backward_rounds = row_rounds
             mean_depth = depths.float().mean()
         self.loop_metrics = {
             "loop depth": mean_depth,
-            "loop active token layers": torch.as_tensor(row_rounds * core, device=device),
-            "loop backward token layers": torch.as_tensor(
-                backward_rounds * core if torch.is_grad_enabled() else 0.0, device=device
+            "loop active token layers": _metric_scalar(row_rounds * core, device),
+            "loop backward token layers": _metric_scalar(
+                backward_rounds * core if torch.is_grad_enabled() else 0.0, device
             ),
         }
         return state
