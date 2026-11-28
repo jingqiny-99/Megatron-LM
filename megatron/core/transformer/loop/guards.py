@@ -263,6 +263,20 @@ def fixed_glm_ring(config: Any) -> bool:
     )
 
 
+def fixed_glm_standard(config: Any) -> bool:
+    """A fixed native DSA decoder with both recurrent visits on the local replica."""
+    return (
+        fixed_depth_loop(config)
+        and getattr(config, "pipeline_model_parallel_size", 1) == 1
+        and getattr(config, "experimental_attention_variant", None) == "dsa"
+        and getattr(config, "loop_carrier", None) == "gated_residual"
+    )
+
+
+def fixed_glm_loop(config: Any) -> bool:
+    return fixed_glm_ring(config) or fixed_glm_standard(config)
+
+
 def has_dsv4_attention(layer_symbols: Sequence[str]) -> bool:
     """True if any sublayer is built with a DSv4 attention (CSA / HCA / window / DSA)."""
     return any(symbol in _DSV4_ATTENTION_SYMBOLS for symbol in layer_symbols)
@@ -351,7 +365,7 @@ def untaped_recompute_routing(config: "TransformerConfig") -> List[str]:
     balancing = set(balancing) if isinstance(balancing, (list, tuple)) else {balancing}
     features = {
         "moe_router_force_load_balancing": config.moe_router_force_load_balancing
-        and not fixed_glm_ring(config),
+        and not fixed_glm_loop(config),
         "moe_router_force_biased": config.moe_router_force_biased is not None,
         "moe_enable_routing_replay": config.moe_enable_routing_replay,
         "sinkhorn": "sinkhorn" in balancing,
@@ -377,7 +391,7 @@ def validate_hybrid_loop_config(config: "TransformerConfig") -> None:
         DELAYED_FP8_SCALING: bool(config.fp8) and config.fp8_recipe == "delayed",
         # The attention-residual carrier names its own reason.
         (CUDA_GRAPHS_ATTN_RES if attn_res else CUDA_GRAPHS): config.cuda_graph_impl != "none"
-        and not (config.cuda_graph_impl == "full_iteration" and fixed_glm_ring(config)),
+        and not (config.cuda_graph_impl == "full_iteration" and fixed_glm_loop(config)),
         MHC_RECOMPUTE: selective and "mhc" in explicit_modules,
         MOE_EP_OVERLAP: config.overlap_moe_expert_parallel_comm,
         PAGED_STASH: config.moe_paged_stash,
@@ -394,7 +408,7 @@ def validate_hybrid_loop_config(config: "TransformerConfig") -> None:
         and not is_ring_loop_config(config),
         # Native GLM DSA gathers token latents and indexer keys over the CP group.
         # The other loop attention implementations still assume local sequence ownership.
-        CONTEXT_PARALLELISM: (config.dynamic_context_parallel and not fixed_glm_ring(config))
+        CONTEXT_PARALLELISM: (config.dynamic_context_parallel and not fixed_glm_loop(config))
         or (config.context_parallel_size != 1 and config.experimental_attention_variant != "dsa"),
         SEQUENCE_PARALLELISM: config.sequence_parallel,
         # Rounds must see the same function; per-call randomness breaks the recurrence and
@@ -411,7 +425,7 @@ def validate_hybrid_loop_config(config: "TransformerConfig") -> None:
         OTHER_RECOMPUTE: (
             config.recompute_granularity == "full"
             and not (
-                fixed_glm_ring(config)
+                fixed_glm_loop(config)
                 and config.recompute_method == "uniform"
                 and (config.recompute_num_layers or 0) > 0
             )
@@ -420,7 +434,7 @@ def validate_hybrid_loop_config(config: "TransformerConfig") -> None:
             selective
             and any(
                 module not in _LOOP_RULED_RECOMPUTE_MODULES
-                and not (module == "layernorm" and fixed_glm_ring(config))
+                and not (module == "layernorm" and fixed_glm_loop(config))
                 for module in _recompute_modules(config)
             )
         ),
@@ -616,7 +630,7 @@ def validate_hybrid_loop_inputs(
 ) -> None:
     """Reject forward inputs the hybrid loop does not support (checked every forward).
 
-    The fixed native-DSA ring carries document boundaries through both attention
+    The fixed native-DSA loop carries document boundaries through both attention
     banks and accepts multiple THD documents. Other schedules require a single
     sequence per microbatch. All boundary checks here use shapes on the host.
     """

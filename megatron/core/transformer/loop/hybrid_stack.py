@@ -123,7 +123,8 @@ from megatron.core.transformer.loop.guards import (
     validate_loop_carrier_stack,
     validate_loop_gtp_shards,
     validate_loop_mtp_pattern,
-    fixed_glm_ring,
+    fixed_glm_loop,
+    fixed_glm_standard,
     validate_loop_ring_config,
     validate_loop_row_depths,
     validate_loop_stack_construction,
@@ -193,6 +194,15 @@ class LoopResidualGate(nn.Module):
         normalized = self.norm(gate_input).to(self.proj.weight.dtype)
         beta = self.proj(normalized).sigmoid().to(previous.dtype)
         return torch.lerp(previous, candidate, beta)
+
+
+def _local_glm_full_recompute(config):
+    return getattr(config, "recompute_granularity", None) == "full" and fixed_glm_standard(config)
+
+
+def _local_glm_visit_stride(config, lap):
+    sizes = getattr(config, "loop_ring_recompute_group_sizes", None)
+    return config.recompute_num_layers if sizes is None else sizes[lap]
 
 
 class LoopHybridStack(HybridStack):
@@ -540,7 +550,7 @@ class LoopHybridStack(HybridStack):
         if (
             self.config.experimental_attention_variant == "dsa"
             and ctx.packed_seq_params is not None
-            and not fixed_glm_ring(self.config)
+            and not fixed_glm_loop(self.config)
         ):
             raise ValueError("The native DSA loop requires unpacked SBHD training inputs")
         if self.loop_ring is not None:
@@ -550,9 +560,12 @@ class LoopHybridStack(HybridStack):
             inference_context=ctx.inference_context,
             attention_mask=ctx.attention_mask,
             has_dsv4_attention=self._has_dsv4_attention,
+            allow_packed_documents=fixed_glm_standard(self.config),
         )
         ctx.grouped_tail_to_skip = None
         depths, self._loop_depths = self._loop_depths, None
+        if depths is not None and getattr(self.config, "cuda_graph_impl", None) == "full_iteration":
+            raise ValueError("Full-iteration GLM loop capture requires fixed depth for all rows")
         if depths is not None and self.config.loop_architecture != "huginn":
             raise ValueError("Per-row loop depths need loop_architecture='huginn'")
         # Fresh dicts every forward: the training loss closure captures them, so a later
@@ -575,7 +588,7 @@ class LoopHybridStack(HybridStack):
                 tokens,
                 squared_lengths,
                 sequence,
-                recompute=self.config.loop_recompute_edges,
+                recompute=self.config.loop_recompute_edges or _local_glm_full_recompute(self.config),
             )
             embedding = self._run_edge(hidden_states, 0, roles.core_start, ctx, label + "/prelude")
             if self._diagnostics_active():
@@ -625,7 +638,7 @@ class LoopHybridStack(HybridStack):
             tokens,
             squared_lengths,
             sequence,
-            recompute=self.config.loop_recompute_edges,
+            recompute=self.config.loop_recompute_edges or _local_glm_full_recompute(self.config),
         )
         self._record_head(tokens, squared_lengths, sequence)
         return self._run_edge(state, roles.core_end, len(self.layers), ctx, label + "/coda")
@@ -1130,14 +1143,21 @@ class LoopHybridStack(HybridStack):
         A retained suffix executes with its ordinary autograd graph until this item's backward.
         Inside the profiler / NVTX range ``label`` (``loop_range``)."""
         with loop_range(label):
-            if (
-                (self.config.loop_recompute or self.config.loop_schedule == "rsbf")
-                and self.config.loop_recompute_edges
-                and torch.is_grad_enabled()
-            ):
+            full = _local_glm_full_recompute(self.config)
+            checkpoint_edges = (
+                self.config.loop_recompute or self.config.loop_schedule == "rsbf"
+            ) and self.config.loop_recompute_edges
+            if (full or checkpoint_edges) and torch.is_grad_enabled():
                 split = end - retain_sublayers
                 if start < split:
-                    x = self._checkpointed_blocks(x, None, start, split, ctx, label)
+                    stride = None
+                    if full:
+                        lap = 0 if start == 0 else self.config.loop_iterations + 1
+                        stride = _local_glm_visit_stride(self.config, lap)
+                    x = self._checkpointed_blocks(
+                        x, None, start, split, ctx, label,
+                        block_stride=stride,
+                    )
                 if retain_sublayers:
                     x = self._run_range(x, split, end, ctx, label)
                 return x
@@ -1502,6 +1522,10 @@ class LoopHybridStack(HybridStack):
 
     def _huginn(self, embedding, ctx, label, depths=None):
         sequence, batch = embedding.shape[:2]
+        full = _local_glm_full_recompute(self.config)
+        separate_gate = fixed_glm_standard(self.config) and (
+            full or getattr(self.config, "loop_recompute_ring_gates", False)
+        )
         online = getattr(self.config, "loop_exit_criterion", None) == "online"
         if online and (batch != 1 or depths is not None):
             raise ValueError("standard online exit requires one live sample and no preset depths")
@@ -1555,7 +1579,7 @@ class LoopHybridStack(HybridStack):
                 tokens * sequence,
                 sequence,
                 backward=step >= first_grad,
-                recompute=self.config.loop_recompute,
+                recompute=self.config.loop_recompute or full,
                 extra=self.round_extra_forward_flops(tokens),
                 cross_loop_pass=pass_scope,
             )
@@ -1602,7 +1626,7 @@ class LoopHybridStack(HybridStack):
                         self._note_state_rms(
                             f"loop state rms r{step + 1}", output, round_ctx.padding_mask
                         )
-                    if gated:
+                    if gated and not separate_gate:
                         return self.loop_gates[step](previous, output)
                     return self._loop_norm(step)(output) if injection_carrier else output
 
@@ -1614,10 +1638,8 @@ class LoopHybridStack(HybridStack):
             binned = forward_statistics_round(step + 1, rounds) if step < rounds else nullcontext()
             with context, binned:
                 if (
-                    self.config.loop_recompute
-                    and torch.is_grad_enabled()
-                    and self.config.loop_recompute_block_stride is not None
-                ):
+                    full or (self.config.loop_recompute and self.config.loop_recompute_block_stride)
+                ) and torch.is_grad_enabled():
                     # Block checkpoints: the round body cut into blocks of the stride.
                     round_label = f"{label}/loop={step + 1}"
                     with loop_range(round_label):
@@ -1630,6 +1652,10 @@ class LoopHybridStack(HybridStack):
                             round_label,
                             step,
                             cross_loop_pass=pass_scope,
+                            round_end=not separate_gate,
+                            block_stride=(
+                                _local_glm_visit_stride(self.config, step + 1) if full else None
+                            ),
                         )
                 elif self.config.loop_recompute and torch.is_grad_enabled():
                     # A residual round returns its last sublayer's output; an injection round
@@ -1639,10 +1665,18 @@ class LoopHybridStack(HybridStack):
                         state,
                         embedding,
                         label=f"{label}/loop={step + 1}",
-                        round_ends_in_layer=online or not (injection_carrier or gated),
+                        round_ends_in_layer=online or separate_gate or not (injection_carrier or gated),
                     )
                 else:
                     updated = recurrence(state, embedding)
+                if separate_gate:
+                    gate = self.loop_gates[step]
+                    if self.config.loop_recompute_ring_gates and torch.is_grad_enabled():
+                        updated = checkpoint(
+                            gate, state, updated, use_reentrant=False, preserve_rng_state=False
+                        )
+                    else:
+                        updated = gate(state, updated)
             if pass_scope is not None and pass_scope.is_source:
                 pass_scope.finish_source()
             # Row exit: an exited row keeps its state on every stream (self-carry).

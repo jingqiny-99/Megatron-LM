@@ -121,11 +121,19 @@ class GLMDSALoopStack(GLMRingStack):
         terms = super()._ring_lap_work(lap, checkpoint, sequence, batch)
         body, _, replay = next(terms)
         tokens = sequence * batch
-        total_select = 0
-        selector_terms = []
         reuse_first = 1 < lap <= self.config.loop_iterations and self._cross_loop_attention_layers
+        yield from self._dsa_body_terms(body, 0, len(self.layers), tokens, sequence, replay, reuse_first)
+        yield from terms
+
+    def _dsa_body_terms(self, body, start, end, tokens, sequence, replay, reuse_first):
+        selectors = list(self._selector_terms(start, end, tokens, sequence, replay, reuse_first))
+        yield body - sum(work for work, _, _ in selectors), 2, replay
+        yield from selectors
+
+    def _selector_terms(self, start, end, tokens, sequence, replay, reuse_first):
         if not reuse_first:
-            for i, (symbol, config, _) in enumerate(self._loop_flop_rows):
+            for i in range(start, end):
+                symbol, config, _ = self._loop_flop_rows[i]
                 if (
                     symbol != Symbols.DS_ATTENTION
                     or self.layers[i].self_attention.core_attention.indexer is None
@@ -134,7 +142,6 @@ class GLMDSALoopStack(GLMRingStack):
                 _, select = native_dsa_forward_work(
                     config, tokens, self._ring_global_sequence(sequence)
                 )
-                total_select += select
                 train = bool(config.dsa_indexer_loss_coeff)
                 compute_replay = replay and not config.dsa_indexer_reuse_checkpoint_topk
                 if replay and config.dsa_indexer_reuse_checkpoint_topk and train:
@@ -146,12 +153,27 @@ class GLMDSALoopStack(GLMRingStack):
                         * tokens
                         * (config.q_lora_rank * heads * dim + config.hidden_size * (dim + heads))
                     )
-                    selector_terms.append((projection, 2, True))
+                    yield projection, 2, True
                     select -= projection
-                selector_terms.append((select, 2 if train else 0, compute_replay))
-        yield body - total_select, 2, replay
-        yield from selector_terms
-        yield from terms
+                yield select, 2 if train else 0, compute_replay
+
+    def _record_range(
+        self, start, end, tokens, squared_lengths, sequence, *, backward=True,
+        recompute=False, extra=0, arbitrary_mask=False, cross_loop_pass=None,
+    ):
+        body = self.range_forward_flops(
+            start, end, tokens, squared_lengths, sequence,
+            arbitrary_mask=arbitrary_mask, cross_loop_pass=cross_loop_pass,
+        )
+        reuse = cross_loop_pass is not None and not cross_loop_pass.is_source
+        for value, factor, replay in self._dsa_body_terms(
+            body, start, end, tokens, sequence, recompute, reuse
+        ):
+            self._add_work(value, backward=backward, backward_factor=factor, recompute=replay)
+        # Under full/uniform the residual gate lives outside the sublayer groups.
+        separate = self.config.recompute_granularity == "full" or self.config.loop_recompute_ring_gates
+        gate_replay = self.config.loop_recompute_ring_gates if separate else recompute
+        self._add_work(extra, backward=backward, recompute=gate_replay)
 
     def _layer_forward_flops(
         self, index, tokens, squared_lengths, sequence, arbitrary_mask, cross_loop_pass=None

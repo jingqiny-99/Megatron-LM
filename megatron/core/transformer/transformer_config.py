@@ -273,7 +273,7 @@ class TransformerConfig(ModelParallelConfig):
     interleaved schedule over prelude, first core pass, second core pass, and coda/head."""
 
     loop_recompute_ring_gates: bool = False
-    """Checkpoint each terminal GLM ring residual gate independently of the local layers."""
+    """Checkpoint each GLM loop residual gate independently of the local layers."""
 
     loop_ring_recompute_plan: Optional[str] = None
     """loop_schedule='ring': the recompute plan, one code per (pipeline stage, round view): P
@@ -288,12 +288,12 @@ class TransformerConfig(ModelParallelConfig):
     core pass 1, core pass 2 and coda. Edge checkpointing also requires loop_recompute_edges."""
 
     loop_ring_recompute_group_sizes: Optional[List[int]] = None
-    """Full uniform recomputation on the separate-edge GLM ring: maximum local sublayers per
+    """Full uniform recomputation on a fixed standard or separate-edge GLM loop: maximum local sublayers per
     checkpoint on each visit, in prelude, core pass(es), coda order, shared by all PP stages.
     None uses recompute_num_layers on every visit. The MTP head keeps its own policy."""
 
     loop_ring_trim_cache_before_first_grad_sync: bool = False
-    """Release unused CUDA allocator blocks once before this ring model first finalizes its
+    """Release unused CUDA allocator blocks once before this loop model first finalizes its
     training gradients, to leave room for communication library initialization."""
 
     loop_rsbf_waves: int = 1
@@ -3288,6 +3288,14 @@ class TransformerConfig(ModelParallelConfig):
             self.loop_prelude_sublayers is not None or self.loop_coda_sublayers is not None
         )
         native_dsa_loop = hybrid_loop_roles and self.experimental_attention_variant == "dsa"
+        standard_glm = False
+        if native_dsa_loop:
+            from megatron.core.transformer.loop.guards import fixed_glm_standard
+
+            standard_glm = fixed_glm_standard(self)
+            if standard_glm and self.cuda_graph_impl == "full_iteration" and self.cuda_graph_warmup_steps < 1:
+                raise ValueError("Fixed GLM full-iteration capture requires an eager warmup step")
+
         stratified = self.loop_exit_criterion == "stratified"
         online = self.loop_exit_criterion == "online"
         if online:
@@ -3368,12 +3376,12 @@ class TransformerConfig(ModelParallelConfig):
                 or self.linear_cp_layout not in (None, "zigzag")
                 or self.cp_partition_mode != "zigzag"
                 or (self.dynamic_context_parallel and not (
-                    separate_ring and self.loop_exit_criterion == "fixed"
+                    (separate_ring or standard_glm) and self.loop_exit_criterion == "fixed"
                 ))
             ):
                 raise ValueError(
                     "Native DSA loop CP requires uniform zigzag shards in each group. Dynamic CP requires a "
-                    "fixed-depth separate-edge ring."
+                    "fixed-depth GLM loop."
                 )
             if self.loop_reuse_indexer and not self.loop_reuse_sparse_kv:
                 raise ValueError("Native DSA index reuse requires loop_reuse_sparse_kv")
@@ -3523,27 +3531,26 @@ class TransformerConfig(ModelParallelConfig):
             ]
             if rsbf_only:
                 raise ValueError(f"{', '.join(rsbf_only)} require loop_schedule='rsbf'")
-        if self.loop_recompute_ring_gates and not (
+        if self.loop_recompute_ring_gates and not standard_glm and not (
             self.loop_schedule == "ring"
             and self.loop_ring_separate_edges
             and self.loop_carrier == "gated_residual"
             and self.experimental_attention_variant == "dsa"
         ):
-            raise ValueError("loop_recompute_ring_gates requires the separate-edge gated GLM DSA ring")
-        if self.loop_ring_trim_cache_before_first_grad_sync and self.loop_schedule != "ring":
+            raise ValueError("loop_recompute_ring_gates requires a fixed standard or separate-edge gated GLM DSA loop")
+        if self.loop_ring_trim_cache_before_first_grad_sync and not (standard_glm or self.loop_schedule == "ring"):
             raise ValueError(
-                "loop_ring_trim_cache_before_first_grad_sync requires loop_schedule='ring'"
+                "loop_ring_trim_cache_before_first_grad_sync requires a ring or fixed standard GLM loop"
             )
         if self.loop_ring_recompute_group_sizes is not None:
             if not (
-                self.loop_schedule == "ring"
-                and self.loop_ring_separate_edges
+                (standard_glm or (self.loop_schedule == "ring" and self.loop_ring_separate_edges))
                 and self.recompute_granularity == "full"
                 and self.recompute_method == "uniform"
             ):
                 raise ValueError(
-                    "loop_ring_recompute_group_sizes requires a separate-edge GLM ring "
-                    "with full uniform recomputation"
+                    "loop_ring_recompute_group_sizes requires a fixed standard GLM loop or a "
+                    "separate-edge GLM ring with full uniform recomputation"
                 )
             sizes = self.loop_ring_recompute_group_sizes
             if (

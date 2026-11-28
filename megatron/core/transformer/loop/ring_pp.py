@@ -543,6 +543,18 @@ def _check_chunks_idle(states: Sequence[_RingChunkState], when: str) -> None:
             )
 
 
+def trim_cache_before_first_grad_sync(chunks, trimmed_models):
+    """Trim at most once per physical model in eager training, before its first finalization."""
+    if (
+        chunks[0] not in trimmed_models
+        and torch.cuda.is_available()
+        and not torch.cuda.is_current_stream_capturing()
+        and any(param.is_cuda for chunk in chunks for param in chunk.parameters())
+    ):
+        torch.cuda.empty_cache()
+        trimmed_models.add(chunks[0])
+
+
 class RingFinalize:
     """The ring config's ``finalize_model_grads_func``.
 
@@ -588,15 +600,8 @@ class RingFinalize:
             )
         # Views and this wrapper are short-lived. The physical model's identity
         # outlives both, including a training-step retry after the trim succeeded.
-        if (
-            self.trimmed_models is not None
-            and chunks[0] not in self.trimmed_models
-            and torch.cuda.is_available()
-            and not torch.cuda.is_current_stream_capturing()
-            and any(param.is_cuda for chunk in chunks for param in chunk.parameters())
-        ):
-            torch.cuda.empty_cache()
-            self.trimmed_models.add(chunks[0])
+        if self.trimmed_models is not None:
+            trim_cache_before_first_grad_sync(chunks, self.trimmed_models)
         self.calls += 1
         return finalize(
             chunks, num_tokens, pg_collection=pg_collection, force_all_reduce=force_all_reduce

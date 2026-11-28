@@ -1,6 +1,7 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import contextlib
+import weakref
 from functools import partial
 from itertools import chain, zip_longest
 from typing import Callable, Dict, Iterator, List, Optional, Union
@@ -48,6 +49,10 @@ except ImportError:
 
 # Types
 Shape = Union[List[int], torch.Size]
+
+
+# Model wrappers survive successive steps, while this schedule can serve different models.
+_local_cache_trimmed_models = weakref.WeakSet()
 
 
 def get_forward_backward_func(
@@ -886,6 +891,10 @@ def forward_backward_no_pipelining(
     if config.finalize_model_grads_func is not None and not forward_only:
         # Finalize model grads (perform full grad all-reduce / reduce-scatter for
         # data parallelism and layernorm all-reduce for sequence parallelism).
+        if getattr(config, "loop_ring_trim_cache_before_first_grad_sync", False):
+            from megatron.core.transformer.loop.ring_pp import trim_cache_before_first_grad_sync
+
+            trim_cache_before_first_grad_sync([model], _local_cache_trimmed_models)
         config.finalize_model_grads_func(
             [model],
             total_num_tokens if config.calculate_per_token_loss else None,
