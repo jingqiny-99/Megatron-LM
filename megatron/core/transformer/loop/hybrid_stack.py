@@ -389,11 +389,10 @@ class LoopHybridStack(HybridStack):
                     attention = getattr(layer, "self_attention", None)
                     if hasattr(attention, "attn_mask_type"):  # '*' sublayers only
                         attention.attn_mask_type = AttnMaskType.arbitrary
-        if self.loop_ring is not None:
-            # A ring core sublayer runs once per round: R calls per microbatch, each from its own
-            # round view and with its own backward. TE must add every call's weight gradient into
-            # main_grad, never overwrite it (the repeated-layer precedent of the MTP block).
-            local = self.loop_ring.local
+        if self.loop_ring is not None or fixed_glm_standard(config):
+            # A shared core is called on every visit. Its first forward can run last in
+            # backward, so the TE first-microbatch fast path must not overwrite later visits.
+            local = self.loop_ring.local if self.loop_ring is not None else self.loop_roles
             for layer in self.layers[local.core_start : local.core_end]:
                 for module in layer.modules():
                     if hasattr(module, "is_first_microbatch"):
