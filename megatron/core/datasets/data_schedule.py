@@ -1481,6 +1481,16 @@ def get_batch_on_this_rank_for_sequence_packing(
         # Contiguous layouts have a different halo plan. Unknown/zero retain their fallback.
         zigzag_params = cp_batch.packed_seq_params_by_layout.get("zigzag")
         if zigzag_params is not None:
+            if zigzag_cp_min_chunk_size and config.sequence_parallel and tp_group.size() > 1:
+                # The per-layout sharder can extend an empty trailing document to make the local
+                # token count divisible by TP. Its shorter half-chunk bounds safe halo offsets.
+                zigzag_cp_min_chunk_size = int(
+                    _refresh_zigzag_cp_certificate(
+                        zigzag_cp_min_chunk_size,
+                        zigzag_params.cu_seqlens_q_padded,
+                        runtime_cp_group.size(),
+                    ).item()
+                )
             zigzag_params.zigzag_cp_min_chunk_size = zigzag_cp_min_chunk_size
 
         if getattr(config, "cuda_graph_thd_max_packed_sequences", None) is not None:

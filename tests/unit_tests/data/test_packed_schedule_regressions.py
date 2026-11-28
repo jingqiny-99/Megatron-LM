@@ -332,10 +332,10 @@ def test_dynamic_layouts_use_injected_runtime_groups(
         )
 
 
-@pytest.mark.parametrize(
-    "certificate,expected", [(None, None), (-1, None), (0, 0), (1, 1), (8, 8)]
-)
-def test_eager_hybrid_zigzag_preserves_certified_mtp_halo(cpu_batch_communication, certificate, expected):
+@pytest.mark.parametrize("certificate,expected", [(None, None), (-1, None), (0, 0), (1, 1), (8, 8)])
+def test_eager_hybrid_zigzag_preserves_certified_mtp_halo(
+    cpu_batch_communication, certificate, expected
+):
     from megatron.core.transformer.mtp_sequence_roll import (
         ZigzagPackedCPRollContext,
         prepare_mtp_sequence_roll_context,
@@ -343,16 +343,25 @@ def test_eager_hybrid_zigzag_preserves_certified_mtp_halo(cpu_batch_communicatio
 
     cp = _group(2)
     pg = ProcessGroupCollection(
-        tp=_group(1), pp=_group(1), cp=cp, tp_cp=cp, dynamic_cp={2: cp},
+        tp=_group(1),
+        pp=_group(1),
+        cp=cp,
+        tp_cp=cp,
+        dynamic_cp={2: cp},
     )
     batch = _batch([32, 32])
     batch["local_cp_size"] = torch.tensor(2, dtype=torch.int32)
     if certificate is not None:
         batch["zigzag_cp_min_chunk_size"] = torch.tensor(certificate, dtype=torch.int32)
     result = data_schedule.get_batch_on_this_rank_for_sequence_packing(
-        iter([batch]), None, dynamic_cp=True, pg_collection=pg,
+        iter([batch]),
+        None,
+        dynamic_cp=True,
+        pg_collection=pg,
         config=SimpleNamespace(
-            linear_cp_layout="contiguous", attention_cp_layout="zigzag", sequence_parallel=False,
+            linear_cp_layout="contiguous",
+            attention_cp_layout="zigzag",
+            sequence_parallel=False,
         ),
         return_context_parallel_batch=True,
     )
@@ -369,9 +378,44 @@ def test_eager_hybrid_zigzag_preserves_certified_mtp_halo(cpu_batch_communicatio
 
         tokens = result.get_batch("zigzag")["tokens"]
         # A genuine positive certificate can still be too short for a seven-token halo.
-        assert prepare_mtp_sequence_roll_fields(
-            context, (MTPSequenceRollField("tokens", tokens, 1, 0, 0),), max_offset=7
-        ) is None
+        assert (
+            prepare_mtp_sequence_roll_fields(
+                context, (MTPSequenceRollField("tokens", tokens, 1, 0, 0),), max_offset=7
+            )
+            is None
+        )
+
+
+def test_dynamic_hybrid_caps_mtp_halo_to_tp_aligned_tail(cpu_batch_communication):
+    cp, tp, tp_cp = _group(2), _group(4), _group(8)
+    pg = ProcessGroupCollection(
+        tp=tp,
+        pp=_group(1),
+        cp=cp,
+        tp_cp=tp_cp,
+        dynamic_cp={2: cp},
+        dynamic_tp_cp={2: tp_cp},
+    )
+    batch = _batch([20, 0])
+    batch.update(
+        local_cp_size=torch.tensor(2, dtype=torch.int32),
+        zigzag_cp_min_chunk_size=torch.tensor(5, dtype=torch.int32),
+    )
+    result = data_schedule.get_batch_on_this_rank_for_sequence_packing(
+        iter([batch]),
+        None,
+        dynamic_cp=True,
+        pg_collection=pg,
+        config=SimpleNamespace(
+            linear_cp_layout="zigzag",
+            attention_cp_layout="zigzag",
+            sequence_parallel=True,
+        ),
+        return_context_parallel_batch=True,
+    )
+    params = result.get_packed_seq_params("zigzag")
+    assert params.cu_seqlens_q_padded.tolist() == [0, 20, 24]
+    assert params.zigzag_cp_min_chunk_size == 1
 
 
 def test_dynamic_group_callbacks_override_collection_maps(cpu_batch_communication):
