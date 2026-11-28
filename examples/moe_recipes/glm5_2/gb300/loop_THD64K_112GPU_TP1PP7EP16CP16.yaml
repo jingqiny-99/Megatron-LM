@@ -242,15 +242,17 @@ ARGS:
   mtp_loss_type: e2e_tv
   mtp_detach_heads: true
   moe_hybridep_routing_map_mode: bool
-  accumulate_allreduce_grads_in_fp32: null
-  main_params_dtype: null
-  main_grads_dtype: null
-  exp_avg_dtype: null
-  exp_avg_sq_dtype: null
-  megatron_fsdp_main_grads_dtype: null
-  megatron_fsdp_grad_comm_dtype: null
-  lr_warmup_iters: null
-  num_distributed_optimizer_instances: null
+  # The measured loop variants use the qualified runtime's optimizer and gradient defaults.
+  <<: &native_training_defaults
+    accumulate_allreduce_grads_in_fp32: null
+    main_params_dtype: null
+    main_grads_dtype: null
+    exp_avg_dtype: null
+    exp_avg_sq_dtype: null
+    megatron_fsdp_main_grads_dtype: null
+    megatron_fsdp_grad_comm_dtype: null
+    lr_warmup_iters: null
+    num_distributed_optimizer_instances: null
   recompute_method: null
   recompute_num_layers: null
   dsa_indexer_reuse_checkpoint_topk: null
@@ -287,7 +289,7 @@ VARIANTS:
     num_distributed_optimizer_instances: '1'
     varlen_mock_dataset_config_json: '{"mode":"distribution","type":"lognormal","min_seq_len":3969,"max_seq_len":3969,"mean_seq_len":3969,"lognormal_sigma":0.15}'
   4k_mok16k_recompute:
-    <<: *source_4k
+    <<: [*native_training_defaults, *source_4k]
     moe_megakernel_backend_config: *mok16k
     loop_ring_recompute_plan: *checkpoint_pre_core_coda
   128k: &source_128k
@@ -305,7 +307,7 @@ VARIANTS:
     varlen_mock_dataset_config_json: '{"mode":"distribution","type":"lognormal","min_seq_len":126977,"max_seq_len":126977,"mean_seq_len":126977,"lognormal_sigma":0.15}'
     max_seqlen_per_dp_cp_rank: '8192'
   128k_mok16k_recompute:
-    <<: *source_128k
+    <<: [*native_training_defaults, *source_128k]
     moe_megakernel_backend_config: *mok16k
     loop_ring_recompute_plan: CCCC/CCCC/CCCC/CCCC/CCCC/CCCC/CCCC
   1m: &source_1m
