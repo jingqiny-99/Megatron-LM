@@ -1432,14 +1432,24 @@ def get_batch_on_this_rank_for_sequence_packing(
     broadcast_tensor(batch['zigzag_cp_min_chunk_size'], tp_src_rank, tp_group)
     broadcast_tensor(batch['local_cp_size'], tp_src_rank, tp_group)
 
+    scalar_metadata = [batch['max_seqlen'].reshape(1), batch['zigzag_cp_min_chunk_size'].reshape(1)]
+    if dynamic_cp:
+        scalar_metadata.append(batch['local_cp_size'].reshape(1))
+    scalar_metadata_host = torch.cat(scalar_metadata).cpu().tolist()
+    max_seqlen = scalar_metadata_host[0]
+    zigzag_cp_min_chunk_size = scalar_metadata_host[1]
+    if zigzag_cp_min_chunk_size < 0 or (
+        not dynamic_cp
+        and config is not None
+        and getattr(config, 'cuda_graph_impl', 'none') == 'full_iteration'
+    ):
+        zigzag_cp_min_chunk_size = None
+    local_cp_size = int(scalar_metadata_host[2]) if dynamic_cp else None
+
     if return_context_parallel_batch:
         if config is None:
             raise ValueError("config is required when returning ContextParallelBatch")
-        runtime_cp_group = (
-            dynamic_cp_group_func(group_size=int(batch['local_cp_size'].item()))
-            if dynamic_cp
-            else cp_group
-        )
+        runtime_cp_group = dynamic_cp_group_func(group_size=local_cp_size) if dynamic_cp else cp_group
         batch['dynamic_cp_group'] = runtime_cp_group if dynamic_cp else None
         # The CP batch sharders expect (1, num_seqs + 1) cu_seqlens, as returned by
         # flatten_batch_for_packed_sequences; the per-document sharder reads row 0.
@@ -1467,6 +1477,11 @@ def get_batch_on_this_rank_for_sequence_packing(
             ),
             tokens_per_sample=None,
         )
+        # The certificate describes this scheduler's final per-document zigzag half-chunks.
+        # Contiguous layouts have a different halo plan. Unknown/zero retain their fallback.
+        zigzag_params = cp_batch.packed_seq_params_by_layout.get("zigzag")
+        if zigzag_params is not None:
+            zigzag_params.zigzag_cp_min_chunk_size = zigzag_cp_min_chunk_size
 
         if getattr(config, "cuda_graph_thd_max_packed_sequences", None) is not None:
             # The general batch builder retains TE's physical-offset workaround
@@ -1489,19 +1504,6 @@ def get_batch_on_this_rank_for_sequence_packing(
     padding_mask = batch['padding_mask']
     cu_seqlens = batch['cu_seqlens']
     cu_seqlens_padded = batch['cu_seqlens_padded']
-    scalar_metadata = [batch['max_seqlen'].reshape(1), batch['zigzag_cp_min_chunk_size'].reshape(1)]
-    if dynamic_cp:
-        scalar_metadata.append(batch['local_cp_size'].reshape(1))
-    scalar_metadata_host = torch.cat(scalar_metadata).cpu().tolist()
-    max_seqlen = scalar_metadata_host[0]
-    zigzag_cp_min_chunk_size = scalar_metadata_host[1]
-    if zigzag_cp_min_chunk_size < 0 or (
-        not dynamic_cp
-        and config is not None
-        and getattr(config, 'cuda_graph_impl', 'none') == 'full_iteration'
-    ):
-        zigzag_cp_min_chunk_size = None
-    local_cp_size = int(scalar_metadata_host[2]) if dynamic_cp else None
     runtime_cp_group = dynamic_cp_group_func(group_size=local_cp_size) if dynamic_cp else None
     runtime_tp_cp_group = (
         _sequence_parallel_tp_cp_group(

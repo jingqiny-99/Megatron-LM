@@ -332,6 +332,48 @@ def test_dynamic_layouts_use_injected_runtime_groups(
         )
 
 
+@pytest.mark.parametrize(
+    "certificate,expected", [(None, None), (-1, None), (0, 0), (1, 1), (8, 8)]
+)
+def test_eager_hybrid_zigzag_preserves_certified_mtp_halo(cpu_batch_communication, certificate, expected):
+    from megatron.core.transformer.mtp_sequence_roll import (
+        ZigzagPackedCPRollContext,
+        prepare_mtp_sequence_roll_context,
+    )
+
+    cp = _group(2)
+    pg = ProcessGroupCollection(
+        tp=_group(1), pp=_group(1), cp=cp, tp_cp=cp, dynamic_cp={2: cp},
+    )
+    batch = _batch([32, 32])
+    batch["local_cp_size"] = torch.tensor(2, dtype=torch.int32)
+    if certificate is not None:
+        batch["zigzag_cp_min_chunk_size"] = torch.tensor(certificate, dtype=torch.int32)
+    result = data_schedule.get_batch_on_this_rank_for_sequence_packing(
+        iter([batch]), None, dynamic_cp=True, pg_collection=pg,
+        config=SimpleNamespace(
+            linear_cp_layout="contiguous", attention_cp_layout="zigzag", sequence_parallel=False,
+        ),
+        return_context_parallel_batch=True,
+    )
+    params = result.get_packed_seq_params("zigzag")
+    assert params.zigzag_cp_min_chunk_size == expected
+    assert result.get_packed_seq_params("contiguous").zigzag_cp_min_chunk_size is None
+    context = prepare_mtp_sequence_roll_context(result.get_batch("zigzag")["tokens"], cp, params)
+    assert isinstance(context, ZigzagPackedCPRollContext) == bool(expected)
+    if expected == 1:
+        from megatron.core.transformer.mtp_sequence_roll import (
+            MTPSequenceRollField,
+            prepare_mtp_sequence_roll_fields,
+        )
+
+        tokens = result.get_batch("zigzag")["tokens"]
+        # A genuine positive certificate can still be too short for a seven-token halo.
+        assert prepare_mtp_sequence_roll_fields(
+            context, (MTPSequenceRollField("tokens", tokens, 1, 0, 0),), max_offset=7
+        ) is None
+
+
 def test_dynamic_group_callbacks_override_collection_maps(cpu_batch_communication):
     cp = _group(2, stride=2)
     tp_cp = _group(4)
